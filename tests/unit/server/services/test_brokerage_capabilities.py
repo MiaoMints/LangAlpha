@@ -178,10 +178,11 @@ def test_placing_an_order_takes_the_trading_group() -> None:
 
 
 @pytest.mark.parametrize("vendor", ["ibkr", "webull"])
-def test_a_broker_that_places_nothing_is_never_asked_about_trading(
+def test_a_broker_whose_order_tools_we_hold_back_is_never_asked_about_trading(
     vendor: str,
 ) -> None:
-    """Neither publishes a tool that places an order, so the toggle would lie."""
+    """Both publish live order tools that no group carries, so the toggle
+    would grant nothing and would read as though it did."""
     assert "trading" not in group_keys_for(vendor)
 
 
