@@ -94,10 +94,11 @@ BROKERAGES: tuple[Brokerage, ...] = (
         site="webull.com",
         description=(
             "Webull brokerage account: balances, positions and buying power, "
-            "order history, watchlists, real-time quotes, and instrument "
-            "reference data. Reads only: nothing here places, previews or "
-            "stages an order. Covers equities, options, futures, event "
-            "contracts and crypto."
+            "order history, watchlists, real-time quotes, instrument reference "
+            "data, fundamentals, news, and insider and institutional holdings, "
+            "and draft orders for stocks, options, futures and crypto that the "
+            "user confirms in the Webull app before anything is placed. Covers "
+            "equities, options, futures, event contracts and crypto."
         ),
     ),
     Brokerage(
