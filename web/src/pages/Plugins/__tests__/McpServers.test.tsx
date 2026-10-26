@@ -82,6 +82,7 @@ vi.mock('@/hooks/useMcpServers', () => ({
   useMcpCatalogServerTools: () => ({ data: undefined, isLoading: false, error: null }),
   useBuiltinMcpServerTools: () => ({ data: undefined, isLoading: false, error: null }),
   useSetMcpServerBinding: () => ({ mutateAsync: vi.fn(), isPending: false }),
+  useSetMcpToolGroup: () => ({ mutateAsync: vi.fn(), isPending: false }),
   // The registry the list joins every row against before it will let a connect
   // start. Most rows here are ordinary servers, so what matters is that the
   // query has *answered* -- an unanswered one deliberately holds the button,

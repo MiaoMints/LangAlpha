@@ -1,6 +1,8 @@
 import { Trans, useTranslation } from 'react-i18next';
 import { Link } from 'react-router';
 import { SegmentedControl } from '@/components/ui/segmented-control';
+import { Select } from '@/components/ui/select';
+import { TOOL_GROUP_AUTO } from '@/hooks/useMcpServers';
 import { EnabledToggle } from '@/components/mcp/McpPrimitives';
 import { OrderModeBadge } from '@/components/orders/OrderModeBadge';
 import { TRADING_PERMISSION_HREF, skipsApproval } from '@/lib/tradingPermission';
@@ -266,6 +268,67 @@ export function ToolBindingControl({
           onChange={write}
         />
       </div>
+      {error && (
+        <span role="alert" className="text-[0.625rem] text-right" style={{ color: 'var(--color-loss)' }}>
+          {error}
+        </span>
+      )}
+    </div>
+  );
+}
+
+/**
+ * Where a read-only tool nobody curated sits, as the compact select at the
+ * right edge of its row. Three kinds of answer share one control: Automatic
+ * (no stored choice, so the background grouping decides), a group the vendor
+ * offers, and Off, which refuses the tool. Automatic removes the choice rather
+ * than writing a matching group, so a later regrouping still reaches the tool.
+ */
+const GROUP_OFF = 'off';
+
+export function ToolGroupControl({
+  tool,
+  offered,
+  busy,
+  error,
+  onChange,
+}: {
+  tool: McpToolSummary;
+  offered: readonly string[];
+  busy: boolean;
+  /** The server's refusal of the last change to this tool, verbatim. */
+  error?: string | null;
+  /** A group key, `null` for Off, or `TOOL_GROUP_AUTO`. */
+  onChange: (group: string | null) => void;
+}) {
+  const { t } = useTranslation();
+  const stored = tool.choice?.group;
+  const value = tool.choice == null ? TOOL_GROUP_AUTO : (stored ?? GROUP_OFF);
+  // A stored group the vendor no longer offers still has to be on the list,
+  // or the select would show whichever option sorts first as if it were chosen.
+  const groups = stored && !offered.includes(stored) ? [...offered, stored] : offered;
+
+  return (
+    <div className="flex flex-col items-end gap-0.5 shrink-0">
+      <Select
+        className="w-36"
+        aria-label={t('plugins.detail.groupAria', { name: tool.name })}
+        value={value}
+        disabled={busy}
+        onChange={(e) => {
+          const next = e.target.value;
+          onChange(next === GROUP_OFF ? null : next);
+        }}
+        style={{ height: '1.5rem', fontSize: '0.6875rem', paddingLeft: '0.5rem', paddingRight: '1.75rem' }}
+      >
+        <option value={TOOL_GROUP_AUTO}>{t('plugins.detail.groupAuto')}</option>
+        {groups.map((key) => (
+          <option key={key} value={key}>
+            {t(`plugins.brokerages.capabilities.${key}.label`)}
+          </option>
+        ))}
+        <option value={GROUP_OFF}>{t('plugins.detail.groupOff')}</option>
+      </Select>
       {error && (
         <span role="alert" className="text-[0.625rem] text-right" style={{ color: 'var(--color-loss)' }}>
           {error}
