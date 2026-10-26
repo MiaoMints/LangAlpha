@@ -45,10 +45,10 @@ export interface McpToolSummary {
    */
   capability?: string | null;
   /**
-   * Whether this tool is refused at every grant. A null `capability` alone does
-   * not say: one we deliberately withheld is always refused, one we have simply
-   * not classified is always permitted. Reading null as "unavailable" is how the
-   * detail view came to promise the agent could not reach tools it could.
+   * Whether this tool is refused at every grant, which at a brokerage is every
+   * tool no group names. Sent rather than read off a null `capability` because
+   * an earlier server permitted the ungrouped tools it had not classified, and
+   * said so with `false` here.
    */
   always_denied?: boolean;
   /**
