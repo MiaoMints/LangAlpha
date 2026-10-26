@@ -165,6 +165,19 @@ def test_the_two_tools_a_prefix_rule_misfiles() -> None:
     assert "provide_customer_feedback" in UNCURATED["ibkr"]
 
 
+def test_a_tool_sits_with_the_objects_it_reads_or_changes() -> None:
+    """Saved things are granted as a whole: reading an alert and changing one
+    are one switch, and a chart's indicators go with its layout."""
+    for tool in ("get_alert_log", "mark_alerts_read", "update_alert"):
+        assert group_of_tool("robinhood", tool) == "alerts"
+    for tool in ("get_legend_layouts", "set_legend_chart_settings", "add_legend_indicator"):
+        assert group_of_tool("robinhood", tool) == "charts"
+    # A whole combo order in, the margin it would use out: a what-if, which the
+    # single-leg capacity read beside it is not.
+    assert group_of_tool("moomoo", "account_combo_trading_info") == "order_preview"
+    assert group_of_tool("moomoo", "account_trading_info") == "account"
+
+
 def test_placing_an_order_takes_the_trading_group() -> None:
     for vendor, tool in (
         ("moomoo", "trading_order_place"),

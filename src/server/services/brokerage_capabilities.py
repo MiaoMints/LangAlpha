@@ -154,6 +154,9 @@ GROUPS: tuple[CapabilityGroup, ...] = (
     CapabilityGroup(key="watchlists", order=20, tone="neutral"),
     CapabilityGroup(key="scanners", order=30, tone="neutral"),
     CapabilityGroup(key="alerts", order=40, tone="neutral"),
+    # Saved chart setups: the layouts and the indicators applied to them,
+    # read and changed. Display state the user arranged, with no money in it.
+    CapabilityGroup(key="charts", order=45, tone="neutral"),
     CapabilityGroup(key="account", order=50, tone="caution"),
     CapabilityGroup(
         key="paper_trading", order=60, tone="neutral", rung=True, default_binding="direct"
@@ -182,7 +185,7 @@ GROUPS: tuple[CapabilityGroup, ...] = (
 _BY_KEY: dict[str, CapabilityGroup] = {g.key: g for g in GROUPS}
 
 # Tool names exactly as the vendor publishes them, which is what the relay
-# compares against. Counted against live discovery: moomoo 88, Robinhood 67,
+# compares against. Counted against live discovery: moomoo 105, Robinhood 85,
 # IBKR 45, Webull 103, and ``UNCURATED`` names the ones deliberately left out.
 _CURATION: dict[str, dict[str, tuple[str, ...]]] = {
     "moomoo": {
@@ -254,6 +257,9 @@ _CURATION: dict[str, dict[str, tuple[str, ...]]] = {
             "quote_valuation_index_stock_plate_list",
             "quote_valuation_plate_stock_list",
             "quote_warrant_screen",
+            # Per-symbol margin and short-selling terms at a moomoo firm, the
+            # same for every account there: reference data, not the user's.
+            "trading_margin_ratio",
         ),
         "watchlists": (
             "quote_modify_user_security",
@@ -262,8 +268,10 @@ _CURATION: dict[str, dict[str, tuple[str, ...]]] = {
         ),
         "account": (
             "account_authorized_trd_accs",
+            "account_cash_logs",
             "account_fills_history",
             "account_funds",
+            "account_order_fees",
             "account_order_fills_today",
             "account_orders_active",
             "account_orders_detail",
@@ -278,6 +286,12 @@ _CURATION: dict[str, dict[str, tuple[str, ...]]] = {
             "crypto_account_purchasing_power",
             "crypto_account_total_balance",
         ),
+        # A what-if for one option combo: the request is a whole order (legs,
+        # side, size, price) and the answer is the buying power and margin it
+        # would use, with nothing placed or saved. The single-leg counterpart,
+        # ``account_trading_info``, asks how much the account could trade at
+        # all, which is why that one is an account read and this is not.
+        "order_preview": ("account_combo_trading_info",),
         "paper_trading": (
             "sim_trade_account_list",
             "sim_trade_cancel_order",
@@ -301,6 +315,7 @@ _CURATION: dict[str, dict[str, tuple[str, ...]]] = {
             "get_currency_pairs",
             "get_earnings_calendar",
             "get_earnings_results",
+            "get_equity_analyst_ratings",
             "get_equity_fundamentals",
             "get_equity_historicals",
             "get_equity_news",
@@ -316,6 +331,7 @@ _CURATION: dict[str, dict[str, tuple[str, ...]]] = {
             "get_option_historicals",
             "get_option_instruments",
             "get_option_quotes",
+            "get_politician_trades",
             "get_sec_filing",
             "get_sec_filing_facts",
             "get_sec_filing_facts_catalog",
@@ -336,13 +352,39 @@ _CURATION: dict[str, dict[str, tuple[str, ...]]] = {
             "unfollow_watchlist",
             "update_watchlist",
         ),
+        # ``preview_scan`` runs a filter set without saving it, and the
+        # datapoint catalog is what a scan's expressions are built from.
         "scanners": (
             "create_scan",
+            "get_scanner_datapoints",
             "get_scanner_filter_specs",
             "get_scans",
+            "preview_scan",
             "run_scan",
             "update_scan_config",
             "update_scan_filters",
+        ),
+        # Price and indicator alerts: set, changed, paused, deleted, and the
+        # log of the ones that fired, marked read once relayed.
+        "alerts": (
+            "create_alert",
+            "delete_alert",
+            "get_alert_log",
+            "get_alerts",
+            "mark_alerts_read",
+            "update_alert",
+        ),
+        # Robinhood Legend's saved charts: their layouts and display settings,
+        # and the indicators applied to them, added, changed and removed.
+        "charts": (
+            "add_legend_indicator",
+            "get_legend_charts",
+            "get_legend_indicator_catalog",
+            "get_legend_indicators",
+            "get_legend_layouts",
+            "remove_legend_indicator",
+            "set_legend_chart_settings",
+            "update_legend_indicator",
         ),
         "account": (
             "get_accounts",

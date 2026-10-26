@@ -4943,7 +4943,11 @@
         },
         "alerts": {
           "label": "Price alerts",
-          "desc": "Read your price alerts, and create or delete them."
+          "desc": "Read your price alerts and the ones that fired, and create, change or delete them."
+        },
+        "charts": {
+          "label": "Saved charts",
+          "desc": "Read your saved chart layouts, and change their settings and the indicators on them."
         },
         "account": {
           "label": "Account and positions",
