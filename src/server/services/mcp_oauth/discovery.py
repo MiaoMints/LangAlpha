@@ -37,6 +37,7 @@ from src.server.database.mcp_tool_schemas import (
 )
 from src.server.database.pool import get_db_connection
 from src.server.models.mcp_server import OK_VERDICTS, ProbeResult
+from src.server.services.mcp_enrichment.jobs import enqueue_if_new
 from src.server.services.mcp_identity import bounded_identity
 from src.server.services.mcp_oauth.lifecycle import (
     TokenUnavailable,
@@ -209,6 +210,16 @@ class _SnapshotWriter:
                 ):
                     async with conn.cursor() as cur:
                         await bump_user_versions(cur, self.user_id)
+                # In the same transaction, so a tool list that lands is queued
+                # for description and grouping or not landed at all.
+                if write.row is not None and now_ok and upsert_kwargs.get("tools"):
+                    await enqueue_if_new(
+                        user_id=self.user_id,
+                        server_name=self.server_name,
+                        url=current.get("url"),
+                        tools=upsert_kwargs["tools"],
+                        conn=conn,
+                    )
         if write.row is None:
             # Refused under the write's own lock, whichever way the credential
             # moved: a disconnect already purged what we would be re-adding, or

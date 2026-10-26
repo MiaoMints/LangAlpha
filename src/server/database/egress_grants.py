@@ -15,7 +15,7 @@ than on the next sync.
 
 import json
 import logging
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from typing import Any
@@ -96,15 +96,30 @@ class _Policies:
 
 
 def _policy(
-    vendor: str | None, granted: Sequence[str], row: Any
+    vendor: str | None,
+    granted: Sequence[str],
+    row: Any,
+    assignments: Mapping[str, Any] | None = None,
 ) -> tuple[str | None, str | None, bool, str | None]:
-    """One grant's policy columns, derived once for every path that writes them."""
-    from src.server.services.brokerage_capabilities import denied_tools, tools_for
+    """One grant's policy columns, derived once for every path that writes them.
+
+    `assignments` is the user's per-brokerage map from
+    `load_assignments`: the groups below the code's own, which the allowlist
+    has to carry because the relay reads nothing else.
+    """
+    from src.server.services.brokerage_capabilities import (
+        NO_ASSIGNMENTS,
+        denied_tools,
+        tools_for,
+    )
     from src.server.services.tool_binding import inputs_from_row, resolve_plan
 
-    tools = denied_tools(vendor, granted)
-    permitted = tools_for(vendor, granted)
-    bound = resolve_plan(vendor, granted, inputs_from_row(row)).sandbox_excluded
+    assigned = (assignments or {}).get(vendor or "", NO_ASSIGNMENTS)
+    tools = denied_tools(vendor, granted, assigned)
+    permitted = tools_for(vendor, granted, assigned)
+    bound = resolve_plan(
+        vendor, granted, inputs_from_row(row), assigned=assigned
+    ).sandbox_excluded
     return (
         None if tools is None else json.dumps(sorted(tools)),
         None if permitted is None else json.dumps(sorted(permitted)),
@@ -179,6 +194,7 @@ async def _tool_policies(
     ``policy_required`` false, which the relay reads as no policy at all.
     """
     from src.server.services.brokerage_capabilities import vendor_for_url
+    from src.server.services.mcp_enrichment.assignments import load_assignments
 
     await cur.execute(
         """
@@ -191,14 +207,25 @@ async def _tool_policies(
         """,
         (list(connection_ids), user_id),
     )
+    rows = await cur.fetchall()
+    assignments = await load_assignments(
+        user_id,
+        (vendor_for_url(row["server_url"]) for row in rows),
+        # The lock holder's own session: a second pool slot per writer can
+        # stall on the pool under load.
+        conn=getattr(cur, "connection", None),
+    )
     policies = _Policies([], [], [], [], [])
-    for row in await cur.fetchall():
+    for row in rows:
         # The vendor comes from the consented address, never the row's name.
         # The name is the user's to pick and to edit, so keying on it let a row
         # called anything else at a broker's host carry no policy, and a row
         # holding a broker's name but pointed elsewhere carry the wrong one.
         denylist, allowlist, required, direct_only = _policy(
-            vendor_for_url(row["server_url"]), row["granted_capabilities"] or (), row
+            vendor_for_url(row["server_url"]),
+            row["granted_capabilities"] or (),
+            row,
+            assignments,
         )
         policies.keys.append(str(row["connection_id"]))
         policies.denylists.append(denylist)
@@ -844,6 +871,7 @@ async def apply_consent_to_active_grants(connection_id: str, *, conn=None) -> in
     land together.
     """
     from src.server.services.brokerage_capabilities import vendor_for_url
+    from src.server.services.mcp_enrichment.assignments import load_assignments
 
     async with get_db_connection(conn) as db, db.transaction():
         async with db.cursor(row_factory=dict_row) as cur:
@@ -885,10 +913,16 @@ async def apply_consent_to_active_grants(connection_id: str, *, conn=None) -> in
             # Both columns, for the reason ``_tool_policies`` gives: the other
             # blue/green colour enforces the allowlist, and a consent change
             # that touched only the denial never reached it.
+            vendor = vendor_for_url(row["server_url"])
             denylist, allowlist, required, direct_only = _policy(
-                vendor_for_url(row["server_url"]),
+                vendor,
                 row["granted_capabilities"] or (),
                 row,
+                await load_assignments(
+                    str(owner["user_id"]),
+                    [vendor],
+                    conn=getattr(cur, "connection", None),
+                ),
             )
             await cur.execute(
                 """

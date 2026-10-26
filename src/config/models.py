@@ -298,6 +298,21 @@ class OrderReconcileConfig(BaseModel):
     group_timeout_seconds: int = Field(default=120, ge=60)
 
 
+class McpEnrichmentConfig(BaseModel):
+    """The background service that has a model describe MCP servers and propose
+    groups for new brokerage tools.
+
+    ``user_servers`` covers the servers users add themselves, which run on
+    each user's own model; off, only shipped brokerages are described. With
+    ``enabled`` off nothing is queued and brokerages fall back to the code's
+    curation plus the reviewed seed shipped in the repo.
+    """
+
+    enabled: bool = Field(default=True)
+    user_servers: bool = Field(default=True)
+    interval_seconds: int = Field(default=20, ge=5)
+
+
 class FeatureFlagOverride(BaseModel):
     """Deployment override for a code-declared feature (src/config/features.py).
 
@@ -532,6 +547,7 @@ class InfrastructureConfig(BaseModel):
     )
 
     # Order reconciliation sweep
+    mcp_enrichment: McpEnrichmentConfig = Field(default_factory=McpEnrichmentConfig)
     order_reconcile: OrderReconcileConfig = Field(
         default_factory=OrderReconcileConfig
     )

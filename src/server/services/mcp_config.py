@@ -41,9 +41,16 @@ from src.server.services.tool_binding import (
     resolve_plan,
 )
 from src.server.services.brokerage_capabilities import (
+    NO_ASSIGNMENTS,
+    Assignments,
     group_keys_for,
     tools_for,
     vendor_for_url,
+)
+from src.server.services.mcp_enrichment.assignments import load_assignments
+from src.server.services.mcp_enrichment.prompt_text import (
+    effective_description,
+    profiles_by_server,
 )
 
 _DEFAULT_PORTS = {"http": 80, "https": 443}
@@ -444,6 +451,7 @@ async def resolve_mcp_config(
     inherited_servers: list[MCPServerConfig] = []
     tombstoned_inherited: list[MCPServerConfig] = []
     user_row_by_name = {row["name"]: row for row in user_rows}
+    profiles = await profiles_by_server(user_id, user_rows)
     for row in user_rows:
         name = row["name"]
         if name in builtin_name_set:
@@ -482,6 +490,11 @@ async def resolve_mcp_config(
                     connection["connection_id"] if connection else None
                 ),
             )
+            # A prompt-only field, outside the discovery fingerprint, so this
+            # changes what the agent reads and nothing about the server.
+            cfg = cfg.model_copy(
+                update={"description": effective_description(row, profiles.get(name))}
+            )
         except Exception:
             logger.error(
                 "[MCP] Failed to parse user server %r for user %s; skipping.",
@@ -501,6 +514,16 @@ async def resolve_mcp_config(
         for row in user_rows
         if row.get("plugin_name")
     }
+
+    # The groups below the code's own, matched on each tool's current digest.
+    # Only connections can be granted anything, so only their vendors matter.
+    assignments = await load_assignments(
+        user_id,
+        (vendor_for_url(c.get("server_url")) for c in connection_by_server.values()),
+    )
+
+    def _assigned(vendor: str | None) -> Assignments:
+        return assignments.get(vendor or "", NO_ASSIGNMENTS)
 
     def _permitted_tools(cfg: MCPServerConfig) -> frozenset[str] | None:
         """What consent permits on this server, or None if we curate no groups.
@@ -533,7 +556,7 @@ async def resolve_mcp_config(
                 "consent; refusing every tool until it is reconnected",
                 user_id, cfg.name,
             )
-        return tools_for(vendor, capabilities or ())
+        return tools_for(vendor, capabilities or (), _assigned(vendor))
 
     def _binding_plan(cfg: MCPServerConfig) -> tuple[BindingPlan, bool]:
         """Which path each granted tool takes, and whether a probe still gates
@@ -552,10 +575,12 @@ async def resolve_mcp_config(
         connection = connection_by_server.get(cfg.name)
         inputs = inputs_from_row(user_row_by_name.get(cfg.name))
         if connection is not None:
+            vendor = vendor_for_url(connection.get("server_url"))
             return resolve_plan(
-                vendor_for_url(connection.get("server_url")),
+                vendor,
                 connection.get("granted_capabilities") or (),
                 inputs,
+                assigned=_assigned(vendor),
             ), False
         # Planning off ``()`` is deliberate: a row that never went through a
         # consent screen is permitted nothing at a brokerage, while a server

@@ -51,6 +51,31 @@ class LLMService:
         self._agent_config = agent_config
         self._logger = logger or logging.getLogger(__name__)
 
+    async def effective_model(
+        self,
+        *,
+        user_id: str | None,
+        slot: Literal["background", "primary"] = "background",
+    ) -> str:
+        """The model name ``complete`` would call for this user and slot.
+
+        For a caller that stores what a model wrote and has to say which model
+        wrote it, resolved the same way ``complete`` resolves it.
+        """
+        if user_id is None:
+            return slot_model(self._agent_config.llm, slot)
+        resolved = await resolve_llm_config(
+            base_config=self._agent_config,
+            user_id=user_id,
+            request_model=None,
+            is_byok=True,
+            slot=slot,
+            reasoning_effort=None,
+            fast_mode=None,
+            user_facing=False,
+        )
+        return slot_model(resolved.llm, slot)
+
     async def complete(
         self,
         *,

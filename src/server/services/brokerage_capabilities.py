@@ -65,9 +65,10 @@ Keys are facts and the words for them belong to the client, the same contract
 
 from __future__ import annotations
 
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from enum import StrEnum
+from types import MappingProxyType
 from typing import TYPE_CHECKING, Literal, get_args
 
 from src.server.services.brokerages import brokerage_by_name, brokerage_for_url
@@ -770,6 +771,42 @@ _ORDER_TOOLS: dict[str, dict[str, OrderTool]] = {
 }
 
 
+@dataclass(frozen=True)
+class Assignment:
+    """A group for a tool no code curation names, from below the code's rungs.
+
+    ``source`` says which: ``seed`` (reviewed rows shipped in the repo),
+    ``user`` (the user's own choice on the tools page) or ``generated`` (a
+    model's proposal that cleared every rule). Built only by
+    ``mcp_enrichment.assignments``, which is where those rules live; this
+    module only refuses to let one override what the code says.
+    """
+
+    tool: str
+    group: str
+    source: Literal["seed", "user", "generated"]
+
+
+# Folded tool name -> assignment, per brokerage and per user.
+Assignments = Mapping[str, Assignment]
+NO_ASSIGNMENTS: Assignments = MappingProxyType({})
+
+
+def _assigned(brokerage: str | None, assigned: Assignments) -> dict[str, Assignment]:
+    """The assignments that may count: never over a curated or UNCURATED tool,
+    and only into a group this brokerage offers."""
+    if not assigned or not brokerage:
+        return {}
+    curated = _BY_TOOL.get(brokerage, {})
+    refused = _UNCURATED_FOLDED.get(brokerage, frozenset())
+    offered = _CURATION.get(brokerage, {})
+    return {
+        folded: a
+        for folded, a in assigned.items()
+        if folded not in curated and folded not in refused and a.group in offered
+    }
+
+
 def groups_for(brokerage: str | None) -> tuple[CapabilityGroup, ...]:
     """The consent toggles to offer for a brokerage, in display order.
 
@@ -822,7 +859,11 @@ def effective_capabilities(
         kept = narrowed
 
 
-def tools_for(brokerage: str | None, granted: Iterable[str]) -> frozenset[str] | None:
+def tools_for(
+    brokerage: str | None,
+    granted: Iterable[str],
+    assigned: Assignments = NO_ASSIGNMENTS,
+) -> frozenset[str] | None:
     """The tools a grant of these groups permits, or None if we curate no policy.
 
     **The gate.** Every layer that decides whether a brokerage tool reaches the
@@ -835,6 +876,11 @@ def tools_for(brokerage: str | None, granted: Iterable[str]) -> frozenset[str] |
     is not one we have a map for, and the caller decides. A shipped brokerage
     we have not curated permits nothing, because every one of its tools is one
     nobody has read.
+
+    ``assigned`` adds the tools the code names in no group but something below
+    it has put in one (see :class:`Assignment`), in precedence order: what
+    ``UNCURATED`` refuses stays refused and what the code groups stays where
+    the code put it, whatever an assignment says.
     """
     if brokerage is None:
         return None
@@ -844,10 +890,16 @@ def tools_for(brokerage: str | None, granted: Iterable[str]) -> frozenset[str] |
     wanted = set(effective_capabilities(brokerage, granted))
     return frozenset(
         tool for key, tools in curated.items() if key in wanted for tool in tools
+    ) | frozenset(
+        a.tool for a in _assigned(brokerage, assigned).values() if a.group in wanted
     )
 
 
-def denied_tools(brokerage: str | None, granted: Iterable[str]) -> frozenset[str] | None:
+def denied_tools(
+    brokerage: str | None,
+    granted: Iterable[str],
+    assigned: Assignments = NO_ASSIGNMENTS,
+) -> frozenset[str] | None:
     """The curated tools this grant refuses, for the previous version's column.
 
     Not the gate, and it cannot be one: it names what we know and so says
@@ -863,12 +915,22 @@ def denied_tools(brokerage: str | None, granted: Iterable[str]) -> frozenset[str
     if curated is None:
         return frozenset() if brokerage_by_name(brokerage) else None
     wanted = set(effective_capabilities(brokerage, granted))
-    return frozenset(
-        tool for key, tools in curated.items() if key not in wanted for tool in tools
-    ) | frozenset(UNCURATED.get(brokerage, ()))
+    return (
+        frozenset(
+            tool for key, tools in curated.items() if key not in wanted for tool in tools
+        )
+        | frozenset(UNCURATED.get(brokerage, ()))
+        | frozenset(
+            a.tool
+            for a in _assigned(brokerage, assigned).values()
+            if a.group not in wanted
+        )
+    )
 
 
-def group_of_tool(brokerage: str | None, tool: str) -> str | None:
+def group_of_tool(
+    brokerage: str | None, tool: str, assigned: Assignments = NO_ASSIGNMENTS
+) -> str | None:
     """The group a tool belongs to, or None if no group names it.
 
     At a shipped brokerage None means refused at every grant, which
@@ -879,17 +941,27 @@ def group_of_tool(brokerage: str | None, tool: str) -> str | None:
     name has it refused at the relay and stripped from the composite while this
     endpoint still reports it under a group, and the detail view tells the user
     a refused tool is callable.
+
+    The code's group first, then an assignment's, under the same precedence
+    :func:`tools_for` applies.
     """
-    return _BY_TOOL.get(brokerage or "", {}).get(fold_tool_name(tool))
+    folded = fold_tool_name(tool)
+    curated = _BY_TOOL.get(brokerage or "", {}).get(folded)
+    if curated is not None:
+        return curated
+    hit = _assigned(brokerage, assigned).get(folded)
+    return hit.group if hit else None
 
 
-def group_for_tool(brokerage: str | None, tool: str) -> CapabilityGroup | None:
+def group_for_tool(
+    brokerage: str | None, tool: str, assigned: Assignments = NO_ASSIGNMENTS
+) -> CapabilityGroup | None:
     """The group itself, for a caller that reads what it says rather than its name.
 
     Same lookup and same folding as :func:`group_of_tool`; the split is only that
     a key is what a JSON payload carries and the group is what a policy reads.
     """
-    key = group_of_tool(brokerage, tool)
+    key = group_of_tool(brokerage, tool, assigned)
     return _BY_KEY.get(key) if key is not None else None
 
 
@@ -925,7 +997,9 @@ def curates(brokerage: str | None) -> bool:
     return brokerage is not None and brokerage in _CURATION
 
 
-def is_always_denied(brokerage: str | None, tool: str) -> bool:
+def is_always_denied(
+    brokerage: str | None, tool: str, assigned: Assignments = NO_ASSIGNMENTS
+) -> bool:
     """Whether a tool is refused whatever the user granted.
 
     True for every tool a shipped brokerage publishes outside a group: one in
@@ -934,8 +1008,25 @@ def is_always_denied(brokerage: str | None, tool: str) -> bool:
     :func:`group_of_tool` gives.
     """
     return brokerage_by_name(brokerage or "") is not None and (
-        group_of_tool(brokerage, tool) is None
+        group_of_tool(brokerage, tool, assigned) is None
     )
+
+
+def is_curated(brokerage: str | None, tool: str) -> bool:
+    """Whether the code itself decided this tool: a group, or ``UNCURATED``.
+
+    What the layers below the code may not touch, so it is also what the
+    enrichment worker skips when it asks a model for a group.
+    """
+    folded = fold_tool_name(tool)
+    return folded in _BY_TOOL.get(brokerage or "", {}) or folded in (
+        _UNCURATED_FOLDED.get(brokerage or "", frozenset())
+    )
+
+
+def is_uncurated(brokerage: str | None, tool: str) -> bool:
+    """Whether the code refuses this tool at every grant: it is in ``UNCURATED``."""
+    return fold_tool_name(tool) in _UNCURATED_FOLDED.get(brokerage or "", frozenset())
 
 
 # Built once rather than scanned per tool: the tools endpoint annotates a whole
@@ -948,6 +1039,11 @@ _BY_TOOL: dict[str, dict[str, str]] = {
         for tool in tools
     }
     for brokerage, curated in _CURATION.items()
+}
+
+_UNCURATED_FOLDED: dict[str, frozenset[str]] = {
+    brokerage: frozenset(fold_tool_name(t) for t in tools)
+    for brokerage, tools in UNCURATED.items()
 }
 
 _BY_ORDER_TOOL: dict[str, dict[str, OrderTool]] = {

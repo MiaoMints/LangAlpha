@@ -203,12 +203,14 @@ async def get_server_tools(name: str, user_id: CurrentUserId) -> dict:
     suppression beside them. Delivery is decided in one place,
     ``list_enabled_user_servers``, and a catalog reader is not it."""
     from src.server.services.brokerage_capabilities import (
+        group_keys_for,
         group_of_tool,
         is_always_denied,
         order_modes,
         vendor_for_url,
     )
     from src.server.services.mcp_config import user_row_to_server_config
+    from src.server.services.mcp_enrichment.choices import grouping_view
     from src.server.services.mcp_discovery import ToolSnapshotIndex
     from src.server.services.tool_binding import inputs_from_row
 
@@ -231,8 +233,11 @@ async def get_server_tools(name: str, user_id: CurrentUserId) -> dict:
     # choose, and joining on it drew somebody's own row wearing a broker's
     # curation (or missed the curation of a row that had been repointed).
     _vendor = vendor_for_url(row.get("url"))
+    assigned, grouping = await grouping_view(user_id, _vendor, tools)
     return {
         "server_name": name,
+        # The groups the page may offer for a tool the user can place.
+        "offered_groups": list(group_keys_for(_vendor)),
         # Which order modes this brokerage has at all, so the page can offer
         # one approval switch per mode without keeping its own vendor table.
         "order_modes": [m.value for m in order_modes(_vendor)],
@@ -246,23 +251,88 @@ async def get_server_tools(name: str, user_id: CurrentUserId) -> dict:
                 # offers, not what this connection may call -- so the group is
                 # the join the detail view needs to say which of them are
                 # actually reachable and which the user declined.
-                "capability": group_of_tool(_vendor, t.get("name", "")),
+                "capability": group_of_tool(_vendor, t.get("name", ""), assigned),
                 # Whether the tool is refused at every grant, which at a
                 # brokerage is every tool no group names. Sent rather than read
                 # off a null capability because a client written against the
                 # earlier policy drew ``false`` here as callable, and an
                 # ungrouped tool is not.
-                "always_denied": is_always_denied(_vendor, t.get("name", "")),
+                "always_denied": is_always_denied(
+                    _vendor, t.get("name", ""), assigned
+                ),
+                # Who grouped it, and whether the user may place it: see
+                # `grouping_view`.
+                **grouping.get(t.get("name", ""), {}),
                 # Which path the tool takes to the model if consent lets it
                 # through, which layer decided, and which paths it may take
                 # at all. Independent of consent on purpose: the column shows
                 # what a grant would put in force.
-                **_binding_fields(_vendor, t.get("name", ""), binding_inputs),
+                **_binding_fields(
+                    _vendor, t.get("name", ""), binding_inputs, assigned
+                ),
             }
             for t in tools
         ],
         "discovered_at": (snapshot or {}).get("discovered_at"),
     }
+
+
+async def _brokerage_tool(user_id: str, name: str, tool: str) -> tuple[str, dict]:
+    """The brokerage and the discovered tool a choice names, or the HTTP refusal."""
+    from src.server.services.brokerage_capabilities import (
+        group_keys_for,
+        vendor_for_url,
+    )
+    from src.server.services.mcp_config import user_row_to_server_config
+    from src.server.services.mcp_discovery import ToolSnapshotIndex
+
+    row = await get_catalog_server(user_id, name)
+    if not row:
+        raise HTTPException(status_code=404, detail="MCP server not found")
+    vendor = vendor_for_url(row.get("url"))
+    if vendor is None or not group_keys_for(vendor):
+        raise HTTPException(status_code=409, detail="Only brokerage tools have groups")
+    snapshot = ToolSnapshotIndex(user_rows=await get_user_tool_schemas(user_id)).ok(
+        user_row_to_server_config(row)
+    )
+    found = next(
+        (t for t in (snapshot or {}).get("tools") or [] if t.get("name") == tool), None
+    )
+    if found is None:
+        raise HTTPException(status_code=404, detail="Tool not found on this server")
+    return vendor, found
+
+
+@router.put("/servers/{name}/tools/{tool}/group")
+@handle_api_exceptions("choose MCP catalog tool group", logger)
+async def choose_tool_group(
+    name: str, tool: str, user_id: CurrentUserId, body: dict = Body(...)
+) -> dict:
+    """Put a brokerage read tool the code did not group into one of the
+    brokerage's groups, or refuse it with `{"group": null}`. Applied to the
+    grants in force before this answers."""
+    from src.server.services.mcp_enrichment.choices import ChoiceRefused, choose_group
+
+    group = body.get("group")
+    if group is not None and not isinstance(group, str):
+        raise HTTPException(status_code=422, detail="group must be a string or null")
+    vendor, found = await _brokerage_tool(user_id, name, tool)
+    try:
+        await choose_group(user_id, vendor, found, group)
+    except ChoiceRefused as e:
+        raise HTTPException(status_code=409, detail=str(e))
+    return {"tool": tool, "choice": {"group": group}}
+
+
+@router.delete("/servers/{name}/tools/{tool}/group")
+@handle_api_exceptions("clear MCP catalog tool group", logger)
+async def clear_tool_group(name: str, tool: str, user_id: CurrentUserId) -> dict:
+    """Drop the user's choice, so the tool follows the automatic grouping again."""
+    from src.server.services.mcp_enrichment.choices import clear_choice
+
+    vendor, found = await _brokerage_tool(user_id, name, tool)
+    await clear_choice(user_id, vendor, found["name"])
+    return {"tool": tool, "choice": None}
 
 
 @router.put("/servers/{name}")
@@ -358,14 +428,14 @@ async def import_servers(
     }
 
 
-def _binding_fields(vendor: str | None, tool: str, inputs) -> dict:
+def _binding_fields(vendor: str | None, tool: str, inputs, assigned) -> dict:
     """The effective path, which layer chose it, which paths the row may pick
     from, and what the call does to an order, so the page offers exactly the
     options the write path accepts rather than keeping its own copy of the
     policy."""
     from src.server.services.tool_binding import order_payload, resolve_tool
 
-    resolved = resolve_tool(vendor, tool, inputs)
+    resolved = resolve_tool(vendor, tool, inputs, assigned)
     return {
         "binding": resolved.binding,
         "binding_source": resolved.source,

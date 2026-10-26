@@ -45,6 +45,8 @@ from typing import Literal
 from src.server.services.brokerage_capabilities import (
     ALL_BINDINGS,
     BINDINGS,
+    NO_ASSIGNMENTS,
+    Assignments,
     Binding,
     CapabilityGroup,
     OrderMode,
@@ -324,7 +326,11 @@ def _allowed(
 
 
 def allowed_bindings(
-    vendor: str | None, tool: str, *, relayable: bool = True
+    vendor: str | None,
+    tool: str,
+    *,
+    relayable: bool = True,
+    assigned: Assignments = NO_ASSIGNMENTS,
 ) -> frozenset[Binding]:
     """The paths this tool may take; all three only where we curate no policy.
 
@@ -334,7 +340,7 @@ def allowed_bindings(
     """
     return _allowed(
         vendor,
-        group_for_tool(vendor, tool),
+        group_for_tool(vendor, tool, assigned),
         order_tool(vendor, tool),
         relayable=relayable,
     )
@@ -383,9 +389,14 @@ def _ladder(
     return "ptc", "default"
 
 
-def resolve_tool(vendor: str | None, tool: str, inputs: BindingInputs) -> Resolved:
+def resolve_tool(
+    vendor: str | None,
+    tool: str,
+    inputs: BindingInputs,
+    assigned: Assignments = NO_ASSIGNMENTS,
+) -> Resolved:
     """One tool's binding, where it came from, and what it does to an order."""
-    group = group_for_tool(vendor, tool)
+    group = group_for_tool(vendor, tool, assigned)
     entry = order_tool(vendor, tool)
     allowed = _allowed(vendor, group, entry, relayable=inputs.relayable)
     binding, source = _ladder(group, tool, inputs)
@@ -412,6 +423,7 @@ def resolve_plan(
     inputs: BindingInputs,
     *,
     candidates: Iterable[str] = (),
+    assigned: Assignments = NO_ASSIGNMENTS,
 ) -> BindingPlan:
     """The plan over every tool consent lets through.
 
@@ -423,7 +435,7 @@ def resolve_plan(
     the gate refuses.
     """
     granted = tuple(granted)
-    permitted = tools_for(vendor, granted)
+    permitted = tools_for(vendor, granted, assigned)
     names: set[str] = set(candidates)
     names.update(permitted or ())
     names.update(inputs.overrides)
@@ -434,7 +446,9 @@ def resolve_plan(
         # which matches folded, still lets through.
         names = {n for n in names if folded_contains(permitted, n)}
 
-    by_tool = {tool: resolve_tool(vendor, tool, inputs) for tool in sorted(names)}
+    by_tool = {
+        tool: resolve_tool(vendor, tool, inputs, assigned) for tool in sorted(names)
+    }
     direct = frozenset(t for t, r in by_tool.items() if r.binding in ("direct", "both"))
     excluded = frozenset(t for t, r in by_tool.items() if r.binding == "direct")
     return BindingPlan(

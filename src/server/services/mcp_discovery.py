@@ -45,6 +45,18 @@ logger = logging.getLogger(__name__)
 MAX_TOOLS_PER_SERVER = 200
 MAX_SCHEMA_CHARS_PER_SERVER = 400_000
 
+# The MCP behaviour hints worth keeping, by their wire names. Only the
+# booleans: the enrichment rules read ``destructiveHint`` and ``readOnlyHint`` to
+# hold a tool back, and a vendor's free-text title has no reader.
+_ANNOTATION_HINTS = ("readOnlyHint", "destructiveHint", "idempotentHint", "openWorldHint")
+
+
+def _annotations(raw: Any) -> dict[str, bool] | None:
+    if not isinstance(raw, dict):
+        return None
+    hints = {k: raw[k] for k in _ANNOTATION_HINTS if isinstance(raw.get(k), bool)}
+    return hints or None
+
 
 def mcp_discovery_fingerprint(server: MCPServerConfig) -> str:
     """Stable per-server hash of discovery-affecting config — never secret values.
@@ -196,6 +208,8 @@ def sanitize_discovered_tools(
             "description": sanitize_tool_text(tool.get("description")),
             "input_schema": raw_schema,
         }
+        if hints := _annotations(tool.get("annotations")):
+            entry["annotations"] = hints
         entry_chars = len(json.dumps(entry, ensure_ascii=False))
         if total_chars + entry_chars > MAX_SCHEMA_CHARS_PER_SERVER:
             skipped.append((name, "server exceeds total schema size cap"))
@@ -332,4 +346,25 @@ async def discover_and_cache(
                 },
             )
         )
+        # A user's own server is described from wherever its tools were
+        # listed; a built-in carries its author's text already.
+        if getattr(server, "source", None) == "user":
+            await _enqueue_user_server(workspace_id, server, kept)
     return rows
+
+
+async def _enqueue_user_server(
+    workspace_id: str, server: MCPServerConfig, tools: list[dict[str, Any]]
+) -> None:
+    from src.server.database.workspace import get_workspace
+    from src.server.services.mcp_enrichment.jobs import enqueue_if_new
+
+    try:
+        workspace = await get_workspace(workspace_id)
+    except Exception:  # noqa: BLE001 - the snapshot already landed; this is extra
+        logger.warning("[MCP_DISCOVERY] owner lookup failed for %s", workspace_id)
+        return
+    if user_id := (workspace or {}).get("user_id"):
+        await enqueue_if_new(
+            user_id=str(user_id), server_name=server.name, url=server.url, tools=tools
+        )

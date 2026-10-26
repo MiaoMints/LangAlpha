@@ -55,6 +55,10 @@ class Brokerage:
     # mark too small to draw sharply. Asked before the site, which stays the
     # fallback if the file ever moves.
     icon: str | None = None
+    # Shipped descriptions this one replaced. Rows connected before a change
+    # still hold the old text, and it is nobody's edit, so the agent is given
+    # the current description instead (see ``mcp_enrichment.prompt_text``).
+    retired_descriptions: tuple[str, ...] = ()
 
     @property
     def mark_sources(self) -> tuple[str, ...]:
@@ -99,6 +103,13 @@ BROKERAGES: tuple[Brokerage, ...] = (
             "and draft orders for stocks, options, futures and crypto that the "
             "user confirms in the Webull app before anything is placed. Covers "
             "equities, options, futures, event contracts and crypto."
+        ),
+        retired_descriptions=(
+            "Webull brokerage account: balances, positions and buying power, "
+            "order history, watchlists, real-time quotes, and instrument "
+            "reference data. Reads only: nothing here places, previews or "
+            "stages an order. Covers equities, options, futures, event "
+            "contracts and crypto.",
         ),
     ),
     Brokerage(
