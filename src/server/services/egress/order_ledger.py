@@ -25,12 +25,14 @@ from ptc_agent.agent.provenance.types import (
 )
 from src.config.env import EGRESS_RELAY_SECRET
 from src.server.database.order_attempts import (
+    adopt_vendor_order_id,
     complete_attempt,
     consume_attempt,
     decide_attempt,
     find_attempt_id,
     get_attempt,
     insert_attempt,
+    latest_attempt_for_confirm_token,
     latest_attempt_for_vendor_order,
     refuse_attempt,
 )
@@ -39,6 +41,7 @@ from src.server.models.orders import (
     order_summary,
     receipt_from_attempt,
 )
+from src.server.services.brokerage_capabilities import OrderAction
 from src.server.services.brokerage_orders import (
     AttemptStatus,
     BrokerOrder,
@@ -120,7 +123,9 @@ class OrderAttemptLedger:
             status=(
                 AttemptStatus.PROPOSED if approval_required else AttemptStatus.APPROVED
             ),
-            parent_attempt_id=await self._parent_of(vendor, parsed),
+            parent_attempt_id=await self._parent_of(
+                vendor, parsed, order.get("action")
+            ),
         )
         attempt = attempt_row_to_response(row)
         return Proposed(
@@ -135,21 +140,31 @@ class OrderAttemptLedger:
             summary=order_summary(attempt),
         )
 
-    async def _parent_of(self, vendor: str, parsed: BrokerOrder | None) -> str | None:
+    async def _parent_of(
+        self, vendor: str, parsed: BrokerOrder | None, action: Any
+    ) -> str | None:
         """The attempt that placed the order this call acts on, if we placed it.
 
         A cancel, a replace or a confirm names a vendor order id; when that id
         belongs to one of this user's own attempts, the two rows are one
-        order's history and the ledger says so. Never fatal: an amend nobody
-        can link is still a valid attempt.
+        order's history and the ledger says so. A confirm may instead name the
+        confirmation a vendor asked for, which no order id carries: then the
+        parent is the attempt whose answer raised it, resolved to the call that
+        started the chain. Never fatal: an amend nobody can link is still a
+        valid attempt.
         """
         target = (parsed.target_ref or "").strip() if parsed else ""
         if not parsed or not target:
             return None
         try:
-            return await latest_attempt_for_vendor_order(
+            parent = await latest_attempt_for_vendor_order(
                 self._user_id, vendor, target, account_ref=parsed.account_ref
             )
+            if parent is None and action == OrderAction.CONFIRM:
+                parent = await latest_attempt_for_confirm_token(
+                    self._user_id, vendor, target, account_ref=parsed.account_ref
+                )
+            return parent
         except Exception:
             logger.warning(
                 "[ORDERS] %s: could not look up the attempt behind %s",
@@ -258,6 +273,7 @@ class OrderAttemptLedger:
             settled = await complete_attempt(attempt_id, outcome, sha256)
             if settled is None:
                 return None
+            await self._hand_up(settled)
             # The settled row, not the answer: the completing write is what
             # merged this outcome with whatever a status read had already put
             # on the row, and only the vendor's own word for the state has no
@@ -274,6 +290,34 @@ class OrderAttemptLedger:
                 exc_info=True,
             )
             return None
+
+    async def _hand_up(self, row: Mapping[str, Any]) -> None:
+        """Give the call a confirm released the order id the confirm learned.
+
+        A placement held for a confirmation is answered with no order id when
+        nothing reaches the market until the confirm, so the id first appears
+        on the confirm's own row. The placement is the row the sweep reads and
+        an order wakeup finds, so the id is written there, only where it is
+        missing; the write is guarded, so a second worker finishing the same
+        tail changes nothing. Never fatal: the confirm's own row is settled
+        either way.
+        """
+        parent = row.get("parent_attempt_id")
+        order_id = row.get("vendor_order_id")
+        if row.get("action") != OrderAction.CONFIRM or not parent or not order_id:
+            return
+        try:
+            await adopt_vendor_order_id(
+                str(parent), str(order_id), user_id=self._user_id
+            )
+        except Exception:
+            logger.warning(
+                "[ORDERS] attempt %s: could not hand order %s up to attempt %s",
+                row.get("attempt_id"),
+                order_id,
+                parent,
+                exc_info=True,
+            )
 
     @staticmethod
     def _outcome(row: Mapping[str, Any], result: ToolMessage) -> OrderOutcome:
