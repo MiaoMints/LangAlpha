@@ -781,6 +781,11 @@ async def _probe(
             "name": t.name,
             "description": t.description or "",
             "input_schema": t.input_schema or {},
+            "annotations": (
+                t.annotations.model_dump(by_alias=True, exclude_none=True)
+                if t.annotations
+                else None
+            ),
         }
         for t in result.tools
     ]

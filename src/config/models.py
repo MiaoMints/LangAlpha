@@ -298,6 +298,18 @@ class OrderReconcileConfig(BaseModel):
     group_timeout_seconds: int = Field(default=120, ge=60)
 
 
+class McpGroupingConfig(BaseModel):
+    """The background service that has a model propose groups for the tools a
+    shipped brokerage publishes outside the code's curation.
+
+    With ``enabled`` off nothing is queued and brokerages fall back to the
+    code's curation plus the reviewed seed shipped in the repo.
+    """
+
+    enabled: bool = Field(default=True)
+    interval_seconds: int = Field(default=20, ge=5)
+
+
 class FeatureFlagOverride(BaseModel):
     """Deployment override for a code-declared feature (src/config/features.py).
 
@@ -531,6 +543,7 @@ class InfrastructureConfig(BaseModel):
         default_factory=WorkflowOrchestrationConfig
     )
 
+    mcp_grouping: McpGroupingConfig = Field(default_factory=McpGroupingConfig)
     # Order reconciliation sweep
     order_reconcile: OrderReconcileConfig = Field(
         default_factory=OrderReconcileConfig

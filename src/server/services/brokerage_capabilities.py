@@ -62,9 +62,10 @@ Keys are facts and the words for them belong to the client, the same contract
 
 from __future__ import annotations
 
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from enum import StrEnum
+from types import MappingProxyType
 from typing import TYPE_CHECKING, Literal, get_args
 
 from src.server.services.brokerages import brokerage_by_name, brokerage_for_url
@@ -789,6 +790,47 @@ _ORDER_TOOLS: dict[str, dict[str, OrderTool]] = {
 }
 
 
+@dataclass(frozen=True)
+class Assignment:
+    """A group for a tool no code curation names, from below the code's own.
+
+    ``source`` says which: ``seed`` (reviewed rows shipped in the repo),
+    ``user`` (the user's own choice on the tools page) or ``generated`` (a
+    model's proposal that cleared every rule). ``group`` None is a refusal at
+    every grant. An assignment only ever moves a tool that would be callable
+    ungrouped into a group, or out of reach, so it can narrow what a grant lets
+    through and never widen it. Built only by ``mcp_grouping.assignments``,
+    where the rules live; this module only refuses to let one override what
+    the code says.
+    """
+
+    tool: str
+    group: str | None
+    source: Literal["seed", "user", "generated"]
+
+
+# Folded tool name -> assignment, per brokerage and per user.
+Assignments = Mapping[str, Assignment]
+NO_ASSIGNMENTS: Assignments = MappingProxyType({})
+
+
+def _assigned(brokerage: str | None, assigned: Assignments) -> dict[str, Assignment]:
+    """The assignments that may count: never over a curated or ``UNCURATED``
+    tool, and only into a group this brokerage offers, or out of reach."""
+    if not assigned or not brokerage:
+        return {}
+    curated = _BY_TOOL.get(brokerage, {})
+    refused = _UNCURATED_FOLDED.get(brokerage, frozenset())
+    offered = _CURATION.get(brokerage, {})
+    return {
+        folded: a
+        for folded, a in assigned.items()
+        if folded not in curated
+        and folded not in refused
+        and (a.group is None or a.group in offered)
+    }
+
+
 def groups_for(brokerage: str | None) -> tuple[CapabilityGroup, ...]:
     """The consent toggles to offer for a brokerage, in display order.
 
@@ -841,7 +883,11 @@ def effective_capabilities(
         kept = narrowed
 
 
-def tools_for(brokerage: str | None, granted: Iterable[str]) -> frozenset[str] | None:
+def tools_for(
+    brokerage: str | None,
+    granted: Iterable[str],
+    assigned: Assignments = NO_ASSIGNMENTS,
+) -> frozenset[str] | None:
     """The tools a grant of these groups permits, or None if we curate no policy.
 
     The affirmative view of a grant, for display and for reasoning about one.
@@ -864,10 +910,16 @@ def tools_for(brokerage: str | None, granted: Iterable[str]) -> frozenset[str] |
     wanted = set(effective_capabilities(brokerage, granted))
     return frozenset(
         tool for key, tools in curated.items() if key in wanted for tool in tools
+    ) | frozenset(
+        a.tool for a in _assigned(brokerage, assigned).values() if a.group in wanted
     )
 
 
-def denied_tools(brokerage: str | None, granted: Iterable[str]) -> frozenset[str] | None:
+def denied_tools(
+    brokerage: str | None,
+    granted: Iterable[str],
+    assigned: Assignments = NO_ASSIGNMENTS,
+) -> frozenset[str] | None:
     """The curated tools this grant refuses. What enforcement actually reads.
 
     The complement of ``tools_for``, and the two are not interchangeable at a
@@ -904,12 +956,24 @@ def denied_tools(brokerage: str | None, granted: Iterable[str]) -> frozenset[str
     # In force, not as stored: a group whose requirement was not granted is
     # refused like one that was declined.
     wanted = set(effective_capabilities(brokerage, granted))
-    return frozenset(
-        tool for key, tools in curated.items() if key not in wanted for tool in tools
-    ) | frozenset(UNCURATED.get(brokerage, ()))
+    # An assignment only adds to the denial: a tool put in a group this grant
+    # leaves out, or refused outright. A tool with none stays callable.
+    return (
+        frozenset(
+            tool for key, tools in curated.items() if key not in wanted for tool in tools
+        )
+        | frozenset(UNCURATED.get(brokerage, ()))
+        | frozenset(
+            a.tool
+            for a in _assigned(brokerage, assigned).values()
+            if a.group not in wanted
+        )
+    )
 
 
-def group_of_tool(brokerage: str | None, tool: str) -> str | None:
+def group_of_tool(
+    brokerage: str | None, tool: str, assigned: Assignments = NO_ASSIGNMENTS
+) -> str | None:
     """The group a tool belongs to, or None if no group names it.
 
     None does not say whether the tool is reachable, and a display must not read
@@ -925,16 +989,23 @@ def group_of_tool(brokerage: str | None, tool: str) -> str | None:
     endpoint still reports it as unclassified, and the detail view tells the
     user a declined tool is callable.
     """
-    return _BY_TOOL.get(brokerage or "", {}).get(fold_tool_name(tool))
+    folded = fold_tool_name(tool)
+    curated = _BY_TOOL.get(brokerage or "", {}).get(folded)
+    if curated is not None:
+        return curated
+    hit = _assigned(brokerage, assigned).get(folded)
+    return hit.group if hit else None
 
 
-def group_for_tool(brokerage: str | None, tool: str) -> CapabilityGroup | None:
+def group_for_tool(
+    brokerage: str | None, tool: str, assigned: Assignments = NO_ASSIGNMENTS
+) -> CapabilityGroup | None:
     """The group itself, for a caller that reads what it says rather than its name.
 
     Same lookup and same folding as :func:`group_of_tool`; the split is only that
     a key is what a JSON payload carries and the group is what a policy reads.
     """
-    key = group_of_tool(brokerage, tool)
+    key = group_of_tool(brokerage, tool, assigned)
     return _BY_KEY.get(key) if key is not None else None
 
 
@@ -970,7 +1041,9 @@ def curates(brokerage: str | None) -> bool:
     return brokerage is not None and brokerage in _CURATION
 
 
-def is_always_denied(brokerage: str | None, tool: str) -> bool:
+def is_always_denied(
+    brokerage: str | None, tool: str, assigned: Assignments = NO_ASSIGNMENTS
+) -> bool:
     """Whether a tool is refused whatever the user granted.
 
     True only for ``UNCURATED``: a tool we read and deliberately put in no
@@ -978,7 +1051,24 @@ def is_always_denied(brokerage: str | None, tool: str) -> bool:
     so is the difference between describing the policy and inverting it. Folded
     for the reason :func:`group_of_tool` gives.
     """
-    return fold_tool_name(tool) in _UNCURATED_FOLDED.get(brokerage or "", frozenset())
+    folded = fold_tool_name(tool)
+    if folded in _UNCURATED_FOLDED.get(brokerage or "", frozenset()):
+        return True
+    # A user who switched a tool off has refused it the same way.
+    hit = _assigned(brokerage, assigned).get(folded)
+    return hit is not None and hit.group is None
+
+
+def is_curated(brokerage: str | None, tool: str) -> bool:
+    """Whether the code itself decided this tool: a group, or ``UNCURATED``.
+
+    What the layers below the code may not touch, so it is also what the
+    grouping worker skips when it asks a model for a group.
+    """
+    folded = fold_tool_name(tool)
+    return folded in _BY_TOOL.get(brokerage or "", {}) or folded in (
+        _UNCURATED_FOLDED.get(brokerage or "", frozenset())
+    )
 
 
 # Built once rather than scanned per tool: the tools endpoint annotates a whole

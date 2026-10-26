@@ -37,11 +37,13 @@ from src.config.env import EGRESS_RELAY_LOOPBACK_URL, EGRESS_RELAY_SECRET
 from src.observability.langsmith_run import TOOL_PROVIDER
 from src.server.database.mcp_oauth import SERVABLE, ConnectionStatus, get_connection
 from src.server.services.brokerage_capabilities import (
+    NO_ASSIGNMENTS,
     denied_tools,
     order_tool,
     vendor_for_url,
 )
 from src.server.services.egress import folded_contains
+from src.server.services.mcp_grouping.assignments import load_assignments
 from src.server.services.egress.execution_token import EXECUTION_HEADER
 from src.server.services.egress.relay_jwt import (
     CALLER_HOST,
@@ -292,14 +294,17 @@ class DirectMCPBinding:
         if identity is None:
             return f"{server} is switched off or no longer connected"
         vendor, granted = identity
-        denied = denied_tools(vendor, granted)
+        assigned = (await load_assignments(self.user_id, [vendor])).get(
+            vendor or "", NO_ASSIGNMENTS
+        )
+        denied = denied_tools(vendor, granted, assigned)
         if denied and folded_contains(denied, tool):
             return f"the connection to {server} does not permit {tool}"
         # Resolved the way the binder resolved it, so a tool the user moved
         # back to the sandbox mid-turn stops being callable here. The relay's
         # own direct-only gate cannot catch this one: it refuses a sandbox
         # caller reaching a direct tool, and this call arrives as the host.
-        plan = resolve_plan(vendor, granted, inputs_from_row(row))
+        plan = resolve_plan(vendor, granted, inputs_from_row(row), assigned=assigned)
         if not folded_contains(plan.direct, tool):
             return (
                 f"{tool} is no longer bound directly; "

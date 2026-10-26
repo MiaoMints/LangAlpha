@@ -45,6 +45,8 @@ from typing import Literal
 from src.server.services.brokerage_capabilities import (
     ALL_BINDINGS,
     BINDINGS,
+    NO_ASSIGNMENTS,
+    Assignments,
     Binding,
     CapabilityGroup,
     OrderMode,
@@ -326,7 +328,11 @@ def _allowed(
 
 
 def allowed_bindings(
-    vendor: str | None, tool: str, *, relayable: bool = True
+    vendor: str | None,
+    tool: str,
+    *,
+    relayable: bool = True,
+    assigned: Assignments = NO_ASSIGNMENTS,
 ) -> frozenset[Binding]:
     """The paths this tool may take; all three only where we curate no policy.
 
@@ -336,7 +342,7 @@ def allowed_bindings(
     """
     return _allowed(
         vendor,
-        group_for_tool(vendor, tool),
+        group_for_tool(vendor, tool, assigned),
         order_tool(vendor, tool),
         relayable=relayable,
     )
@@ -385,9 +391,14 @@ def _ladder(
     return "ptc", "default"
 
 
-def resolve_tool(vendor: str | None, tool: str, inputs: BindingInputs) -> Resolved:
+def resolve_tool(
+    vendor: str | None,
+    tool: str,
+    inputs: BindingInputs,
+    assigned: Assignments = NO_ASSIGNMENTS,
+) -> Resolved:
     """One tool's binding, where it came from, and what it does to an order."""
-    group = group_for_tool(vendor, tool)
+    group = group_for_tool(vendor, tool, assigned)
     entry = order_tool(vendor, tool)
     allowed = _allowed(vendor, group, entry, relayable=inputs.relayable)
     binding, source = _ladder(group, tool, inputs)
@@ -414,6 +425,7 @@ def resolve_plan(
     inputs: BindingInputs,
     *,
     candidates: Iterable[str] = (),
+    assigned: Assignments = NO_ASSIGNMENTS,
 ) -> BindingPlan:
     """The plan over every tool consent lets through.
 
@@ -425,16 +437,18 @@ def resolve_plan(
     """
     granted = tuple(granted)
     names: set[str] = set(candidates)
-    names.update(tools_for(vendor, granted) or ())
+    names.update(tools_for(vendor, granted, assigned) or ())
     names.update(inputs.overrides)
-    refused = denied_tools(vendor, granted) or frozenset()
+    refused = denied_tools(vendor, granted, assigned) or frozenset()
     # Folded, because the denial carries the curated spelling while a name here
     # may be an override key or a discovered one. A raw difference would leave a
     # recased spelling of a denied tool in ``by_tool`` reporting a binding the
     # user cannot reach, since the split applies the same denial folded.
     names = {n for n in names if not folded_contains(refused, n)}
 
-    by_tool = {tool: resolve_tool(vendor, tool, inputs) for tool in sorted(names)}
+    by_tool = {
+        tool: resolve_tool(vendor, tool, inputs, assigned) for tool in sorted(names)
+    }
     direct = frozenset(t for t, r in by_tool.items() if r.binding in ("direct", "both"))
     excluded = frozenset(t for t, r in by_tool.items() if r.binding == "direct")
     return BindingPlan(

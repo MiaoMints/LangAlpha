@@ -41,10 +41,13 @@ from src.server.services.tool_binding import (
     resolve_plan,
 )
 from src.server.services.brokerage_capabilities import (
+    NO_ASSIGNMENTS,
+    Assignments,
     denied_tools,
     group_keys_for,
     vendor_for_url,
 )
+from src.server.services.mcp_grouping.assignments import load_assignments
 
 _DEFAULT_PORTS = {"http": 80, "https": 443}
 
@@ -502,6 +505,16 @@ async def resolve_mcp_config(
         if row.get("plugin_name")
     }
 
+    # The groups below the code's own, matched on each tool's current digest.
+    # Only connections can be granted anything, so only their vendors matter.
+    assignments = await load_assignments(
+        user_id,
+        (vendor_for_url(c.get("server_url")) for c in connection_by_server.values()),
+    )
+
+    def _assigned(vendor: str | None) -> Assignments:
+        return assignments.get(vendor or "", NO_ASSIGNMENTS)
+
     def _denied_tools(cfg: MCPServerConfig) -> frozenset[str] | None:
         """What consent refuses for this server, or None if we curate no groups.
 
@@ -536,7 +549,7 @@ async def resolve_mcp_config(
                 "consent; refusing every curated tool until it is reconnected",
                 user_id, cfg.name,
             )
-        return denied_tools(vendor, capabilities or ())
+        return denied_tools(vendor, capabilities or (), _assigned(vendor))
 
     def _binding_plan(cfg: MCPServerConfig) -> tuple[BindingPlan, bool]:
         """Which path each granted tool takes, and whether a probe still gates
@@ -555,10 +568,12 @@ async def resolve_mcp_config(
         connection = connection_by_server.get(cfg.name)
         inputs = inputs_from_row(user_row_by_name.get(cfg.name))
         if connection is not None:
+            vendor = vendor_for_url(connection.get("server_url"))
             return resolve_plan(
-                vendor_for_url(connection.get("server_url")),
+                vendor,
                 connection.get("granted_capabilities") or (),
                 inputs,
+                assigned=_assigned(vendor),
             ), False
         # Planning off ``()`` is deliberate: a row that never went through a
         # consent screen is denied a curated vendor's whole curation, while

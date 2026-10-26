@@ -13,6 +13,7 @@ from typing import Any, Dict, List, Optional
 
 from src.config.core import get_infrastructure_config
 from src.config.models import (
+    McpGroupingConfig,
     NewsPollConfig,
     OrderReconcileConfig,
     WorkflowOrchestrationConfig,
@@ -197,6 +198,11 @@ def is_redis_cache_enabled() -> bool:
 def get_news_poll_config() -> NewsPollConfig:
     """News refresh poller config (enabled / interval / max_items / feeds)."""
     return get_infrastructure_config().news_poll
+
+
+def get_mcp_grouping_config() -> McpGroupingConfig:
+    """Brokerage tool grouping service (enabled / cadence)."""
+    return get_infrastructure_config().mcp_grouping
 
 
 def get_order_reconcile_config() -> OrderReconcileConfig:
