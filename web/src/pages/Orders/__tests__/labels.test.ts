@@ -71,8 +71,8 @@ describe('order label keys', () => {
     });
   }
 
-  it('covers all fifteen attempt statuses', () => {
-    expect(Object.keys(ORDER_STATUS_KEY)).toHaveLength(15);
+  it('covers all sixteen attempt statuses', () => {
+    expect(Object.keys(ORDER_STATUS_KEY)).toHaveLength(16);
   });
 
   // Three of the five are durations vendors added after the ledger shipped,
@@ -143,6 +143,23 @@ describe('what a staged order is called', () => {
     );
   });
 
+  // Nobody cancelled it, so it must never read as cancelled.
+  it('says an expired instruction expired before it was confirmed', () => {
+    expect(orderStatusLabel('expired', 'staged', 'Webull')).toEqual({
+      key: 'toolArtifact.directTool.orderStatus.expiredStaged',
+      params: { vendor: 'Webull' },
+    });
+    expect(orderStatusLabel('expired', 'staged', null)).toEqual({
+      key: 'toolArtifact.directTool.orderStatus.expiredStagedUnnamed',
+    });
+    expect(orderStatusLabel('expired', 'live', 'Webull')).toEqual({
+      key: 'toolArtifact.directTool.orderStatus.expired',
+    });
+    expect(orderStatusShortLabel('expired', 'staged')).toBe(
+      'toolArtifact.directTool.orderStatusShort.expired',
+    );
+  });
+
   it('reads the broker as having named the end only on an explicit null', () => {
     expect(vendorNamedEnd(null)).toBe(true);
     expect(vendorNamedEnd('2026-10-26T01:00:00+00:00')).toBe(false);
@@ -169,7 +186,7 @@ describe('what a staged order is called', () => {
 
   it('leaves every other staged state on the word it had', () => {
     for (const status of ORDER_STATUSES) {
-      if (status === 'submitted' || status === 'handed_off') continue;
+      if (status === 'submitted' || status === 'handed_off' || status === 'expired') continue;
       expect(orderStatusLabel(status, 'staged', 'Interactive Brokers')).toEqual({
         key: ORDER_STATUS_KEY[status],
       });

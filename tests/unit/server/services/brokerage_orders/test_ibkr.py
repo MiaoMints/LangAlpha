@@ -848,7 +848,7 @@ def test_a_live_transport_failure_and_a_refusal_read_as_before():
         ("PARTIALLY_FILLED", AttemptStatus.PARTIALLY_FILLED),
         ("FILLED", AttemptStatus.FILLED),
         ("CANCELLED", AttemptStatus.CANCELLED),
-        ("EXPIRED", AttemptStatus.CANCELLED),
+        ("EXPIRED", AttemptStatus.EXPIRED),
         ("REJECTED", AttemptStatus.REJECTED_BY_VENDOR),
         ("SUSPENDED", AttemptStatus.UNKNOWN),
     ],

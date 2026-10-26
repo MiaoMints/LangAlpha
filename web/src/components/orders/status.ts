@@ -17,6 +17,7 @@ export const ORDER_STATUS_KEY: Record<OrderStatus, string> = {
   partially_filled: 'toolArtifact.directTool.orderStatus.partiallyFilled',
   filled: 'toolArtifact.directTool.orderStatus.filled',
   cancelled: 'toolArtifact.directTool.orderStatus.cancelled',
+  expired: 'toolArtifact.directTool.orderStatus.expired',
   rejected_by_vendor: 'toolArtifact.directTool.orderStatus.rejectedByVendor',
   handed_off: 'toolArtifact.directTool.orderStatus.handedOff',
   failed: 'toolArtifact.directTool.orderStatus.failed',
@@ -39,6 +40,7 @@ export const ORDER_STATUS_SHORT_KEY: Record<OrderStatus, string> = {
   partially_filled: 'toolArtifact.directTool.orderStatusShort.partiallyFilled',
   filled: 'toolArtifact.directTool.orderStatusShort.filled',
   cancelled: 'toolArtifact.directTool.orderStatusShort.cancelled',
+  expired: 'toolArtifact.directTool.orderStatusShort.expired',
   rejected_by_vendor: 'toolArtifact.directTool.orderStatusShort.rejectedByVendor',
   handed_off: 'toolArtifact.directTool.orderStatusShort.handedOff',
   failed: 'toolArtifact.directTool.orderStatusShort.failed',
@@ -80,12 +82,14 @@ const CONFIRMED_SHORT_KEY = 'toolArtifact.directTool.orderStatusShort.handedOffC
 const STAGED_STATUS_KEY: Partial<Record<OrderStatus, string>> = {
   submitted: 'toolArtifact.directTool.orderStatus.submittedStaged',
   handed_off: 'toolArtifact.directTool.orderStatus.handedOffStaged',
+  expired: 'toolArtifact.directTool.orderStatus.expiredStaged',
 };
 
 /** The same sentence for a surface that cannot name the broker. */
 const STAGED_STATUS_KEY_UNNAMED: Partial<Record<OrderStatus, string>> = {
   submitted: 'toolArtifact.directTool.orderStatus.submittedStagedUnnamed',
   handed_off: 'toolArtifact.directTool.orderStatus.handedOffStagedUnnamed',
+  expired: 'toolArtifact.directTool.orderStatus.expiredStagedUnnamed',
 };
 
 /** Every staged sentence, so the tests that hold keys against both catalogs

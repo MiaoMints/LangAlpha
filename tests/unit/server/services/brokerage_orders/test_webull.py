@@ -383,7 +383,8 @@ def test_an_attempt_with_no_account_has_no_read_to_make():
         (PENDING, None, AttemptStatus.SUBMITTED),
         (PROCESSED, "APPROVED", AttemptStatus.HANDED_OFF),
         (PROCESSED, "REJECTED", AttemptStatus.CANCELLED),
-        (PROCESSED, "EXPIRED", AttemptStatus.CANCELLED),
+        # Never confirmed in time, which nobody cancelled.
+        (PROCESSED, "EXPIRED", AttemptStatus.EXPIRED),
         (PROCESSED, "SOMETHING_NEW", AttemptStatus.UNKNOWN),
         (PROCESSED, None, AttemptStatus.UNKNOWN),
     ],

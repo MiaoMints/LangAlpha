@@ -140,8 +140,9 @@ _LIVE_TIF: dict[str, TimeInForce] = {k: _TIF[k] for k in ("DAY", "OVT", "OND")}
 # ``order_id``, so the order under that id is the one now working at the new
 # parameters. ``DONE_FOR_THE_DAY`` is not an end: IBKR names it apart from
 # ``EXPIRED``, and an ``OND`` order carries into the next day, so it stays open
-# for the read that names one. ``EXPIRED`` is the lifecycle's ``cancelled``: it
-# will not fill further, and any fill it got stays on the row.
+# for the read that names one. ``EXPIRED`` is an end of its own rather than a
+# cancel nobody asked for: it will not fill further, and any fill it got stays
+# on the row.
 _LIVE_STATUSES: dict[str, AttemptStatus] = {
     "PENDING_NEW": AttemptStatus.SUBMITTED,
     "NEW": AttemptStatus.WORKING,
@@ -153,7 +154,7 @@ _LIVE_STATUSES: dict[str, AttemptStatus] = {
     "PARTIALLY_FILLED": AttemptStatus.PARTIALLY_FILLED,
     "FILLED": AttemptStatus.FILLED,
     "CANCELLED": AttemptStatus.CANCELLED,
-    "EXPIRED": AttemptStatus.CANCELLED,
+    "EXPIRED": AttemptStatus.EXPIRED,
     "REJECTED": AttemptStatus.REJECTED_BY_VENDOR,
 }
 

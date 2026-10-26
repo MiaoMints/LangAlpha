@@ -118,7 +118,7 @@ _STATES: dict[str, AttemptStatus] = {
     "PENDING": AttemptStatus.SUBMITTED,
     "APPROVED": AttemptStatus.HANDED_OFF,
     "REJECTED": AttemptStatus.CANCELLED,
-    "EXPIRED": AttemptStatus.CANCELLED,
+    "EXPIRED": AttemptStatus.EXPIRED,
 }
 
 # Webull's US options settle 100 shares a contract, and no leg names a
