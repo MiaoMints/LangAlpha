@@ -73,6 +73,8 @@ OAUTH_SERVER = "vendor_desk"
 
 VENDOR_HOST = "mcp.vendor-under-test.example"
 DESTINATION = f"https://{VENDOR_HOST}/mcp"
+# A shipped brokerage's address, where the relay polices every call.
+BROKER = "https://mcp.moomoo.com/mcp"
 PINNED_IP = "198.51.100.7"  # TEST-NET-2 — stand-in for the stubbed guard only
 # The real guard resolves nothing for an IP literal but demands is_global, and
 # the documentation ranges (TEST-NET, RFC5737) all fail that. This one passes.
@@ -98,7 +100,7 @@ def _grant(**overrides) -> dict:
         "server_name": None,
         "destination_url": DESTINATION,
         "allowed_methods": ["POST"],
-        "tool_denylist": None,
+        "tool_allowlist": None,
         "tool_direct_only": None,
         "grant_status": "active",
         "connection_status": "connected",
@@ -617,8 +619,8 @@ class TestGrantAuthorization:
         assert env.vendor.sends == 1
 
     @pytest.mark.asyncio
-    async def test_a_tool_the_grant_denies_is_blocked(self, env, client):
-        env.grant = _grant(tool_denylist=["place_order"])
+    async def test_a_tool_outside_the_grant_is_blocked(self, env, client):
+        env.grant = _grant(destination_url=BROKER, tool_allowlist=["list_positions"])
 
         resp = await _post(client, token=_jwt(), body=_rpc(name="place_order"))
 
@@ -627,8 +629,8 @@ class TestGrantAuthorization:
         assert env.vendor.sends == 0
 
     @pytest.mark.asyncio
-    async def test_a_tool_the_grant_does_not_deny_passes(self, env, client):
-        env.grant = _grant(tool_denylist=["place_order"])
+    async def test_a_tool_the_grant_permits_passes(self, env, client):
+        env.grant = _grant(destination_url=BROKER, tool_allowlist=["list_positions"])
 
         resp = await _post(client, token=_jwt(), body=_rpc(name="list_positions"))
 
@@ -636,35 +638,35 @@ class TestGrantAuthorization:
         assert env.vendor.sends == 1
 
     @pytest.mark.asyncio
-    async def test_a_tool_no_group_names_passes(self, env, client):
-        """The policy regulates what is curated and does not block what is not.
+    async def test_a_tool_no_group_names_is_refused(self, env, client):
+        """A tool the vendor published after we curated it waits for curation.
 
-        A vendor publishing a tool between our releases is the case this exists
-        for: it appears in no capability group, so it appears in no denial, and
-        the connector goes on covering what the broker offers instead of
-        refusing until a deploy catches up.
+        It is in no group, so no grant can name it, and the relay refuses it
+        rather than letting an unread tool reach the vendor. A denial could not
+        do this: it names only what we know, which is how live order tools
+        reached the sandbox when it was what this read.
         """
-        env.grant = _grant(tool_denylist=["place_order"])
+        env.grant = _grant(
+            destination_url=BROKER,
+            tool_allowlist=["list_positions"],
+            tool_denylist=["place_order"],
+        )
 
         resp = await _post(client, token=_jwt(), body=_rpc(name="brand_new_tool"))
 
-        assert resp.status_code == 200
-        assert env.vendor.sends == 1
+        assert resp.status_code == 403
+        assert _error(resp) == "tool_blocked"
+        assert env.vendor.sends == 0
 
     @pytest.mark.asyncio
-    async def test_an_empty_denial_blocks_nothing(self, env, client):
-        """Empty and NULL are the same answer now, which they were not before.
-
-        Under the allowlist an empty list served nothing, so a derivation that
-        came out empty failed shut and was obvious. Here it serves everything,
-        which is why ``policy_required`` can no longer prove a policy is right.
-        """
-        env.grant = _grant(tool_denylist=[])
+    async def test_an_empty_grant_permits_nothing(self, env, client):
+        env.grant = _grant(destination_url=BROKER, tool_allowlist=[])
 
         resp = await _post(client, token=_jwt(), body=_rpc(name="place_order"))
 
-        assert resp.status_code == 200
-        assert env.vendor.sends == 1
+        assert resp.status_code == 403
+        assert _error(resp) == "tool_blocked"
+        assert env.vendor.sends == 0
 
     @pytest.mark.asyncio
     async def test_a_directly_bound_tool_is_refused_to_the_sandbox(self, env, client):
@@ -695,7 +697,9 @@ class TestGrantAuthorization:
     @pytest.mark.asyncio
     async def test_the_host_still_honours_the_consent_denial(self, env, client):
         """The caller claim lifts one refusal, never the user's own."""
-        env.grant = _grant(tool_denylist=["place_order"], tool_direct_only=["place_order"])
+        env.grant = _grant(
+            destination_url=BROKER, tool_allowlist=[], tool_direct_only=["place_order"]
+        )
 
         resp = await _post(
             client, token=_jwt(caller="host"), body=_rpc(name="place_order")
@@ -715,16 +719,14 @@ class TestGrantAuthorization:
 
     @pytest.mark.asyncio
     async def test_a_brokerage_grant_with_no_policy_is_refused(self, env, client):
-        """The fail-open hole the denylist inversion opened, closed here.
-
-        A shipped broker always derives a denial -- an uncurated one derives the
-        empty list -- so NULL is a bug, not a state: a sync that failed, a
-        rollback, a migration that blanked the column. It has to be refused at
-        the one point that can still see the difference, because everything
-        downstream reads it as "no policy" and passes the vendor's order tools.
+        """A shipped broker always derives a permitted set -- an uncurated one
+        derives the empty list -- so NULL is a bug, not a state: a sync that
+        failed, a rollback, a migration that blanked the column. A denial on the
+        row does not stand in for it, since a denial says nothing about a tool
+        nobody curated.
         """
         env.grant = _grant(
-            destination_url="https://mcp.moomoo.com/mcp", tool_denylist=None
+            destination_url=BROKER, tool_allowlist=None, tool_denylist=[]
         )
 
         resp = await _post(client, token=_jwt(), body=_rpc(name="trading_order_place"))
@@ -743,7 +745,7 @@ class TestGrantAuthorization:
         derive from, so making NULL fatal in general would break every one of
         them. It is fatal only where a policy was supposed to exist.
         """
-        env.grant = _grant(tool_denylist=None)
+        env.grant = _grant(tool_allowlist=None)
 
         resp = await _post(client, token=_jwt(), body=_rpc(name="place_order"))
 
@@ -758,9 +760,7 @@ class TestGrantAuthorization:
         connector down rather than the tools the user declined, which is a
         louder failure than the one being prevented and a different one.
         """
-        env.grant = _grant(
-            destination_url="https://mcp.moomoo.com/mcp", tool_denylist=None
-        )
+        env.grant = _grant(destination_url=BROKER, tool_allowlist=None)
 
         resp = await _post(client, token=_jwt(), body=_rpc(method="tools/list"))
 
@@ -768,23 +768,22 @@ class TestGrantAuthorization:
         assert env.vendor.sends == 1
 
     @pytest.mark.asyncio
-    async def test_a_variant_spelling_of_a_denied_tool_is_still_blocked(
+    async def test_a_variant_spelling_of_a_permitted_tool_passes(
         self, env, client
     ):
-        """The denial is exact strings; the vendor decides what it matches.
+        """The grant is exact strings; the vendor decides what it matches.
 
-        Under an allowlist a variant spelling failed shut and cost the user a
-        working tool. Under a denylist the same variant sails through, so the
-        comparison folds case and width on the call side only -- what is
-        forwarded is still the exact bytes the sandbox sent.
+        Compared without folding, a vendor that recases a name would have its
+        permitted tool refused, so the comparison folds case and width on the
+        call side only -- what is forwarded is still the exact bytes the
+        sandbox sent.
         """
-        env.grant = _grant(tool_denylist=["place_order"])
+        env.grant = _grant(destination_url=BROKER, tool_allowlist=["list_positions"])
 
-        resp = await _post(client, token=_jwt(), body=_rpc(name="Place_Order"))
+        resp = await _post(client, token=_jwt(), body=_rpc(name="List_Positions"))
 
-        assert resp.status_code == 403
-        assert _error(resp) == "tool_blocked"
-        assert env.vendor.sends == 0
+        assert resp.status_code == 200
+        assert env.vendor.sends == 1
 
     @pytest.mark.asyncio
     async def test_a_grant_without_post_in_allowed_methods_is_blocked(
@@ -1081,7 +1080,7 @@ class TestBodyHandling:
         # There is no header-declared method to disagree with the frame: the
         # denial reads the canonicalized body, so a header advertising an
         # innocent method buys the caller nothing.
-        env.grant = _grant(tool_denylist=["place_order"])
+        env.grant = _grant(destination_url=BROKER, tool_allowlist=[])
 
         resp = await _post(
             client,
@@ -2058,7 +2057,7 @@ def _header_grant(**overrides) -> dict:
         "server_name": HEADER_SERVER,
         "destination_url": DESTINATION,
         "allowed_methods": ["POST"],
-        "tool_denylist": None,
+        "tool_allowlist": None,
         "tool_direct_only": None,
         "grant_status": "active",
         "connection_status": None,

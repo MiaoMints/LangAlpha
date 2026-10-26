@@ -1,7 +1,7 @@
 """Turn one server's discovered tools into what each path gets.
 
 The composite install splits each server's tools between the sandbox wrappers
-and the direct path from three inputs, the vendor's list, the consent's denial
+and the direct path from three inputs, the vendor's list, what consent permits
 and the row's binding plan. Folded names throughout, the way
 the relay matches them, so a vendor that recases a name is treated the same
 at every gate.
@@ -62,7 +62,7 @@ class DirectServerTools:
 def split_server_tools(
     tools: list[dict],
     *,
-    denied: frozenset[str] | None,
+    permitted: frozenset[str] | None,
     plan: BindingPlan | None,
     vendor: str | None = None,
 ) -> tuple[list[dict], DirectServerTools | None]:
@@ -71,8 +71,8 @@ def split_server_tools(
     ``sandbox_tools`` is what the wrappers and docs are generated from;
     ``direct`` is None when nothing on this server is bound directly.
     """
-    if denied:
-        tools = [t for t in tools if not folded_contains(denied, t.get("name"))]
+    if permitted is not None:
+        tools = [t for t in tools if folded_contains(permitted, t.get("name"))]
     if plan is None or not plan.direct:
         return tools, None
     # Folded, because the plan is keyed by the curated or stored spelling while
@@ -97,7 +97,7 @@ def build_direct_entries(
     servers: Iterable[Any],
     snapshots: Any,
     *,
-    denied: Mapping[str, frozenset[str]],
+    permitted: Mapping[str, frozenset[str]],
     plans: Mapping[str, BindingPlan],
 ) -> tuple[dict[str, list[dict]], dict[str, DirectServerTools]]:
     """Split every server with a current snapshot, keyed by server name.
@@ -115,7 +115,7 @@ def build_direct_entries(
         tools = overlay_tool_schemas(vendor, snapshot.get("tools") or [])
         sandbox_tools, direct = split_server_tools(
             tools,
-            denied=denied.get(server.name),
+            permitted=permitted.get(server.name),
             plan=plans.get(server.name),
             vendor=vendor,
         )

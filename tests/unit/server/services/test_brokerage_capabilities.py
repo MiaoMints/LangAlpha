@@ -130,9 +130,9 @@ def test_a_shipped_brokerage_we_have_not_curated_yet_is_a_policy_with_no_rules(
     assert tools_for(shipped.name, ["market_data", "trading"]) == frozenset()
     # No toggles to offer, which is what keeps the consent dialog away.
     assert group_keys_for(shipped.name) == ()
-    # And what the gate reads: nothing is classified, so nothing is refused.
-    # The affirmative set being empty is why the two must not be swapped there.
-    assert denied_tools(shipped.name, []) == frozenset()
+    # Nothing is classified, so nothing is permitted, and the tools page says
+    # so rather than drawing an unread vendor's tools as callable.
+    assert is_always_denied(shipped.name, "place_order") is True
 
 
 @pytest.mark.parametrize("vendor", sorted(UNCURATED))
@@ -144,17 +144,14 @@ def test_uncurated_tools_are_in_no_group(vendor: str) -> None:
 
 @pytest.mark.parametrize("vendor", sorted(UNCURATED))
 def test_uncurated_tools_are_refused_however_much_is_granted(vendor: str) -> None:
-    """Being in no group stopped meaning "unreachable" when the gate inverted.
-
-    A tool in no group now passes, which is the point: a vendor's new one is
-    not refused until we ship. UNCURATED is the opposite case wearing the same
-    shape -- read, understood, and deliberately kept away -- so it has to be
-    denied explicitly or the list that exists to block a tool becomes the thing
-    that lets it through.
-    """
-    everything = denied_tools(vendor, group_keys_for(vendor))
+    """Refused at the gate by being in no group, and named in the previous
+    version's denial, which is the only policy that version can read."""
+    everything = tools_for(vendor, group_keys_for(vendor))
+    denied = denied_tools(vendor, group_keys_for(vendor))
     for tool in UNCURATED[vendor]:
-        assert tool in everything
+        assert tool not in everything
+        assert is_always_denied(vendor, tool)
+        assert tool in denied
 
 
 def test_the_two_tools_a_prefix_rule_misfiles() -> None:
@@ -202,14 +199,16 @@ def test_webull_has_no_rung_at_all() -> None:
 
 
 @pytest.mark.parametrize("vendor", VENDORS)
-def test_a_tool_no_group_names_is_never_denied(vendor: str) -> None:
-    """The headline of the policy: regulate the known, do not block the unknown.
+def test_a_tool_no_group_names_is_never_permitted(vendor: str) -> None:
+    """The headline of the policy: a tool nobody has read waits for curation.
 
     Stated against a name the vendor has not published, which is what a tool
-    added between our releases looks like to this map.
+    added between our releases looks like to this map. Live order tools have
+    arrived exactly this way, so no grant, however wide, may reach one.
     """
     for granted in ([], list(group_keys_for(vendor))):
-        assert "a_tool_the_vendor_added_later" not in denied_tools(vendor, granted)
+        assert "a_tool_the_vendor_added_later" not in tools_for(vendor, granted)
+    assert is_always_denied(vendor, "a_tool_the_vendor_added_later")
 
 
 @pytest.mark.parametrize("vendor", VENDORS)
@@ -238,6 +237,7 @@ def test_granting_everything_denies_only_what_we_set_aside(vendor: str) -> None:
 def test_a_server_we_curate_nothing_for_has_no_denial() -> None:
     """None, not empty: the relay reads it as no policy, same as before."""
     assert denied_tools("some_users_own_server", ["market_data"]) is None
+    assert is_always_denied("some_users_own_server", "anything") is False
 
 
 def test_declining_trading_still_refuses_the_tools_that_place_orders() -> None:
@@ -283,15 +283,15 @@ def test_the_catalog_annotation_reads_a_name_the_way_the_relay_does() -> None:
 
     Discovery returns the vendor's spelling, and the relay and the workspace
     filter compare it folded. Annotating on the exact bytes instead let a
-    recased or padded name be refused per call and stripped from the composite
-    while the detail view still reported it as unclassified, which the client
-    draws as callable.
+    recased or padded name be permitted per call while the detail view still
+    reported it as refused, or the other way round.
     """
     assert group_of_tool("moomoo", " Trading_Order_Place ") == "trading"
+    assert is_always_denied("moomoo", " Trading_Order_Place ") is False
     assert is_always_denied("ibkr", "Provide_Customer_Feedback\u00a0") is True
     # Folding widens what matches; it must not invent a match.
     assert group_of_tool("moomoo", "trading_order_place_v2") is None
-    assert is_always_denied("ibkr", "provide_customer_feedback_v2") is False
+    assert is_always_denied("moomoo", "trading_order_place_v2") is True
 
 
 def test_a_groups_default_path_is_always_one_it_allows() -> None:
@@ -366,9 +366,9 @@ def test_no_grant_passes_an_order_it_cannot_settle(vendor: str) -> None:
     keys = group_keys_for(vendor)
     for size in range(len(keys) + 1):
         for granted in combinations(keys, size):
-            denied = denied_tools(vendor, granted)
+            permitted = tools_for(vendor, granted)
             for tool, entry in _ORDER_TOOLS[vendor].items():
                 read = _status_read(vendor, entry)
-                assert tool in denied or read not in denied, (
+                assert tool not in permitted or read in permitted, (
                     f"{vendor} granting {granted} passes {tool} but refuses {read}"
                 )

@@ -247,11 +247,11 @@ async def get_server_tools(name: str, user_id: CurrentUserId) -> dict:
                 # the join the detail view needs to say which of them are
                 # actually reachable and which the user declined.
                 "capability": group_of_tool(_vendor, t.get("name", "")),
-                # A null capability alone does not say whether the tool can be
-                # called: one we deliberately withheld is refused at every
-                # grant, one we simply have not classified passes at every
-                # grant. The client cannot tell them apart and drew both as
-                # unreachable, so the distinction travels.
+                # Whether the tool is refused at every grant, which at a
+                # brokerage is every tool no group names. Sent rather than read
+                # off a null capability because a client written against the
+                # earlier policy drew ``false`` here as callable, and an
+                # ungrouped tool is not.
                 "always_denied": is_always_denied(_vendor, t.get("name", "")),
                 # Which path the tool takes to the model if consent lets it
                 # through, which layer decided, and which paths it may take

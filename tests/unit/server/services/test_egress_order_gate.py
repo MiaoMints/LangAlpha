@@ -65,7 +65,7 @@ def _grant(**overrides) -> dict:
         "server_name": None,
         "destination_url": DESTINATION,
         "allowed_methods": ["POST"],
-        "tool_denylist": [],
+        "tool_allowlist": [ORDER_TOOL, READ_TOOL],
         "tool_direct_only": [],
         "grant_status": "active",
         "connection_status": "connected",

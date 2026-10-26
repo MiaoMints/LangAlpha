@@ -4974,8 +4974,8 @@
         "unclassified": "Not in a group",
         "unclassifiedNote": "No group covers these, so declining a group does not refuse them. The agent can still call them.",
         "unclassifiedNoteUnconnected": "No group covers these, so declining a group does not refuse them. Nothing is connected here, so nothing can call them yet.",
-        "neverAvailable": "Never available",
-        "neverAvailableNote": "Held back deliberately. Refused whatever you grant."
+        "neverAvailable": "Not available",
+        "neverAvailableNote": "No group covers these, so they are refused whatever you grant. New tools from the broker wait here until they are reviewed."
       },
       "exclusiveNote": "Disconnects other AI apps linked to this account",
       "exclusiveWarning": "This account allows one connected AI platform, so connecting here replaces whichever one is connected now.",

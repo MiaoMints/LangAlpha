@@ -389,9 +389,9 @@ class TestResolveInheritedLayer:
                 }
             ],
         )
-        denied = {e.name: e.denied_tools for e in resolved.entries}["my_broker"]
-        assert "trading_order_place" in denied
-        assert "quote_stock_quote" not in denied
+        permitted = {e.name: e.permitted_tools for e in resolved.entries}["my_broker"]
+        assert "trading_order_place" not in permitted
+        assert "quote_stock_quote" in permitted
 
     async def test_a_brokerage_name_pointed_elsewhere_gets_no_policy(self):
         """The mirror shape: the name is reserved, the address is not ours.
@@ -416,10 +416,10 @@ class TestResolveInheritedLayer:
                 }
             ],
         )
-        denied = {e.name: e.denied_tools for e in resolved.entries}["moomoo"]
-        assert denied is None
+        permitted = {e.name: e.permitted_tools for e in resolved.entries}["moomoo"]
+        assert permitted is None
 
-    async def test_a_brokerage_with_no_recorded_consent_denies_its_curation(self):
+    async def test_a_brokerage_with_no_recorded_consent_permits_nothing(self):
         base = _base_config(MCPServerConfig(name="alpha"))
         resolved = await _resolve(
             base,
@@ -435,9 +435,8 @@ class TestResolveInheritedLayer:
                 }
             ],
         )
-        denied = {e.name: e.denied_tools for e in resolved.entries}["moomoo"]
-        assert "trading_order_place" in denied
-        assert "quote_stock_quote" in denied
+        permitted = {e.name: e.permitted_tools for e in resolved.entries}["moomoo"]
+        assert permitted == frozenset()
 
     async def test_user_tier_is_read_through_list_enabled_user_servers(self):
         # The enabled filter lives in the DB layer: every row that read

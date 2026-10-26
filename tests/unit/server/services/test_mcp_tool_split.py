@@ -48,14 +48,14 @@ TOOLS = [
 
 
 def test_no_plan_means_everything_goes_to_the_sandbox():
-    sandbox, direct = split_server_tools(TOOLS, denied=None, plan=None)
+    sandbox, direct = split_server_tools(TOOLS, permitted=None, plan=None)
     assert [t["name"] for t in sandbox] == [t["name"] for t in TOOLS]
     assert direct is None
 
 
 def test_direct_only_tools_leave_the_sandbox_and_both_keeps_them():
     plan = _plan(trading_order_place="direct", sim_trade_input_order="both")
-    sandbox, direct = split_server_tools(TOOLS, denied=None, plan=plan)
+    sandbox, direct = split_server_tools(TOOLS, permitted=None, plan=plan)
     assert [t["name"] for t in sandbox] == ["account_list", "sim_trade_input_order"]
     # Folded matching: the vendor's recased name still lands in the direct set.
     assert [t.name for t in direct.tools] == [
@@ -69,12 +69,19 @@ def test_direct_only_tools_leave_the_sandbox_and_both_keeps_them():
     assert [t.resolved.approval for t in direct.tools] == [True, False]
 
 
-def test_a_denied_tool_reaches_neither_path():
+def test_a_tool_outside_the_grant_reaches_neither_path():
     plan = _plan(trading_order_place="direct")
     sandbox, direct = split_server_tools(
-        TOOLS, denied=frozenset({"trading_order_place"}), plan=plan
+        TOOLS, permitted=frozenset({"account_list", "sim_trade_input_order"}), plan=plan
     )
     assert [t["name"] for t in sandbox] == ["account_list", "sim_trade_input_order"]
+    assert direct is None
+
+
+def test_an_empty_grant_wraps_nothing():
+    """Empty is consent to nothing, not the absence of a policy."""
+    sandbox, direct = split_server_tools(TOOLS, permitted=frozenset(), plan=None)
+    assert sandbox == []
     assert direct is None
 
 
@@ -99,7 +106,7 @@ def test_build_direct_entries_keys_both_halves_by_server_name():
     sandbox, direct = build_direct_entries(
         servers,
         _Snapshots({"moomoo": TOOLS, "nosnapshot": None}),
-        denied={},
+        permitted={},
         plans={"moomoo": plan},
     )
     # A server with no usable snapshot is in neither half, which is how the
@@ -114,7 +121,7 @@ def test_build_direct_entries_keys_both_halves_by_server_name():
 
 def test_build_direct_entries_keeps_a_planless_server_out_of_the_direct_half():
     sandbox, direct = build_direct_entries(
-        [_Server("moomoo")], _Snapshots({"moomoo": TOOLS}), denied={}, plans={}
+        [_Server("moomoo")], _Snapshots({"moomoo": TOOLS}), permitted={}, plans={}
     )
     assert [t["name"] for t in sandbox["moomoo"]] == [t["name"] for t in TOOLS]
     assert direct == {}

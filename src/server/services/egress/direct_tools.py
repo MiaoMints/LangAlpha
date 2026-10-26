@@ -37,8 +37,8 @@ from src.config.env import EGRESS_RELAY_LOOPBACK_URL, EGRESS_RELAY_SECRET
 from src.observability.langsmith_run import TOOL_PROVIDER
 from src.server.database.mcp_oauth import SERVABLE, ConnectionStatus, get_connection
 from src.server.services.brokerage_capabilities import (
-    denied_tools,
     order_tool,
+    tools_for,
     vendor_for_url,
 )
 from src.server.services.egress import folded_contains
@@ -292,8 +292,8 @@ class DirectMCPBinding:
         if identity is None:
             return f"{server} is switched off or no longer connected"
         vendor, granted = identity
-        denied = denied_tools(vendor, granted)
-        if denied and folded_contains(denied, tool):
+        permitted = tools_for(vendor, granted)
+        if permitted is not None and not folded_contains(permitted, tool):
             return f"the connection to {server} does not permit {tool}"
         # Resolved the way the binder resolved it, so a tool the user moved
         # back to the sandbox mid-turn stops being callable here. The relay's

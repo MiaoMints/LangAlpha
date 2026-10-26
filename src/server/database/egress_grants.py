@@ -119,8 +119,8 @@ async def _header_policies(
     """The same expansion for a header-authenticated row, off the row itself.
 
     A header row has no consent record to read: the vendor comes from its own
-    address and nothing is granted, which denies a curated vendor's whole
-    curation and leaves everything else unpoliced. What the row does decide is
+    address and nothing is granted, which permits nothing at a brokerage and
+    leaves every other server unpoliced. What the row does decide is
     the direct set, so a tool the user put on the JSON path is still refused to
     a sandbox caller at the relay.
     """
@@ -138,8 +138,7 @@ async def _header_policies(
     policies = _Policies([], [], [], [], [])
     for row in await cur.fetchall():
         # Granting ``()`` is the deliberate half of that: a row that never went
-        # through a consent screen is denied a curated vendor's whole curation,
-        # while its uncurated tools flow.
+        # through a consent screen is permitted nothing at a brokerage.
         denylist, allowlist, required, direct_only = _policy(
             vendor_for_url(row["url"]), (), row
         )
@@ -154,7 +153,7 @@ async def _header_policies(
 async def _tool_policies(
     cur: Any, *, user_id: str, connection_ids: Sequence[str]
 ) -> _Policies:
-    """Expand each connection's stored consent into the denial its grant carries.
+    """Expand each connection's stored consent into the policy its grant carries.
 
     Read inside the caller's transaction and keyed only by connection_id, so
     the policy has the same provenance as ``destination_url``: the DB row, not
@@ -163,19 +162,13 @@ async def _tool_policies(
     applies at the next sync, with no row to migrate and no way for the two to
     drift.
 
-    The denial names the curated tools whose group the user declined, so
-    curating a tool the user did not consent to is what *adds* a refusal. A
-    vendor's newly published tool is in no group and so in no denial, which is
-    the deliberate choice this policy makes.
-
-    The permitted set is derived alongside it and written to the old
-    ``tool_allowlist`` column, which nothing in this version reads. That column
-    is what the previous version enforces, and both versions serve at once
-    through a blue/green cutover -- so writing only the denial left the draining
-    colour reading a policy frozen at the last deploy, still honouring a group
-    the user had since declined. The two disagree on an uncurated tool (the
-    allowlist refuses it, the denylist permits it), and the stricter reading is
-    the right one to hand a version on its way out.
+    The permitted set goes to ``tool_allowlist``, which is what the relay
+    enforces: the tools in a granted group and nothing else, so a vendor's
+    newly published tool is refused until it is curated. The denial of declined
+    groups is still written to ``tool_denylist`` because the previous version
+    enforces that column and for a while both versions serve at once, so
+    writing only one column would leave the older one reading a policy frozen
+    at the last release, still honouring a group the user had since declined.
 
     The fifth array is the direct-only set: granted tools bound to the model
     as JSON tools, which the relay refuses to a sandbox caller so the one
@@ -778,7 +771,7 @@ async def fetch_grant_for_relay(grant_id: str) -> dict[str, Any] | None:
                 """
                 SELECT g.user_id, g.workspace_id, g.computer_id, g.kind,
                        g.connection_id, g.server_name,
-                       g.destination_url, g.allowed_methods, g.tool_denylist,
+                       g.destination_url, g.allowed_methods, g.tool_allowlist,
                        g.tool_direct_only,
                        g.status AS grant_status,
                        c.status AS connection_status
@@ -806,7 +799,7 @@ async def fetch_grant_for_relay(grant_id: str) -> dict[str, Any] | None:
                 "server_name": row["server_name"],
                 "destination_url": row["destination_url"],
                 "allowed_methods": row["allowed_methods"],
-                "tool_denylist": row["tool_denylist"],
+                "tool_allowlist": row["tool_allowlist"],
                 "tool_direct_only": row["tool_direct_only"],
                 "grant_status": row["grant_status"],
                 "connection_status": row["connection_status"],
@@ -814,7 +807,7 @@ async def fetch_grant_for_relay(grant_id: str) -> dict[str, Any] | None:
 
 
 async def apply_consent_to_active_grants(connection_id: str, *, conn=None) -> int:
-    """Rewrite the denial on every active grant of a connection. Returns count.
+    """Rewrite the policy on every active grant of a connection. Returns count.
 
     Narrowing consent has to bite when the user confirms it, not when something
     later happens to resolve. A reconnect writes the new keys onto the

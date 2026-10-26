@@ -391,12 +391,13 @@ class McpSecretsMixin:
                 user_rows=user_rows,
             )
             # Filter consent here: shared discovery snapshots must describe all vendor
-            # capabilities, with consent-independent schema_digest values. Remove only
-            # declined groups so newly added vendor tools remain available.
+            # capabilities, with consent-independent schema_digest values. Keep only
+            # what the grant permits, so a tool the vendor added since we curated it
+            # is not wrapped.
             tool_schemas, direct_mcp_tools = build_direct_entries(
                 untrusted_servers,
                 snapshots,
-                denied=resolved.denied_tools_by_name,
+                permitted=resolved.permitted_tools_by_name,
                 plans=resolved.binding_plans_by_name,
             )
             # Only a usable snapshot lets a server answer for itself.

@@ -10,14 +10,17 @@ it wrong in both directions. moomoo's ``quote_modify_user_security`` writes the
 watchlist despite reading like a quote, and IBKR's ``provide_customer_feedback``
 sends a message to the broker despite reading like nothing at all.
 
-The policy regulates what is curated and does not block what is not: a tool in
-no capability group is permitted, so a vendor publishing one between our
-releases reaches the agent rather than being refused until a deploy catches up.
-That is a deliberate trade. It is also why ``UNCURATED`` is a list rather than
-an omission -- the second tool above is one we read and chose to keep away, and
-that decision has to be written down somewhere the denial can see it, or "we
-never classified this" and "we classified this and said no" become the same
-state and the second one wins the wrong way.
+At a shipped brokerage the policy permits what a granted group names and
+nothing else, so a tool the vendor publishes between our releases is refused
+until it is curated here. It used to be the other way round, on the theory that
+a connector which stops carrying a new tool is a worse failure than one that
+carries a tool nobody classified. Then IBKR and Webull each published live order
+tools between releases, and every one of them reached the sandbox as an
+ungrouped tool: no consent toggle, no order gate, no ledger record. A vendor's
+new tool is exactly the one nobody has read, so it is the one that has to wait.
+``UNCURATED`` stays a list for the reader rather than for the gate -- the
+second tool above is one we read and chose to keep away, and writing that down
+is what tells "decided no" from "not reviewed yet" on the tools page.
 
 The rungs below ``trading`` are three different things, not one, which is why
 they are three groups. moomoo's ``sim_trade_*`` is **paper trading**: a parallel
@@ -506,23 +509,27 @@ _CURATION: dict[str, dict[str, tuple[str, ...]]] = {
     },
 }
 
-# Named so a reader can see it was a decision, not an omission. ``denied_tools``
-# refuses these whatever the user granted, which is the only place the policy is
-# stricter than the groups -- everything else it blocks, a capability toggle can
-# unblock.
+# Tools we read and deliberately put in no group. Being in no group already
+# refuses them; the list records the decision, so the next curation pass reads
+# them as settled rather than not reviewed yet, and it is what the previous
+# version's denial column names.
 #
-# IBKR's submits a feature request in the user's name, which is not a thing an
-# analysis turn should be able to do on its own. moomoo's crypto tools place,
+# IBKR's submits a feature request in the user's name, and Webull's publish a
+# post or a comment to its community in the user's name: none of that is a thing
+# an analysis turn should be able to do on its own. moomoo's crypto tools place,
 # change and cancel real orders, but the order adapter reads only moomoo's
-# equity order shape: behind the gate they would be approved and recorded
-# without anyone knowing what they are, and left ungrouped they would reach the
-# sandbox with no gate at all.
+# equity order shape, so behind the gate they would be approved and recorded
+# without anyone knowing what they are.
 UNCURATED: dict[str, tuple[str, ...]] = {
     "ibkr": ("provide_customer_feedback",),
     "moomoo": (
         "crypto_account_cancel_order",
         "crypto_account_create_order",
         "crypto_account_modify_order",
+    ),
+    "webull": (
+        "create_community_comment",
+        "create_community_post",
     ),
 }
 
@@ -676,17 +683,16 @@ def effective_capabilities(
 def tools_for(brokerage: str | None, granted: Iterable[str]) -> frozenset[str] | None:
     """The tools a grant of these groups permits, or None if we curate no policy.
 
-    The affirmative view of a grant, for display and for reasoning about one.
-    **Not the gate.** Enforcement reads ``denied_tools``, and the difference is
-    the whole policy: this answers "which curated tools did they say yes to",
-    which says nothing about a tool that is in no group at all.
-
-    Reaching for this at a gate would turn every uncurated tool into a refusal,
-    including the ones a vendor publishes between our releases. That is the
-    behaviour the denial is here to avoid, so the two must not be swapped.
+    **The gate.** Every layer that decides whether a brokerage tool reaches the
+    agent reads this -- the relay, the direct-call re-check, the binding plan
+    and the sandbox install -- and a tool outside it is refused, whether it sits
+    in a declined group, in ``UNCURATED``, or in no group because the vendor
+    published it after we curated them.
 
     None is not "allow nothing" and not "allow everything": it means this server
-    is not one we have a map for, and the caller decides.
+    is not one we have a map for, and the caller decides. A shipped brokerage
+    we have not curated permits nothing, because every one of its tools is one
+    nobody has read.
     """
     if brokerage is None:
         return None
@@ -700,41 +706,20 @@ def tools_for(brokerage: str | None, granted: Iterable[str]) -> frozenset[str] |
 
 
 def denied_tools(brokerage: str | None, granted: Iterable[str]) -> frozenset[str] | None:
-    """The curated tools this grant refuses. What enforcement actually reads.
+    """The curated tools this grant refuses, for the previous version's column.
 
-    The complement of ``tools_for``, and the two are not interchangeable at a
-    gate: this regulates what we know and never blocks what we do not. A tool
-    in no group is in no denial, so a tool the vendor publishes after we curated
-    them is reachable rather than refused. That is the deliberate line -- every
-    other harness a user could connect these brokers to grants the whole tool
-    list, and a connector that silently stops working when the vendor ships an
-    update is a worse failure in practice than one that carries a tool we have
-    not classified yet.
-
-    The consequence to know when reading a bug report: a mistake here fails
-    permissive. An allowlist that came out empty served nothing and was obvious;
-    a denial that comes out empty serves everything and looks healthy. That is
-    why ``policy_required`` still rides along -- it can no longer prove the
-    policy is right, only that it was computed at all.
-
-    ``UNCURATED`` is denied unconditionally, and that is the line between the
-    two kinds of absence. A tool we never looked at is unknown, and passes. A
-    tool we read, understood, and deliberately put in no group is *known* and
-    refused, whatever groups the user granted. Collapsing them would turn the
-    one list we wrote down to keep a tool away into the mechanism that lets it
-    through, which is the opposite of what it says on it.
-
-    None only for a server we hold no map for, matching ``tools_for``. A shipped
-    brokerage we have not curated denies nothing, because every one of its tools
-    is one we have not classified.
+    Not the gate, and it cannot be one: it names what we know and so says
+    nothing about a tool the vendor published later, which is how live order
+    tools reached the sandbox when this was what enforcement read. It is still
+    written to ``tool_denylist`` because the previous version, which can still
+    be serving beside this one, enforces that column, and handing it the
+    declined groups and ``UNCURATED`` is the strictest reading it can take.
     """
     if brokerage is None:
         return None
     curated = _CURATION.get(brokerage)
     if curated is None:
         return frozenset() if brokerage_by_name(brokerage) else None
-    # In force, not as stored: a group whose requirement was not granted is
-    # refused like one that was declined.
     wanted = set(effective_capabilities(brokerage, granted))
     return frozenset(
         tool for key, tools in curated.items() if key not in wanted for tool in tools
@@ -744,18 +729,14 @@ def denied_tools(brokerage: str | None, granted: Iterable[str]) -> frozenset[str
 def group_of_tool(brokerage: str | None, tool: str) -> str | None:
     """The group a tool belongs to, or None if no group names it.
 
-    None does not say whether the tool is reachable, and a display must not read
-    it that way: ask :func:`is_always_denied` for that. The two ungrouped cases
-    are opposites -- an ``UNCURATED`` tool is refused at every grant, one we
-    never classified passes at every grant -- and the old docstring here claimed
-    they looked the same to a reader, which was the bug: the detail view labelled
-    both "the agent never sees them" while half of them were callable.
+    At a shipped brokerage None means refused at every grant, which
+    :func:`is_always_denied` answers for a display.
 
     ``tool`` comes from discovery, so it is matched folded, the way the relay
     and the registry filter match it. Otherwise a vendor that recases or pads a
     name has it refused at the relay and stripped from the composite while this
-    endpoint still reports it as unclassified, and the detail view tells the
-    user a declined tool is callable.
+    endpoint still reports it under a group, and the detail view tells the user
+    a refused tool is callable.
     """
     return _BY_TOOL.get(brokerage or "", {}).get(fold_tool_name(tool))
 
@@ -796,8 +777,8 @@ def curates(brokerage: str | None) -> bool:
     """Whether we hold a capability map for this brokerage at all.
 
     The difference between a tool nobody classified at a vendor we curate,
-    which stays in the sandbox, and one on a server we have no map for, which
-    the row is free to bind however it likes.
+    which is refused, and one on a server we have no map for, which the row is
+    free to bind however it likes.
     """
     return brokerage is not None and brokerage in _CURATION
 
@@ -805,12 +786,14 @@ def curates(brokerage: str | None) -> bool:
 def is_always_denied(brokerage: str | None, tool: str) -> bool:
     """Whether a tool is refused whatever the user granted.
 
-    True only for ``UNCURATED``: a tool we read and deliberately put in no
-    group. A tool we simply have not classified is not one of these, and saying
-    so is the difference between describing the policy and inverting it. Folded
-    for the reason :func:`group_of_tool` gives.
+    True for every tool a shipped brokerage publishes outside a group: one in
+    ``UNCURATED`` and one nobody has curated yet are refused alike, so the
+    tools page must not draw the second as callable. Folded for the reason
+    :func:`group_of_tool` gives.
     """
-    return fold_tool_name(tool) in _UNCURATED_FOLDED.get(brokerage or "", frozenset())
+    return brokerage_by_name(brokerage or "") is not None and (
+        group_of_tool(brokerage, tool) is None
+    )
 
 
 # Built once rather than scanned per tool: the tools endpoint annotates a whole
@@ -823,11 +806,6 @@ _BY_TOOL: dict[str, dict[str, str]] = {
         for tool in tools
     }
     for brokerage, curated in _CURATION.items()
-}
-
-_UNCURATED_FOLDED: dict[str, frozenset[str]] = {
-    brokerage: frozenset(fold_tool_name(t) for t in tools)
-    for brokerage, tools in UNCURATED.items()
 }
 
 _BY_ORDER_TOOL: dict[str, dict[str, OrderTool]] = {

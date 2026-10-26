@@ -31,12 +31,14 @@ export interface ToolSection {
  * The tool list bucketed the way it is read, shared by the renderer and the
  * selection above it so both agree about which tools are reachable.
  *
- * Two trailing buckets rather than one, because a tool outside every group is
- * in one of two opposite states: `always_denied` is one we read and withheld,
- * refused whatever is granted, while the rest are unclassified and the policy
- * permits them by design. Absent, not merely falsy, is a server that predates
- * the field, and that server's policy was an allowlist -- under which an
- * ungrouped tool was refused.
+ * Two trailing buckets rather than one, because a tool outside every group was
+ * once in one of two opposite states. The server now refuses every ungrouped
+ * tool at a brokerage and says so with `always_denied`, so they all land in
+ * `never`; `always_denied: false` on an ungrouped tool comes only from a
+ * server that let unclassified tools through, and `unclassified` draws those
+ * as callable. Absent, not merely falsy, is a server that predates the field,
+ * and that server's policy was an allowlist -- under which an ungrouped tool
+ * was refused.
  *
  * With no groups to read against (any server that is not a brokerage) the whole
  * list is one flat section, so a caller never branches on the shape.

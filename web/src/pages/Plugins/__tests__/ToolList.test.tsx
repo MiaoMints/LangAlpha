@@ -38,7 +38,7 @@ describe('the trailing buckets', () => {
     expect(screen.getByText(/does not refuse them/)).toBeInTheDocument();
   });
 
-  it('lists a deliberately withheld tool as refused', () => {
+  it('lists a tool the server refuses as refused', () => {
     renderWithProviders(
       <ToolList
         groups={GROUPS}
@@ -46,7 +46,7 @@ describe('the trailing buckets', () => {
         tools={[tool({ name: 'held_tool', capability: null, always_denied: true })]}
       />,
     );
-    expect(screen.getByText(/Refused whatever you grant/)).toBeInTheDocument();
+    expect(screen.getByText(/refused whatever you grant/)).toBeInTheDocument();
   });
 
   it('does not call a tool reachable when the server never said it was', () => {
@@ -58,7 +58,7 @@ describe('the trailing buckets', () => {
         tools={[tool({ name: 'unknown_tool', capability: null })]}
       />,
     );
-    expect(screen.getByText(/Refused whatever you grant/)).toBeInTheDocument();
+    expect(screen.getByText(/refused whatever you grant/)).toBeInTheDocument();
     expect(screen.queryByText(/does not refuse them/)).not.toBeInTheDocument();
   });
 

@@ -489,7 +489,7 @@ def test_a_fold_colliding_map_reports_what_the_split_does():
     assert plan.by_tool[upper].binding == reported
     assert reported == "both", "sorted raw keys, later wins"
     sandbox, direct = split_server_tools(
-        [{"name": PAPER_READ}], denied=None, plan=plan
+        [{"name": PAPER_READ}], permitted=None, plan=plan
     )
     kept_wrapper = any(t["name"] == PAPER_READ for t in sandbox)
     assert kept_wrapper == (reported == "both")
@@ -527,11 +527,18 @@ def test_a_recased_override_for_a_denied_tool_is_not_reported_as_reachable():
 class TestUnclassifiedAtACuratedVendor:
     """A tool a brokerage publishes that no capability group names.
 
-    Reachable, because the policy regulates what is curated and never blocks
-    what is not, but only through the sandbox: the direct set at a brokerage
-    is then exactly the curated set, so nothing is bound past a policy that
-    has never read it. A server we hold no map for is untouched.
+    Refused at every grant, so the plan never carries it, whatever the row
+    stored for it. The binding write path still answers for it on its own,
+    where only the sandbox is on offer. A server we hold no map for is
+    untouched.
     """
+
+    def test_no_grant_plans_it(self):
+        inputs = BindingInputs(overrides={self.NEW: "ptc"})
+        plan = resolve_plan(
+            MOOMOO, group_keys_for(MOOMOO), inputs, candidates=(self.NEW,)
+        )
+        assert self.NEW not in plan.by_tool
 
     NEW = "quote_something_the_vendor_shipped_later"
 
@@ -539,10 +546,9 @@ class TestUnclassifiedAtACuratedVendor:
         assert allowed_bindings(MOOMOO, self.NEW) == frozenset({"ptc"})
 
     @pytest.mark.parametrize("asked", ["direct", "both"])
-    def test_the_write_path_refuses_it_and_says_why(self, asked):
+    def test_the_write_path_refuses_it(self, asked):
         reason = validate_overrides(MOOMOO, {self.NEW: asked})
-        assert reason and "we classify" in reason and MOOMOO in reason
-        assert "sandbox wrapper" in reason
+        assert reason and "sandbox wrapper" in reason
 
     @pytest.mark.parametrize("asked", ["direct", "both"])
     def test_an_override_that_got_in_earlier_resolves_to_ptc(self, asked):
@@ -560,16 +566,11 @@ class TestUnclassifiedAtACuratedVendor:
         assert allowed_bindings(None, self.NEW) == ALL_BINDINGS
         assert validate_overrides(None, {self.NEW: "direct"}) is None
 
-    def test_a_tool_we_read_and_withheld_is_a_different_absence(self):
-        """``UNCURATED`` is denied at every grant, so consent drops it from the
-        plan entirely rather than leaving it a sandbox binding to argue about,
-        and the refusal must not call it unclassified: this module's whole
-        point is that the two absences do not collapse into one sentence."""
+    def test_a_tool_we_read_and_withheld_is_refused_the_same_way(self):
         plan = resolve_plan("ibkr", group_keys_for("ibkr"), BindingInputs())
         assert "provide_customer_feedback" not in plan.by_tool
         reason = validate_overrides("ibkr", {"provide_customer_feedback": "direct"})
-        assert reason and "we classify" not in reason
-        assert "sandbox wrapper" in reason
+        assert reason and "sandbox wrapper" in reason
 
 
 class TestMergeOverrides:

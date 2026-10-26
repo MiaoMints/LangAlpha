@@ -372,35 +372,30 @@ async def prepare_relay(
         raise RelayRejection(403, RelayError.METHOD_BLOCKED, "POST not in grant policy")
 
     if canonical.method == "tools/call":
-        denylist = grant.get("tool_denylist")
-        # NULL means the denial was never computed, and for a brokerage that is
-        # a bug rather than a state: every shipped broker derives a policy, an
-        # uncurated one deriving the empty list. Under an allowlist NULL served
-        # nothing and was loud; under a denylist it serves everything and looks
-        # healthy, so it has to be refused here rather than trusted. This is the
-        # one place that can see it -- the grant row is written by a sync that
-        # may have failed, been rolled back, or been blanked by a migration,
-        # while the destination is pinned from the address consent was given
-        # for and cannot drift.
-        if denylist is None and brokerage_for_url(grant["destination_url"]):
-            raise RelayRejection(
-                403,
-                RelayError.POLICY_MISSING,
-                "this connection's capability policy has not been computed",
-            )
-        # Membership, not absence from a permitted set. The policy names the
-        # curated tools whose capability group the user declined, so a tool it
-        # does not mention passes: one we never classified is not one they said
-        # no to. Compared case- and width-folded because the denial is exact
-        # strings while the vendor decides what it considers the same name, and
-        # under an allowlist a variant spelling failed shut where here it would
-        # sail through.
-        if denylist and folded_contains(denylist, canonical.tool_name):
-            raise RelayRejection(
-                403,
-                RelayError.TOOL_BLOCKED,
-                "tool refused by this connection's policy",
-            )
+        # A brokerage is policed by what its grant permits, never by what it
+        # names as declined: a tool the vendor published after we curated it is
+        # in no group, so a denial cannot mention it and an allowlist refuses it.
+        # Keyed on the destination rather than on the column being set, because
+        # the destination is pinned from the address consent was given for and
+        # cannot drift, while the row is written by a sync that may have failed,
+        # been rolled back, or been blanked by a migration. NULL there is a
+        # policy nobody computed, and it is refused rather than trusted.
+        if brokerage_for_url(grant["destination_url"]):
+            permitted = grant.get("tool_allowlist")
+            if permitted is None:
+                raise RelayRejection(
+                    403,
+                    RelayError.POLICY_MISSING,
+                    "this connection's capability policy has not been computed",
+                )
+            # Folded because the grant is exact strings while the vendor
+            # decides what it considers the same name.
+            if not folded_contains(permitted, canonical.tool_name):
+                raise RelayRejection(
+                    403,
+                    RelayError.TOOL_BLOCKED,
+                    "tool refused by this connection's policy",
+                )
         # A tool bound directly to the model has no sandbox wrapper, and this
         # is what keeps it that way: the policy middleware gates the direct
         # call, and a sandbox that could reach the same tool by hand-writing

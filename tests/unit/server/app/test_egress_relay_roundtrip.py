@@ -93,7 +93,7 @@ def _grant() -> dict:
         "server_name": None,
         "destination_url": VENDOR_URL,
         "allowed_methods": ["POST"],
-        "tool_denylist": None,
+        "tool_allowlist": None,
         "grant_status": "active",
         "connection_status": "connected",
     }

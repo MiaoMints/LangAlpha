@@ -41,8 +41,8 @@ from src.server.services.tool_binding import (
     resolve_plan,
 )
 from src.server.services.brokerage_capabilities import (
-    denied_tools,
     group_keys_for,
+    tools_for,
     vendor_for_url,
 )
 
@@ -138,7 +138,7 @@ class ResolvedServer:
     # curate no capability groups for, which is every server that is not a
     # shipped brokerage. Empty is a real answer and distinct from None: it
     # means the user granted no group, so the server runs and offers nothing.
-    denied_tools: frozenset[str] | None = None
+    permitted_tools: frozenset[str] | None = None
     # How each granted tool reaches the model (sandbox wrapper, JSON tool,
     # or both), with the set the sandbox must not wrap and the set whose calls
     # stop for the user. None for a server nothing binds directly.
@@ -208,18 +208,18 @@ class ResolvedMCP:
         }
 
     @cached_property
-    def denied_tools_by_name(self) -> dict[str, frozenset[str]]:
+    def permitted_tools_by_name(self) -> dict[str, frozenset[str]]:
         """Consent filters for the running set, keyed by server name.
 
         Only servers that have one, so a caller reads "absent" as "no policy"
         without having to know which vendors we curate. The value is what to
-        subtract, never what to keep: a tool no capability group names is not in
-        it, and stays visible.
+        keep, never what to subtract: a tool the vendor published after we
+        curated it is in no group, so it is not in the value and is not wrapped.
         """
         return {
-            e.name: e.denied_tools
+            e.name: e.permitted_tools
             for e in self.entries
-            if e.state is State.ACTIVE and e.denied_tools is not None
+            if e.state is State.ACTIVE and e.permitted_tools is not None
         }
 
 
@@ -502,8 +502,8 @@ async def resolve_mcp_config(
         if row.get("plugin_name")
     }
 
-    def _denied_tools(cfg: MCPServerConfig) -> frozenset[str] | None:
-        """What consent refuses for this server, or None if we curate no groups.
+    def _permitted_tools(cfg: MCPServerConfig) -> frozenset[str] | None:
+        """What consent permits on this server, or None if we curate no groups.
 
         Keyed on the address, never on ``cfg.name``: the name is the user's to
         choose and to edit, so a row called anything else at a broker's host
@@ -513,39 +513,36 @@ async def resolve_mcp_config(
         relay dials, so it is the only identity worth deriving from. Without a
         connection there is nothing consented to read, and the row's own URL is
         all there is -- which is the conservative direction anyway, since it
-        denies that vendor's whole curation.
+        permits nothing at that vendor.
 
         A brokerage whose connection carries no record of consent is read as
-        consent to nothing, so every curated tool is denied. That is the one
-        place this policy is still strict: an absent record is a bug, not a
-        vendor publishing something new, and the two must not be confused.
-
-        Loud only where it is actually a bug, which is why the warning asks
-        whether the vendor has groups rather than whether it has a policy. A
-        brokerage listed but not yet curated has no groups to consent to, so it
-        legitimately stores no record, and it denies nothing.
+        consent to nothing. Loud only where that is actually a bug, which is why
+        the warning asks whether the vendor has groups rather than whether it
+        has a policy: a brokerage listed but not yet curated has no groups to
+        consent to, so it legitimately stores no record, and it permits nothing
+        either way.
         """
         connection = connection_by_server.get(cfg.name)
         if connection is None:
-            return denied_tools(vendor_for_url(cfg.url), ())
+            return tools_for(vendor_for_url(cfg.url), ())
         vendor = vendor_for_url(connection.get("server_url"))
         capabilities = connection.get("granted_capabilities")
         if capabilities is None and group_keys_for(vendor):
             logger.warning(
                 "[MCP] user %s connection %r has no recorded capability "
-                "consent; refusing every curated tool until it is reconnected",
+                "consent; refusing every tool until it is reconnected",
                 user_id, cfg.name,
             )
-        return denied_tools(vendor, capabilities or ())
+        return tools_for(vendor, capabilities or ())
 
     def _binding_plan(cfg: MCPServerConfig) -> tuple[BindingPlan, bool]:
         """Which path each granted tool takes, and whether a probe still gates
-        it. Same identity rule as the denial: the consented URL, never the row
+        it. Same identity rule as the consent filter: the consented URL, never the row
         name.
 
         A row with no connection is planned off its own address and consent to
         nothing: a header-authenticated server has no consent record to read,
-        and a curated vendor's tools are all denied by that emptiness anyway.
+        and a brokerage's tools are all refused by that emptiness anyway.
         What survives is what the row itself asked for, and whether it may ask
         at all is the row's transport -- a stdio server has no address the
         relay could dial, so ``inputs_from_row`` clamps every one of its tools
@@ -561,8 +558,8 @@ async def resolve_mcp_config(
                 inputs,
             ), False
         # Planning off ``()`` is deliberate: a row that never went through a
-        # consent screen is denied a curated vendor's whole curation, while
-        # its uncurated tools still take the path the row asked for.
+        # consent screen is permitted nothing at a brokerage, while a server
+        # that is not one still takes the paths the row asked for.
         vendor = vendor_for_url(cfg.url)
         plan = resolve_plan(vendor, (), inputs)
         snapshot = snapshots.snapshot(cfg) if snapshots is not None else None
@@ -581,7 +578,7 @@ async def resolve_mcp_config(
             state=state,
             oauth_status=oauth_status_by_name.get(cfg.name),
             plugin_name=plugin_name_by_server.get(cfg.name),
-            denied_tools=_denied_tools(cfg),
+            permitted_tools=_permitted_tools(cfg),
             binding_plan=plan,
             awaiting_probe=awaiting_probe,
         )

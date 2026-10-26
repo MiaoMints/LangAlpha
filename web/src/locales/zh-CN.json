@@ -4910,8 +4910,8 @@
         "unclassified": "不属于任何分组",
         "unclassifiedNote": "没有分组涵盖这些工具，因此拒绝某个分组并不会拒绝它们。 Agent 仍然可以调用。",
         "unclassifiedNoteUnconnected": "这些工具不属于任何分组，拒绝某个分组不会屏蔽它们。此处尚未连接，因此暂时无法调用。",
-        "neverAvailable": "始终不可用",
-        "neverAvailableNote": "已刻意保留。无论授权什么都会被拒绝。"
+        "neverAvailable": "不可用",
+        "neverAvailableNote": "这些工具不属于任何分组，无论授权什么都会被拒绝。券商新推出的工具在审核前也会列在这里。"
       },
       "exclusiveNote": "会断开此账户已关联的其他 AI 应用",
       "exclusiveWarning": "该账户只允许连接一个 AI 平台，因此在此连接会取代当前已连接的那一个。",

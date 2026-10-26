@@ -50,9 +50,7 @@ from src.server.services.brokerage_capabilities import (
     OrderMode,
     OrderTool,
     curates,
-    denied_tools,
     group_for_tool,
-    is_always_denied,
     order_tool,
     tools_for,
 )
@@ -420,19 +418,21 @@ def resolve_plan(
     The candidate set is what the vendor's curation grants plus whatever a map
     or an override names, so a server we curate nothing for still gets the
     bindings its own config asks for. ``candidates`` adds the discovered names
-    when the caller has them, which is how an unclassified tool the vendor
-    added later shows up with its ``default`` binding on the tools page.
+    when the caller has them. At a brokerage the set is then narrowed to what
+    the grant permits, so neither an override nor discovery can plan a tool
+    the gate refuses.
     """
     granted = tuple(granted)
+    permitted = tools_for(vendor, granted)
     names: set[str] = set(candidates)
-    names.update(tools_for(vendor, granted) or ())
+    names.update(permitted or ())
     names.update(inputs.overrides)
-    refused = denied_tools(vendor, granted) or frozenset()
-    # Folded, because the denial carries the curated spelling while a name here
-    # may be an override key or a discovered one. A raw difference would leave a
-    # recased spelling of a denied tool in ``by_tool`` reporting a binding the
-    # user cannot reach, since the split applies the same denial folded.
-    names = {n for n in names if not folded_contains(refused, n)}
+    if permitted is not None:
+        # Folded, because the grant carries the curated spelling while a name
+        # here may be an override key or a discovered one. A raw comparison
+        # would drop a recased spelling of a permitted tool that the split,
+        # which matches folded, still lets through.
+        names = {n for n in names if folded_contains(permitted, n)}
 
     by_tool = {tool: resolve_tool(vendor, tool, inputs) for tool in sorted(names)}
     direct = frozenset(t for t, r in by_tool.items() if r.binding in ("direct", "both"))
@@ -466,23 +466,6 @@ def _refusal(
     if binding in allowed:
         return None
     paths = " or ".join(_PATH_WORDS[b] for b in sorted(allowed))
-    if (
-        relayable
-        and curates(vendor)
-        and group_for_tool(vendor, tool) is None
-        and order_tool(vendor, tool) is None
-        # A tool we read and deliberately put in no group is a different
-        # absence from one we never classified, and this module's whole point
-        # is that the two do not collapse into one sentence.
-        and not is_always_denied(vendor, tool)
-    ):
-        # Named rather than folded into the generic line, because the fix is
-        # ours and not the user's: the tool is reachable, it is simply one no
-        # capability group has classified yet.
-        return (
-            f"{tool!r} is not one of the {vendor} tools we classify, so it can "
-            f"only be bound as {paths}"
-        )
     return f"{tool!r} can only be bound as {paths}"
 
 
