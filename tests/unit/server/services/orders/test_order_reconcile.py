@@ -1583,6 +1583,70 @@ async def test_a_vendor_that_keeps_ended_orders_listed_leaves_a_missing_one_open
     assert ledger.cancel_reads == [False]
 
 
+# ------------------------------------------------------- a live IBKR order
+
+LIVE_ID = "5001001"
+
+
+def _live_ibkr_row(
+    attempt_id: str, status: AttemptStatus, vendor_order_id: str | None = LIVE_ID
+):
+    """An IBKR submit, as the ledger holds it once an answer named the order."""
+    return {
+        **_row(attempt_id, status, vendor_order_id),
+        "server": "ibkr",
+        "vendor": "ibkr",
+        "tool": "submit_order",
+        "action": "place",
+        "mode": "live",
+        "account_ref": "",
+        "order_json": {"vendor": "ibkr", "account_ref": "", "mode": "live"},
+    }
+
+
+@pytest.mark.asyncio
+async def test_a_live_ibkr_order_settles_from_its_own_status_read():
+    """One order by its id, never the staged list, and its fill comes with it."""
+    ledger = FakeLedger([_live_ibkr_row("a1", AttemptStatus.WORKING)])
+    client = FakeClient(
+        json.dumps(
+            {
+                "order_status": "FILLED",
+                "total_quantity": 2.0,
+                "filled_quantity": 2.0,
+                "remaining_quantity": 0.0,
+                "contract_id_ex": "1234567",
+                "side": "BUY",
+                "order_type": "MARKET",
+                "tif": "DAY",
+                "limit_price": 0.0,
+                "stop_price": 0.0,
+                "outside_rth": False,
+            }
+        )
+    )
+
+    report = await _run(ledger, IbkrOrderAdapter(), client, vendor="ibkr")
+
+    assert client.calls == [("get_order_status", {"order_id": LIVE_ID})]
+    assert report.moved == 1
+    assert ledger.rows["a1"]["status"] == "filled"
+    assert ledger.rows["a1"]["filled_qty"] == Decimal("2")
+
+
+@pytest.mark.asyncio
+async def test_a_live_ibkr_submit_no_answer_named_is_left_for_a_person():
+    """IBKR's order list does not spell its rows, so there is nothing to match."""
+    ledger = FakeLedger([_live_ibkr_row("a1", AttemptStatus.UNKNOWN, None)])
+    client = FakeClient()
+
+    report = await _run(ledger, IbkrOrderAdapter(), client, vendor="ibkr")
+
+    assert client.calls == []
+    assert report.unresolved == 1
+    assert ledger.rows["a1"]["status"] == "unknown"
+
+
 @pytest.mark.parametrize("vendor", ["moomoo", "robinhood"])
 @pytest.mark.parametrize("action", list(OrderAction))
 def test_only_an_ibkr_staged_instruction_ends_by_leaving_the_list(vendor, action):

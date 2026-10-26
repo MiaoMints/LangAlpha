@@ -288,18 +288,40 @@ def test_a_staged_instruction_is_direct_and_asks_by_default():
     that skips approval the row can say otherwise; nothing on the row moves the
     binding."""
     vendor, tool = STAGED_ORDER
-    plan = resolve_plan(vendor, group_keys_for(vendor), BindingInputs())
+    # The staged rung without the live one, so the switch below is the only
+    # one asking.
+    granted = [key for key in group_keys_for(vendor) if key != "trading"]
+    plan = resolve_plan(vendor, granted, BindingInputs())
     assert _answer(plan.by_tool[tool]) == ("direct", "policy", True)
     assert tool in _asks(plan) and tool in plan.sandbox_excluded
     off = resolve_plan(
         vendor,
-        group_keys_for(vendor),
+        granted,
         BindingInputs(
             order_approval={**UNTOUCHED, "staged": False}, trading=TradingPermission.PLAN_FIRST
         ),
     )
     assert _asks(off) == frozenset()
     assert off.direct == plan.direct
+
+
+def test_ibkr_live_orders_take_the_direct_path_and_ask_beside_its_staged_ones():
+    """Both IBKR rungs are real money, and each keeps its own switch."""
+    vendor = "ibkr"
+    live = {t for t, e in _ORDER_TOOLS[vendor].items() if e.mode is OrderMode.LIVE}
+    assert live == {"submit_order", "modify_order", "cancel_order", "answer_order_question"}
+    plan = resolve_plan(vendor, group_keys_for(vendor), BindingInputs())
+    for tool in live:
+        assert _answer(plan.by_tool[tool]) == ("direct", "policy", True), tool
+        assert tool in plan.sandbox_excluded
+    off = resolve_plan(
+        vendor,
+        group_keys_for(vendor),
+        BindingInputs(
+            order_approval={**UNTOUCHED, "live": False}, trading=TradingPermission.PLAN_FIRST
+        ),
+    )
+    assert _asks(off) == {STAGED_ORDER[1], "delete_order_instruction"}
 
 
 def test_an_untouched_row_asks_for_real_money_and_not_for_paper():
@@ -313,7 +335,7 @@ def test_an_untouched_row_asks_for_real_money_and_not_for_paper():
 def test_only_the_modes_a_vendor_has_are_offered():
     assert order_modes(MOOMOO) == (OrderMode.LIVE, OrderMode.PAPER)
     assert order_modes("robinhood") == (OrderMode.LIVE,)
-    assert order_modes("ibkr") == (OrderMode.STAGED,)
+    assert order_modes("ibkr") == (OrderMode.LIVE, OrderMode.STAGED)
     assert order_modes("webull") == ()
     assert order_modes(None) == ()
 

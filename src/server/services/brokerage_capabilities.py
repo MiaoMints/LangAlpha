@@ -439,6 +439,16 @@ _CURATION: dict[str, dict[str, tuple[str, ...]]] = {
             "delete_order_instruction",
             "get_order_instructions",
         ),
+        # Stocks and single-leg options, under the session's AUTONOMOUS flow
+        # type. A submit, a modify or a cancel can come back holding a broker
+        # question, and none of the three reaches the market until the answer
+        # releases it, so the answer is a live order tool like the other three.
+        "trading": (
+            "answer_order_question",
+            "cancel_order",
+            "modify_order",
+            "submit_order",
+        ),
     },
     # No rung of any kind here, and the line is the vendor's rather than ours.
     # Webull's consent screen offers exactly four capabilities -- account infos,
@@ -538,17 +548,9 @@ _CURATION: dict[str, dict[str, tuple[str, ...]]] = {
 # an analysis turn should be able to do on its own. moomoo's crypto tools place,
 # change and cancel real orders, but the order adapter reads only moomoo's
 # equity order shape, so behind the gate they would be approved and recorded
-# without anyone knowing what they are. IBKR's live order tools are the same
-# case until its order adapter reads them: ``answer_order_question`` is what
-# releases a submit, modify or cancel to the market, so it is one of them.
+# without anyone knowing what they are.
 UNCURATED: dict[str, tuple[str, ...]] = {
-    "ibkr": (
-        "answer_order_question",
-        "cancel_order",
-        "modify_order",
-        "provide_customer_feedback",
-        "submit_order",
-    ),
+    "ibkr": ("provide_customer_feedback",),
     "moomoo": (
         "crypto_account_cancel_order",
         "crypto_account_create_order",
@@ -647,10 +649,17 @@ _ORDER_TOOLS: dict[str, dict[str, OrderTool]] = {
     "ibkr": {
         # IBKR calls an instruction "not a live order", and it is not: it is an
         # object written into the real account, one human click from being one.
-        # One ``contract_id_ex`` addresses every class it stages, so the class
-        # is not something either tool's name says.
+        # One ``contract_id_ex`` addresses every class it stages or trades, so
+        # the class is not something any of these tools' names says.
         "create_order_instruction": OrderTool(OrderAction.STAGE, OrderMode.STAGED),
         "delete_order_instruction": OrderTool(OrderAction.UNSTAGE, OrderMode.STAGED),
+        "submit_order": OrderTool(OrderAction.PLACE, OrderMode.LIVE),
+        "modify_order": OrderTool(OrderAction.REPLACE, OrderMode.LIVE),
+        "cancel_order": OrderTool(OrderAction.CANCEL, OrderMode.LIVE),
+        # IBKR's own confirmation, not a second one of ours: a submit, modify or
+        # cancel answered with a pending question is not applied until this
+        # answers it, and an answer can raise the next question.
+        "answer_order_question": OrderTool(OrderAction.CONFIRM, OrderMode.LIVE),
     },
 }
 
@@ -791,7 +800,7 @@ def order_modes(brokerage: str | None) -> tuple[OrderMode, ...]:
     """The order modes this brokerage actually has, in declaration order.
 
     What the connection's approval switches are offered for: moomoo has live
-    and paper, robinhood live, IBKR staged, and Webull none at all.
+    and paper, robinhood live, IBKR live and staged, and Webull none at all.
     """
     tools = _ORDER_TOOLS.get(brokerage or "")
     if not tools:
