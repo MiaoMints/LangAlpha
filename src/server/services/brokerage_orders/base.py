@@ -249,6 +249,7 @@ def adapter_for(vendor: str) -> OrderAdapter | None:
     from src.server.services.brokerage_orders.ibkr import IbkrOrderAdapter
     from src.server.services.brokerage_orders.moomoo import MoomooOrderAdapter
     from src.server.services.brokerage_orders.robinhood import RobinhoodOrderAdapter
+    from src.server.services.brokerage_orders.webull import WebullOrderAdapter
 
     match (vendor or "").strip().casefold():
         case "moomoo":
@@ -257,6 +258,8 @@ def adapter_for(vendor: str) -> OrderAdapter | None:
             return RobinhoodOrderAdapter()
         case "ibkr":
             return IbkrOrderAdapter()
+        case "webull":
+            return WebullOrderAdapter()
         case _:
             return None
 

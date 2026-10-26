@@ -207,8 +207,8 @@ PAPER_EMPTY_ORDER_LIST = {
 
 def test_adapter_for_knows_moomoo_and_not_an_unmodeled_vendor():
     assert MOOMOO is not None
-    # Webull publishes nothing that places an order, so it never gets one.
-    assert adapter_for("webull") is None
+    # A vendor we ship no order tools for has nothing to translate.
+    assert adapter_for("a_vendor_we_do_not_ship") is None
 
 
 def test_live_place_request():

@@ -28,11 +28,12 @@ from src.server.services.brokerage_capabilities import (
     group_of_tool,
     groups_for,
     is_always_denied,
+    order_modes,
     order_tool,
     required_groups,
     tools_for,
 )
-from src.server.services.brokerage_orders import ibkr, moomoo, robinhood
+from src.server.services.brokerage_orders import ibkr, moomoo, robinhood, webull
 from src.server.services.brokerages import brokerage_names
 
 VENDORS = sorted(_CURATION)
@@ -181,8 +182,8 @@ def test_placing_an_order_takes_the_trading_group() -> None:
 
 
 def test_a_broker_whose_order_tools_we_hold_back_is_never_asked_about_trading() -> None:
-    """Webull publishes live order tools that no group carries, so the toggle
-    would grant nothing and would read as though it did."""
+    """Every Webull order tool stages, so the live toggle would grant nothing
+    and would read as though it did."""
     assert "trading" not in group_keys_for("webull")
 
 
@@ -197,17 +198,16 @@ def test_ibkr_offers_live_orders_beside_its_staged_ones() -> None:
     assert UNCURATED["ibkr"] == ("provide_customer_feedback",)
 
 
-def test_webull_has_no_rung_at_all() -> None:
-    """Read-only by the vendor's own line, not by our reading of a tool list.
+def test_webull_stops_at_staged() -> None:
+    """The vendor's line, not our reading of a tool list.
 
-    Webull's consent screen offers account, order query, market data and
-    instruments, and no trading capability, so the write scope is not grantable
-    and nothing published places, previews or stages an order. IBKR by contrast
-    stops one rung down rather than at zero, with a staged order a human submits.
+    Every Webull order tool writes an instruction a person sends from Webull's
+    own client, so the one rung it has is staged, and every order tool it
+    publishes is a staged one.
     """
     rungs = {g.key for g in GROUPS if g.rung}
-    assert not rungs & set(group_keys_for("webull"))
-    assert "staged_orders" in set(group_keys_for("ibkr")) & rungs
+    assert rungs & set(group_keys_for("webull")) == {"staged_orders"}
+    assert order_modes("webull") == (OrderMode.STAGED,)
 
 
 @pytest.mark.parametrize("vendor", VENDORS)
@@ -369,6 +369,8 @@ def _status_read(vendor: str, entry: OrderTool) -> str:
         return {OrderMode.LIVE: ibkr.ORDER_STATUS, OrderMode.STAGED: ibkr.LIST_INSTRUCTIONS}[
             entry.mode
         ]
+    if vendor == "webull":
+        return webull.LIST_PENDING
     raise AssertionError(f"name the read {vendor}'s adapter settles an order with")
 
 

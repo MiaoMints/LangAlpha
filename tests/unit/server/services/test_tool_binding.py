@@ -336,7 +336,7 @@ def test_only_the_modes_a_vendor_has_are_offered():
     assert order_modes(MOOMOO) == (OrderMode.LIVE, OrderMode.PAPER)
     assert order_modes("robinhood") == (OrderMode.LIVE,)
     assert order_modes("ibkr") == (OrderMode.LIVE, OrderMode.STAGED)
-    assert order_modes("webull") == ()
+    assert order_modes("webull") == (OrderMode.STAGED,)
     assert order_modes(None) == ()
 
 
