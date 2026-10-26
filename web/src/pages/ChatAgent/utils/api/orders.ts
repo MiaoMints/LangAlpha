@@ -145,6 +145,10 @@ export interface OrderAttempt {
   parent_attempt_id: string | null;
   created_at: string | null;
   updated_at: string | null;
+  /** When a complete vendor listing first lacked this order. An end the
+   *  vendor named clears it and an end read from absence keeps it, so on a
+   *  handed-off attempt null means the vendor said how it ended. */
+  unlisted_at?: string | null;
 }
 
 export interface OrderPage {

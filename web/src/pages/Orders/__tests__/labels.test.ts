@@ -8,6 +8,7 @@ import {
   ORDER_STATUS_STAGED_KEYS,
   orderStatusLabel,
   orderStatusShortLabel,
+  vendorNamedEnd,
 } from '@/components/orders/status';
 import {
   OPTION_RIGHT_KEY,
@@ -119,6 +120,34 @@ describe('what a staged order is called', () => {
     expect(orderStatusLabel('handed_off', 'staged', null)).toEqual({
       key: 'toolArtifact.directTool.orderStatus.handedOffStagedUnnamed',
     });
+  });
+
+  it('says a handed-off instruction was confirmed only when the broker said so', () => {
+    expect(orderStatusLabel('handed_off', 'staged', 'Webull', true)).toEqual({
+      key: 'toolArtifact.directTool.orderStatus.handedOffConfirmedStaged',
+      params: { vendor: 'Webull' },
+    });
+    expect(orderStatusLabel('handed_off', 'staged', null, true)).toEqual({
+      key: 'toolArtifact.directTool.orderStatus.handedOffConfirmedStagedUnnamed',
+    });
+    expect(orderStatusShortLabel('handed_off', 'staged', true)).toBe(
+      'toolArtifact.directTool.orderStatusShort.handedOffConfirmed',
+    );
+    // A broker that only stopped listing it keeps the sentence that admits it.
+    expect(orderStatusLabel('handed_off', 'staged', 'Webull', false).key).toBe(
+      'toolArtifact.directTool.orderStatus.handedOffStaged',
+    );
+    // Naming the end changes no other state.
+    expect(orderStatusLabel('submitted', 'staged', 'Webull', true).key).toBe(
+      'toolArtifact.directTool.orderStatus.submittedStaged',
+    );
+  });
+
+  it('reads the broker as having named the end only on an explicit null', () => {
+    expect(vendorNamedEnd(null)).toBe(true);
+    expect(vendorNamedEnd('2026-10-26T01:00:00+00:00')).toBe(false);
+    // A record from before the ledger sent the field says nothing either way.
+    expect(vendorNamedEnd(undefined)).toBe(false);
   });
 
   it('shortens to "Staged" on a row, and only there', () => {

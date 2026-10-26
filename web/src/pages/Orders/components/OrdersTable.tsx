@@ -145,6 +145,7 @@ function OrderRow({
           status={order.status}
           mode={order.mode}
           vendorLabel={vendorLabel}
+          unlistedAt={order.unlisted_at}
         />
       </td>
     </tr>

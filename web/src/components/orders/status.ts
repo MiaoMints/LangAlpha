@@ -50,6 +50,25 @@ const STAGED_STATUS_SHORT_KEY: Partial<Record<OrderStatus, string>> = {
 };
 
 /**
+ * Whether the vendor itself said how a handed-off order ended.
+ *
+ * The ledger stamps `unlisted_at` when a complete listing first lacks an
+ * order, an end the vendor names in its own listing clears it, and an end
+ * founded on the order leaving the list keeps it. A record from before the
+ * field existed carries neither, so only an explicit null says the vendor
+ * spoke; anything else keeps the sentence that admits we do not know.
+ */
+export function vendorNamedEnd(unlistedAt: string | null | undefined): boolean {
+  return unlistedAt === null;
+}
+
+/** A staged instruction the user confirmed in the broker's own client, as the
+ *  broker reported it, in place of the sentence for one that only left. */
+const CONFIRMED_KEY = 'toolArtifact.directTool.orderStatus.handedOffConfirmedStaged';
+const CONFIRMED_KEY_UNNAMED = 'toolArtifact.directTool.orderStatus.handedOffConfirmedStagedUnnamed';
+const CONFIRMED_SHORT_KEY = 'toolArtifact.directTool.orderStatusShort.handedOffConfirmed';
+
+/**
  * What a staged order that reached the vendor is actually waiting on.
  *
  * Nothing was sent to a market: the instruction sits in the broker's own
@@ -75,24 +94,41 @@ export const ORDER_STATUS_STAGED_KEYS: readonly string[] = [
   ...Object.values(STAGED_STATUS_KEY),
   ...Object.values(STAGED_STATUS_KEY_UNNAMED),
   ...Object.values(STAGED_STATUS_SHORT_KEY),
+  CONFIRMED_KEY,
+  CONFIRMED_KEY_UNNAMED,
+  CONFIRMED_SHORT_KEY,
 ];
 
-/** The one-word verdict for a row. */
-export function orderStatusShortLabel(status: OrderStatus, mode?: OrderMode | null): string {
+function confirmed(status: OrderStatus, mode: OrderMode | null | undefined, named: boolean): boolean {
+  return named && mode === 'staged' && status === 'handed_off';
+}
+
+/** The one-word verdict for a row. `named` is {@link vendorNamedEnd}. */
+export function orderStatusShortLabel(
+  status: OrderStatus,
+  mode?: OrderMode | null,
+  named = false,
+): string {
+  if (confirmed(status, mode, named)) return CONFIRMED_SHORT_KEY;
   if (mode === 'staged' && STAGED_STATUS_SHORT_KEY[status]) {
     return STAGED_STATUS_SHORT_KEY[status] as string;
   }
   return ORDER_STATUS_SHORT_KEY[status] ?? ORDER_STATUS_SHORT_KEY.unknown;
 }
 
-/** What to call a status on a card, and what to interpolate into it. */
+/** What to call a status on a card, and what to interpolate into it.
+ *  `named` is {@link vendorNamedEnd}. */
 export function orderStatusLabel(
   status: OrderStatus,
   mode?: OrderMode | null,
   vendorLabel?: string | null,
+  named = false,
 ): { key: string; params?: { vendor: string } } {
   if (mode === 'staged') {
     const vendor = vendorLabel?.trim();
+    if (confirmed(status, mode, named)) {
+      return vendor ? { key: CONFIRMED_KEY, params: { vendor } } : { key: CONFIRMED_KEY_UNNAMED };
+    }
     if (vendor && STAGED_STATUS_KEY[status]) {
       return { key: STAGED_STATUS_KEY[status] as string, params: { vendor } };
     }

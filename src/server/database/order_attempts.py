@@ -40,7 +40,7 @@ _COLUMNS = """
     decided_at,
     decision_message, executed_at, dispatched_at, completed_at, vendor_order_id, route,
     action_url, filled_qty, avg_fill_price, fees, parent_attempt_id,
-    result_sha256, failure, created_at, updated_at
+    result_sha256, failure, created_at, updated_at, unlisted_at
 """
 
 # What a decision means in the ledger's vocabulary.

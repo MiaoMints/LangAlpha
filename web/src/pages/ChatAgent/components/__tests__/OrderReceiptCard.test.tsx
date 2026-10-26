@@ -684,6 +684,24 @@ describe('what a staged order says it is waiting on', () => {
     );
   });
 
+  // Webull lists a processed instruction as APPROVED, and the ledger then
+  // ends it with no unlisted stamp: the broker said it was sent.
+  it('says a handed-off instruction was confirmed when the broker said so', () => {
+    shipped.brokerages = [{ name: 'webull', label: 'Webull' }];
+    const artifact = stagedArtifact('handed_off');
+    const receipt = artifact.order_receipt as Record<string, unknown>;
+    receipt.vendor = 'webull';
+    (receipt.outcome as Record<string, unknown>).unlisted_at = null;
+    renderWithProviders(<OrderReceiptCard artifact={artifact} />);
+
+    expect(screen.getByTestId('order-status-handed_off')).toHaveTextContent(
+      'toolArtifact.directTool.orderStatusShort.handedOffConfirmed',
+    );
+    expect(screen.getByTestId('order-status-sentence')).toHaveTextContent(
+      'toolArtifact.directTool.orderStatus.handedOffConfirmedStaged',
+    );
+  });
+
   it('changes no other staged state', () => {
     renderWithProviders(<OrderReceiptCard artifact={stagedArtifact('cancelled')} />);
     expect(screen.getByTestId('order-status-cancelled')).toHaveTextContent(
@@ -782,6 +800,23 @@ describe('overlayLedgerRow', () => {
     // The order is what was sent, and the ledger is a summary of it.
     expect(merged?.order).toBe(ORDER);
     expect(merged?.vendor).toBe('moomoo');
+  });
+
+  // The ledger's null is the broker having said how the order ended, so it
+  // overrides the frozen receipt rather than falling through to it.
+  it('takes the row\'s unlisted stamp, a null included', () => {
+    const staged: OrderReceipt = {
+      ...receipt,
+      mode: 'staged',
+      outcome: { status: 'submitted', unlisted_at: '2026-10-26T00:00:00Z' },
+    };
+    const named = overlayLedgerRow(staged, ledgerRow({ status: 'handed_off', unlisted_at: null }));
+    expect(named?.outcome.unlisted_at).toBeNull();
+    const unnamed = overlayLedgerRow(
+      { ...staged, outcome: { status: 'submitted', unlisted_at: null } },
+      ledgerRow({ status: 'handed_off', unlisted_at: '2026-10-26T01:00:00Z' }),
+    );
+    expect(unnamed?.outcome.unlisted_at).toBe('2026-10-26T01:00:00Z');
   });
 
   // A lost answer froze a transport failure into the artifact. The ledger

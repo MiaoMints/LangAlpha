@@ -41,7 +41,7 @@ export function OrderReceiptCard({ artifact, onClick }: InlineCardProps): React.
   const narrow = useCardNarrow();
   const receipt = useOrderReceipt(artifact);
   if (!receipt) return null;
-  const { status, mode } = receipt;
+  const { status, mode, vendorNamedEnd } = receipt;
   const owner = [receipt.vendorLabel, receipt.account].filter(Boolean).join(' · ');
   const ownerLine = owner && (
     <>
@@ -59,7 +59,7 @@ export function OrderReceiptCard({ artifact, onClick }: InlineCardProps): React.
       // The ticket line names the order's type whenever it has one.
       part.field !== 'order_type' && (!narrow || (part !== lead.qty && part !== lead.at)),
   );
-  const word = t(orderStatusShortLabel(status, mode));
+  const word = t(orderStatusShortLabel(status, mode, vendorNamedEnd));
   const modeWord = mode ? t(ORDER_MODE_KEY[mode]) : null;
   const answered = !!(
     receipt.outcome.decisionMessage ||
@@ -283,11 +283,11 @@ function ReceiptFigures({
  */
 function ReceiptOutcome({ receipt }: { receipt: OrderReceiptView }): React.ReactElement | null {
   const { t } = useTranslation();
-  const { status, mode, vendorLabel, attemptId, actionUrl } = receipt;
+  const { status, mode, vendorLabel, attemptId, actionUrl, vendorNamedEnd } = receipt;
   const { decisionMessage, failure, fill } = receipt.outcome;
   const fillSentence = fill.filter((part) => part.field === 'fill');
-  const word = t(orderStatusShortLabel(status, mode));
-  const { key, params } = orderStatusLabel(status, mode, vendorLabel);
+  const word = t(orderStatusShortLabel(status, mode, vendorNamedEnd));
+  const { key, params } = orderStatusLabel(status, mode, vendorLabel, vendorNamedEnd);
   const sentence = t(key, params);
   // The edge names the state in a word. The sentence is said here when it
   // says more than that word, and not beside a fill, which says it with its
