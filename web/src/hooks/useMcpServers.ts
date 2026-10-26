@@ -22,6 +22,8 @@ import {
   setMcpCatalogServerEnabled,
   setMcpCatalogServerNewWorkspaces,
   setMcpCatalogServerBinding,
+  setMcpToolGroup,
+  clearMcpToolGroup,
   mergeToolBinding,
   mergeOrderApproval,
   importMcpCatalogServers,
@@ -659,6 +661,30 @@ export function useSetMcpServerBinding() {
         order_approval: mergeOrderApproval(s.order_approval, body.order_approval),
       }),
     })),
+  });
+}
+
+type ToolGroupVars = { name: string; tool: string; group: string | null };
+
+/** The group value that means "follow the automatic grouping", i.e. no stored
+ *  choice. Distinct from `null`, which is the user turning the tool off. */
+export const TOOL_GROUP_AUTO = 'auto';
+
+/**
+ * Place one read-only tool in a group, turn it off, or hand it back to the
+ * automatic grouping. The tools query is where the effective group lives, so
+ * the fan-out refetches it once the server has accepted the choice.
+ */
+export function useSetMcpToolGroup() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: async ({ name, tool, group }: ToolGroupVars) => {
+      if (group === TOOL_GROUP_AUTO) await clearMcpToolGroup(name, tool);
+      else await setMcpToolGroup(name, tool, group);
+    },
+    onSuccess: () => {
+      invalidateMcpFanout(queryClient);
+    },
   });
 }
 

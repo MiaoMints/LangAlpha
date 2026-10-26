@@ -8,9 +8,10 @@ import { mediumDate } from '@/lib/format';
 import type { BuiltinMcpServer, CatalogServer, McpToolSummary } from '@/pages/ChatAgent/utils/api';
 import type { CapabilityGroup } from '../../brokerages';
 import { DetailSection } from '../DetailPage';
-import { ToolAccessSwitches, ToolBindingControl } from '../ToolAccess';
+import { ToolAccessSwitches, ToolBindingControl, ToolGroupControl } from '../ToolAccess';
 import { CapabilityList } from '../BrokerageDetailParts';
 import { ToolList } from '../ToolList';
+import { useToolGroupWrites } from './useToolGroupWrites';
 import { BULK, SERVER, type BindingWrites, type WriteScope } from './useBindingWrites';
 
 /**
@@ -50,6 +51,21 @@ export function ServerToolsSection({
   const catalogTools = useMcpCatalogServerTools(catalog?.name ?? null);
   const builtinTools = useBuiltinMcpServerTools(builtin?.name ?? null);
   const toolsQuery = builtin ? builtinTools : catalogTools;
+  const groupWrites = useToolGroupWrites(catalog?.name ?? null);
+  const offeredGroups = catalogTools.data?.offered_groups ?? [];
+
+  const groupControl =
+    catalog && brokerage
+      ? (tool: McpToolSummary) => (
+          <ToolGroupControl
+            tool={tool}
+            offered={offeredGroups}
+            busy={groupWrites.busy(tool.name)}
+            error={groupWrites.refusalOn(tool.name)}
+            onChange={(group) => groupWrites.write(tool.name, group)}
+          />
+        )
+      : undefined;
 
   const bindingControl = catalog
     ? (tool: McpToolSummary) => {
@@ -159,6 +175,7 @@ export function ServerToolsSection({
               groups={brokerage ? groups : []}
               granted={granted}
               renderControl={bindingControl}
+              renderGroupControl={groupControl}
               onBulkPatch={catalog ? (body) => writes.write(BULK, body) : undefined}
               bulkBusy={writes.busy(BULK)}
               bulkError={writes.refusalOn(BULK)}

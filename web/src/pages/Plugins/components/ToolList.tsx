@@ -56,6 +56,7 @@ export function ToolList({
   groups,
   granted,
   renderControl,
+  renderGroupControl,
   onBulkPatch,
   bulkBusy = false,
   bulkError,
@@ -67,6 +68,10 @@ export function ToolList({
   granted: string[] | null | undefined;
   /** A control per reachable tool; absent = the list is read-only. */
   renderControl?: (tool: McpToolSummary) => ReactNode;
+  /** Where a tool sits, for the tools the user may place. Drawn whether or not
+   *  the bucket is dimmed: a tool turned off sits in a refused bucket, and
+   *  that is exactly where the way back has to be. */
+  renderGroupControl?: (tool: McpToolSummary) => ReactNode;
   /** One write for the whole selection. Absent = no bulk affordances. */
   onBulkPatch?: (body: McpServerBindingPatch) => void;
   bulkBusy?: boolean;
@@ -200,6 +205,7 @@ export function ToolList({
               section={section}
               copy={sectionCopy(section, granted != null, t)}
               renderControl={renderControl}
+              renderGroupControl={renderGroupControl}
               selection={selection}
             />
           ))}
@@ -371,12 +377,15 @@ function ToolSectionBlock({
   section,
   copy,
   renderControl,
+  renderGroupControl,
   selection,
 }: {
   section: ToolSection;
   copy: SectionCopy;
   /** A control for each reachable tool; a dimmed bucket's tools get none. */
   renderControl?: (tool: McpToolSummary) => ReactNode;
+  /** A group control for each tool the user may place, dimmed bucket or not. */
+  renderGroupControl?: (tool: McpToolSummary) => ReactNode;
   /** Present = rows carry checkboxes and each header stands for its bucket. */
   selection?: ToolListSelection;
 }) {
@@ -387,6 +396,20 @@ function ToolSectionBlock({
   const movable = selection && control ? section.tools.filter(isSelectable) : [];
   const names = movable.map((tool) => tool.name);
   const state = checkStateOf(names, selection?.selected ?? NO_SELECTION);
+  const placeable = renderGroupControl
+    ? section.tools.filter((tool) => tool.choosable)
+    : [];
+  const rowControl = (tool: McpToolSummary): ReactNode => {
+    const binding = control?.(tool);
+    const group = tool.choosable ? renderGroupControl?.(tool) : null;
+    if (!binding || !group) return binding ?? group;
+    return (
+      <div className="flex items-start justify-end gap-2 flex-wrap">
+        {group}
+        {binding}
+      </div>
+    );
+  };
   return (
     <div className="flex flex-col gap-1.5">
       {copy.label && (
@@ -421,7 +444,7 @@ function ToolSectionBlock({
           {copy.note}
         </p>
       )}
-      {copy.names === 'chip' && !control ? (
+      {copy.names === 'chip' && !control && placeable.length === 0 ? (
         // Nothing to put at the right edge, so the names read as a cloud
         // rather than as rows of one word each.
         <div className="flex flex-wrap gap-1">
@@ -436,7 +459,7 @@ function ToolSectionBlock({
               key={tool.name}
               tool={tool}
               checkbox={selection && <ToolRowCheckbox tool={tool} selection={selection} />}
-              control={control?.(tool)}
+              control={rowControl(tool)}
               defaultOpen={section.tools.length === 1}
             />
           ))}
@@ -453,7 +476,7 @@ function ToolSectionBlock({
                 )}
                 <ToolChip tool={tool} dimmed={section.dimmed} />
               </div>
-              {control?.(tool)}
+              {rowControl(tool)}
             </div>
           ))}
         </div>
@@ -464,7 +487,8 @@ function ToolSectionBlock({
 
 /** A name under a header that already said what the bucket is for. */
 function ToolChip({ tool, dimmed }: { tool: McpToolSummary; dimmed: boolean }) {
-  return (
+  const { t } = useTranslation();
+  const chip = (
     <span
       title={tool.description || undefined}
       className="text-[0.625rem] px-1.5 py-0.5 rounded break-all min-w-0"
@@ -475,6 +499,15 @@ function ToolChip({ tool, dimmed }: { tool: McpToolSummary; dimmed: boolean }) {
       }}
     >
       {tool.name}
+    </span>
+  );
+  if (tool.capability_source !== 'generated') return chip;
+  return (
+    <span className="inline-flex items-center gap-1.5 flex-wrap">
+      {chip}
+      <TagBadge soft title={t('plugins.detail.groupedAutoTitle')}>
+        {t('plugins.detail.groupedAuto')}
+      </TagBadge>
     </span>
   );
 }

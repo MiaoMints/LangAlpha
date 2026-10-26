@@ -73,6 +73,27 @@ export interface McpToolSummary {
    * badges and what the gate above it is keyed by.
    */
   order?: McpToolOrder | null;
+  /**
+   * Who put this tool in its group: `code` and `seed` are LangAlpha's own
+   * curation, `generated` is the background grouping service, `user` is the
+   * user's own choice. Absent on a server that predates grouping.
+   */
+  capability_source?: McpCapabilitySource | null;
+  /** What the tool does, as the grouping service read it. */
+  effect?: 'read' | 'account_write' | 'public_post' | 'order' | null;
+  /** The user may place this tool: a read-only tool nobody curated. */
+  choosable?: boolean;
+  /**
+   * The user's stored placement. Null is no choice, which is Automatic;
+   * `{ group: null }` is the user having turned the tool off.
+   */
+  choice?: McpToolGroupChoice | null;
+}
+
+export type McpCapabilitySource = 'code' | 'seed' | 'user' | 'generated';
+
+export interface McpToolGroupChoice {
+  group: string | null;
 }
 
 export type McpToolBinding = 'ptc' | 'direct' | 'both';
@@ -657,6 +678,9 @@ export async function getMcpCatalogServerTools(name: string): Promise<{
    *  read still gets the gates that will govern them. Empty on a server that
    *  places no orders, and on a backend that predates the field. */
   order_modes: McpOrderMode[];
+  /** The groups a brokerage offers a tool to be placed in. Empty for any other
+   *  server, and on a backend that predates grouping. */
+  offered_groups: string[];
   tools: McpToolSummary[];
   discovered_at: string | null;
 }> {
@@ -666,9 +690,28 @@ export async function getMcpCatalogServerTools(name: string): Promise<{
   return {
     server_name: data.server_name ?? name,
     order_modes: data.order_modes ?? [],
+    offered_groups: data.offered_groups ?? [],
     tools: data.tools ?? [],
     discovered_at: data.discovered_at ?? null,
   };
+}
+
+/** Place one tool in a group, or turn it off with `null`. 409 when the server
+ *  refuses the placement; the detail says why. */
+export async function setMcpToolGroup(name: string, tool: string, group: string | null) {
+  const { data } = await api.put<{ tool: string; choice: McpToolGroupChoice }>(
+    `/api/v1/mcp/servers/${encodeURIComponent(name)}/tools/${encodeURIComponent(tool)}/group`,
+    { group },
+  );
+  return data;
+}
+
+/** Drop the user's placement, so the tool follows the automatic grouping. */
+export async function clearMcpToolGroup(name: string, tool: string) {
+  const { data } = await api.delete<{ tool: string; choice: null }>(
+    `/api/v1/mcp/servers/${encodeURIComponent(name)}/tools/${encodeURIComponent(tool)}/group`,
+  );
+  return data;
 }
 
 /** What a builtin reported to this process at startup. Same shape as the
