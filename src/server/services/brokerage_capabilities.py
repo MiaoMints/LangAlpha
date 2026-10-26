@@ -303,6 +303,9 @@ _CURATION: dict[str, dict[str, tuple[str, ...]]] = {
             "sim_trade_position_list",
         ),
         "trading": (
+            "crypto_account_cancel_order",
+            "crypto_account_create_order",
+            "crypto_account_modify_order",
             "trading_order_cancel",
             "trading_order_confirm",
             "trading_order_place",
@@ -618,22 +621,14 @@ _CURATION: dict[str, dict[str, tuple[str, ...]]] = {
 #
 # IBKR's submits a feature request in the user's name, and Webull's publish a
 # post or a comment to its community in the user's name: none of that is a thing
-# an analysis turn should be able to do on its own. moomoo's crypto tools place,
-# change and cancel real orders, but the order adapter reads only moomoo's
-# equity order shape, so behind the gate they would be approved and recorded
-# without anyone knowing what they are. Webull's event and algo instructions
-# stage real orders the adapter cannot describe: an event order buys the yes
-# or the no of a question, which no side or instrument in the order shape can
-# say, and an algo order is a TWAP, VWAP or participation schedule rather than
-# an order type. Recorded as something they are not, a person would approve
-# the wrong order.
+# an analysis turn should be able to do on its own. Webull's event and algo
+# instructions stage real orders the adapter cannot describe: an event order
+# buys the yes or the no of a question, which no side or instrument in the
+# order shape can say, and an algo order is a TWAP, VWAP or participation
+# schedule rather than an order type. Recorded as something they are not, a
+# person would approve the wrong order.
 UNCURATED: dict[str, tuple[str, ...]] = {
     "ibkr": ("provide_customer_feedback",),
-    "moomoo": (
-        "crypto_account_cancel_order",
-        "crypto_account_create_order",
-        "crypto_account_modify_order",
-    ),
     "webull": (
         "create_community_comment",
         "create_community_post",
@@ -695,6 +690,17 @@ _ORDER_TOOLS: dict[str, dict[str, OrderTool]] = {
         # Not a second confirmation of ours: moomoo can answer a place with
         # ``need_order_confirm``, and the order is not live until this runs.
         "trading_order_confirm": OrderTool(OrderAction.CONFIRM, OrderMode.LIVE),
+        # A family of their own, with a pair for an instrument and an envelope
+        # of their own, which is the class the adapter dispatches on.
+        "crypto_account_create_order": OrderTool(
+            OrderAction.PLACE, OrderMode.LIVE, "crypto"
+        ),
+        "crypto_account_modify_order": OrderTool(
+            OrderAction.REPLACE, OrderMode.LIVE, "crypto"
+        ),
+        "crypto_account_cancel_order": OrderTool(
+            OrderAction.CANCEL, OrderMode.LIVE, "crypto"
+        ),
         "sim_trade_input_order": OrderTool(OrderAction.PLACE, OrderMode.PAPER),
         "sim_trade_modify_order": OrderTool(OrderAction.REPLACE, OrderMode.PAPER),
         "sim_trade_cancel_order": OrderTool(OrderAction.CANCEL, OrderMode.PAPER),
