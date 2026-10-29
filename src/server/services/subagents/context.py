@@ -141,12 +141,17 @@ class SubagentContext:
         return canonical_reasoning_efforts(reasoning_block(entry).get("efforts"))
 
     async def model_options(self) -> list[str]:
-        """The models this user can pick, for a refusal to list."""
+        """The models this user can pick, for a refusal to list. Never a
+        Claude Code row: a subagent does not run on the Claude Code runtime."""
         from src.config.settings import HOST_MODE
+        from src.llms.claude_code import is_claude_code_model
         from src.llms.llm import get_configured_llm_models
         from src.llms.preferences import custom_model_names
 
-        names = [n for group in get_configured_llm_models().values() for n in group]
+        names = [
+            n for group in get_configured_llm_models().values() for n in group
+            if not is_claude_code_model(n)
+        ]
         names += sorted(custom_model_names(self.model_pref))
         names = list(dict.fromkeys(names))
         if HOST_MODE != "platform":
@@ -338,12 +343,13 @@ async def _oauth_accounts(user_id: str) -> dict[str, str]:
     """The OAuth providers with a working account connected, as the model
     list reads them, and each one's plan. One that needs signing in again
     cannot serve a turn, so its models read as unavailable."""
+    from src.llms import claude_code
     from src.llms.llm import LLM
     from src.server.database.oauth_tokens import get_oauth_connection
 
     providers = [
         name for name, info in LLM.get_model_config().flat_providers.items()
-        if info.get("access_type") == "oauth"
+        if info.get("access_type") == "oauth" and info.get("sdk") != claude_code.SDK
     ]
     rows = await asyncio.gather(*(get_oauth_connection(user_id, p) for p in providers))
     return {
