@@ -5,6 +5,7 @@ import re
 from typing import Any, Dict, Optional
 
 from src.config import settings as app_settings
+from src.server.services.llm.claude_code import claude_code_refusal
 from src.server.services.oauth_health import subscription_token_refusal
 from src.server.utils.error_sanitization import sanitize_error_text
 
@@ -205,13 +206,14 @@ def failure_kind_metadata(exc: BaseException) -> Dict[str, Any]:
     could carry no frame (its quota spent) sent none, and the row's own
     error item is then the only place the failure is worded.
 
-    ``{}`` for the turn's time limit: its own frame is worded for the user and
-    carries no kind, and the reload replays it unchanged.
+    ``{}`` for the turn's time limit and a Claude Code token refused mid-turn:
+    their frames are worded for the user and carry no kind, and the reload
+    replays them unchanged.
     """
     # Lazy: sse_producer imports this module.
     from src.server.services.runs.sse_producer import TurnTimeLimitError
 
-    if isinstance(exc, TurnTimeLimitError):
+    if isinstance(exc, TurnTimeLimitError) or claude_code_refusal(exc, None) is not None:
         return {}
     return {"error_kind": failure_kind(exc)["kind"]}
 
@@ -222,6 +224,7 @@ def error_event_data(
     *,
     exc: Optional[BaseException] = None,
     credential_source: Any = None,
+    model: Optional[str] = None,
 ) -> Dict[str, Any]:
     """The ``error`` frame's data.
 
@@ -232,7 +235,12 @@ def error_event_data(
     status and then filtered by who holds the credential (see
     ``user_owns_credential``), so a platform-billed turn never asks the user
     to check a key they do not have.
+
+    A Claude Code turn whose token Anthropic refused gets the admission
+    refusal's shape instead, ``model`` naming the turn's row.
     """
+    if exc is not None and (refusal := claude_code_refusal(exc, model)):
+        return {"thread_id": thread_id, "error": refusal["message"], **refusal}
     data: Dict[str, Any] = {
         "thread_id": thread_id,
         "error": sanitize_error_text(error_message),

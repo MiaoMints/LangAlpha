@@ -144,6 +144,22 @@ class TestModelOnCreate:
 
     @pytest.mark.asyncio
     @patch(f"{_LIFECYCLE}.auto_db")
+    async def test_a_claude_code_model_is_refused_in_home_and_not_in_a_workspace(self, mock_auto_db, models):
+        """Chief of Staff, which runs Home's automations, does not run on one."""
+        models.return_value = ("system", {"model_id": "claude-haiku-5-5"})
+        with pytest.raises(AutomationRefusal) as exc:
+            await create_automation(OWNER, _create_data(llm_model="claude-haiku-5-5-code"))
+        assert exc.value.field == "llm_model"
+        mock_auto_db.create_automation.assert_not_called()
+
+        mock_auto_db.create_automation = AsyncMock(return_value=_row(llm_model="claude-haiku-5-5-code"))
+        workspace = str(uuid.uuid4())
+        with patch(f"{_LIFECYCLE}._placement", AsyncMock(return_value=workspace)):
+            await create_automation(OWNER, _create_data(llm_model="claude-haiku-5-5-code", workspace_id=workspace))
+        mock_auto_db.create_automation.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    @patch(f"{_LIFECYCLE}.auto_db")
     async def test_no_model_skips_the_check(self, mock_auto_db, models):
         mock_auto_db.create_automation = AsyncMock(return_value=_row())
 
@@ -160,6 +176,20 @@ class TestModelOnUpdate:
 
         with pytest.raises(AutomationRefusal) as exc:
             await update_automation(AUTOMATION_ID, OWNER, {"llm_model": "no-such-model"})
+
+        assert exc.value.field == "llm_model"
+        mock_auto_db.update_automation.assert_not_called()
+
+    @pytest.mark.asyncio
+    @patch(f"{_LIFECYCLE}.auto_db")
+    async def test_moving_a_claude_code_automation_into_home_is_refused(self, mock_auto_db, models):
+        workspace = str(uuid.uuid4())
+        mock_auto_db.get_automation = AsyncMock(
+            return_value=_row(workspace_id=workspace, llm_model="claude-haiku-5-5-code")
+        )
+
+        with pytest.raises(AutomationRefusal) as exc:
+            await update_automation(AUTOMATION_ID, OWNER, {"workspace_id": HOME})
 
         assert exc.value.field == "llm_model"
         mock_auto_db.update_automation.assert_not_called()
