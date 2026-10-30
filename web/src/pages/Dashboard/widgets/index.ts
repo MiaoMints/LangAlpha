@@ -11,6 +11,10 @@ import './definitions/ConversationWidget';
 import './definitions/WorkspacePickerWidget';
 import './definitions/RecentThreadsWidget';
 import './definitions/MiniChartGridWidget';
+// The cards the dashboard drew before the widget rewrite, kept as widgets of
+// their own so they can sit beside the term-style ones instead of replacing them.
+import './definitions/ClassicNewsWidget';
+import './definitions/ClassicHoldingsWidget';
 // ChartWidget is registered lazily so lightweight-charts stays out of the dashboard chunk.
 import './definitions/ChartWidget.register';
 // TradingView embeds — under widgets/definitions/tv/. Most use the iframe

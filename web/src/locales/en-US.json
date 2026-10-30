@@ -1085,6 +1085,14 @@
         "addTransaction": "Add Transaction",
         "cardTitle": "Portfolio"
       },
+      "classicNews": {
+        "title": "Classic news card",
+        "description": "The glass card from before the rewrite: market, holdings and watchlist tabs, with a thumbnail on every story."
+      },
+      "classicHoldings": {
+        "title": "Classic holdings card",
+        "description": "The glass card from before the rewrite: watchlist and holdings in one table, with a kind label on each symbol."
+      },
       "miniChartGrid": {
         "title": "Mini Chart Grid",
         "description": "Sparkline grid across multiple symbols — 30-day trend at a glance.",
@@ -1256,6 +1264,37 @@
       "suggestion4": "Analyze my portfolio risk",
       "placeholderMobile": "Ask AI about market trends...",
       "placeholderDesktop": "Ask AI about market trends, specific stocks, or portfolio analysis..."
+    },
+    "newsFeedCard": {
+      "tabMarket": "Market Pulse",
+      "tabPortfolio": "Your Portfolio",
+      "tabWatchlist": "Your Watchlist",
+      "rangeAll": "All",
+      "range1h": "1H",
+      "range6h": "6H",
+      "range24h": "24H",
+      "range7d": "7D",
+      "tickerPlaceholder": "Ticker...",
+      "emptyFilters": "No news matching your filters",
+      "emptyMarket": "No market news available",
+      "emptyPortfolio": "Add stocks to your portfolio to see relevant news here",
+      "emptyWatchlist": "Add stocks to your watchlist to see relevant news here",
+      "emptyDefault": "No news available"
+    },
+    "portfolioWatchlistCard": {
+      "stock": "Stock",
+      "shares": "{{qty}} shares",
+      "sharesHidden": "*** shares",
+      "edit": "Edit",
+      "delete": "Delete",
+      "headerWatchlist": "Watchlist",
+      "headerPortfolio": "Portfolio",
+      "tabWatch": "Watch",
+      "tabHoldings": "Holdings",
+      "netAssetValue": "Net Asset Value",
+      "netAssetValueByCurrency": "Net Asset Value by Currency",
+      "addSymbol": "Add Symbol",
+      "addTransaction": "Add Transaction"
     },
     "newsDetail": {
       "title": "Article",

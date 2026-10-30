@@ -1083,6 +1083,14 @@
         "addTransaction": "添加交易",
         "cardTitle": "投资组合"
       },
+      "classicNews": {
+        "title": "经典新闻卡",
+        "description": "改版前的玻璃卡片：市场、持仓、自选三个标签页，每条新闻带缩略图。"
+      },
+      "classicHoldings": {
+        "title": "经典持仓卡",
+        "description": "改版前的玻璃卡片：自选与持仓合并展示，每个标的带种类标签。"
+      },
       "miniChartGrid": {
         "title": "缩略走势图网格",
         "description": "多标的缩略走势图网格——一眼看尽 30 天趋势。",
@@ -1254,6 +1262,37 @@
       "suggestion4": "分析我的投资组合风险",
       "placeholderMobile": "向 AI 询问市场趋势……",
       "placeholderDesktop": "向 AI 询问市场趋势、特定股票或投资组合分析……"
+    },
+    "newsFeedCard": {
+      "tabMarket": "市场动态",
+      "tabPortfolio": "我的持仓",
+      "tabWatchlist": "我的自选",
+      "rangeAll": "全部",
+      "range1h": "1小时",
+      "range6h": "6小时",
+      "range24h": "24小时",
+      "range7d": "7天",
+      "tickerPlaceholder": "股票代码……",
+      "emptyFilters": "没有符合筛选条件的新闻",
+      "emptyMarket": "暂无市场新闻",
+      "emptyPortfolio": "添加股票到持仓以查看相关新闻",
+      "emptyWatchlist": "添加股票到自选以查看相关新闻",
+      "emptyDefault": "暂无新闻"
+    },
+    "portfolioWatchlistCard": {
+      "stock": "股票",
+      "shares": "{{qty}} 股",
+      "sharesHidden": "*** 股",
+      "edit": "编辑",
+      "delete": "删除",
+      "headerWatchlist": "自选股",
+      "headerPortfolio": "投资组合",
+      "tabWatch": "自选",
+      "tabHoldings": "持仓",
+      "netAssetValue": "净资产",
+      "netAssetValueByCurrency": "按币种净资产价值",
+      "addSymbol": "添加标的",
+      "addTransaction": "添加交易"
     },
     "newsDetail": {
       "title": "文章",

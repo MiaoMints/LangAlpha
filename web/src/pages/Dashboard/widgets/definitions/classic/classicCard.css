@@ -1,0 +1,27 @@
+/* ============================================
+   Classic dashboard cards, restored.
+   The baseline dashboard drew every panel as a glass card; the widget
+   rewrite replaced them with term cards. These two rules bring the old
+   surface back for the classic widgets only — nothing else uses the class.
+   ============================================ */
+
+.dashboard-glass-card {
+  background: var(--color-bg-card);
+  backdrop-filter: blur(24px);
+  border: 1px solid var(--color-border-muted);
+  border-radius: 1.5rem;
+}
+
+.dashboard-glass-card:hover {
+  border-color: var(--color-border-default);
+}
+
+/* Inside a cell the classic cards fill the height they are given, so their
+   own scroll area (the news list, the holdings list) does the scrolling
+   rather than the page. */
+.classic-cell {
+  height: 100%;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
