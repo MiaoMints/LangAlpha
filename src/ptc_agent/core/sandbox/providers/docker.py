@@ -1005,13 +1005,25 @@ class DockerProvider(SandboxProvider):
                 tar.add(dockerfile_path, arcname=dockerfile_basename)
             build_tar.seek(0)
 
+            proxy = os.environ.get('HTTPS_PROXY') or os.environ.get('https_proxy')
+            buildargs = None
+            if proxy:
+                # Image build runs in a sibling container on docker0.
+                # host.docker.internal is injected only into this backend.
+                proxy = proxy.replace('host.docker.internal', '172.17.0.1')
+                buildargs = {
+                    'HTTP_PROXY': proxy,
+                    'HTTPS_PROXY': proxy,
+                    'NO_PROXY': 'localhost,127.0.0.1',
+                }
             async for log_line in client.images.build(
                 fileobj=build_tar,
                 path_dockerfile=dockerfile_basename,
                 tag=image_tag,
                 rm=True,
                 stream=True,
-                encoding="identity",
+                encoding='identity',
+                buildargs=buildargs,
             ):
                 if isinstance(log_line, dict) and "stream" in log_line:
                     line = log_line["stream"].strip()

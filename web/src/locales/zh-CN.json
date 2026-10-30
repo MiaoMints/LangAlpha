@@ -767,6 +767,10 @@
         }
       },
       "holdings": {
+        "stock": "股票",
+        "etf": "ETF",
+        "index": "指数",
+        "crypto": "加密货币",
         "sharesHidden": "*** 股",
         "shares": "{{n}}股",
         "nav": "净资产价值",

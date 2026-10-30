@@ -45,21 +45,23 @@ HOLDER_POLL_SECONDS = 15
 
 
 _TAIL = (
-    "Only include genuinely noteworthy stories. "
-    "Report facts, not predictions or recommendations. US market focus."
+    "只写确实重要的事实，不要预测，不要给买卖建议。"
+    "范围是 A 股和加密货币，不要写成美股简报。"
+    "标题、摘要和话题都用简体中文。"
 )
 
 _JSON_GUIDELINES = """
 You MUST respond with ONLY a valid JSON object (no markdown, no explanation, no preamble).
+Every human-readable string (headline, summary, title, body, text) MUST be Simplified Chinese.
 The JSON must have exactly these fields:
 {
-  "headline": "Concise headline capturing the dominant market theme (max 120 chars)",
-  "summary": "2-3 sentence overview of the most important developments",
+  "headline": "用简体中文概括主要市场主题，不超过 120 字",
+  "summary": "用简体中文用 2 到 3 句话概述最重要的变化",
   "news_items": [
-    {"title": "Short factual headline", "body": "2-4 sentence factual summary", "url": "source URL or null"}
+    {"title": "简体中文标题", "body": "2 到 4 句简体中文事实摘要", "url": "source URL or null"}
   ],
   "topics": [
-    {"text": "Topic name (1-2 words)", "trend": "up|down|neutral"}
+    {"text": "1 到 2 个词的中文话题", "trend": "up|down|neutral"}
   ]
 }
 Include 4-8 news_items and 3-5 topics. Respond with ONLY the JSON object.
@@ -68,38 +70,31 @@ Include 4-8 news_items and 3-5 topics. Respond with ONLY the JSON object.
 
 def _build_instruction(insight_type: str, now_et: datetime) -> str:
     """Build the research instruction for the given job type."""
-    time_str = now_et.strftime("%A, %B %-d, %Y %-I:%M %p ET")
-    today_date = now_et.strftime("%A, %B %-d, %Y")
+    time_str = now_et.strftime("%Y-%m-%d %H:%M Asia/Shanghai")
+    today_date = now_et.strftime("%Y-%m-%d")
 
     if insight_type == "pre_market":
-        yesterday = now_et - timedelta(days=1)
-        yesterday_date = yesterday.strftime("%A, %B %-d, %Y")
         return (
-            f"Current time: {time_str}\n\n"
-            f"Curate the most significant US financial market news "
-            f"from last night ({yesterday_date} ~8 PM ET) through this morning. "
-            f"For each story, provide a short headline and a 2-4 sentence "
-            f"factual summary of what happened. {_TAIL}"
+            f"当前北京时间：{time_str}\n\n"
+            f"整理从昨日 A 股收盘到今天开盘前，"
+            f"A 股和加密货币最重要的消息。"
+            f"每条写一句短标题，再用 2 到 4 句话说清发生了什么。{_TAIL}"
         )
 
     if insight_type == "market_update":
-        window_end = now_et.strftime("%-I:%M %p")
-        window_start = (now_et - timedelta(hours=1)).strftime("%-I:%M %p")
+        window_end = now_et.strftime("%H:%M")
+        window_start = (now_et - timedelta(hours=1)).strftime("%H:%M")
         return (
-            f"Current time: {time_str}\n\n"
-            f"Curate the most significant US financial market news from the "
-            f"past hour ({window_start} – {window_end} ET). "
-            f"For each story, provide a short headline and a 2-4 sentence "
-            f"factual summary of what happened. {_TAIL}"
+            f"当前北京时间：{time_str}\n\n"
+            f"整理过去一小时（{window_start}–{window_end}，北京时间）"
+            f"A 股和加密货币最重要的消息。"
+            f"每条写一句短标题，再用 2 到 4 句话说清发生了什么。{_TAIL}"
         )
 
-    # post_market
     return (
-        f"Current time: {time_str}\n\n"
-        f"Curate the most significant US financial market news from today "
-        f"({today_date}) for an end-of-day recap. "
-        f"For each story, provide a short headline and a 2-4 sentence "
-        f"factual summary of what happened. {_TAIL}"
+        f"当前北京时间：{time_str}\n\n"
+        f"整理 {today_date} A 股收盘和加密货币的要闻。"
+        f"每条写一句短标题，再用 2 到 4 句话说清发生了什么。{_TAIL}"
     )
 
 
@@ -107,15 +102,12 @@ def _build_personalized_instruction(
     symbols_context: str, now_et: datetime
 ) -> str:
     """Build a personalized insight prompt with watchlist/portfolio context."""
-    time_str = now_et.strftime("%A, %B %-d, %Y %-I:%M %p ET")
+    time_str = now_et.strftime("%Y-%m-%d %H:%M Asia/Shanghai")
     return (
-        f"Current time: {time_str}\n\n"
-        f"Generate a personalized market brief focused on the user's portfolio "
-        f"and watchlist. Cover the most significant recent news, price movements, "
-        f"and developments for these holdings:\n\n{symbols_context}\n\n"
-        f"For each relevant story, provide a short headline and a 2-4 sentence "
-        f"factual summary. Prioritize stories that directly affect the listed "
-        f"symbols. {_TAIL}"
+        f"当前北京时间：{time_str}\n\n"
+        f"围绕用户的自选和持仓，用简体中文写一份 A 股与加密货币简报。"
+        f"优先写直接影响这些标的的消息和价格变化：\n\n{symbols_context}\n\n"
+        f"每条写一句短标题，再用 2 到 4 句话说清发生了什么。{_TAIL}"
     )
 
 
@@ -573,7 +565,6 @@ class InsightService:
     def _todays_schedule(self, now_et: datetime) -> list[tuple[datetime, str]]:
         """Compute all scheduled jobs for today (full day), sorted by time."""
         date = now_et.date()
-        is_weekday = date.weekday() < 5  # Mon=0 .. Fri=4
         jobs: list[tuple[datetime, str]] = []
 
         # pre_market — every day
@@ -582,13 +573,12 @@ class InsightService:
             "pre_market",
         ))
 
-        # market_update — weekdays only
-        if is_weekday:
-            t = datetime.combine(date, self._update_start, tzinfo=self._tz)
-            end = datetime.combine(date, self._update_end, tzinfo=self._tz)
-            while t <= end:
-                jobs.append((t, "market_update"))
-                t += timedelta(minutes=self._update_interval_min)
+        # Crypto trades every day, so the hourly brief is not weekday-only.
+        t = datetime.combine(date, self._update_start, tzinfo=self._tz)
+        end = datetime.combine(date, self._update_end, tzinfo=self._tz)
+        while t <= end:
+            jobs.append((t, "market_update"))
+            t += timedelta(minutes=self._update_interval_min)
 
         # post_market — every day
         jobs.append((
@@ -636,9 +626,9 @@ class InsightService:
         try:
             now_et = datetime.now(self._tz)
             hour = now_et.hour
-            if hour < 10:
+            if hour < 9:
                 catchup_type = "pre_market"
-            elif hour < 20:
+            elif hour < 23:
                 catchup_type = "market_update"
             else:
                 catchup_type = "post_market"

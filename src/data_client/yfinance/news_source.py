@@ -15,7 +15,7 @@ from .yahoo import yahoo_symbol_search, yahoo_ticker
 logger = logging.getLogger(__name__)
 
 
-_DEFAULT_NEWS_TICKERS = ["SPY", "QQQ", "AAPL", "MSFT", "GOOGL", "AMZN", "NVDA", "TSLA"]
+_DEFAULT_NEWS_TICKERS = ["600519.SS", "000001.SZ", "BTC-USD", "ETH-USD"]
 
 
 def _fetch_news(

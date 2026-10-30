@@ -119,7 +119,7 @@ function NewsFeedWidget({ instance, updateConfig }: WidgetRenderProps<NewsFeedCo
   const [activeTab, setActiveTab] = useState<NewsFeedSource>(initialSource);
   const [tickerFilter, setTickerFilter] = useState('');
   const [dateRange, setDateRange] = useState<NewsDateRange>('all');
-  const [sourceFilter, setSourceFilter] = useState('all');
+  const [pickedSources, setPickedSources] = useState<string[]>([]);
   const now = useNow();
 
   const sources: Record<NewsFeedSource, { items: NewsItem[]; loading: boolean }> = {
@@ -172,11 +172,24 @@ function NewsFeedWidget({ instance, updateConfig }: WidgetRenderProps<NewsFeedCo
     return () => obs.disconnect();
   }, [activeTab]);
 
-  // Publisher facet derived from the active feed (pre-filter), for the source dropdown.
+  // Publisher facet derived from the active feed (pre-filter), for the source checks.
   const sourceOptions = useMemo(
     () => Array.from(new Set(items.map((i) => i.source).filter((s): s is string => !!s))).sort(),
     [items],
   );
+
+  // Empty means every publisher. A non-empty list is the publishers to keep.
+  const showEverySource =
+    pickedSources.length === 0 ||
+    (sourceOptions.length > 0 && sourceOptions.every((name) => pickedSources.includes(name)));
+  const sourceFilter = showEverySource ? 'all' : [...pickedSources].sort().join(', ');
+
+  const toggleSource = (name: string) => {
+    setPickedSources((current) => {
+      if (current.length === 0) return [name];
+      return current.includes(name) ? current.filter((item) => item !== name) : [...current, name];
+    });
+  };
 
   const switchTab = (key: NewsFeedSource) => {
     // The feeds dissolve in one cell at the same scroll offset, so the next
@@ -185,11 +198,11 @@ function NewsFeedWidget({ instance, updateConfig }: WidgetRenderProps<NewsFeedCo
     setActiveTab(key);
     setTickerFilter('');
     setDateRange('all');
-    setSourceFilter('all');
+    setPickedSources([]);
     updateConfig({ source: key });
   };
 
-  const hasFilters = tickerFilter.trim() !== '' || dateRange !== 'all' || sourceFilter !== 'all';
+  const hasFilters = tickerFilter.trim() !== '' || dateRange !== 'all' || !showEverySource;
 
   const filteredItems = useMemo(() => {
     let result = items;
@@ -197,14 +210,15 @@ function NewsFeedWidget({ instance, updateConfig }: WidgetRenderProps<NewsFeedCo
     if (query) {
       result = result.filter((item) => item.tickers?.some((t) => t.toUpperCase().includes(query)));
     }
-    if (sourceFilter !== 'all') {
-      result = result.filter((item) => item.source === sourceFilter);
+    if (!showEverySource) {
+      const allow = new Set(pickedSources);
+      result = result.filter((item) => !!item.source && allow.has(item.source));
     }
     if (dateRange !== 'all') {
       result = result.filter((item) => isWithinDateRange(item.publishedAt, dateRange, now));
     }
     return result;
-  }, [items, tickerFilter, sourceFilter, dateRange, now]);
+  }, [items, tickerFilter, pickedSources, showEverySource, dateRange, now]);
   const showSkeleton = loading && filteredItems.length === 0;
 
   // Snapshot exporter: full = visible filtered list, rows = single headline.
@@ -315,20 +329,36 @@ function NewsFeedWidget({ instance, updateConfig }: WidgetRenderProps<NewsFeedCo
           </span>
 
           {sourceOptions.length > 0 ? (
-            <select
-              value={sourceFilter}
-              onChange={(e) => setSourceFilter(e.target.value)}
-              aria-label={t('dashboard.widgets.newsFeed.sourceLabel')}
+            <div
               className="dash-field"
-              data-set={sourceFilter !== 'all' ? '' : undefined}
+              role="group"
+              aria-label={t('dashboard.widgets.newsFeed.sourceLabel')}
+              style={{ flexWrap: 'wrap', gap: '0.125rem 0.5rem', paddingTop: '0.125rem', paddingBottom: '0.125rem' }}
             >
-              <option value="all">{t('dashboard.widgets.newsFeed.allSources')}</option>
-              {sourceOptions.map((s) => (
-                <option key={s} value={s}>
-                  {s}
-                </option>
+              <button
+                type="button"
+                className="dash-range"
+                aria-pressed={showEverySource}
+                onClick={() => setPickedSources([])}
+              >
+                {t('dashboard.widgets.newsFeed.allSources')}
+              </button>
+              {sourceOptions.map((name) => (
+                <label
+                  key={name}
+                  className="dash-range"
+                  style={{ display: 'inline-flex', alignItems: 'center', gap: '0.25rem', cursor: 'pointer' }}
+                >
+                  <input
+                    type="checkbox"
+                    checked={pickedSources.includes(name)}
+                    onChange={() => toggleSource(name)}
+                    style={{ width: '0.625rem', height: '0.625rem', accentColor: 'var(--color-accent-primary)' }}
+                  />
+                  {name}
+                </label>
               ))}
-            </select>
+            </div>
           ) : null}
 
           {hasFilters ? (
@@ -338,7 +368,7 @@ function NewsFeedWidget({ instance, updateConfig }: WidgetRenderProps<NewsFeedCo
               onClick={() => {
                 setTickerFilter('');
                 setDateRange('all');
-                setSourceFilter('all');
+                setPickedSources([]);
               }}
             >
               {t('dashboard.widgets.newsFeed.clear')}

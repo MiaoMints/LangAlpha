@@ -89,6 +89,29 @@ interface WatchlistRowItemProps {
   attach?: ReactNode;
 }
 
+/** A venue suffix is noise in a narrow cell: BTC-USDT reads as BTC. */
+function cryptoTicker(symbol: string): string {
+  const base = symbol.split('-')[0]?.trim();
+  return base || symbol;
+}
+
+/** The words a row goes by: a coin's base ticker, else the instrument's name. */
+function watchlistLabel(item: WatchlistRow): string {
+  const kind = String(item.instrumentType || item.assetClass || '').toLowerCase();
+  if (kind === 'crypto') return cryptoTicker(item.symbol);
+  const name = String(item.name || '').trim();
+  return name || item.symbol;
+}
+
+/** The instrument's kind, as a locale key. */
+function watchlistKindKey(item: WatchlistRow): string {
+  const kind = String(item.instrumentType || item.assetClass || '').toLowerCase();
+  if (kind === 'crypto') return 'dashboard.widgets.holdings.crypto';
+  if (kind === 'index') return 'dashboard.widgets.holdings.index';
+  if (kind === 'etf') return 'dashboard.widgets.holdings.etf';
+  return 'dashboard.widgets.holdings.stock';
+}
+
 export function WatchlistRowItem({ item, marketStatus, onDelete, attach }: WatchlistRowItemProps) {
   const { t } = useTranslation();
   const locale = useLocale();
@@ -112,7 +135,8 @@ export function WatchlistRowItem({ item, marketStatus, onDelete, attach }: Watch
       onClick={() => navigate(`/market?symbol=${encodeURIComponent(item.symbol)}`)}
     >
       <td className="term-fill term-code term-strong dash-attach-cell">
-        <span title={item.symbol}>{item.symbol}</span>
+        <span title={item.symbol}>{watchlistLabel(item)}</span>
+        <span className="dash-sub">{t(watchlistKindKey(item))}</span>
         {attach}
       </td>
       <td className="term-num">

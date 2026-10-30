@@ -195,6 +195,10 @@
   font-weight: 600;
   color: var(--color-text-primary);
   min-width: 56px;
+  max-width: 46%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .market-sidebar-row-price {

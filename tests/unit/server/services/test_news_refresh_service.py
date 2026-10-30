@@ -110,8 +110,7 @@ class TestRefreshFeed:
 
     @pytest.mark.asyncio
     async def test_chain_feed_never_sets_cursor(self, monkeypatch):
-        """provider=None resolves to the chain (FMP/yfinance), which can't honor a
-        cursor — so the buffer is served without one even when full."""
+        """A chain response with no next_cursor still cannot continue."""
         svc = _make_service()
         cache = AsyncMock()
         cache.acquire_lock = AsyncMock(return_value=True)
@@ -129,6 +128,30 @@ class TestRefreshFeed:
         payload = cache.set.await_args.args[0]
         assert payload["next_cursor"] is None  # full buffer but chain feed
         assert cache.acquire_lock.await_args.args[0] == "newspolllock:news:general:3"
+
+
+    @pytest.mark.asyncio
+    async def test_chain_feed_keeps_source_cursor(self, monkeypatch):
+        """cn-desk reports the id that continues its own stream. The market
+        buffer must store that id, not a time-sorted boundary."""
+        svc = _make_service()
+        cache = AsyncMock()
+        cache.acquire_lock = AsyncMock(return_value=True)
+        cache.get = AsyncMock(return_value=None)
+        cache.set = AsyncMock()
+        svc._cache = cache
+
+        fetched = [_article(f"s{i}", i) for i in range(3)]
+        source = AsyncMock()
+        source.get_news = AsyncMock(
+            return_value={"results": fetched, "count": 3, "next_cursor": "keep-me"}
+        )
+        monkeypatch.setattr(svc, "_resolve_source", AsyncMock(return_value=source))
+
+        await svc._refresh_feed(NewsPollFeedConfig(provider=None, limit=3))
+
+        payload = cache.set.await_args.args[0]
+        assert payload["next_cursor"] == "keep-me"
 
     @pytest.mark.asyncio
     async def test_cursor_is_page_boundary_not_buffer_tail(self, monkeypatch):

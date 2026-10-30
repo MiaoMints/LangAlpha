@@ -181,17 +181,16 @@ class NewsRefreshService:
         existing = existing_wrap.get("results", []) if existing_wrap else []
 
         merged, new_count = _merge_delta(existing, fetched, self._max_items)
-        # Continuation cursor for infinite scroll: the id at the served-page
-        # boundary (the endpoint slices the buffer to `limit`), so page 2 picks
-        # up exactly where page 1 ends — no gap, no overlap. Only named
-        # providers (e.g. tickertick) paginate by cursor; the chain feed
-        # (provider=None → FMP/yfinance) can't honor one, so leave it None.
-        cursor_capable = provider is not None
-        next_cursor = (
-            merged[limit - 1].get("id")
-            if cursor_capable and len(merged) >= limit
-            else None
-        )
+        # Named providers paginate by article id. The cursor stored for them is
+        # the served-page boundary in this time-sorted buffer (the endpoint
+        # slices to `limit`). The default chain's cursor is the one cn-desk
+        # already computed for its interleaved stream; rewriting it to the
+        # time-sorted boundary would skip or repeat rows.
+        if provider is None:
+            next_cursor = data.get("next_cursor") if len(merged) >= limit else None
+        else:
+            boundary = merged[limit - 1].get("id") if len(merged) >= limit else None
+            next_cursor = boundary or None
         await self._cache.set(
             {"results": merged, "count": len(merged), "next_cursor": next_cursor},
             tickers=None, limit=limit, provider=provider,

@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, afterEach } from 'vitest';
-import { render, screen, fireEvent, within } from '@testing-library/react';
+import { render, screen, fireEvent } from '@testing-library/react';
 
 // i18n passthrough — assert on raw keys / publisher strings, not translations.
 vi.mock('react-i18next', () => ({
@@ -68,18 +68,41 @@ describe('NewsFeedWidget', () => {
     expect(screen.getByText('Curated headline two')).toBeInTheDocument();
   });
 
-  it('by-source dropdown filters the active feed to a publisher', () => {
-    ctx = baseCtx();
+  it('source checkboxes show every publisher together, or only the ones checked', () => {
+    ctx = baseCtx({
+      dashboard: {
+        curatedItems: [
+          makeItem('c1', 'Curated headline one', 'Bloomberg'),
+          makeItem('c2', 'Curated headline two', 'Reuters'),
+          makeItem('c3', 'Curated headline three', 'CNBC'),
+        ],
+        curatedLoading: false,
+        newsItems: [makeItem('m1', 'Market headline', 'CNBC')],
+        newsLoading: false,
+      },
+    });
     renderWidget({ source: 'top' });
 
-    const select = screen.getByRole('combobox') as HTMLSelectElement;
-    // Facet derives from loaded items: All + Bloomberg + Reuters.
-    const optionValues = within(select).getAllByRole('option').map((o) => (o as HTMLOptionElement).value);
-    expect(optionValues).toEqual(['all', 'Bloomberg', 'Reuters']);
+    expect(screen.getByText('Curated headline one')).toBeInTheDocument();
+    expect(screen.getByText('Curated headline two')).toBeInTheDocument();
+    expect(screen.getByText('Curated headline three')).toBeInTheDocument();
+    expect(
+      screen.getByRole('button', { name: 'dashboard.widgets.newsFeed.allSources' }),
+    ).toBeInTheDocument();
 
-    fireEvent.change(select, { target: { value: 'Reuters' } });
+    fireEvent.click(screen.getByRole('checkbox', { name: 'Reuters' }));
     expect(screen.queryByText('Curated headline one')).not.toBeInTheDocument();
     expect(screen.getByText('Curated headline two')).toBeInTheDocument();
+    expect(screen.queryByText('Curated headline three')).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole('checkbox', { name: 'CNBC' }));
+    expect(screen.queryByText('Curated headline one')).not.toBeInTheDocument();
+    expect(screen.getByText('Curated headline two')).toBeInTheDocument();
+    expect(screen.getByText('Curated headline three')).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole('button', { name: 'dashboard.widgets.newsFeed.allSources' }));
+    expect(screen.getByText('Curated headline one')).toBeInTheDocument();
+    expect(screen.getByText('Curated headline three')).toBeInTheDocument();
   });
 
   it('time filter buckets on the ISO publishedAt, not the "10m ago" display string', () => {

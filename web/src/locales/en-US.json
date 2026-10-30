@@ -769,6 +769,10 @@
         }
       },
       "holdings": {
+        "stock": "Stock",
+        "etf": "ETF",
+        "index": "Index",
+        "crypto": "Crypto",
         "sharesHidden": "*** shares",
         "shares": "{{n}} shares",
         "nav": "Net Asset Value",

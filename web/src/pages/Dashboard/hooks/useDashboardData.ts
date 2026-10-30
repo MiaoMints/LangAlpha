@@ -153,9 +153,9 @@ export function useDashboardData(): DashboardData {
   //    server-side by the news poller.
   //    Eligible CN users (A-share pack + zh locale) get the tushare CN feed;
   //    the backend re-checks eligibility and falls back to the chain if not.
-  //    The chain feed serves next_cursor=null (it can't paginate), so
-  //    load-more simply never triggers for non-CN users. The feed waits while
-  //    eligibility is undecided, so a cold load fetches one feed, not two.
+  //    The chain (cn-desk) pages the same way: a next_cursor asks for older
+  //    rows. The feed waits while eligibility is undecided, so a cold load
+  //    fetches one feed, not two.
   const cnNewsEligible = useCnNewsEligibility();
   const newsProvider = cnNewsEligible ? 'tushare' : undefined;
   const news = useInfiniteNewsFeed(

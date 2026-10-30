@@ -96,10 +96,22 @@ async def _build_fmp_news_source() -> NewsDataSource:
     return FMPNewsSource()
 
 
+async def _build_desk_source() -> MarketDataSource:
+    from .desk.market import DeskMarketSource
+
+    return DeskMarketSource()
+
+
 async def _build_yfinance_source() -> MarketDataSource:
     from .yfinance.data_source import YFinanceDataSource
 
     return YFinanceDataSource()
+
+
+async def _build_cn_desk_news_source() -> NewsDataSource:
+    from .cn_desk.news_source import CnDeskNewsSource
+
+    return CnDeskNewsSource()
 
 
 async def _build_yfinance_news_source() -> NewsDataSource:
@@ -130,6 +142,7 @@ _SOURCE_REGISTRY: dict[str, tuple[Any, Any]] = {
     "tushare": (_ginlix_data_available, _build_tushare_source),
     "fmp": (_fmp_available, _build_fmp_source),
     "yfinance": (_yfinance_available, _build_yfinance_source),
+    "desk": (lambda: True, _build_desk_source),
 }
 
 @dataclass(frozen=True)
@@ -160,6 +173,7 @@ def _any_article(_: str) -> bool:
 
 
 _NEWS_SOURCE_REGISTRY: dict[str, NewsSourceSpec] = {
+    "cn-desk": NewsSourceSpec(lambda: True, _build_cn_desk_news_source),
     "ginlix-data": NewsSourceSpec(_ginlix_data_available, _build_ginlix_data_news_source),
     "fmp": NewsSourceSpec(_fmp_available, _build_fmp_news_source),
     "yfinance": NewsSourceSpec(_yfinance_available, _build_yfinance_news_source),

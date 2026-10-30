@@ -530,6 +530,11 @@ def _screen_stocks_sync(**filters: Any) -> list[dict[str, Any]]:
 
 def _search_stocks(query: str, limit: int) -> list[dict[str, Any]]:
     try:
+        from src.data_client.desk.search import search_cn
+        head = search_cn(query, limit)
+    except Exception:
+        head = []
+    try:
         results = yf.Search(query, max_results=limit)
         quotes = results.quotes if hasattr(results, "quotes") else []
     except Exception:
@@ -543,7 +548,8 @@ def _search_stocks(query: str, limit: int) -> list[dict[str, Any]]:
             "stockExchange": q.get("exchange"),
             "exchangeShortName": q.get("exchDisp"),
         })
-    return out
+    seen = {row.get("symbol") for row in head}
+    return (head + [row for row in out if row.get("symbol") not in seen])[:limit]
 
 
 class YFinanceFinancialSource:

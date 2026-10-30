@@ -28,6 +28,10 @@ export interface WatchlistRow {
   currency: string | null;
   /** The snapshot's asset class: an `index` row prints a level, not a price. */
   assetClass: string | null;
+  /** The instrument's display name, when the venue gives one. */
+  name?: string;
+  /** The venue's own instrument kind (`crypto`, `stock`, `etf`, `index`). */
+  instrumentType?: string;
   [key: string]: unknown;
 }
 
@@ -190,6 +194,8 @@ export function useWatchlistData() {
         lateTradingChangePercent: p.lateTradingChangePercent ?? null,
         currency: p.currency ?? null,
         assetClass: quotes[sym]?.asset_class ?? null,
+        name: String(i.name || '').trim(),
+        instrumentType: String(i.instrument_type || ''),
       };
     });
   }, [items, symbols, quotes]);

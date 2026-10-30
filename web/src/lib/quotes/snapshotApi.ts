@@ -14,7 +14,7 @@ export type SnapshotEntry = SnapshotData;
 export type SnapshotResponse = SnapshotBatchResponse;
 
 // Default index basket for a no-arg indexes batch (mirrors Dashboard's).
-const DEFAULT_INDEX_SYMBOLS: string[] = ['GSPC', 'IXIC', 'DJI', 'RUT', 'VIX'];
+const DEFAULT_INDEX_SYMBOLS: string[] = ['000001.SH', '399001.SZ', '000300.SH', '399006.SZ'];
 
 /**
  * GET /api/v1/market-data/snapshots/indexes?symbols=GSPC,IXIC,...

@@ -31,6 +31,16 @@ interface SidebarRow {
   [key: string]: unknown;
 }
 
+function sidebarLabel(row: SidebarRow): string {
+  const kind = String(row.instrumentType || row.assetClass || '').toLowerCase();
+  if (kind === 'crypto') {
+    const base = String(row.symbol || '').split('-')[0]?.trim();
+    return base || String(row.symbol || '');
+  }
+  const name = String(row.name || '').trim();
+  return name || String(row.symbol || '');
+}
+
 interface DeleteConfirmState {
   open: boolean;
   title: string;
@@ -123,7 +133,7 @@ function MarketSidebarPanel({ activeSymbol, onSymbolClick, marketStatus }: Marke
           className={`market-sidebar-row${isActive ? ' market-sidebar-row--active' : ''}`}
           onClick={() => onSymbolClick?.(row.symbol)}
         >
-          <span className="market-sidebar-row-symbol">{row.symbol}</span>
+          <span className="market-sidebar-row-symbol" title={row.symbol}>{sidebarLabel(row)}</span>
           <span className="market-sidebar-row-price">{formatPrice(mainPrice)}</span>
           <span className={`market-sidebar-row-change ${changeClass(row.isPositive, row[changeField] as number | null | undefined)}`}>
             {formatChange(row[changeField] as number | null | undefined)}
