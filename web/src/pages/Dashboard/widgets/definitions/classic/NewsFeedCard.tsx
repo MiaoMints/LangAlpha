@@ -378,7 +378,7 @@ function NewsFeedCard({
           animate={{ opacity: 1, y: 0 }}
           exit={{ opacity: 0, y: -8 }}
           transition={{ duration: 0.2 }}
-          className="flex flex-col gap-1"
+          className="classic-news-list flex flex-col gap-1"
         >
           {loading ? (
             <SkeletonRows />

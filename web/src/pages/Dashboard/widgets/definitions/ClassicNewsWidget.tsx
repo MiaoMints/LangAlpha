@@ -83,19 +83,21 @@ function ClassicNewsWidget({ instance }: WidgetRenderProps<ClassicNewsConfig>) {
   });
 
   return (
-    <NewsFeedCard
-      marketItems={dashboard.newsItems}
-      marketLoading={dashboard.newsLoading}
-      portfolioItems={portfolioNews.items}
-      portfolioLoading={portfolioNews.loading}
-      watchlistItems={watchlistNews.items}
-      watchlistLoading={watchlistNews.loading}
-      onNewsClick={(id, articleUrl) => {
-        const all = [...dashboard.newsItems, ...portfolioNews.items, ...watchlistNews.items];
-        const item = all.find((it) => String(it.id) === String(id));
-        modals.openNews(id, item ? fallbackFor(item) : { articleUrl: articleUrl ?? null });
-      }}
-    />
+    <div className="classic-cell classic-fill">
+      <NewsFeedCard
+        marketItems={dashboard.newsItems}
+        marketLoading={dashboard.newsLoading}
+        portfolioItems={portfolioNews.items}
+        portfolioLoading={portfolioNews.loading}
+        watchlistItems={watchlistNews.items}
+        watchlistLoading={watchlistNews.loading}
+        onNewsClick={(id, articleUrl) => {
+          const all = [...dashboard.newsItems, ...portfolioNews.items, ...watchlistNews.items];
+          const item = all.find((it) => String(it.id) === String(id));
+          modals.openNews(id, item ? fallbackFor(item) : { articleUrl: articleUrl ?? null });
+        }}
+      />
+    </div>
   );
 }
 
@@ -108,7 +110,6 @@ registerWidget<ClassicNewsConfig>({
   component: ClassicNewsWidget,
   defaultConfig: {},
   frame: 'bare',
-  fitToContent: true,
   defaultSize: { w: 8, h: 26 },
   minSize: { w: 4, h: 12 },
   maxSize: { w: 12, h: 40 },

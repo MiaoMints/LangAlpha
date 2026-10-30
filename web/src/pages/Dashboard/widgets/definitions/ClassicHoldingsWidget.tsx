@@ -102,19 +102,21 @@ function ClassicHoldingsWidget({ instance }: WidgetRenderProps<ClassicHoldingsCo
   });
 
   return (
-    <PortfolioWatchlistCard
-      watchlistRows={watchlist.rows}
-      watchlistLoading={watchlist.loading}
-      onWatchlistAdd={watchlistHandlers.onAdd}
-      onWatchlistDelete={watchlistHandlers.onDelete}
-      portfolioRows={portfolio.rows}
-      portfolioLoading={portfolio.loading}
-      hasRealHoldings={portfolio.hasRealHoldings}
-      onPortfolioAdd={portfolioHandlers.onAdd}
-      onPortfolioDelete={portfolioHandlers.onDelete}
-      onPortfolioEdit={portfolioHandlers.onEdit}
-      marketStatus={dashboard.marketStatus}
-    />
+    <div className="classic-cell">
+      <PortfolioWatchlistCard
+        watchlistRows={watchlist.rows}
+        watchlistLoading={watchlist.loading}
+        onWatchlistAdd={watchlistHandlers.onAdd}
+        onWatchlistDelete={watchlistHandlers.onDelete}
+        portfolioRows={portfolio.rows}
+        portfolioLoading={portfolio.loading}
+        hasRealHoldings={portfolio.hasRealHoldings}
+        onPortfolioAdd={portfolioHandlers.onAdd}
+        onPortfolioDelete={portfolioHandlers.onDelete}
+        onPortfolioEdit={portfolioHandlers.onEdit}
+        marketStatus={dashboard.marketStatus}
+      />
+    </div>
   );
 }
 
@@ -127,7 +129,6 @@ registerWidget<ClassicHoldingsConfig>({
   component: ClassicHoldingsWidget,
   defaultConfig: {},
   frame: 'bare',
-  fitToContent: true,
   defaultSize: { w: 4, h: 16 },
   minSize: { w: 3, h: 10 },
   maxSize: { w: 12, h: 30 },
