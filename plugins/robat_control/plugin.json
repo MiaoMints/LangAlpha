@@ -1,0 +1,31 @@
+{
+  "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
+  "name": "robat_control",
+  "version": "1.0.0",
+  "description": "Your own Binance trading bot's console API: open and closed positions, orders, fills, signals, risk controls, and the maintenance actions that move a stop or close a position.",
+  "author": {
+    "name": "LangAlpha",
+    "url": "https://langalpha.ai"
+  },
+  "homepage": "https://langalpha.ai",
+  "license": "Apache-2.0",
+  "keywords": [
+    "trading",
+    "positions",
+    "binance",
+    "risk",
+    "portfolio"
+  ],
+  "extensions": {
+    "ai.langalpha": {
+      "icon": "binance.com",
+      "servers": {
+        "robat": {
+          "description": "Read and control the user's own Binance trading bot: positions, orders, fills, signals, risk state, and position maintenance actions",
+          "instruction": "Use this for anything about the user's live trading account: what is open, why a trade exists, realised P&L, risk halts, and moving a stop or closing a position. Start with get_dashboard or list_active_positions; drill into get_position_detail for the lot ledger. Write tools all require confirm=True and act on real money, so state the exact trader_id and symbol you are about to change and get agreement first. Never guess a symbol for manage_position — pass it, or let the bot refuse.",
+          "tool_exposure_mode": "detailed"
+        }
+      }
+    }
+  }
+}

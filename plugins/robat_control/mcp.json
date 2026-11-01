@@ -1,0 +1,18 @@
+{
+  "$schema": "https://agent-plugins.org/schemas/1.0.0/mcp.schema.json",
+  "mcpServers": {
+    "robat": {
+      "type": "stdio",
+      "command": "uv",
+      "args": [
+        "run",
+        "python",
+        "plugins/robat_control/robat_mcp_server.py"
+      ],
+      "env": {
+        "ROBAT_BASE_URL": "${ROBAT_BASE_URL}",
+        "ROBAT_API_TOKEN": "${ROBAT_API_TOKEN}"
+      }
+    }
+  }
+}
