@@ -273,6 +273,15 @@
   font-size: 0.71875rem;
 }
 .dash-preset-use {
+  /* A button so the click has its own target; dressed as the text it replaces. */
+  appearance: none;
+  background: none;
+  border: 0;
+  padding: 0;
+  margin: 0;
+  font: inherit;
+  line-height: inherit;
+  cursor: pointer;
   color: var(--color-term-text);
   opacity: 0;
   transition: opacity var(--motion-quick) var(--ease-out);

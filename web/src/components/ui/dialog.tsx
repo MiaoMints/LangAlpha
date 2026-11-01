@@ -16,7 +16,19 @@ const Dialog = DialogPrimitive.Root
 
 const DialogTrigger = DialogPrimitive.Trigger
 
-const DialogPortal = DialogPrimitive.Portal
+// Radix portals to document.body by default, which puts dialog content outside
+// React's root container. Clicks inside the dialog then bubble to <body> and
+// stop: the root's delegated listeners never fire, so a card whose whole surface
+// is an onClick answers the keyboard (its title is a real <button>) but ignores
+// the mouse. Portalling into #root keeps the dialog inside the tree the
+// listeners watch. Falls back to the portal's own default before #root exists.
+function DialogPortal(props: React.ComponentProps<typeof DialogPrimitive.Portal>) {
+  const [container, setContainer] = React.useState<HTMLElement | null>(null)
+  React.useEffect(() => {
+    setContainer(document.getElementById('root'))
+  }, [])
+  return <DialogPrimitive.Portal container={container ?? undefined} {...props} />
+}
 
 const DialogClose = DialogPrimitive.Close
 

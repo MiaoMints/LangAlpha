@@ -66,9 +66,20 @@ export function PresetsDialog({ open, onOpenChange, onApply }: PresetsDialogProp
                     <span className="term-t3">
                       {t('dashboard.widgets.presetsDialog.bestWhen', { bestFor: t(preset.bestForKey) })}
                     </span>
-                    <span className="term-push dash-preset-use" aria-hidden="true">
+                    {/* A real button, not a label riding the card's click: the
+                        card's own onClick sits inside a modal, and a click that
+                        lands on plain text there can be swallowed before React
+                        hears it. The button is its own event target. */}
+                    <button
+                      type="button"
+                      className="term-push dash-preset-use"
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        apply(preset.id);
+                      }}
+                    >
                       {t('dashboard.widgets.presetsDialog.useLayout')}
-                    </span>
+                    </button>
                   </div>
                 </TermCard>
               ))}
