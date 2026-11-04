@@ -24,11 +24,12 @@ logger = logging.getLogger(__name__)
 # Ten minutes: reopening a story is free, yet a corrected article does not stay
 # stale for the rest of a session.
 BODY_TTL_SECONDS = 600.0
+# A failure is usually a block, a timeout or a slow origin, not a page that has
+# no text. Remember it briefly so a burst of opens does not hammer the site, but
+# let the row recover on its own instead of staying empty for ten minutes.
+FAILURE_TTL_SECONDS = 60.0
 BODY_TIMEOUT_SECONDS = 10.0
 BODY_MAX_BYTES = 3_000_000
-# Anything shorter is a paywall, a consent wall or an error page rather than an
-# article; the description serves the reader better than a stub.
-BODY_MIN_CHARS = 120
 # A runaway number of cached keys would only ever come from a crawl; this keeps
 # the map bounded without a timer.
 _MAX_CACHE_KEYS = 512
@@ -75,6 +76,9 @@ _BOILERPLATE = re.compile(
 # A stock container with any real prose beats a generic extraction, which on
 # Chinese finance pages drags the page chrome into the body.
 _MIN_CONTAINER_CHARS = 40
+# Wire copy is sometimes one sentence: "3M shares hit an eight-year high, up
+# 9.7%." That is the whole article, so a long-body floor would throw it away.
+_MIN_TEXT_CHARS = 12
 
 
 def _clean(text: str) -> str:
@@ -101,9 +105,14 @@ def _container_text(html: str) -> str | None:
         lines = [line.strip() for line in node.get_text("\n", strip=True).splitlines()]
         kept = [line for line in lines if len(line) >= _MIN_LINE_CHARS]
         text = _clean("\n".join(kept))
-        if len(text) >= _MIN_CONTAINER_CHARS:
+        if len(text) >= _MIN_CONTAINER_CHARS or _is_substantive(text):
             return text
     return None
+
+
+def _is_substantive(text: str) -> bool:
+    """Real prose, not a label: long enough and made of words or numbers."""
+    return len(text) >= _MIN_TEXT_CHARS and re.search(r"[0-9\u4e00-\u9fff]", text) is not None
 
 
 def extract_article_text(html: str, url: str) -> str | None:
@@ -125,7 +134,7 @@ def extract_article_text(html: str, url: str) -> str | None:
     if not extracted:
         return None
     cleaned = _clean(extracted)
-    return cleaned if len(cleaned) >= BODY_MIN_CHARS else None
+    return cleaned if _is_substantive(cleaned) else None
 
 
 async def _download(url: str) -> str | None:
@@ -174,5 +183,6 @@ async def read_article_body(url: Any, *, cache_key: str | None = None) -> str | 
         body = extract_article_text(html, url) if html else None
         if len(_cache) >= _MAX_CACHE_KEYS:
             _cache.clear()
-        _cache[key] = (time.monotonic() + BODY_TTL_SECONDS, body)
+        ttl = BODY_TTL_SECONDS if body else FAILURE_TTL_SECONDS
+        _cache[key] = (time.monotonic() + ttl, body)
         return body
