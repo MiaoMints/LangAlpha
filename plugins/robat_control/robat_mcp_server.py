@@ -749,6 +749,7 @@ def submit_signal(
     side: str,
     sl: float,
     entry_price: float | None = None,
+    entry_prices: list[float] | None = None,
     tp: float | None = None,
     tp_levels: list[float] | None = None,
     risk_budget_usdt: float | None = None,
@@ -773,6 +774,11 @@ def submit_signal(
         side: "LONG" or "SHORT".
         sl: Stop-loss price, must be > 0. Required, no default.
         entry_price: Entry price. Omit for a market entry at the live price.
+        entry_prices: Band low and high, exactly two different positive prices, e.g.
+            [79200, 79700]. The bot sorts them, fills the near leg first and the far
+            leg on a pullback, and sizes risk off the leg nearest the stop. Use
+            order_type="LIMIT" with a band. Pass either entry_price or
+            entry_prices, never both.
         tp: Single take-profit price, for an explicit plan.
         tp_levels: Explicit take-profit ladder, top to bottom.
         risk_budget_usdt: Risk budget in USDT; omit to let the bot decide.
@@ -794,6 +800,19 @@ def submit_signal(
     refused = _confirmed(confirm, "open a position")
     if refused is not None:
         return refused
+    levels: list[float] | None = None
+    if entry_prices is not None:
+        if entry_price is not None:
+            return make_error(
+                "invalid_argument",
+                "pass either entry_price (one leg) or entry_prices (a two-price range), not both; nothing was sent.",
+            )
+        levels = [float(value) for value in entry_prices]
+        if len(levels) != 2 or any(level <= 0 for level in levels) or levels[0] == levels[1]:
+            return make_error(
+                "invalid_argument",
+                "entry_prices needs exactly two different positive prices (the band low and high); nothing was sent.",
+            )
     body: dict[str, Any] = {
         "symbol": symbol.strip().upper(),
         "side": side.strip().upper(),
@@ -812,6 +831,8 @@ def submit_signal(
     ):
         if value is not None:
             body[key] = value
+    if levels is not None:
+        body["entry_prices"] = levels
     if order_type:
         body["order_type"] = order_type.strip().upper()
     return _envelope(_call("POST", "/webhook", body=body))
