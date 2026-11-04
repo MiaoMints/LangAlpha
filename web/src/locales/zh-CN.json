@@ -1318,6 +1318,8 @@
       "source": "来源",
       "summary": "摘要",
       "summaryMeta": "AI",
+      "fullText": "正文",
+      "fullTextMeta": "原文",
       "tickerImpact": "标的影响",
       "topics": "话题",
       "attachedNews": "新闻：{{title}}",

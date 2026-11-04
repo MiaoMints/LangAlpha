@@ -22,6 +22,7 @@ from src.server.models.news import (
     NewsPublisher,
 )
 from src.server.services.cache.news_cache_service import NewsCacheService, news_cache_key
+from src.server.services.news_body import read_article_body
 from src.server.utils.api import CurrentUserId
 
 logger = logging.getLogger(__name__)
@@ -290,6 +291,16 @@ async def get_news(
     )
 
 
+async def _with_body(article: dict) -> NewsArticle:
+    """The article plus its page text, fetched on demand and cached by id."""
+    payload = dict(article)
+    if not payload.get("content"):
+        payload["content"] = await read_article_body(
+            payload.get("article_url"), cache_key=str(payload.get("id") or "") or None
+        )
+    return NewsArticle(**payload)
+
+
 @router.get("/{article_id}", response_model=NewsArticle)
 async def get_news_article(article_id: str, request: Request, user_id: CurrentUserId):
     not_found = HTTPException(status_code=404, detail="Article not found")
@@ -307,7 +318,7 @@ async def get_news_article(article_id: str, request: Request, user_id: CurrentUs
     # Fast path: check cache
     cached = await _cache.get_article_by_id(article_id)
     if cached:
-        return NewsArticle(**cached)
+        return await _with_body(cached)
 
     # Slow path: fetch from provider chain
     from src.data_client import get_news_data_provider
@@ -315,7 +326,7 @@ async def get_news_article(article_id: str, request: Request, user_id: CurrentUs
     provider = await get_news_data_provider()
     article = await provider.get_news_article(article_id, user_id=user_id)
     if article:
-        return NewsArticle(**article)
+        return await _with_body(article)
 
     # Directly-targeted providers (not in the chain) that may have issued this id.
     for name in owners:
@@ -325,7 +336,7 @@ async def get_news_article(article_id: str, request: Request, user_id: CurrentUs
             source = await get_news_source(name)
             article = await source.get_news_article(article_id, user_id=user_id)
             if article:
-                return NewsArticle(**article)
+                return await _with_body(article)
         except Exception:
             logger.debug("news.%s.article_lookup_failed", name, exc_info=True)
 

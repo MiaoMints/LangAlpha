@@ -32,6 +32,7 @@ interface ArticleSentiment {
 interface Article {
   title: string;
   description?: string;
+  content?: string | null;
   image_url?: string;
   article_url?: string;
   author?: string;
@@ -54,6 +55,7 @@ interface NewsFallback {
   articleUrl?: string | null;
   author?: string | null;
   description?: string | null;
+  content?: string | null;
   keywords?: string[];
   sentiments?: ArticleSentiment[] | null;
   imageUrl?: string | null;
@@ -72,6 +74,7 @@ function fallbackToArticle(fb: NewsFallback | null | undefined): Article | null 
   return {
     title: fb.title,
     description: fb.description ?? undefined,
+    content: fb.content ?? undefined,
     image_url: fb.imageUrl ?? undefined,
     article_url: fb.articleUrl ?? undefined,
     author: fb.author ?? undefined,
@@ -235,6 +238,19 @@ function NewsBody({
 
       <div className={hasSide ? 'dash-window-grid' : 'dash-window-grid dash-window-grid--one'}>
         <div className="dash-window-col">
+          {article.content && (
+            <TermCard title={t('dashboard.newsDetail.fullText')} meta={t('dashboard.newsDetail.fullTextMeta')}>
+              {article.content
+                .split(/\r?\n+/)
+                .map((paragraph, index) =>
+                  paragraph.trim() ? (
+                    <p className="dash-window-prose" key={index}>
+                      {paragraph.trim()}
+                    </p>
+                  ) : null,
+                )}
+            </TermCard>
+          )}
           {article.description && (
             <TermCard title={t('dashboard.newsDetail.summary')} meta={t('dashboard.newsDetail.summaryMeta')}>
               <p className="dash-window-prose">{article.description}</p>
@@ -314,15 +330,8 @@ function NewsDetailModal({ newsId, onClose, fallback }: NewsDetailModalProps) {
     setArticle(seed);
     setFetchFailed(false);
 
-    // The list now inlines the full article body, so when the row already
-    // carries a description we render straight from it — no by-id round-trip.
-    if (seed?.description) {
-      setLoading(false);
-      return;
-    }
-
-    // Optional enrichment: rows without an inlined body still fetch the full
-    // article by id.
+    // The row carries no page text — the list payload stays compact — so the
+    // body is always worth one by-id round-trip. The seed renders meanwhile.
     setLoading(true);
     getNewsArticle(newsId)
       .then((data) => {

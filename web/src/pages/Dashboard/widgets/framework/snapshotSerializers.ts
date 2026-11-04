@@ -107,6 +107,7 @@ export function serializeNewsItemToMarkdown(item: NewsItem): string {
 export interface NewsArticleDetail {
   title: string;
   description?: string;
+  content?: string | null;
   author?: string;
   publishedAt?: string;
   url?: string;
@@ -131,6 +132,7 @@ export function serializeNewsArticleToMarkdown(article: NewsArticleDetail): stri
   if (meta.length) lines.push(meta.join(' · '));
   if (article.url) lines.push(`URL: ${article.url}`);
   if (article.description) lines.push('', '**Summary**', article.description);
+  if (article.content) lines.push('', '**Full text**', article.content);
   if (article.keywords?.length) {
     lines.push('', `**Topics:** ${article.keywords.map((k) => `#${k}`).join(' ')}`);
   }

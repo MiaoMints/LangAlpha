@@ -1320,6 +1320,8 @@
       "source": "Source",
       "summary": "Summary",
       "summaryMeta": "AI",
+      "fullText": "Full text",
+      "fullTextMeta": "Article",
       "tickerImpact": "Ticker impact",
       "topics": "Topics",
       "attachedNews": "News: {{title}}",

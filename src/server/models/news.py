@@ -23,6 +23,7 @@ class NewsArticle(BaseModel):
     title: str
     author: str | None = None
     description: str | None = None
+    content: str | None = None
     published_at: str  # ISO 8601
     article_url: str
     image_url: str | None = None

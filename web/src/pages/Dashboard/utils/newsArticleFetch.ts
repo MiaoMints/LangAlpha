@@ -19,6 +19,7 @@ import { getNewsArticle } from './api';
 interface RawArticle {
   title?: string;
   description?: string;
+  content?: string;
   article_url?: string | null;
   author?: string;
   published_at?: string;
@@ -39,6 +40,7 @@ export function normalizeArticle(raw: RawArticle): NewsArticleDetail {
   return {
     title: raw.title ?? '',
     description: raw.description,
+    content: typeof raw.content === 'string' ? raw.content : undefined,
     author: raw.author,
     publishedAt: raw.published_at,
     url: raw.article_url ?? undefined,
