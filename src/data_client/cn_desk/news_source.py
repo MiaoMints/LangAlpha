@@ -1,13 +1,15 @@
 """Chinese desk news: A-share flashes plus crypto flashes.
 
 No API key. The general feed (no tickers) merges Eastmoney kuaixun, PANews,
-exchange announcements, Jin10, Wallstreetcn, 10jqka, Sina Finance, and the
-CoinDesk and Cointelegraph RSS feeds. A ticker query is refused so the
-provider chain can fall through to a symbol-specific source.
+exchange announcements, Jin10, Wallstreetcn, 10jqka, Sina Finance, Cailianpress,
+Odaily, ChainCatcher, Wublockchain, and the CoinDesk and Cointelegraph RSS
+feeds. A ticker query is refused so the provider chain can fall through to a
+symbol-specific source.
 """
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import re
@@ -31,6 +33,20 @@ _SINA = (
 )
 _COINTELEGRAPH = "https://cointelegraph.com/rss"
 _COINDESK = "https://www.coindesk.com/arc/outboundfeeds/rss/"
+_ODAILY = "https://api.odaily.news/api/v1/newsflash"
+_WUBLOCK = "https://wublock123.com/rss"
+# Cailianpress signs every call: md5 of the sha1 of its sorted query string.
+_CLS = "https://www.cls.cn/v1/roll/get_roll_list"
+_CLS_QUERY = {"app": "CailianpressWeb", "os": "web", "sv": "8.7.9"}
+# ChainCatcher takes a plain JSON POST; ref and language are the only gates.
+_CHAINCATCHER = (
+    "https://www.api.chaincatcher.com/pc/content/page"
+    "?channel=PC&cversion=1.0.0&requestid=PC"
+)
+_CHAINCATCHER_HEADERS = {
+    "ref": "https://www.chaincatcher.com/news",
+    "language": "zh-CN",
+}
 
 # Eastmoney kuaixun: .../getlist_102_ajaxResult_{pageSize}_{page}_.html
 _EAST_PAGE_SIZE = 50
@@ -258,6 +274,111 @@ async def _sina(client: httpx.AsyncClient) -> list[dict[str, Any]]:
     return rows
 
 
+def _cls_sign(query: dict[str, str]) -> dict[str, str]:
+    """Cailianpress wants sign = md5(sha1(k=v&k=v sorted by key))."""
+    body = "&".join(f"{key}={query[key]}" for key in sorted(query))
+    digest = hashlib.sha1(body.encode()).hexdigest()
+    return {**query, "sign": hashlib.md5(digest.encode()).hexdigest()}
+
+
+async def _cls(client: httpx.AsyncClient) -> list[dict[str, Any]]:
+    """Cailianpress telegraph. The list row already carries the paragraph."""
+    rows: list[dict[str, Any]] = []
+    try:
+        response = await client.get(
+            _CLS, params=_cls_sign({**_CLS_QUERY, "rn": "30"}), timeout=10.0
+        )
+        response.raise_for_status()
+        payload = (response.json() or {}).get("data") or {}
+        for item in payload.get("roll_data") or []:
+            title = str(item.get("title") or "").strip()
+            brief = str(item.get("brief") or "").strip()
+            content = _plain(str(item.get("content") or ""))
+            if not title and not brief:
+                continue
+            rows.append(
+                _article(
+                    "cnd-cls-" + str(item.get("id") or title[:24]),
+                    title or brief[:80],
+                    content if len(content) > len(brief) else brief,
+                    _epoch(item.get("ctime")),
+                    "https://www.cls.cn/detail/" + str(item.get("id") or ""),
+                    "\u8d22\u8054\u793e",
+                )
+            )
+    except Exception:
+        logger.warning("cn_desk.cls_failed", exc_info=True)
+    return rows
+
+
+async def _chaincatcher(client: httpx.AsyncClient) -> list[dict[str, Any]]:
+    """ChainCatcher flashes. A plain JSON POST; no signing needed."""
+    rows: list[dict[str, Any]] = []
+    try:
+        response = await client.post(
+            _CHAINCATCHER,
+            headers=_CHAINCATCHER_HEADERS,
+            json={
+                "type": 2,
+                "newsFlashTypes": [1, 2],
+                "pageNumber": 1,
+                "pageSize": 30,
+            },
+            timeout=10.0,
+        )
+        response.raise_for_status()
+        payload = (response.json() or {}).get("data") or {}
+        for item in payload.get("items") or []:
+            title = str(item.get("title") or "").strip()
+            if not title:
+                continue
+            rows.append(
+                _article(
+                    "cnd-cc-" + str(item.get("id") or title[:24]),
+                    title,
+                    str(item.get("description") or ""),
+                    _stamp(
+                        str(item.get("createTime") or item.get("releaseTime") or "")
+                    ),
+                    "https://www.chaincatcher.com/article/"
+                    + str(item.get("id") or ""),
+                    "ChainCatcher",
+                )
+            )
+    except Exception:
+        logger.warning("cn_desk.chaincatcher_failed", exc_info=True)
+    return rows
+
+
+async def _odaily(client: httpx.AsyncClient) -> list[dict[str, Any]]:
+    """Odaily newsflash. The list payload already carries the paragraph text."""
+    rows: list[dict[str, Any]] = []
+    try:
+        response = await client.get(
+            _ODAILY, params={"page": "1", "size": "30"}, timeout=10.0
+        )
+        response.raise_for_status()
+        payload = (response.json() or {}).get("data") or {}
+        for item in payload.get("list") or []:
+            title = str(item.get("title") or "").strip()
+            link = str(item.get("link") or "").strip()
+            if not title or not link:
+                continue
+            rows.append(
+                _article(
+                    "cnd-od-" + str(item.get("id") or link[-24:]),
+                    title,
+                    _plain(str(item.get("content") or "")),
+                    _epoch(item.get("publishTimestamp")),
+                    link,
+                    "Odaily\u661f\u7403\u65e5\u62a5",
+                )
+            )
+    except Exception:
+        logger.warning("cn_desk.odaily_failed", exc_info=True)
+    return rows
+
+
 async def _rss(
     client: httpx.AsyncClient, url: str, publisher: str, prefix: str
 ) -> list[dict[str, Any]]:
@@ -373,6 +494,14 @@ async def _load(
                 await _exchange_announcements(client),
                 await _rss(client, _COINTELEGRAPH, "Cointelegraph", "cnd-ct-"),
                 await _rss(client, _COINDESK, "CoinDesk", "cnd-cd-"),
+                await _odaily(client),
+                await _chaincatcher(client),
+                await _rss(
+                    client,
+                    _WUBLOCK,
+                    "\u5434\u8bf4\u533a\u5757\u94fe",
+                    "cnd-wu-",
+                ),
             ]
         )
 
@@ -382,6 +511,7 @@ async def _load(
                 await _wallstcn(client),
                 await _ths(client),
                 await _sina(client),
+                await _cls(client),
             ]
         )
 
