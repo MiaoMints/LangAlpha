@@ -1,8 +1,9 @@
 """Chinese desk news: A-share flashes plus crypto flashes.
 
-No API key. The general feed (no tickers) merges Eastmoney kuaixun and
-PANews. A ticker query is refused so the provider chain can fall through
-to a symbol-specific source.
+No API key. The general feed (no tickers) merges Eastmoney kuaixun, PANews,
+exchange announcements, Jin10, Wallstreetcn, 10jqka, Sina Finance, and the
+CoinDesk and Cointelegraph RSS feeds. A ticker query is refused so the
+provider chain can fall through to a symbol-specific source.
 """
 
 from __future__ import annotations
@@ -18,6 +19,18 @@ from typing import Any
 import httpx
 
 logger = logging.getLogger(__name__)
+
+# Jin10 only answers its own page, which passes a client id.
+_JIN10 = "https://flash-api.jin10.com/get_flash_list?channel=-8200&vip=1"
+_JIN10_HEADERS = {"x-app-id": "bVBF4FyRTn5NJF5n", "x-version": "1.0.0"}
+_WALLSTCN = "https://api-one.wallstcn.com/apiv1/content/lives?channel=global-channel&limit=30"
+_THS = "https://news.10jqka.com.cn/tapp/news/push/stock/?page=1&tag=&track=website"
+_SINA = (
+    "https://zhibo.sina.com.cn/api/zhibo/feed"
+    "?page=1&page_size=30&zhibo_id=152&tag_id=0&dire=f&dpc=1"
+)
+_COINTELEGRAPH = "https://cointelegraph.com/rss"
+_COINDESK = "https://www.coindesk.com/arc/outboundfeeds/rss/"
 
 # Eastmoney kuaixun: .../getlist_102_ajaxResult_{pageSize}_{page}_.html
 _EAST_PAGE_SIZE = 50
@@ -115,6 +128,163 @@ async def _announcements(codes: list[str], limit: int) -> list[dict[str, Any]]:
     return rows
 
 
+def _epoch(value: Any) -> str:
+    """Unix seconds or milliseconds, rendered as the stamp the API expects."""
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return ""
+    if number > 10_000_000_000:
+        number /= 1000.0
+    return datetime.fromtimestamp(number, timezone.utc).isoformat()
+
+
+def _plain(text: str) -> str:
+    return re.sub(r"<[^>]+>", "", text or "").strip()
+
+
+def _interleave(batches: list[list[dict[str, Any]]]) -> list[dict[str, Any]]:
+    """Draw one row from each batch in turn, dropping repeats by id."""
+    pooled: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    longest = max((len(batch) for batch in batches), default=0)
+    for index in range(longest):
+        for batch in batches:
+            if index < len(batch):
+                _absorb(pooled, seen, [batch[index]])
+    return pooled
+
+
+async def _jin10(client: httpx.AsyncClient) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    try:
+        response = await client.get(_JIN10, headers=_JIN10_HEADERS, timeout=8.0)
+        response.raise_for_status()
+        for item in (response.json() or {}).get("data") or []:
+            content = str((item.get("data") or {}).get("content") or "").strip()
+            if not content:
+                continue
+            first, _, rest = content.partition("\n")
+            title = re.sub(r"^【(.*?)】.*$", r"\1", first).strip() or first.strip()[:80]
+            rows.append(
+                _article(
+                    "cnd-j10-" + str(item.get("id") or title[:24]),
+                    title,
+                    rest.strip() or content,
+                    _stamp(str(item.get("time") or "")),
+                    "https://flash.jin10.com/detail/" + str(item.get("id") or ""),
+                    "\u91d1\u5341\u6570\u636e",
+                )
+            )
+    except Exception:
+        logger.warning("cn_desk.jin10_failed", exc_info=True)
+    return rows
+
+
+async def _wallstcn(client: httpx.AsyncClient) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    try:
+        response = await client.get(_WALLSTCN, timeout=8.0)
+        response.raise_for_status()
+        items = ((response.json() or {}).get("data") or {}).get("items") or []
+        for item in items:
+            text = _plain(str(item.get("content_text") or item.get("content") or ""))
+            title = str(item.get("title") or "").strip() or text[:80]
+            if not title:
+                continue
+            rows.append(
+                _article(
+                    "cnd-wscn-" + str(item.get("id") or title[:24]),
+                    title,
+                    text,
+                    _epoch(item.get("display_time")),
+                    str(item.get("uri") or ""),
+                    "\u534e\u5c14\u8857\u89c1\u95fb",
+                )
+            )
+    except Exception:
+        logger.warning("cn_desk.wallstcn_failed", exc_info=True)
+    return rows
+
+
+async def _ths(client: httpx.AsyncClient) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    try:
+        response = await client.get(_THS, timeout=8.0)
+        response.raise_for_status()
+        items = ((response.json() or {}).get("data") or {}).get("list") or []
+        for item in items:
+            title = str(item.get("title") or "").strip()
+            if not title:
+                continue
+            rows.append(
+                _article(
+                    "cnd-ths-" + str(item.get("id") or title[:24]),
+                    title,
+                    str(item.get("digest") or ""),
+                    _epoch(item.get("rtime") or item.get("ctime")),
+                    str(item.get("url") or ""),
+                    "\u540c\u82b1\u987a",
+                )
+            )
+    except Exception:
+        logger.warning("cn_desk.ths_failed", exc_info=True)
+    return rows
+
+
+async def _sina(client: httpx.AsyncClient) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    try:
+        response = await client.get(_SINA, timeout=8.0)
+        response.raise_for_status()
+        payload = response.json() or {}
+        feed = (((payload.get("result") or {}).get("data") or {}).get("feed") or {})
+        for item in feed.get("list") or []:
+            text = _plain(str(item.get("rich_text") or ""))
+            if not text:
+                continue
+            rows.append(
+                _article(
+                    "cnd-sina-" + str(item.get("id") or text[:24]),
+                    text[:80],
+                    text if len(text) > 80 else "",
+                    _stamp(str(item.get("create_time") or "")),
+                    str(item.get("docurl") or ""),
+                    "\u65b0\u6d6a\u8d22\u7ecf",
+                )
+            )
+    except Exception:
+        logger.warning("cn_desk.sina_failed", exc_info=True)
+    return rows
+
+
+async def _rss(
+    client: httpx.AsyncClient, url: str, publisher: str, prefix: str
+) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    try:
+        response = await client.get(url, timeout=10.0)
+        response.raise_for_status()
+        for item in re.findall(r"<item>(.*?)</item>", response.text, re.S):
+            title = _tag(item, "title")
+            link = _tag(item, "link")
+            if not title or not link:
+                continue
+            rows.append(
+                _article(
+                    prefix + ((_tag(item, "guid") or link)[-64:]),
+                    title,
+                    _tag(item, "description"),
+                    _stamp(_tag(item, "pubDate")),
+                    link,
+                    publisher,
+                )
+            )
+    except Exception:
+        logger.warning("cn_desk.rss_failed | %s", url, exc_info=True)
+    return rows
+
+
 def _stamp(value: str | None) -> str:
     if not value:
         return ""
@@ -197,10 +367,23 @@ async def _load(
     async with httpx.AsyncClient(
         timeout=timeout, headers=_HEADERS, follow_redirects=True
     ) as client:
-        crypto: list[dict[str, Any]] = []
-        crypto_seen: set[str] = set()
-        _absorb(crypto, crypto_seen, await _panews(client))
-        _absorb(crypto, crypto_seen, await _exchange_announcements(client))
+        crypto = _interleave(
+            [
+                await _panews(client),
+                await _exchange_announcements(client),
+                await _rss(client, _COINTELEGRAPH, "Cointelegraph", "cnd-ct-"),
+                await _rss(client, _COINDESK, "CoinDesk", "cnd-cd-"),
+            ]
+        )
+
+        zh = _interleave(
+            [
+                await _jin10(client),
+                await _wallstcn(client),
+                await _ths(client),
+                await _sina(client),
+            ]
+        )
 
         east: list[dict[str, Any]] = []
         east_seen: set[str] = set()
@@ -227,7 +410,10 @@ async def _load(
         stream: list[dict[str, Any]] = []
         seen: set[str] = set()
         east_index = 0
-        crypto_index = 0
+        # Eastmoney is the only paged feed; the snapshots are in memory already
+        # and are drawn round-robin so every publisher reaches page one.
+        snapshots = [crypto, zh]
+        positions = [0] * len(snapshots)
         while True:
             await ensure_east(east_index)
             added = False
@@ -235,11 +421,17 @@ async def _load(
                 _absorb(stream, seen, [east[east_index]])
                 east_index += 1
                 added = True
-            if crypto_index < len(crypto):
-                _absorb(stream, seen, [crypto[crypto_index]])
-                crypto_index += 1
-                added = True
-            more = east_more or east_index < len(east) or crypto_index < len(crypto)
+            for pool_index, pool in enumerate(snapshots):
+                position = positions[pool_index]
+                if position < len(pool):
+                    _absorb(stream, seen, [pool[position]])
+                    positions[pool_index] = position + 1
+                    added = True
+            more = (
+                east_more
+                or east_index < len(east)
+                or any(positions[i] < len(pool) for i, pool in enumerate(snapshots))
+            )
             if not added:
                 sliced = _slice_page(stream, limit, cursor, False)
                 return sliced if sliced is not None else ([], False)
