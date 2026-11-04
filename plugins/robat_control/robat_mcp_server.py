@@ -838,5 +838,33 @@ def submit_signal(
     return _envelope(_call("POST", "/webhook", body=body))
 
 
+_OUT_NOTIFY = output_model("RobatNotify", envelope_schema(ANY))
+
+
+@mcp.tool()
+def notify_telegram(text: str, chat_id: str | None = None) -> _OUT_NOTIFY:
+    """Send yourself a Telegram message through the account session the bot owns.
+
+    Nothing goes to the exchange, so no confirm is needed. Use it to report a
+    finished analysis, a range that got filled, or anything the operator asked to
+    be told about. The operator reads this on the same account the bot forwards
+    signals from.
+
+    Args:
+        text: The message body, plain text, at most 4000 characters.
+        chat_id: Optional target id or username. Defaults to the operator's own
+            Saved Messages, which is where unattended reports should go.
+
+    Returns:
+        dict: {count, data, source}. data carries {ok, chat_id, chars}. On error:
+        {error, detail} — not_configured means the bridge is off, upstream_error
+        means Telegram refused the message.
+    """
+    body: dict[str, Any] = {"text": text}
+    if chat_id:
+        body["chat_id"] = chat_id
+    return _envelope(_call("POST", "/notify/telegram", body=body))
+
+
 if __name__ == "__main__":
     mcp.run(transport="stdio")
