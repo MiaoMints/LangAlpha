@@ -2,8 +2,8 @@
 
 No API key. The general feed (no tickers) merges Eastmoney kuaixun, PANews,
 exchange announcements, Jin10, Wallstreetcn, 10jqka, Sina Finance, Cailianpress,
-Odaily, ChainCatcher, Wublockchain, and the CoinDesk and Cointelegraph RSS
-feeds. A ticker query is refused so the provider chain can fall through to a
+Odaily, ChainCatcher, Wublockchain, Jinse, and the CoinDesk and Cointelegraph
+RSS feeds. A ticker query is refused so the provider chain can fall through to a
 symbol-specific source.
 """
 
@@ -47,6 +47,8 @@ _CHAINCATCHER_HEADERS = {
     "ref": "https://www.chaincatcher.com/news",
     "language": "zh-CN",
 }
+_JINSE = "https://newapi.jinse2.com/noah/v1/flashes/simple"
+_JINSE_HEADERS = {"referer": "https://jinse2.com/"}
 
 # Eastmoney kuaixun: .../getlist_102_ajaxResult_{pageSize}_{page}_.html
 _EAST_PAGE_SIZE = 50
@@ -350,6 +352,37 @@ async def _chaincatcher(client: httpx.AsyncClient) -> list[dict[str, Any]]:
     return rows
 
 
+async def _jinse(client: httpx.AsyncClient) -> list[dict[str, Any]]:
+    """Jinse flashes. The public list carries the headline only."""
+    rows: list[dict[str, Any]] = []
+    try:
+        response = await client.get(
+            _JINSE,
+            params={"limit": "20", "flag": "down", "category": "0"},
+            headers=_JINSE_HEADERS,
+            timeout=10.0,
+        )
+        response.raise_for_status()
+        payload = (response.json() or {}).get("data") or {}
+        for item in payload.get("list") or []:
+            title = str(item.get("title") or "").strip()
+            if not title:
+                continue
+            rows.append(
+                _article(
+                    "cnd-jinse-" + str(item.get("id") or title[:24]),
+                    title,
+                    "",
+                    _epoch(item.get("published_at")),
+                    str(item.get("jump_url") or ""),
+                    "\u91d1\u8272\u8d22\u7ecf",
+                )
+            )
+    except Exception:
+        logger.warning("cn_desk.jinse_failed", exc_info=True)
+    return rows
+
+
 async def _odaily(client: httpx.AsyncClient) -> list[dict[str, Any]]:
     """Odaily newsflash. The list payload already carries the paragraph text."""
     rows: list[dict[str, Any]] = []
@@ -496,6 +529,7 @@ async def _load(
                 await _rss(client, _COINDESK, "CoinDesk", "cnd-cd-"),
                 await _odaily(client),
                 await _chaincatcher(client),
+                await _jinse(client),
                 await _rss(
                     client,
                     _WUBLOCK,
