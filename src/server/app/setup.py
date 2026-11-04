@@ -1318,6 +1318,7 @@ from src.server.app.trading_permission import router as trading_permission_route
 from src.server.app.features import router as features_router
 from src.server.app.watchlist import router as watchlist_router
 from src.server.app.portfolio import router as portfolio_router
+from src.server.app.robat_bridge import router as robat_bridge_router
 from src.server.app.news import router as news_router
 from src.server.app.calendar import router as calendar_router
 from src.server.app.sec_proxy import router as sec_proxy_router
@@ -1406,6 +1407,7 @@ app.include_router(
 app.include_router(
     portfolio_router
 )  # /api/v1/users/me/portfolio/* - Portfolio management
+app.include_router(robat_bridge_router)  # /api/v1/robat/* - ROBAT console bridge
 app.include_router(news_router)  # /api/v1/news - News feed (general + ticker-filtered)
 app.include_router(
     calendar_router

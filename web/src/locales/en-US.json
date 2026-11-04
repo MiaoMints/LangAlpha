@@ -1070,6 +1070,21 @@
         "header": "Watchlist",
         "addSymbol": "Add Symbol"
       },
+      "robat": {
+        "title": "Portfolio",
+        "header": "Holdings",
+        "description": "Live ROBAT positions with entry, stops and unrealised P&L.",
+        "colSymbol": "Symbol",
+        "colQty": "Qty",
+        "colEntry": "Entry",
+        "colMark": "Mark",
+        "colTpSl": "TP / SL",
+        "colPnl": "uPnL",
+        "empty": "No open positions",
+        "unconfigured": "ROBAT connection is not configured",
+        "unavailable": "Cannot reach ROBAT",
+        "error": "Could not load positions"
+      },
       "portfolio": {
         "title": "Portfolio",
         "description": "Your holdings with market value and unrealized P/L.",

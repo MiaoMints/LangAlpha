@@ -740,5 +740,82 @@ def update_runtime_settings(patch: dict[str, Any], confirm: bool = False) -> _OU
     return _envelope(_call("POST", "/api/runtime-settings", body=patch))
 
 
+_OUT_SUBMIT_SIGNAL = output_model("RobatSubmitSignal", envelope_schema(ANY))
+
+
+@mcp.tool()
+def submit_signal(
+    symbol: str,
+    side: str,
+    sl: float,
+    entry_price: float | None = None,
+    tp: float | None = None,
+    tp_levels: list[float] | None = None,
+    risk_budget_usdt: float | None = None,
+    margin_usdt: float | None = None,
+    leverage: int | None = None,
+    order_type: str = "MARKET",
+    trader_id: str | None = None,
+    account_key: str | None = None,
+    source_text: str | None = None,
+    confirm: bool = False,
+) -> _OUT_SUBMIT_SIGNAL:
+    """Open a NEW position by submitting a signal to the trading bot's own webhook.
+
+    This spends real money: the bot sizes it, risk-gates it, registers it in
+    trade_state, and manages it afterwards (TP ladder, stop, runner) exactly like a
+    signal that arrived from Discord or Telegram. Nothing is placed on the exchange
+    until the signal passes the bot's own gates, so a rejected response means no
+    order exists.
+
+    Args:
+        symbol: Exchange symbol such as "ANKRUSDT".
+        side: "LONG" or "SHORT".
+        sl: Stop-loss price, must be > 0. Required, no default.
+        entry_price: Entry price. Omit for a market entry at the live price.
+        tp: Single take-profit price, for an explicit plan.
+        tp_levels: Explicit take-profit ladder, top to bottom.
+        risk_budget_usdt: Risk budget in USDT; omit to let the bot decide.
+        margin_usdt: Margin to commit; omit to let the bot decide.
+        leverage: 1-125.
+        order_type: "MARKET" (default) or "LIMIT".
+        trader_id: Attribute the trade to an existing trader.
+        account_key: Execution account. Read list_accounts first and pass it when
+            more than one account is configured, because the bot refuses an
+            unmapped signal with account_unmapped instead of guessing.
+        source_text: Free-text rationale stored with the trade.
+        confirm: Must be True; otherwise nothing is sent.
+
+    Returns:
+        dict: {count, data, source}. data is the webhook verdict - {"status": "ok",
+        ...} with the trade ids, or {"status": "rejected", "reason": "...",
+        "error": "..."} when a risk gate refused it. On error: {error, detail}.
+    """
+    refused = _confirmed(confirm, "open a position")
+    if refused is not None:
+        return refused
+    body: dict[str, Any] = {
+        "symbol": symbol.strip().upper(),
+        "side": side.strip().upper(),
+        "sl": sl,
+    }
+    for key, value in (
+        ("entry_price", entry_price),
+        ("tp", tp),
+        ("tp_levels", tp_levels),
+        ("risk_budget_usdt", risk_budget_usdt),
+        ("margin_usdt", margin_usdt),
+        ("leverage", leverage),
+        ("trader_id", trader_id),
+        ("account_key", account_key),
+        ("source_text", source_text),
+    ):
+        if value is not None:
+            body[key] = value
+    if order_type:
+        body["order_type"] = order_type.strip().upper()
+    return _envelope(_call("POST", "/webhook", body=body))
+
+
 if __name__ == "__main__":
     mcp.run(transport="stdio")

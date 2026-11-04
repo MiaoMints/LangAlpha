@@ -344,6 +344,42 @@
           ]
         }
       }
+    },
+    "deepseek": {
+      "display_name": "DeepSeek",
+      "env_key": "DEEPSEEK_API_KEY",
+      "capabilities": {
+        "search": {
+          "tracking_name": "DeepSeekSearchTool",
+          "default_level": "standard",
+          "levels": [
+            {
+              "name": "standard",
+              "display_name": "Standard",
+              "credits": 1,
+              "native_params": {}
+            }
+          ]
+        }
+      }
+    },
+    "auto": {
+      "display_name": "Auto (free tier first)",
+      "env_key": null,
+      "capabilities": {
+        "search": {
+          "tracking_name": "AutoSearchTool",
+          "default_level": "standard",
+          "levels": [
+            {
+              "name": "standard",
+              "display_name": "Standard",
+              "credits": 1,
+              "native_params": {}
+            }
+          ]
+        }
+      }
     }
   },
   "auxiliary_tools": {

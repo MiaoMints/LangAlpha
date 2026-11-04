@@ -1068,6 +1068,21 @@
         "header": "自选股",
         "addSymbol": "添加标的"
       },
+      "robat": {
+        "title": "投资组合",
+        "header": "持仓",
+        "description": "ROBAT 实盘持仓，含入场、止损止盈与浮亏。",
+        "colSymbol": "合约",
+        "colQty": "数量",
+        "colEntry": "入场",
+        "colMark": "标记",
+        "colTpSl": "止盈 / 止损",
+        "colPnl": "浮亏",
+        "empty": "当前无持仓",
+        "unconfigured": "未配置 ROBAT 连接",
+        "unavailable": "无法连接 ROBAT",
+        "error": "读取持仓失败"
+      },
       "portfolio": {
         "title": "投资组合",
         "description": "您的持仓，含市值与未实现盈亏。",

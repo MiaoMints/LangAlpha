@@ -265,8 +265,7 @@ compaction:
 
 # Search API Configuration
 # Options: tavily, bocha, serper, exa, parallel
-search_api: tavily
-
+search_api: auto
 # Crawler Configuration
 # Web crawling with SafeCrawlerWrapper for circuit breaker and fault tolerance.
 # Backend: "scrapling" uses tiered HTTP→browser→stealth fetching.
