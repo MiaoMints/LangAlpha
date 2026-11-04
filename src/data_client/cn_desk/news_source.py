@@ -530,6 +530,7 @@ async def _load(
                 await _odaily(client),
                 await _chaincatcher(client),
                 await _jinse(client),
+                await _blockbeats(),
                 await _rss(
                     client,
                     _WUBLOCK,
@@ -638,6 +639,29 @@ async def _eastmoney(client: httpx.AsyncClient, page: int) -> list[dict[str, Any
             )
     except Exception:
         logger.warning("cn_desk.eastmoney_failed | page=%s", page, exc_info=True)
+    return rows
+
+
+async def _blockbeats() -> list[dict[str, Any]]:
+    """BlockBeats flashes, relayed through Cloudflare and read from __NUXT__."""
+    from src.data_client.cn_desk.blockbeats import fetch_flashes
+
+    rows: list[dict[str, Any]] = []
+    for item in await fetch_flashes():
+        article_id = str(item.get("article_id") or item.get("id") or "").strip()
+        title = str(item.get("title") or "").strip()
+        if not article_id or not title:
+            continue
+        rows.append(
+            _article(
+                "cnd-bb-" + article_id,
+                title,
+                _plain(str(item.get("content") or "")),
+                _epoch(item.get("add_time")),
+                "https://www.theblockbeats.info/flash/" + article_id,
+                "BlockBeats",
+            )
+        )
     return rows
 
 
