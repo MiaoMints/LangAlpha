@@ -22,7 +22,7 @@
       "servers": {
         "robat": {
           "description": "Read and control the user's own Binance trading bot: positions, orders, fills, signals, risk state, and position maintenance actions",
-          "instruction": "Use this for anything about the user's live trading account: what is open, why a trade exists, realised P&L, risk halts, and moving a stop or closing a position. Start with get_dashboard or list_active_positions; drill into get_position_detail for the lot ledger. Write tools all require confirm=True and act on real money, so state the exact trader_id and symbol you are about to change and get agreement first. Never guess a symbol for manage_position — pass it, or let the bot refuse.",
+          "instruction": "Use this for anything about the user's live trading account: what is open, why a trade exists, realised P&L, risk halts, and moving a stop or closing a position. Start with get_dashboard or list_active_positions; drill into get_position_detail for the lot ledger. Write tools all require confirm=True and act on real money, so state the exact trader_id and symbol you are about to change and get agreement first. Never guess a symbol for manage_position — pass it, or let the bot refuse. To reach the operator, call notify_telegram: it pushes a Telegram message to the operator's own Saved Messages, needs no confirm and no bot token. Use it for fills, stop moves, closes and failures - one short message with symbol, side, size and price.",
           "tool_exposure_mode": "detailed"
         }
       }
