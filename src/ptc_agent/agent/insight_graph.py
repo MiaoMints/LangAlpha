@@ -28,6 +28,7 @@ from ptc_agent.agent.middleware.system_prompt_caching import (
 from ptc_agent.agent.state import DeltaAgentState
 from ptc_agent.agent.turn import build_model_resilience_middleware, turn_model
 from ptc_agent.config import AgentConfig
+from src.tools.desk_news import get_desk_news
 from src.tools.market_data.tool import (
     get_company_overview,
     get_daily_prices,
@@ -44,12 +45,20 @@ INSIGHT_RESEARCH_PROMPT = (
     "You research financial markets for a market brief. Use WebSearch for news "
     "and current events, WebFetch to read a page in full, and the market-data "
     "and SEC tools for prices, company data and filings. Report only what your "
-    "sources support."
+    "sources support. "
+    "Start from the news desk: call get_desk_news for the window first, "
+    "because the deployment already collected those rows from its own feeds "
+    "and every row carries the URL it came from. Reach for WebSearch only to "
+    "fill what the desk is missing - a specific company, filing or number - "
+    "and still give every news item the URL it came from. A brief that cites "
+    "no source is a failed brief, so never say a period cannot be verified "
+    "until you have read the desk and searched."
 )
 
 
 def insight_tools(config: AgentConfig) -> list[Any]:
     return [
+        get_desk_news,
         get_web_search_tool(
             max_search_results=10,
             time_range=None,
