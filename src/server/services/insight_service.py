@@ -67,6 +67,15 @@ The JSON must have exactly these fields:
 Include 4-8 news_items and 3-5 topics. Respond with ONLY the JSON object.
 """
 
+# A brief that cites nothing usually means the research model answered from
+# memory instead of searching. One retry, told plainly, is cheaper than a
+# refusal that reads like the data source is broken.
+_NO_SOURCE_RETRY = (
+    "\n\n上一次回答没有引用任何来源。这一次必须先调用 WebSearch 查证："
+    "分别搜 A 股与加密货币，至少各两次，再用查到的结果写简报。"
+    "每条 news_item 的 url 必须是真实来源链接。"
+)
+
 
 def _build_instruction(insight_type: str, now_et: datetime) -> str:
     """Build the research instruction for the given job type."""
@@ -110,6 +119,16 @@ def _build_personalized_instruction(
         f"每条写一句短标题，再用 2 到 4 句话说清发生了什么。{_TAIL}"
     )
 
+
+
+def _source_count(parsed: dict) -> int:
+    """How many news items carry a real source URL."""
+    items = parsed.get("news_items") or []
+    return sum(
+        1
+        for item in items
+        if isinstance(item, dict) and str(item.get("url") or "").strip()
+    )
 
 def _extract_json_string(text: str) -> str | None:
     """Extract a JSON object string from text that may contain reasoning.
@@ -728,13 +747,27 @@ class InsightService:
         from src.config.settings import HOST_MODE, LOCAL_DEV_USER_ID
         system_user_id = None if HOST_MODE == "platform" else LOCAL_DEV_USER_ID
 
-        async def research_and_extract() -> dict:
+        async def run_research(prompt: str) -> dict:
             raw_text = await _research(
-                instruction + "\n\n" + _JSON_GUIDELINES,
+                prompt,
                 user_id=system_user_id,
                 insight_type=job_type,
             )
             return await self._extract_with_fallback(raw_text, user_id=system_user_id)
+
+        async def research_and_extract() -> dict:
+            parsed = await run_research(instruction + "\n\n" + _JSON_GUIDELINES)
+            if _source_count(parsed) > 0:
+                return parsed
+            logger.warning(
+                f"[MARKET_INSIGHT] {job_type} cited no source; retrying the research once"
+            )
+            retried = await run_research(
+                instruction + _NO_SOURCE_RETRY + "\n\n" + _JSON_GUIDELINES
+            )
+            if _source_count(retried) > 0:
+                return retried
+            return parsed
 
         try:
             # Extraction is inside the timeout so a run never outlives the
