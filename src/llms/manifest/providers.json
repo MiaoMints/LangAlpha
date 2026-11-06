@@ -1211,6 +1211,35 @@
         }
       }
     },
+    "commandcode": {
+      "sdk": "anthropic",
+      "base_url": "https://api.commandcode.ai/provider",
+      "models_url": "https://api.commandcode.ai/provider/v1/models",
+      "env_key": "COMMANDCODE_API_KEY",
+      "access_type": "coding_plan",
+      "display_name": "Command Code",
+      "category": "inference",
+      "operator_channel": null,
+      "default_headers": {
+        "User-Agent": "LangAlpha/1.0"
+      },
+      "model_catalog": {
+        "url": "https://models.dev/api.json",
+        "provider": "commandcode",
+        "routes": {
+          "@ai-sdk/anthropic": "commandcode",
+          "@ai-sdk/openai-compatible": "commandcode-chat"
+        },
+        "fallback_route": "commandcode-chat"
+      },
+      "variants": {
+        "commandcode-chat": {
+          "sdk": "openai",
+          "base_url": "https://api.commandcode.ai/provider/v1",
+          "use_response_api": false
+        }
+      }
+    },
     "openrouter": {
       "sdk": "openrouter",
       "base_url": "https://openrouter.ai/api/v1",
