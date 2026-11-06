@@ -13,7 +13,7 @@ import hashlib
 import json
 import logging
 import re
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 from email.utils import parsedate_to_datetime
 from typing import Any
@@ -54,6 +54,10 @@ _JINSE_HEADERS = {"referer": "https://jinse2.com/"}
 _EAST_PAGE_SIZE = 50
 # Cap so a deep scroll cannot walk the flash history forever in one request.
 _MAX_EAST_PAGES = 40
+# A desk reader wants the current tape, not last quarter's. Rows older than
+# this never enter a pool, so a stray two-year-old exchange notice cannot
+# surface once the reader pages past today's flashes.
+_MAX_AGE = timedelta(days=7)
 _PANEWS = "https://www.panewslab.com/zh/rss/newsflash.xml"
 
 
@@ -483,6 +487,32 @@ def _article(
     }
 
 
+def _published_ts(row: dict[str, Any]) -> float:
+    """Epoch seconds for a pooled row; an unreadable stamp sorts last."""
+    text = str(row.get("published_at") or "").strip()
+    if not text:
+        return 0.0
+    try:
+        parsed = datetime.fromisoformat(text.replace(" ", "T"))
+    except (TypeError, ValueError):
+        return 0.0
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=ZoneInfo("Asia/Shanghai"))
+    return parsed.timestamp()
+
+
+def _newest_first(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Order pooled rows the way a desk reader reads them: newest first.
+
+    Ties break on id so the order is stable between two identical requests.
+    """
+    return sorted(
+        rows,
+        key=lambda row: (_published_ts(row), str(row.get("id") or "")),
+        reverse=True,
+    )
+
+
 def _slice_page(
     rows: list[dict[str, Any]],
     limit: int,
@@ -575,8 +605,9 @@ async def _load(
         stream: list[dict[str, Any]] = []
         seen: set[str] = set()
         east_index = 0
-        # Eastmoney is the only paged feed; the snapshots are in memory already
-        # and are drawn round-robin so every publisher reaches page one.
+        # Eastmoney is the only paged feed; every other desk is already in
+        # memory. Both are pooled and then ordered by publication time, so the
+        # page boundary falls where the clock says it should.
         snapshots = [crypto, zh]
         positions = [0] * len(snapshots)
         while True:
@@ -597,20 +628,26 @@ async def _load(
                 or east_index < len(east)
                 or any(positions[i] < len(pool) for i, pool in enumerate(snapshots))
             )
-            if not added:
-                sliced = _slice_page(stream, limit, cursor, False)
-                return sliced if sliced is not None else ([], False)
-            sliced = _slice_page(stream, limit, cursor, more)
+            # Desks publish on their own clocks, so the pool is ordered by
+            # when each row ran before a page is cut out of it. Slicing the
+            # round-robin transcript instead is what made page one look right
+            # and every later page arrive shuffled.
+            sliced = _slice_page(_newest_first(stream), limit, cursor, more)
             if sliced is not None:
                 return sliced
+            if not added:
+                return [], False
 
 
 def _absorb(
     pooled: list[dict[str, Any]], seen: set[str], batch: list[dict[str, Any]]
 ) -> None:
+    cutoff = (datetime.now(timezone.utc) - _MAX_AGE).timestamp()
     for row in batch:
         article_id = row.get("id")
         if not row.get("title") or not article_id or article_id in seen:
+            continue
+        if _published_ts(row) < cutoff:
             continue
         seen.add(article_id)
         pooled.append(row)
