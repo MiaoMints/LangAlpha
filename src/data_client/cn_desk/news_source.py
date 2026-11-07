@@ -58,6 +58,12 @@ _MAX_EAST_PAGES = 40
 # this never enter a pool, so a stray two-year-old exchange notice cannot
 # surface once the reader pages past today's flashes.
 _MAX_AGE = timedelta(days=7)
+# Desks reprint each other's headlines within minutes, so the pool carries
+# the same story three or four times under different ids. Two rows count as
+# one story when the shorter title is almost entirely inside the longer one.
+_DUP_WINDOW_SECONDS = 24 * 3600.0
+_DUP_CONTAINMENT = 0.82
+_DUP_MIN_SHINGLES = 8
 _PANEWS = "https://www.panewslab.com/zh/rss/newsflash.xml"
 
 
@@ -469,7 +475,7 @@ def _article(
 ) -> dict[str, Any]:
     return {
         "id": article_id,
-        "title": title.strip(),
+        "title": _plain(title).strip(),
         "author": None,
         "description": (body or "").strip() or None,
         "published_at": published_at,
@@ -639,6 +645,35 @@ async def _load(
                 return [], False
 
 
+def _norm_title(text: str) -> str:
+    """Comparable form of a headline, with wire-service lead-ins removed."""
+    cleaned = _plain(str(text or "")).strip()
+    cleaned = re.sub(
+        r"^\u8d22\u8054\u793e\d{1,2}\u6708\d{1,2}\u65e5\u7535", "", cleaned
+    )
+    cleaned = re.sub(r"^\u636e[^\uff0c,\u3002]{1,24}\u62a5\u9053", "", cleaned)
+    return re.sub(r"[^0-9A-Za-z\u4e00-\u9fff]+", "", cleaned).lower()
+
+
+def _shingles(text: str) -> frozenset[str]:
+    if len(text) < 2:
+        return frozenset()
+    return frozenset(text[index : index + 2] for index in range(len(text) - 1))
+
+
+def _same_story(
+    row: dict[str, Any], other: dict[str, Any]
+) -> bool:
+    """True when two pooled rows report the same headline."""
+    left = _shingles(_norm_title(str(row.get("title") or "")))
+    right = _shingles(_norm_title(str(other.get("title") or "")))
+    shorter = min(len(left), len(right))
+    if shorter < _DUP_MIN_SHINGLES:
+        return False
+    shared = len(left & right)
+    return shared / shorter >= _DUP_CONTAINMENT
+
+
 def _absorb(
     pooled: list[dict[str, Any]], seen: set[str], batch: list[dict[str, Any]]
 ) -> None:
@@ -647,7 +682,14 @@ def _absorb(
         article_id = row.get("id")
         if not row.get("title") or not article_id or article_id in seen:
             continue
-        if _published_ts(row) < cutoff:
+        stamp = _published_ts(row)
+        if stamp < cutoff:
+            continue
+        if any(
+            abs(stamp - _published_ts(kept)) <= _DUP_WINDOW_SECONDS
+            and _same_story(row, kept)
+            for kept in pooled
+        ):
             continue
         seen.add(article_id)
         pooled.append(row)
