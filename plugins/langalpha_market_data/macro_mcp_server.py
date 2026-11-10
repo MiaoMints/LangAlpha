@@ -27,6 +27,12 @@ except ModuleNotFoundError:  # imported as a package module (tests)
 
 from typing import Optional
 
+import asyncio
+import json
+import time
+import urllib.request
+from datetime import datetime, timezone
+
 
 from data_client.fmp import get_fmp_client, fmp_lifespan
 from mcp_servers._dates import calendar_days
@@ -144,13 +150,24 @@ async def get_economic_calendar(
         order is as returned by FMP. On error: {error: <code>, detail}.
     """
     try:
+        lo, hi = calendar_days(from_date, to_date)
+    except Exception as e:  # noqa: BLE001
+        return error_from_exception(e, _UPSTREAM_FAILED)
+
+    try:
         client = await get_fmp_client()
     except Exception:  # noqa: BLE001
+        events = await _fallback_calendar(lo, hi)
+        if events:
+            return _fallback_response(events, from_date, to_date)
         return make_error("client_unavailable", _CLIENT_UNAVAILABLE)
 
     try:
-        lo, hi = calendar_days(from_date, to_date)
         data = await client.get_economic_calendar(from_date=lo, to_date=hi)
+        if not data:
+            events = await _fallback_calendar(lo, hi)
+            if events:
+                return _fallback_response(events, from_date, to_date)
 
         return make_response(
             data or [],
@@ -161,6 +178,9 @@ async def get_economic_calendar(
         )
 
     except Exception as e:  # noqa: BLE001
+        events = await _fallback_calendar(lo, hi)
+        if events:
+            return _fallback_response(events, from_date, to_date)
         return error_from_exception(e, _UPSTREAM_FAILED)
 
 
@@ -309,3 +329,116 @@ async def get_earnings_calendar(
 
 if __name__ == "__main__":
     mcp.run(transport="stdio")
+
+
+# --- Keyless calendar fallback -------------------------------------------
+#
+# FMP gates its calendar behind the Starter plan; the public forex-factory week
+# files carry the same events with a UTC-able timestamp and an impact rating.
+# Only used when FMP answers nothing, so the FMP path stays authoritative.
+
+_FF_WEEKS = (
+    "https://nfs.faireconomy.media/ff_calendar_thisweek.json",
+    "https://nfs.faireconomy.media/ff_calendar_nextweek.json",
+)
+_FF_TTL_SECONDS = 600.0
+_FF_TIMEOUT_SECONDS = 20.0
+_FF_CACHE: dict[str, tuple[float, list[dict[str, object]]]] = {}
+_FF_COUNTRIES = {
+    "USD": "US",
+    "EUR": "EU",
+    "GBP": "UK",
+    "JPY": "JP",
+    "CNY": "CN",
+    "AUD": "AU",
+    "NZD": "NZ",
+    "CAD": "CA",
+    "CHF": "CH",
+}
+
+
+def _ff_fetch(url: str) -> list[dict[str, object]]:
+    """Read one week file, or nothing when the feed is unreachable."""
+    now = time.monotonic()
+    cached = _FF_CACHE.get(url)
+    if cached is not None and now - cached[0] < _FF_TTL_SECONDS:
+        return cached[1]
+    request = urllib.request.Request(
+        url,
+        headers={
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                "(KHTML, like Gecko) Chrome/152.0.0.0 Safari/537.36"
+            )
+        },
+    )
+    with urllib.request.urlopen(request, timeout=_FF_TIMEOUT_SECONDS) as response:
+        payload = json.loads(response.read().decode("utf-8", "replace"))
+    rows = payload if isinstance(payload, list) else []
+    _FF_CACHE[url] = (now, rows)
+    return rows
+
+
+def _ff_stamp(raw: object) -> str:
+    """Render an offset timestamp as naive UTC, the shape FMP returns."""
+    text = str(raw or "").strip()
+    if not text:
+        return ""
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError:
+        return ""
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+
+
+async def _fallback_calendar(lo: str, hi: str) -> list[dict[str, object]]:
+    """Events between two YYYY-MM-DD dates, shaped like FMP's calendar rows."""
+    rows: list[dict[str, object]] = []
+    for url in _FF_WEEKS:
+        try:
+            rows.extend(await asyncio.to_thread(_ff_fetch, url))
+        except Exception:  # noqa: BLE001
+            continue
+
+    events: list[dict[str, object]] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        stamp = _ff_stamp(row.get("date"))
+        if not stamp:
+            continue
+        day = stamp[:10]
+        if day < lo or day > hi:
+            continue
+        currency = str(row.get("country") or "").upper()
+        events.append(
+            {
+                "date": stamp,
+                "country": _FF_COUNTRIES.get(currency, currency),
+                "event": str(row.get("title") or ""),
+                "currency": currency,
+                "previous": row.get("previous"),
+                "estimate": row.get("forecast"),
+                "actual": row.get("actual"),
+                "change": None,
+                "changePercentage": None,
+                "impact": str(row.get("impact") or ""),
+                "unit": None,
+            }
+        )
+
+    events.sort(key=lambda event: (str(event["date"]), str(event["event"])))
+    return events
+
+
+def _fallback_response(events, from_date, to_date):
+    """Wrap fallback rows in the standard market-data envelope."""
+    return make_response(
+        events,
+        source="forexfactory",
+        data_type="economic_calendar",
+        from_date=from_date,
+        to_date=to_date,
+    )
