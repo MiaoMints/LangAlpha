@@ -47,7 +47,7 @@ from src.tools.web.types import (
 
 logger = logging.getLogger(__name__)
 
-_BASE_URL = "https://api.tavily.com"
+_BASE_URL = os.environ.get("TAVILY_API_BASE", "https://api.tavily.com")
 _TIMEOUT = 60.0
 
 
@@ -97,7 +97,7 @@ class TavilySearchWrapper:
         self._api_key = api_key or os.environ.get("TAVILY_API_KEY", "")
         if not self._api_key:
             raise ValueError("TAVILY_API_KEY not provided or found in environment")
-        self._client = AsyncTavilyClient(api_key=self._api_key)
+        self._client = AsyncTavilyClient(api_key=self._api_key, api_base_url=os.environ.get("TAVILY_API_BASE") or None)
         self._country = country
 
     async def raw_results(
