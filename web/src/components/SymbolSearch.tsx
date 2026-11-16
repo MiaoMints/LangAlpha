@@ -5,6 +5,7 @@ import { Loader } from '@/components/ui/loader';
 import { useSymbolSearch } from '@/hooks/useSymbolSearch';
 import { normalizeSymbolInput, readTypedTicker, type StockSearchHit } from '@/lib/marketUtils';
 import './SymbolSearch.css';
+import { isImeComposing } from '@/lib/ime';
 
 interface SymbolSearchProps {
   /** The hit rides along when there was one, so a host can show its name before the quote arrives. */
@@ -43,6 +44,7 @@ export function SymbolSearch({ onPick }: SymbolSearchProps): React.ReactElement 
   const listOpen = hits.length > 0 || (query.trim() !== '' && !loading);
 
   const onKeyDown = (e: React.KeyboardEvent<HTMLInputElement>) => {
+    if (isImeComposing(e)) return;
     if (e.key === 'ArrowDown') { e.preventDefault(); setHighlight((h) => Math.min(h + 1, hits.length - 1)); return; }
     if (e.key === 'ArrowUp') { e.preventDefault(); setHighlight((h) => Math.max(h - 1, 0)); return; }
     if (e.key === 'Enter') {

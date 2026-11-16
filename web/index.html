@@ -4,6 +4,7 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
     <meta name="referrer" content="strict-origin-when-cross-origin" />
+    <meta name="color-scheme" content="dark light" />
     <!-- This build reserves the strip macOS window buttons float over, so a
          desktop shell may hide the titlebar and hand the top of the window to
          it. Read by the shell after load; see watchChrome in desktop/src/main.js.
@@ -25,6 +26,7 @@
         var t = (stored === 'light' || stored === 'dark') ? stored
           : (window.matchMedia && window.matchMedia('(prefers-color-scheme: light)').matches ? 'light' : 'dark');
         d.setAttribute('data-theme', t);
+        d.style.colorScheme = t;
         // Same pre-paint reason as the theme: the root font-size multiplier
         // (tokens.css `html { font-size: calc(100% * var(--app-font-scale)) }`)
         // must land before first layout, or every rem-sized box reflows once.

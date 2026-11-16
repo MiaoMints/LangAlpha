@@ -473,10 +473,18 @@ function ChatInput({
 
   // Auto-resize textarea; past the cap the box scrolls (overflow-y-auto).
   useEffect(() => {
-    if (textareaRef.current) {
-      textareaRef.current.style.height = 'auto';
-      textareaRef.current.style.height = Math.min(textareaRef.current.scrollHeight, MAX_TEXTAREA_HEIGHT) + 'px';
+    const el = textareaRef.current;
+    if (!el) return;
+    // `field-sizing: content` grows the box from its content natively
+    // (Chromium 123+); only run the JS scrollHeight measurement when the
+    // engine lacks it. The 200px cap holds either way, then overflow scrolls.
+    if (typeof CSS !== 'undefined' && typeof CSS.supports === 'function' && CSS.supports('field-sizing', 'content')) {
+      el.style.setProperty('field-sizing', 'content');
+      el.style.maxHeight = MAX_TEXTAREA_HEIGHT + 'px';
+      return;
     }
+    el.style.height = 'auto';
+    el.style.height = Math.min(el.scrollHeight, MAX_TEXTAREA_HEIGHT) + 'px';
   }, [message]);
 
   // Large text pastes condense into a pill (snippet-mention mechanics) instead

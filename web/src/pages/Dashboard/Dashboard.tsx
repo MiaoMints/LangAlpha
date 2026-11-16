@@ -1,4 +1,5 @@
 import { use, useCallback, useEffect, useRef, useState } from 'react';
+import { isImeComposing } from '@/lib/ime';
 import { useTranslation } from 'react-i18next';
 import { useQueryClient } from '@tanstack/react-query';
 import { Plus, Layers, RotateCcw, X } from 'lucide-react';
@@ -337,6 +338,7 @@ function DashboardPage() {
             <div
               className="grid gap-3"
               onKeyDown={(e) => {
+                if (isImeComposing(e)) return;
                 if (e.key === 'Enter') {
                   e.preventDefault();
                   portfolio.handleUpdate?.();

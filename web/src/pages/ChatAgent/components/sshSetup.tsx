@@ -25,6 +25,7 @@ import type { SshTarget } from '@/types/api';
 import { apiErrorStatus } from '@/api/errors';
 import { failureText, type SshFailure, type SshReadyStep, type SshSetupState } from './sshSetupState';
 import { formatSshReached, type SshReady } from './sshTarget';
+import { isImeComposing } from '@/lib/ime';
 
 const SSH_ADDRESS_PLACEHOLDER = 'ubuntu@203.0.113.10';
 
@@ -134,6 +135,7 @@ function AddressField({
   const describedBy = [hint && hintId, error && errorId].filter(Boolean).join(' ') || undefined;
   // Enter connects rather than submitting the dialog, which is closed until then anyway.
   const onKeyDown = (e: KeyboardEvent<HTMLInputElement>) => {
+    if (isImeComposing(e)) return;
     if (e.key !== 'Enter') return;
     e.preventDefault();
     onConnect();

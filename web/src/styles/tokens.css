@@ -744,6 +744,16 @@ html {
   background-color: var(--color-text-tertiary);
 }
 
+/* Firefox and other engines without the -webkit- pseudo-elements get the
+   standard scrollbar properties, matched to the same lane and thumb colour.
+   The @supports guard keeps Blink on its 3px-inset custom thumb above. */
+@supports not selector(::-webkit-scrollbar) {
+  * {
+    scrollbar-width: thin;
+    scrollbar-color: var(--color-border-elevated) transparent;
+  }
+}
+
 /* Monaco's own scrollbar, inset through CodeEditor's options. Its arrows are
    there only to hold the track short of both ends. */
 .monaco-editor .scrollbar > .scra,

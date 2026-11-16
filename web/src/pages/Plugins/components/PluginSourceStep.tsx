@@ -11,6 +11,7 @@ import {
 } from '../utils/pluginSchemas';
 import { useCatalogOn } from '../hooks/useCatalogOn';
 import { RefusalBox } from './RefusalView';
+import { isImeComposing } from '@/lib/ime';
 
 const DISCOVER_HREF = '/plugins?tab=plugins&view=discover';
 
@@ -224,6 +225,7 @@ export function PluginSourceStep({
             if (e.target.value.trim()) setFile(null);
           }}
           onKeyDown={(e) => {
+            if (isImeComposing(e)) return;
             if (e.key === 'Enter') submit();
           }}
           placeholder="https://github.com/owner/repo"

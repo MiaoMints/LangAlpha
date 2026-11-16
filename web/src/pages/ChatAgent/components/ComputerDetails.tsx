@@ -40,6 +40,7 @@ import {
   type MachineActions,
 } from './computerParts';
 import { railOrdinal } from './computerRailState';
+import { isImeComposing } from '@/lib/ime';
 
 type Translate = ReturnType<typeof useTranslation>['t'];
 
@@ -361,6 +362,7 @@ function EditableName({ name, onCommit }: { name: string; onCommit: (name: strin
               // Left with the refused name still standing, the field backs out.
               onBlur={refusal ? backOut : save}
               onKeyDown={(e) => {
+                if (isImeComposing(e)) return;
                 if (e.key === 'Enter') {
                   e.preventDefault();
                   // Enter on a refused name keeps the field and its reason.

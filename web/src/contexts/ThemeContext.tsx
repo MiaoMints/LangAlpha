@@ -23,6 +23,18 @@ function getInitialPreference(): ThemePreference {
   return 'auto';
 }
 
+// One place that stamps everything the browser reads the theme from: the
+// attribute the CSS keys off, `color-scheme` on the root (scrollbars, form
+// controls, the UA pre-paint clear colour), and the <meta name="color-scheme">
+// so that clear colour is right before this module even runs on the next load.
+function applyResolvedTheme(theme: ResolvedTheme) {
+  const root = document.documentElement;
+  root.setAttribute('data-theme', theme);
+  root.style.colorScheme = theme;
+  const meta = document.querySelector('meta[name="color-scheme"]') as HTMLMetaElement | null;
+  if (meta) meta.content = theme === 'light' ? 'light' : 'dark';
+}
+
 export function ThemeProvider({ children }: { children: React.ReactNode }) {
   const [preference, setPreference] = useState<ThemePreference>(getInitialPreference);
   const [systemTheme, setSystemTheme] = useState<ResolvedTheme>(getSystemTheme);
@@ -35,6 +47,18 @@ export function ThemeProvider({ children }: { children: React.ReactNode }) {
     return () => mq.removeEventListener('change', handler);
   }, []);
 
+  // Cross-tab sync: another tab changing the preference writes localStorage and
+  // fires `storage` here (never in the tab that wrote it), so mirror it in.
+  useEffect(() => {
+    const onStorage = (e: StorageEvent) => {
+      if (e.key !== null && e.key !== 'theme') return;
+      const next = e.key === null ? localStorage.getItem('theme') : e.newValue;
+      setPreference(next === 'light' || next === 'dark' || next === 'auto' ? next : 'auto');
+    };
+    window.addEventListener('storage', onStorage);
+    return () => window.removeEventListener('storage', onStorage);
+  }, []);
+
   // Resolved theme: what actually gets applied
   const theme: ResolvedTheme = preference === 'auto' ? systemTheme : preference;
 
@@ -43,7 +67,7 @@ export function ThemeProvider({ children }: { children: React.ReactNode }) {
   // resolve tokens off the stamped `data-theme` (lib/themeTokens) would read
   // the previous theme for one frame on every flip.
   useLayoutEffect(() => {
-    document.documentElement.setAttribute('data-theme', theme);
+    applyResolvedTheme(theme);
     localStorage.setItem('theme', preference);
     const favicon = document.querySelector('link[rel="icon"]') as HTMLLinkElement | null;
     if (favicon) favicon.href = theme === 'light' ? '/logo-favicon.svg' : '/logo-favicon-dark.svg';

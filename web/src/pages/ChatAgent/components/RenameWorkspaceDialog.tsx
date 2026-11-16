@@ -12,6 +12,7 @@ import { Input } from '@/components/ui/input';
 import { Button } from '@/components/ui/button';
 import type { Workspace } from '@/types/api';
 import { clampWorkspaceName } from '../utils/workspaceName';
+import { isImeComposing } from '@/lib/ime';
 
 interface RenameWorkspaceDialogProps {
   target: Workspace | null;
@@ -46,7 +47,7 @@ function RenameWorkspaceDialog({ target, onClose, onSubmit, busy }: RenameWorksp
           placeholder={t('workspace.workspaceName')}
           aria-label={t('workspace.rename')}
           autoFocus
-          onKeyDown={(e) => { if (e.key === 'Enter' && !busy) { e.preventDefault(); onSubmit(trimmed); } }}
+          onKeyDown={(e) => { if (isImeComposing(e)) return; if (e.key === 'Enter' && !busy) { e.preventDefault(); onSubmit(trimmed); } }}
         />
         <DialogFooter>
           <Button variant="ghost" onClick={onClose} disabled={busy}>

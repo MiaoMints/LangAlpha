@@ -17,6 +17,7 @@ import { SecretValueInput } from '@/pages/Plugins/components/secrets/SecretValue
 import { formatApiErrorDetail } from '../../utils/api';
 import { McpQuietButton } from './McpQuietButton';
 import { useVaultKeys } from './useMcpFormFacts';
+import { isImeComposing } from '@/lib/ime';
 
 /**
  * One value field for an env var or header. It takes a plain literal by
@@ -284,6 +285,7 @@ export function VaultSecretPicker({
               labels={{ show: t('mcp.secret.showValue'), hide: t('mcp.secret.hideValue') }}
               onBlur={onSettle}
               onKeyDown={(e) => {
+                if (isImeComposing(e)) return;
                 if (e.key === 'Enter') onSettle?.();
               }}
               placeholder={t('mcp.secret.valuePlaceholder')}

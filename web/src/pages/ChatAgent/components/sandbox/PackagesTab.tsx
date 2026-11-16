@@ -3,6 +3,7 @@ import { Package, Search } from 'lucide-react';
 import { Loader } from '@/components/ui/loader';
 import { formatApiErrorDetail, installSandboxPackages } from '../../utils/api';
 import type { InstallResult, SandboxPackage } from './sandboxTypes';
+import { isImeComposing } from '@/lib/ime';
 
 interface PackagesTabProps {
   workspaceId: string;
@@ -123,7 +124,7 @@ export function PackagesTab({ workspaceId, packages, defaultPackages, onInstalle
             value={installInput}
             onChange={e => setInstallInput(e.target.value)}
             placeholder="Package names (e.g. torch transformers>=4.0)"
-            onKeyDown={e => e.key === 'Enter' && !installing && handleInstall()}
+            onKeyDown={e => { if (isImeComposing(e)) return; if (e.key === 'Enter' && !installing) handleInstall(); }}
             className="flex-1 px-3 py-2 text-sm rounded-md bg-transparent"
             style={{
               color: 'var(--color-text-primary)',

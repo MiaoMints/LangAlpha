@@ -91,7 +91,7 @@ export function TradingViewEmbed({ scriptKey, config, className, contentHeight }
       if (cancelled) return;
       builtOnceRef.current = true;
 
-      container.innerHTML = '';
+      container.replaceChildren();
 
       const widgetDiv = document.createElement('div');
       widgetDiv.className = 'tradingview-widget-container__widget';
@@ -171,7 +171,7 @@ export function TradingViewEmbed({ scriptKey, config, className, contentHeight }
       if (buildTimer !== null) window.clearTimeout(buildTimer);
       if (timeoutId !== null) window.clearTimeout(timeoutId);
       observer?.disconnect();
-      if (container) container.innerHTML = '';
+      if (container) container.replaceChildren();
     };
   // Intentionally NOT including `config` in deps — `configKey` (the stable
   // JSON string) already tracks content changes. Including the raw object

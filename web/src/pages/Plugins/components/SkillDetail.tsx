@@ -23,6 +23,7 @@ import { useCatalogPlugins } from '../hooks/useCatalogPlugins';
 import { useHomeOption } from '../hooks/useWorkspaceOptions';
 import { SkillDocument } from './pluginsPage/SkillDocument';
 import { SkillFiles } from './pluginsPage/SkillFiles';
+import { isImeComposing } from '@/lib/ime';
 
 /**
  * A skill's page. Its tile is the skill kind's glyph, never a vendor's: a
@@ -351,6 +352,7 @@ function CommandBox({
           value={value}
           onChange={(e) => setValue(e.target.value)}
           onKeyDown={(e) => {
+            if (isImeComposing(e)) return;
             if (e.key === 'Enter') save();
             else if (e.key === 'Escape') {
               e.stopPropagation();

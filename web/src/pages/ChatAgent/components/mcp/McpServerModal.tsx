@@ -50,6 +50,7 @@ import {
   type McpServerDraft,
   type McpServerInput,
 } from '../../utils/api';
+import { isImeComposing } from '@/lib/ime';
 
 /**
  * Create/edit modal for a workspace (or catalog) MCP server.
@@ -433,6 +434,7 @@ export function McpServerModal({
           }}
           onBlur={() => dispatch({ type: 'commit' })}
           onKeyDown={(e) => {
+            if (isImeComposing(e)) return;
             if (e.key === 'Enter') dispatch({ type: 'commit' });
           }}
           placeholder={t('mcp.modal.entryPlaceholder')}

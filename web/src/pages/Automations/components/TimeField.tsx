@@ -8,6 +8,7 @@ import { useScrollReveal } from '../hooks/useScrollReveal';
 import { DAY_SLOTS, MORNING, parseTime, sameTime, stepTime, type TimeOfDay } from '../utils/timeOfDay';
 import { formatTimeOfDay } from '../utils/time';
 import './TimeField.css';
+import { isImeComposing } from '@/lib/ime';
 
 const minutes = (t: TimeOfDay) => t.hour * 60 + t.minute;
 
@@ -109,6 +110,7 @@ export function TimeInput({ value, onCommit, onEnter, onKeyDown, onBlur, classNa
       onKeyDown={(e) => {
         onKeyDown?.(e);
         if (e.defaultPrevented) return;
+        if (isImeComposing(e)) return;
         if (e.key === 'Enter') {
           // Inside the form, Enter would otherwise submit it.
           e.preventDefault();

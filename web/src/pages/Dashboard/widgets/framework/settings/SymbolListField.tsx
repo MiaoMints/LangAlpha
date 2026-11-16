@@ -3,6 +3,7 @@ import { useTranslation } from 'react-i18next';
 import { X } from 'lucide-react';
 import { Input } from '@/components/ui/input';
 import '@/pages/Dashboard/components/dashForms.css';
+import { isImeComposing } from '@/lib/ime';
 
 // Split incoming text on whitespace, comma, semicolon, or newline so a paste
 // of `NVDA, AAPL MSFT;TSLA` becomes 4 chips instead of 1 bad symbol that the
@@ -72,6 +73,7 @@ export function SymbolListField({
   };
 
   const onKey = (e: KeyboardEvent<HTMLInputElement>) => {
+    if (isImeComposing(e)) return;
     if (e.key === 'Enter' || e.key === ',') {
       e.preventDefault();
       add();

@@ -83,7 +83,7 @@ function SubagentStatusBar({ agent, onSendInstruction }: SubagentStatusBarProps)
 
   const messages = (agent.messages || []) as AgentMessage[];
 
-  const lastAssistant = [...messages].reverse().find(m => m.role === 'assistant');
+  const lastAssistant = messages.findLast((m) => m.role === 'assistant');
 
   // Derive current tool from message state
   const derivedCurrentTool = ((): string => {

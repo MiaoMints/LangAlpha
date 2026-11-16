@@ -6,6 +6,7 @@ import type { CustomModelEntry } from '@/components/model/types';
 import type { ListedModel } from '@/api/model';
 import { slugifyModelName } from './slugifyModelName';
 import { ModalityChips, QuietNote } from './parts';
+import { isImeComposing } from '@/lib/ime';
 
 /** The window a custom model may declare (`_MIN_CONTEXT` / `_MAX_CONTEXT` on the server). */
 const MIN_CONTEXT = 1_000;
@@ -111,7 +112,7 @@ export function CustomModelFields({
   const contextValue = parseTokenCount(draft.context);
   const contextBad = !!draft.context.trim() && (contextValue === null || contextValue < MIN_CONTEXT || contextValue > MAX_CONTEXT);
   const maxBad = !!draft.maxOutput.trim() && parseTokenCount(draft.maxOutput) === null;
-  const enter = onSubmit ? (e: React.KeyboardEvent) => { if (e.key === 'Enter') onSubmit(); } : undefined;
+  const enter = onSubmit ? (e: React.KeyboardEvent) => { if (isImeComposing(e)) return; if (e.key === 'Enter') onSubmit(); } : undefined;
   const labelClass = 'text-xs font-medium';
   const labelStyle = { color: 'var(--color-text-secondary)' };
 

@@ -125,10 +125,20 @@ export async function exportServedPdf({
   // A render outlasts the page that asked for it, so the stale-build reload a
   // section switch takes waits until the file is handed to the browser.
   const release = holdReload();
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), PDF_FETCH_TIMEOUT_MS);
+  let fallbackTimer: ReturnType<typeof setTimeout> | undefined;
   try {
-    const res = await fetch(pdfUrl, { signal: controller.signal });
+    // Prefer AbortSignal.timeout; on engines that lack it fall back to an
+    // AbortController + timer so the request still times out and the
+    // release/cleanup in `finally` runs instead of hanging forever.
+    let signal: AbortSignal;
+    if (typeof AbortSignal !== 'undefined' && typeof AbortSignal.timeout === 'function') {
+      signal = AbortSignal.timeout(PDF_FETCH_TIMEOUT_MS);
+    } else {
+      const controller = new AbortController();
+      fallbackTimer = setTimeout(() => controller.abort(), PDF_FETCH_TIMEOUT_MS);
+      signal = controller.signal;
+    }
+    const res = await fetch(pdfUrl, { signal });
     if (!res.ok) {
       printFallback();
       return;
@@ -143,11 +153,11 @@ export async function exportServedPdf({
     document.body.removeChild(a);
     URL.revokeObjectURL(url);
   } catch {
-    // Includes the AbortError from the timeout above — fall back to print.
+    // Includes the abort/timeout error from the signal above — fall back to print.
     printFallback();
   } finally {
+    if (fallbackTimer !== undefined) clearTimeout(fallbackTimer);
     release();
-    clearTimeout(timeout);
     pending.dismiss();
   }
 }

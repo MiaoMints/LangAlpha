@@ -12,6 +12,7 @@ import { portfolioHoldingsQuery } from '@/pages/Dashboard/hooks/usePortfolioData
 import { addPortfolioHolding, deletePortfolioHolding } from '@/pages/Dashboard/utils/portfolio';
 import { watchlistItemsQuery } from '@/pages/Dashboard/hooks/useWatchlistData';
 import { addWatchlistItem, deleteWatchlistItem } from '@/pages/Dashboard/utils/watchlistItems';
+import { isImeComposing } from '@/lib/ime';
 
 const chipClass =
   'inline-flex h-7 items-center gap-1 rounded-full border border-(--color-border-muted) pl-2.5 pr-1 text-xs tabular-nums text-(--color-text-primary)';
@@ -92,6 +93,7 @@ export function HoldingsEntry({ onPreparing }: HoldingsEntryProps) {
   }
 
   function onSearchKeyDown(event: KeyboardEvent<HTMLInputElement>) {
+    if (isImeComposing(event)) return;
     if (event.key === 'ArrowDown' || event.key === 'ArrowUp') {
       if (hits.length === 0) return;
       event.preventDefault();

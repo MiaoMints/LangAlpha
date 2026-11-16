@@ -63,6 +63,7 @@ import {
   summarizeOhlcv,
   wrapWidgetContext,
 } from '../framework/snapshotSerializers';
+import { isImeComposing } from '@/lib/ime';
 
 // Compact volumes ("1.23B", "1.23M", "1.2K"). Intl.NumberFormat with
 // notation: 'compact' produces locale-appropriate scale suffixes — `1.23亿`
@@ -1160,6 +1161,7 @@ function ChartWidget({ instance, updateConfig }: WidgetRenderProps<ChartConfig>)
               value={symbolDraft}
               onChange={(e) => setSymbolDraft(e.target.value.toUpperCase())}
               onKeyDown={(e) => {
+                if (isImeComposing(e)) return;
                 if (e.key === 'Enter') {
                   // Prefer the top search hit so users can type "nvid" and
                   // land on NVDA. Neither the hit nor the draft is taken while
@@ -1398,7 +1400,7 @@ export function ChartSettings({ config, onChange, onClose }: WidgetSettingsProps
           }}
           value={draft.symbol}
           onChange={(e) => setDraft((p) => ({ ...p, symbol: e.target.value.toUpperCase() }))}
-          onKeyDown={(e) => e.key === 'Enter' && save()}
+          onKeyDown={(e) => { if (isImeComposing(e)) return; if (e.key === 'Enter') save(); }}
         />
       </div>
       <div>

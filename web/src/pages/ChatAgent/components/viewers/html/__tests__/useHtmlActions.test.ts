@@ -182,6 +182,7 @@ describe('useHtmlActions — file mode', () => {
   let anchorClick: Mock<() => void>;
   let lastAnchor: HTMLAnchorElement | undefined;
   let createSpy: { mockRestore: () => void };
+  let savedTimeoutDesc: PropertyDescriptor | undefined;
 
   /** A Response stub whose .blob() resolves so the download path completes. */
   const pdfResponse = (ok: boolean, status = ok ? 200 : 501) => ({
@@ -215,6 +216,11 @@ describe('useHtmlActions — file mode', () => {
 
   afterEach(() => {
     createSpy.mockRestore();
+    if (savedTimeoutDesc) {
+      Object.defineProperty(AbortSignal, 'timeout', savedTimeoutDesc);
+      savedTimeoutDesc = undefined;
+    }
+    vi.restoreAllMocks();
     vi.unstubAllGlobals();
     vi.useRealTimers();
     toastDismiss.mockClear();
@@ -368,6 +374,13 @@ describe('useHtmlActions — file mode', () => {
 
   it('aborts a hung fetch after the timeout and falls back to print', async () => {
     vi.useFakeTimers();
+    // The cap is applied with AbortSignal.timeout in production; that runs on
+    // wall-clock timers, so stub it to drive the abort from the fake clock.
+    vi.spyOn(AbortSignal, 'timeout').mockImplementation(((ms: number) => {
+      const controller = new AbortController();
+      setTimeout(() => controller.abort(new DOMException('Timeout', 'TimeoutError')), ms);
+      return controller.signal;
+    }) as typeof AbortSignal.timeout);
     open.mockReturnValue({ print: vi.fn() });
     // Never resolves on its own; rejects only when its signal aborts (mirrors
     // the browser's AbortError) so the timeout is what drives the fallback.
@@ -440,6 +453,36 @@ describe('useHtmlActions — file mode', () => {
     });
     expect(open).toHaveBeenCalledWith('http://localhost:3000/s/tok-1', '_blank');
     expect(print).toHaveBeenCalled();
+  });
+
+  it('falls back to AbortController + setTimeout when AbortSignal.timeout is missing', async () => {
+    vi.useFakeTimers();
+    savedTimeoutDesc = Object.getOwnPropertyDescriptor(AbortSignal, 'timeout');
+    Object.defineProperty(AbortSignal, 'timeout', { value: undefined, configurable: true, writable: true });
+    const print = vi.fn();
+    open.mockReturnValue({ print });
+    let sawSignal: AbortSignal | undefined;
+    fetchMock.mockImplementation((_url: string, init: { signal: AbortSignal }) => {
+      sawSignal = init.signal;
+      return new Promise((_resolve, reject) => {
+        init.signal.addEventListener('abort', () =>
+          reject(new DOMException('Aborted', 'AbortError')),
+        );
+      });
+    });
+    const { result } = renderHook(() =>
+      useHtmlActions({ mode: 'file', filePath: 'results/report.html', servedUrl: SERVED, openUrl: OPEN }),
+    );
+    const pending = result.current.exportPdf();
+    // With no AbortSignal.timeout the abort must come from the setTimeout fallback.
+    await vi.advanceTimersByTimeAsync(120_000);
+    await pending;
+    expect(sawSignal).toBeInstanceOf(AbortSignal);
+    expect(open).toHaveBeenCalledWith(OPEN, '_blank');
+    // Abort rejects the fetch -> catch -> print fallback fires.
+    expect(print).toHaveBeenCalled();
+    // The in-flight "generating" toast is dismissed in `finally`.
+    expect(toastDismiss).toHaveBeenCalled();
   });
 });
 

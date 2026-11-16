@@ -110,6 +110,12 @@ function DescriptionField({
   useLayoutEffect(() => {
     const el = ref.current;
     if (!el) return;
+    // Native field-sizing replaces the manual measure where the engine has it.
+    if (typeof CSS !== 'undefined' && typeof CSS.supports === 'function' && CSS.supports('field-sizing', 'content')) {
+      el.style.setProperty('field-sizing', 'content');
+      el.style.maxHeight = `${DESCRIPTION_MAX_PX}px`;
+      return;
+    }
     el.style.height = 'auto';
     // scrollHeight leaves out the border, which a border-box height includes.
     const border = el.offsetHeight - el.clientHeight;

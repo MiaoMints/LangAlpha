@@ -226,7 +226,7 @@ export default function ExportPreviewModal({
       container.style.visibility = 'hidden';
 
       // Clean up previous Paged.js artifacts
-      container.innerHTML = '';
+      container.replaceChildren();
       document.querySelectorAll('style[data-pagedjs-inserted-styles]').forEach((el) => el.remove());
 
       // Clone source content into a wrapper with our typography classes
