@@ -220,3 +220,43 @@ def test_a_deployment_key_connects_no_gateway_and_lists_it_once_not_each_api(mon
     # Nor does a key go under one of its APIs, where no row would show it.
     assert GATEWAY in api_keys._get_allowed_providers([])
     assert not set(ROUTES) & api_keys._get_allowed_providers([])
+
+
+import asyncio
+
+from src.llms.llm import create_llm_from_custom
+from src.server.services.llm.provider_models.catalog import fetch_section
+
+
+class TestOpenDesignManifest:
+    """OpenDesign resolves its models from a local manifest catalog file."""
+
+    def test_fetch_section_reads_local_manifest_and_routes(self):
+        mc = ModelConfig()
+        info = mc.get_provider_info("opendesign")
+        section = asyncio.run(fetch_section(info["model_catalog"]))
+        assert isinstance(section, dict) and isinstance(section.get("models"), dict)
+        assert len(section["models"]) == 27
+        catalog = GatewayCatalog(info["model_catalog"], section)
+        listed = [{"id": x} for x in
+                  ["claude-sonnet-5-5", "gpt-6.1-sol", "deepseek-v4.1-flash", "unknown-new-model"]]
+        out = {m["id"]: m for m in catalog.describe(listed, mc)}
+        assert out["claude-sonnet-5-5"]["route"] == "opendesign"
+        assert out["gpt-6.1-sol"]["route"] == "opendesign-responses"
+        assert out["deepseek-v4.1-flash"]["route"] == "opendesign-chat"
+        assert out["unknown-new-model"]["route"] == "opendesign-chat"
+        from src.llms.vendor.langchain_zai import ChatZai
+        llm = create_llm_from_custom(
+            {"name": "x", "model_id": "deepseek-v4.1-flash", "provider": "opendesign-chat"}, api_key="k")
+        assert isinstance(llm, ChatZai) and llm.preserve_reasoning
+
+    @pytest.mark.parametrize("config", [
+        {"url": None, "provider": "opendesign"},
+        {"url": 123, "provider": "opendesign"},
+        {"url": "manifest://../../etc/passwd", "provider": "opendesign"},
+        {"url": "manifest:///etc/passwd", "provider": "opendesign"},
+        {"url": "opendesign_catalog.json", "provider": "opendesign"},
+        {"url": "manifest://missing.json", "provider": "opendesign"},
+    ])
+    def test_fetch_section_rejects_bad_inputs_without_raising(self, config):
+        assert asyncio.run(fetch_section(config)) is None

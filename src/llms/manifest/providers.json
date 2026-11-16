@@ -1240,6 +1240,40 @@
         }
       }
     },
+    "opendesign": {
+      "sdk": "anthropic",
+      "base_url": "https://amr-link.open-design.ai",
+      "models_url": "https://amr-link.open-design.ai/v1/models",
+      "env_key": "OPENDESIGN_API_KEY",
+      "access_type": "coding_plan",
+      "display_name": "OpenDesign",
+      "category": "inference",
+      "operator_channel": null,
+      "default_headers": {
+        "User-Agent": "LangAlpha/1.0"
+      },
+      "model_catalog": {
+        "url": "manifest://opendesign_catalog.json",
+        "provider": "opendesign",
+        "routes": {
+          "@ai-sdk/anthropic": "opendesign",
+          "@ai-sdk/openai": "opendesign-responses",
+          "@ai-sdk/openai-compatible": "opendesign-chat"
+        },
+        "fallback_route": "opendesign-chat"
+      },
+      "variants": {
+        "opendesign-chat": {
+          "sdk": "glm",
+          "base_url": "https://amr-link.open-design.ai/v1"
+        },
+        "opendesign-responses": {
+          "sdk": "openai",
+          "base_url": "https://amr-link.open-design.ai/v1",
+          "use_response_api": true
+        }
+      }
+    },
     "openrouter": {
       "sdk": "openrouter",
       "base_url": "https://openrouter.ai/api/v1",

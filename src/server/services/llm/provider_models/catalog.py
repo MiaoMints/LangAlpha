@@ -17,8 +17,10 @@ Reading and describing only; the service caches the section.
 
 from __future__ import annotations
 
+import json
 import logging
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 from src.llms.gateway_names import gateway_slug, manifest_slug_index
@@ -74,20 +76,59 @@ _API_SHAPES: dict[str, dict[str, Any]] = {
 
 async def fetch_section(config: dict) -> dict | None:
     """The gateway's section of its catalog, or None when it cannot be read,
-    which lists the gateway's models untuned."""
-    url = config["url"]
-    try:
-        payload = await fetch_list(
-            ListRequest(shape=OPENAI, url=url, headers={}),
-            timeout=FETCH_TIMEOUT_S * 2,
-            max_bytes=MAX_CATALOG_BYTES,
-        )
-    except ListFetchError as e:
-        logger.warning("[model_catalog] could not read %s: %s", url, e)
-        return None
-    section = payload.get(config["provider"]) if isinstance(payload, dict) else None
-    return section if isinstance(section, dict) and isinstance(section.get("models"), dict) else None
+    which lists the gateway's models untuned.
 
+    A ``manifest://<name>.json`` url names a file served from
+    ``src/llms/manifest`` (for a gateway models.dev does not cover yet); it is
+    read from disk under the same section contract as the HTTP branch, with the
+    resolved path confined to that directory. Any other scheme, a non-string or
+    empty url, or a path that escapes the manifest directory is refused with a
+    warning instead of raising.
+    """
+    url = config.get("url") if isinstance(config, dict) else None
+    if not isinstance(url, str) or not url:
+        logger.warning("[model_catalog] invalid catalog url: %r", url)
+        return None
+
+    if url.startswith("manifest://"):
+        rel = url[len("manifest://"):]
+        if not rel or Path(rel).is_absolute():
+            logger.warning("[model_catalog] refused manifest url (no relative name): %r", url)
+            return None
+        manifest_dir = (Path(__file__).resolve().parents[4] / "llms" / "manifest").resolve()
+        try:
+            path = (manifest_dir / rel).resolve()
+            if (
+                not path.is_relative_to(manifest_dir)
+                or path.suffix != ".json"
+                or not path.is_file()
+                or path.stat().st_size > MAX_CATALOG_BYTES
+            ):
+                logger.warning("[model_catalog] refused manifest path outside %s: %s", manifest_dir, path)
+                return None
+            with path.open("r", encoding="utf-8") as fh:
+                payload = json.load(fh)
+        except (OSError, ValueError) as e:
+            logger.warning("[model_catalog] could not read %s: %s", url, e)
+            return None
+        section = payload.get(config.get("provider")) if isinstance(payload, dict) else None
+        return section if isinstance(section, dict) and isinstance(section.get("models"), dict) else None
+
+    if url.startswith(("http://", "https://")):
+        try:
+            payload = await fetch_list(
+                ListRequest(shape=OPENAI, url=url, headers={}),
+                timeout=FETCH_TIMEOUT_S * 2,
+                max_bytes=MAX_CATALOG_BYTES,
+            )
+        except ListFetchError as e:
+            logger.warning("[model_catalog] could not read %s: %s", url, e)
+            return None
+        section = payload.get(config.get("provider")) if isinstance(payload, dict) else None
+        return section if isinstance(section, dict) and isinstance(section.get("models"), dict) else None
+
+    logger.warning("[model_catalog] unsupported catalog url scheme: %r", url)
+    return None
 
 def _dict(value: Any) -> dict:
     """``value`` where it is an object, else an empty one: the catalog is

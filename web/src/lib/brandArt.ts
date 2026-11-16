@@ -32,6 +32,7 @@ import iconVllm from '@/assets/providers/vllm.svg';
 import iconXai from '@/assets/providers/xai.svg';
 import iconOpencode from '@/assets/providers/opencode.svg';
 import iconCommandcode from '@/assets/providers/commandcode.svg';
+import iconOpendesign from '@/assets/providers/opendesign.svg';
 
 export type BrandArt = {
   src: string;
@@ -69,6 +70,7 @@ const KIMI = mark(iconKimi, true, 'Kimi');
 const XAI = mark(iconXai, true, 'Grok');
 const OPENCODE = mark(iconOpencode, true);
 const COMMANDCODE = mark(iconCommandcode, true);
+const OPENDESIGN = mark(iconOpendesign, true);
 
 /** Every manifest provider and its variants, which wear their parent's mark. */
 const LLM_PROVIDER_ART: Record<string, BrandArt> = {
@@ -98,6 +100,9 @@ const LLM_PROVIDER_ART: Record<string, BrandArt> = {
   'opencode-go-google': OPENCODE,
   commandcode: COMMANDCODE,
   'commandcode-chat': COMMANDCODE,
+  opendesign: OPENDESIGN,
+  'opendesign-chat': OPENDESIGN,
+  'opendesign-responses': OPENDESIGN,
   deepseek: mark(iconDeepseek, false, 'DeepSeek'),
   groq: mark(iconGroq),
   cerebras: mark(iconCerebras, true),
