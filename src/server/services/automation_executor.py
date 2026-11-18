@@ -14,7 +14,7 @@ import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Dict, Optional
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 from fastapi import HTTPException
 
@@ -52,6 +52,45 @@ ABANDONED_AFTER_SECONDS = 5 * 60
 
 # 429s that are our capacity rather than the user's usage limit.
 _OUR_429_TYPES = frozenset({"burst_limit", "service_unavailable"})
+
+# A thread an automation no longer continues is pruned only once it has
+# reached a terminal status; a live one is refused by the guarded delete and
+# simply left for a later run.
+_FINISHED_THREAD_STATUSES = frozenset({"completed", "error", "cancelled"})
+
+# A "new" automation that opted in replaces its own old threads. Candidates
+# are the user's threads tied to this automation either by ``metadata.origin``
+# (written by _precreate_titled_thread) or by a past execution's
+# ``conversation_thread_id``, oldest first, excluding the one about to be
+# created and any thread that still has a live run or a pending/running
+# execution. Nothing here is cancelled — such a thread is only skipped.
+_PRUNE_THREADS_SQL = """
+    SELECT ct.conversation_thread_id, ct.workspace_id, ct.current_status
+    FROM conversation_threads ct
+    JOIN workspaces w ON w.workspace_id = ct.workspace_id
+    WHERE w.user_id = %s
+      AND ct.conversation_thread_id::text <> %s
+      AND (
+          (ct.metadata->'origin'->>'type' = 'automation'
+           AND ct.metadata->'origin'->>'id' = %s)
+          OR EXISTS (
+              SELECT 1 FROM automation_executions ae
+              WHERE ae.automation_id = %s::uuid
+                AND ae.conversation_thread_id = ct.conversation_thread_id
+          )
+      )
+      AND NOT EXISTS (
+          SELECT 1 FROM conversation_responses cr
+          WHERE cr.conversation_thread_id = ct.conversation_thread_id
+            AND cr.status = 'in_progress'
+      )
+      AND NOT EXISTS (
+          SELECT 1 FROM automation_executions ae2
+          WHERE ae2.conversation_thread_id = ct.conversation_thread_id
+            AND ae2.status IN ('pending', 'waiting', 'running')
+      )
+    ORDER BY ct.created_at ASC, ct.conversation_thread_id ASC
+"""
 
 # Automations a firing may still run under after a wait. Any other status,
 # unless the firing started under it (a manual run of a paused automation),
@@ -321,6 +360,87 @@ async def _stored_workspace(automation: Dict[str, Any]) -> Dict[str, Any]:
     return workspace
 
 
+def _should_prune_previous_threads(automation: Dict[str, Any]) -> bool:
+    """Only a 'new' automation that opted in replaces its old threads.
+
+    Guards every other automation, and 'continue' (which reuses one thread),
+    against having its history swept merely because a run started.
+    """
+    if automation.get("thread_strategy") != "new":
+        return False
+    metadata = automation.get("metadata") or {}
+    return bool(metadata.get("prune_previous_threads"))
+
+
+async def _fetch_prune_rows(
+    automation_uuid: str, user_id: str, keep_thread_id: str
+):
+    """The automation's own finished-looking threads, oldest first.
+
+    Read on a short pool checkout; the rows are returned and the connection
+    released before any delete opens its own transaction, so the delete loop
+    never holds a pool slot. Excludes the thread about to be created, other
+    users' threads and any thread with a live run or pending execution.
+    """
+    from psycopg.rows import dict_row
+
+    from src.server.database.pool import get_db_connection
+
+    async with get_db_connection() as conn:
+        async with conn.cursor(row_factory=dict_row) as cur:
+            await cur.execute(
+                _PRUNE_THREADS_SQL,
+                (str(user_id), str(keep_thread_id), str(automation_uuid), str(automation_uuid)),
+            )
+            return await cur.fetchall()
+
+
+async def _delete_pruned_thread(
+    thread_id: str, user_id: Any, workspace_id: Any
+) -> None:
+    """Retire one finished thread with the endpoint's own guarded chain.
+
+    Same steps as ``delete_thread_endpoint``: the delete runs
+    ``refuse_attempts_on_thread_delete`` on its own session before removing
+    anything (so a live fenced run, or an order still waiting in the thread,
+    fails closed and raises), then its existence and market-watch caches are
+    invalidated, its sandbox dirs pruned and the deletion published. No
+    cancellation is ever sent: an overlapping live run is the delete's job to
+    refuse, not ours to stop. Raises whatever a step raises; the caller logs
+    it as a warning and moves on.
+    """
+    from src.server.database.conversation import thread_exists_key
+    from src.server.database.order_attempts import refuse_attempts_on_thread_delete
+    from src.server.services.commands.control import delete_thread_ending_commands
+    from src.server.services.thread_lifecycle_feed import publish_thread_deleted
+    from src.server.services.workspace_manager import prune_thread_dirs_soon
+    from src.utils.cache.redis_cache import get_cache_client
+    from src.utils.market_watch import watch_key
+
+    await delete_thread_ending_commands(
+        thread_id,
+        before_delete=lambda conn: refuse_attempts_on_thread_delete(
+            thread_id, conn=conn
+        ),
+    )
+
+    try:
+        cache = get_cache_client()
+        if cache.enabled and cache.client:
+            await cache.client.delete(thread_exists_key(thread_id), watch_key(thread_id))
+    except Exception:
+        pass
+
+    if workspace_id:
+        prune_thread_dirs_soon(str(workspace_id))
+
+    await publish_thread_deleted(
+        user_id=str(user_id) if user_id else None,
+        thread_id=thread_id,
+        workspace_id=str(workspace_id) if workspace_id else None,
+    )
+
+
 class AutomationExecutor:
     """Singleton that executes automation runs."""
 
@@ -348,17 +468,20 @@ class AutomationExecutor:
         automation: Dict[str, Any],
         thread_id: str,
         workspace_id: str,
-    ) -> None:
+    ) -> bool:
         """Pre-create the run's thread titled "<automation name> — <date>".
 
         Automation runs bypass POST /threads, so without this the thread would be
         born inside ensure_thread_exists with the raw instruction as title (then
         LLM-retitled). A stable name+date reads better for recurring runs. Never
         raises — on failure the run proceeds and the ensure path creates the row.
+        Returns True only when this thread really was written now, so the caller
+        knows an old-thread cleanup would be safe; False (no name, or a failed
+        write) means no thread exists yet and nothing may be pruned.
         """
         name = (automation.get("name") or "").strip()
         if not name:
-            return  # no name to stamp — let the ensure path LLM-title it
+            return False  # no name to stamp — let the ensure path LLM-title it
         try:
             from src.server.database.conversation import create_thread
             from src.utils.timezone_utils import zone_or_none
@@ -379,8 +502,62 @@ class AutomationExecutor:
                     }
                 },
             )
+            return True
         except Exception as e:
             logger.warning(f"[AUTOMATION_EXEC] Thread pre-create failed: {e}")
+            return False
+
+    async def _prune_finished_threads(
+        self, automation: Dict[str, Any], keep_thread_id: str
+    ) -> int:
+        """Delete this automation's finished threads after a new one lands.
+
+        Runs only for a 'new' automation that opted in (see
+        ``_should_prune_previous_threads``), so the sidebar ends up with just
+        the one thread this run created. Every candidate that is already
+        terminal is deleted through ``_delete_pruned_thread``; a thread that
+        is still live is skipped by the guarded delete and never cancelled.
+        Best-effort throughout: each delete's failure is logged and skipped,
+        the caller's run is never blocked. Returns how many were deleted.
+        """
+        if not _should_prune_previous_threads(automation):
+            return 0
+        try:
+            automation_uuid = str(UUID(str(automation["automation_id"])))
+        except (KeyError, ValueError, TypeError, AttributeError):
+            return 0
+        user_id = automation.get("user_id")
+        if not user_id:
+            return 0
+
+        try:
+            rows = await _fetch_prune_rows(
+                automation_uuid, str(user_id), str(keep_thread_id)
+            )
+        except Exception as error:
+            logger.warning(f"[AUTOMATION_EXEC] Thread prune query failed: {error}")
+            return 0
+
+        deleted = 0
+        for row in rows:
+            thread_id = str(row["conversation_thread_id"])
+            workspace_id = row.get("workspace_id")
+            if str(row.get("current_status") or "") not in _FINISHED_THREAD_STATUSES:
+                continue
+            try:
+                await _delete_pruned_thread(thread_id, user_id, workspace_id)
+                deleted += 1
+            except Exception as error:
+                logger.warning(
+                    f"[AUTOMATION_EXEC] Thread prune skipped thread_id={thread_id}: {error}"
+                )
+
+        if deleted:
+            logger.debug(
+                f"[AUTOMATION_EXEC] Pruned {deleted} finished thread(s) for automation "
+                f"{_obs_hash_id(automation_uuid)}"
+            )
+        return deleted
 
     async def _resolve_thread(
         self, automation: Dict[str, Any], place: _Place, workspace_id: str
@@ -395,7 +572,11 @@ class AutomationExecutor:
                 str(automation["automation_id"]), automation["user_id"],
                 conversation_thread_id=thread_id,
             )
-        await self._precreate_titled_thread(automation, thread_id, workspace_id)
+        created = await self._precreate_titled_thread(
+            automation, thread_id, workspace_id
+        )
+        if created:
+            await self._prune_finished_threads(automation, thread_id)
         return thread_id
 
     async def _wait_for_thread(

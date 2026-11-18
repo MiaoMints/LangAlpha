@@ -177,7 +177,9 @@ async def test_a_run_that_leaves_its_pin_behind_pins_the_thread_it_starts():
     automation = _automation(workspace_id=_WS, automation_id="auto-1")
     with (
         patch("src.server.services.automation_executor.auto_db") as auto_db,
-        patch.object(executor, "_precreate_titled_thread", new=AsyncMock()),
+        patch.object(
+            executor, "_precreate_titled_thread", new=AsyncMock(return_value=True)
+        ),
     ):
         auto_db.update_automation = AsyncMock()
         thread_id = await executor._resolve_thread(automation, _Place(_PROJECT, None), _WS)
@@ -186,3 +188,221 @@ async def test_a_run_that_leaves_its_pin_behind_pins_the_thread_it_starts():
     auto_db.update_automation.assert_awaited_once_with(
         "auto-1", _USER, conversation_thread_id=thread_id
     )
+
+
+# ---------------------------------------------------------------------------
+# Pruning an automation's own finished threads before it starts a new one.
+# ---------------------------------------------------------------------------
+
+from src.server.services import automation_executor as _ae  # noqa: E402
+from unittest.mock import Mock  # noqa: E402
+
+
+def _row(thread_id, status="completed", workspace_id=_WS):
+    return {
+        "conversation_thread_id": thread_id,
+        "workspace_id": workspace_id,
+        "current_status": status,
+    }
+
+
+def _new_automation(**overrides):
+    automation = _automation(
+        automation_id="33333333-3333-3333-3333-333333333333",
+        thread_strategy="new",
+        conversation_thread_id=None,
+        metadata={"prune_previous_threads": True},
+    )
+    automation.update(overrides)
+    return automation
+
+
+def test_should_prune_only_for_a_new_automation_that_opted_in():
+    assert _ae._should_prune_previous_threads(_new_automation()) is True
+    assert _ae._should_prune_previous_threads(_automation(thread_strategy="new")) is False
+    assert (
+        _ae._should_prune_previous_threads(
+            _new_automation(metadata={"prune_previous_threads": False})
+        )
+        is False
+    )
+    assert (
+        _ae._should_prune_previous_threads(
+            _new_automation(metadata=None)
+        )
+        is False
+    )
+    assert _ae._should_prune_previous_threads(_automation()) is False
+
+
+@pytest.mark.asyncio
+async def test_resolve_thread_prunes_only_when_new_and_opted_in():
+    executor = AutomationExecutor()
+    with (
+        patch.object(
+            executor, "_precreate_titled_thread", new=AsyncMock(return_value=True)
+        ),
+        patch.object(
+            executor, "_prune_finished_threads", new=AsyncMock(return_value=0)
+        ) as prune,
+    ):
+        await executor._resolve_thread(_new_automation(), _Place(_PROJECT, None), _WS)
+        prune.assert_awaited_once()
+
+    executor = AutomationExecutor()
+    with (
+        patch("src.server.services.automation_executor.auto_db") as auto_db,
+        patch.object(
+            executor, "_precreate_titled_thread", new=AsyncMock(return_value=True)
+        ),
+        patch.object(_ae, "_fetch_prune_rows", new=AsyncMock()) as fetch,
+    ):
+        auto_db.update_automation = AsyncMock()
+        await executor._resolve_thread(
+            _automation(workspace_id=_WS, automation_id="auto-1"),
+            _Place(_PROJECT, None),
+            _WS,
+        )
+        fetch.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_prune_deletes_every_finished_thread_including_a_single_one():
+    executor = AutomationExecutor()
+    rows = [_row("aaaaaaaa-0000-0000-0000-000000000001", "completed")]
+    with (
+        patch.object(_ae, "_fetch_prune_rows", new=AsyncMock(return_value=rows)),
+        patch.object(_ae, "_delete_pruned_thread", new=AsyncMock()) as delete,
+    ):
+        count = await executor._prune_finished_threads(_new_automation(), "keep")
+
+    assert count == 1
+    delete.assert_awaited_once()
+    assert delete.await_args.args[0] == "aaaaaaaa-0000-0000-0000-000000000001"
+
+
+@pytest.mark.asyncio
+async def test_prune_skips_a_thread_that_is_not_finished_and_keeps_going():
+    executor = AutomationExecutor()
+    rows = [
+        _row("aaaaaaaa-0000-0000-0000-000000000001", "in_progress"),
+        _row("aaaaaaaa-0000-0000-0000-000000000002", "completed"),
+    ]
+    with (
+        patch.object(_ae, "_fetch_prune_rows", new=AsyncMock(return_value=rows)),
+        patch.object(_ae, "_delete_pruned_thread", new=AsyncMock()) as delete,
+    ):
+        count = await executor._prune_finished_threads(_new_automation(), "keep")
+
+    assert count == 1
+    delete.assert_awaited_once()
+    assert delete.await_args.args[0] == "aaaaaaaa-0000-0000-0000-000000000002"
+
+
+@pytest.mark.asyncio
+async def test_prune_returns_zero_without_a_user_or_a_real_automation_id():
+    executor = AutomationExecutor()
+    with patch.object(_ae, "_fetch_prune_rows", new=AsyncMock()) as fetch:
+        assert await executor._prune_finished_threads(
+            _new_automation(user_id=None), "keep"
+        ) == 0
+        assert await executor._prune_finished_threads(
+            _new_automation(automation_id="auto-1"), "keep"
+        ) == 0
+        fetch.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_prune_skips_a_thread_the_delete_refuses_and_still_deletes_the_next():
+    from src.server.services.thread_mutation import MutationConflict
+
+    executor = AutomationExecutor()
+    rows = [
+        _row("aaaaaaaa-0000-0000-0000-000000000001", "completed"),
+        _row("aaaaaaaa-0000-0000-0000-000000000002", "completed"),
+    ]
+    delete = AsyncMock(
+        side_effect=[MutationConflict("thread_busy", "delete", "busy"), None]
+    )
+    with (
+        patch.object(_ae, "_fetch_prune_rows", new=AsyncMock(return_value=rows)),
+        patch.object(_ae, "_delete_pruned_thread", new=delete),
+    ):
+        count = await executor._prune_finished_threads(_new_automation(), "keep")
+
+    assert count == 1
+    assert delete.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_delete_pruned_thread_guards_with_the_refusal_and_never_cancels():
+    from src.server.services import automation_executor as _ae_local
+
+    delete_mock = AsyncMock()
+    refuse = Mock(return_value=None)
+    cancel = AsyncMock()
+    with (
+        patch(
+            "src.server.services.commands.control.delete_thread_ending_commands",
+            new=delete_mock,
+        ),
+        patch(
+            "src.server.database.order_attempts.refuse_attempts_on_thread_delete",
+            new=refuse,
+        ),
+        patch(
+            "src.server.services.thread_lifecycle_feed.publish_thread_deleted",
+            new=AsyncMock(),
+        ),
+        patch(
+            "src.server.services.workspace_manager.prune_thread_dirs_soon",
+            new=Mock(),
+        ),
+        patch.object(_ae_local.tl_db, "request_run_cancel", new=cancel),
+    ):
+        await _ae_local._delete_pruned_thread("thread-9", _USER, _WS)
+
+    assert delete_mock.await_args.args[0] == "thread-9"
+    before_delete = delete_mock.await_args.kwargs["before_delete"]
+    before_delete("CONN")
+    refuse.assert_called_once_with("thread-9", conn="CONN")
+    cancel.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_resolve_thread_skips_prune_when_precreate_reports_failure():
+    executor = AutomationExecutor()
+    with (
+        patch.object(
+            executor, "_precreate_titled_thread", new=AsyncMock(return_value=False)
+        ),
+        patch.object(
+            executor, "_prune_finished_threads", new=AsyncMock(return_value=0)
+        ) as prune,
+    ):
+        thread_id = await executor._resolve_thread(
+            _new_automation(), _Place(_PROJECT, None), _WS
+        )
+
+    assert thread_id
+    prune.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_a_precreate_that_throws_is_reported_as_failure_and_never_prunes():
+    executor = AutomationExecutor()
+    with (
+        patch(
+            "src.server.database.conversation.create_thread",
+            new=AsyncMock(side_effect=RuntimeError("boom")),
+        ),
+        patch.object(
+            executor, "_prune_finished_threads", new=AsyncMock(return_value=0)
+        ) as prune,
+    ):
+        thread_id = await executor._resolve_thread(
+            _new_automation(name="Nightly"), _Place(_PROJECT, None), _WS
+        )
+
+    assert thread_id
+    prune.assert_not_awaited()
