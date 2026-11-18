@@ -479,6 +479,17 @@ async def _after_settling(
         1,
         {"status": policy.metric, "trigger": automation.get("trigger_type") or "unknown"},
     )
+    # A settled firing may leave an older thread of the same automation
+    # behind; keep only the newest. Best-effort, after every delivery.
+    try:
+        from src.server.services.automation_executor import prune_superseded_threads
+
+        await prune_superseded_threads(automation)
+    except Exception as e:
+        logger.warning(
+            f"[AUTOMATION_SETTLE] Superseded-thread prune failed: "
+            f"execution_id={execution_id} error={e}"
+        )
 
 
 async def _record_delivery(execution_id: str, delivery_result: list) -> None:

@@ -68,8 +68,11 @@ _PRUNE_THREADS_SQL = """
     SELECT ct.conversation_thread_id, ct.workspace_id, ct.current_status
     FROM conversation_threads ct
     JOIN workspaces w ON w.workspace_id = ct.workspace_id
+    JOIN conversation_threads keep_ct
+      ON keep_ct.conversation_thread_id = %s::uuid
     WHERE w.user_id = %s
-      AND ct.conversation_thread_id::text <> %s
+      AND (ct.created_at, ct.conversation_thread_id)
+          < (keep_ct.created_at, keep_ct.conversation_thread_id)
       AND (
           (ct.metadata->'origin'->>'type' = 'automation'
            AND ct.metadata->'origin'->>'id' = %s)
@@ -372,6 +375,89 @@ def _should_prune_previous_threads(automation: Dict[str, Any]) -> bool:
     return bool(metadata.get("prune_previous_threads"))
 
 
+async def _active_prune_busy(
+    automation_id: str, execution_id: str
+) -> Optional[Dict[str, Any]]:
+    """The earlier firing a 'new' prune run must wait out, else None.
+
+    A firing whose row is still ``running`` counts as busy even before its
+    thread is recorded — its turn is live somewhere. One whose row left
+    ``running`` is busy only while a run on its thread is still live.
+    """
+    row = await exec_db.get_active_execution(automation_id, execution_id)
+    if row is None:
+        return None
+    if row.get("status") == "running":
+        return row
+    thread_id = row.get("conversation_thread_id")
+    if thread_id and await _thread_busy(str(thread_id)):
+        return row
+    return None
+
+
+async def _latest_automation_thread_id(automation: Dict[str, Any]) -> Optional[str]:
+    """The newest thread this automation owns, or None.
+
+    Owned means stamped with the automation's id in its origin, or recorded
+    on one of the automation's executions — within the owner's workspaces.
+    """
+    automation_uuid = str(UUID(str(automation["automation_id"])))
+    user_id = automation.get("user_id")
+    if not user_id:
+        return None
+    from psycopg.rows import dict_row
+    from src.server.database.pool import get_db_connection
+
+    async with get_db_connection() as conn:
+        async with conn.cursor(row_factory=dict_row) as cur:
+            await cur.execute("""
+                SELECT ct.conversation_thread_id
+                FROM conversation_threads ct
+                JOIN workspaces w ON w.workspace_id = ct.workspace_id
+                WHERE w.user_id = %s
+                  AND (
+                        ct.metadata->'origin'->>'id' = %s
+                        OR EXISTS (
+                            SELECT 1 FROM automation_executions ae
+                            WHERE ae.automation_id = %s::uuid
+                              AND ae.conversation_thread_id = ct.conversation_thread_id
+                        )
+                  )
+                ORDER BY ct.created_at DESC, ct.conversation_thread_id DESC
+                LIMIT 1
+            """, (str(user_id), str(automation["automation_id"]), automation_uuid))
+            row = await cur.fetchone()
+            return str(row["conversation_thread_id"]) if row else None
+
+
+async def prune_superseded_threads(automation: Dict[str, Any]) -> list[str]:
+    """After a firing settles, delete its automation's older finished threads.
+
+    Keeps the newest thread: a settle of an older thread removes it, while a
+    settle of the newest keeps it and clears anything older. Best-effort —
+    never raises into the settlement.
+    """
+    if not _should_prune_previous_threads(automation):
+        return []
+    try:
+        str(UUID(str(automation["automation_id"])))
+    except (KeyError, ValueError, TypeError, AttributeError):
+        return []
+    latest = await _latest_automation_thread_id(automation)
+    if not latest:
+        return []
+    try:
+        deleted = await AutomationExecutor.get_instance()._prune_finished_threads(
+            automation, latest
+        )
+    except Exception as error:
+        logger.warning(
+            f"[AUTOMATION_EXEC] Superseded-thread prune failed: {error}"
+        )
+        return []
+    return [latest] if deleted else []
+
+
 async def _fetch_prune_rows(
     automation_uuid: str, user_id: str, keep_thread_id: str
 ):
@@ -390,7 +476,7 @@ async def _fetch_prune_rows(
         async with conn.cursor(row_factory=dict_row) as cur:
             await cur.execute(
                 _PRUNE_THREADS_SQL,
-                (str(user_id), str(keep_thread_id), str(automation_uuid), str(automation_uuid)),
+                (str(keep_thread_id), str(user_id), str(automation_uuid), str(automation_uuid)),
             )
             return await cur.fetchall()
 
@@ -639,6 +725,165 @@ class AutomationExecutor:
                 await self._skip_interrupted(automation, execution_id)
                 return None
         except asyncio.CancelledError:
+            await self._skip_interrupted(automation, execution_id)
+            raise
+
+    async def _wait_for_previous_execution(
+        self,
+        automation: Dict[str, Any],
+        execution_id: str,
+        deadline: float,
+        *,
+        already_claimed: bool = False,
+    ) -> Optional[Dict[str, Any]]:
+        """Hold a 'new' prune firing as ``waiting`` until the atomic admission
+        lets it run, then run it on the automation as it stands.
+
+        Every look takes the same automation-row lock the fast path uses, so
+        an earlier waiting firing and a newly started one can never be let
+        through at once: the lock decides one winner per automation. The wait
+        is not pinned to one thread, so two runs that start with no thread yet
+        still line up one behind the other rather than both creating one.
+        Returns None once this firing ended skipped instead.
+        """
+        automation_id = str(automation["automation_id"])
+        logger.info(
+            f"[AUTOMATION_EXEC] Waiting for previous execution: "
+            f"execution_id={execution_id} automation_id={automation_id}"
+        )
+
+        claimed_by_self = already_claimed
+        initialized = already_claimed
+        hand_back_initial_claim = already_claimed
+
+        async def _release_claim() -> None:
+            nonlocal claimed_by_self
+            if not claimed_by_self:
+                return
+            try:
+                if await exec_db.transition_execution(
+                    execution_id,
+                    from_statuses=("running",),
+                    to="waiting",
+                    started_at=datetime.now(timezone.utc),
+                ):
+                    claimed_by_self = False
+                elif await exec_db.get_execution_status(execution_id) != "running":
+                    claimed_by_self = False
+            except Exception as rollback_err:
+                logger.warning(
+                    f"[AUTOMATION_EXEC] Rolling back claimed execution to waiting "
+                    f"failed: execution_id={execution_id} error={rollback_err}"
+                )
+
+        try:
+            while True:
+                try:
+                    if not initialized:
+                        initial_status = await exec_db.get_execution_status(
+                            execution_id
+                        )
+                        if initial_status is None:
+                            return None
+                        if initial_status != "waiting":
+                            # Only a running row handed in without the caller's
+                            # claim may be moved to waiting here; never steal a
+                            # pending row owned by another caller.
+                            if (
+                                initial_status != "running"
+                                or not await exec_db.transition_execution(
+                                    execution_id,
+                                    from_statuses=("running",),
+                                    to="waiting",
+                                    started_at=datetime.now(timezone.utc),
+                                )
+                            ):
+                                return None
+                        initialized = True
+                    if hand_back_initial_claim:
+                        # Hand back the claim execute() just won once before
+                        # polling; if that release hits a transient DB error,
+                        # claimed_by_self stays True and try_admit reconciles
+                        # ("waiting", "running") under the row lock.
+                        hand_back_initial_claim = False
+                        await _release_claim()
+                    from_st = (
+                        ("waiting", "running") if claimed_by_self else ("waiting",)
+                    )
+                    action = await exec_db.try_admit_prune_execution(
+                        automation_id, execution_id, from_statuses=from_st
+                    )
+                    if action == "gone":
+                        claimed_by_self = False
+                        return None
+                    if action == "already_claimed":
+                        # Another worker/caller already owns this running
+                        # execution; exit without settling someone else's run.
+                        return None
+                    if action == "skip_queued":
+                        # A waiting row is what settle(SKIPPED) accepts; if we
+                        # were still holding running, hand it back first.
+                        await _release_claim()
+                        await settle(
+                            automation, execution_id, Outcome.SKIPPED,
+                            skip_reason="thread_busy",
+                        )
+                        return None
+                    if action == "admitted":
+                        claimed_by_self = True
+                        # The row lock clears DB-side executions, but a thread
+                        # the process still marks busy (a follow-up run) keeps
+                        # us waiting: hand the admission back and poll again.
+                        if (
+                            await _active_prune_busy(automation_id, execution_id)
+                            is not None
+                        ):
+                            await _release_claim()
+                        else:
+                            fresh = await auto_db.get_automation(
+                                automation_id, automation["user_id"]
+                            )
+                            if fresh is None or (
+                                fresh["status"] not in _RUNNABLE
+                                and fresh["status"] != automation["status"]
+                            ):
+                                await _release_claim()
+                                await settle(
+                                    automation, execution_id, Outcome.SKIPPED,
+                                    skip_reason="user",
+                                )
+                                return None
+                            claimed_by_self = False
+                            return fresh
+                    else:
+                        # action == "wait": try_admit already moved this claim
+                        # (running -> waiting) back if we were holding it.
+                        claimed_by_self = False
+                except Exception as e:
+                    logger.warning(
+                        f"[AUTOMATION_EXEC] Waiting for previous execution failed, "
+                        f"still waiting: execution_id={execution_id} error={e}"
+                    )
+                    await _release_claim()
+                if time.monotonic() >= deadline:
+                    # settle(SKIPPED) only ends a waiting row.
+                    await _release_claim()
+                    await settle(
+                        automation, execution_id, Outcome.SKIPPED,
+                        skip_reason="thread_busy",
+                    )
+                    return None
+                try:
+                    await asyncio.wait_for(
+                        self._stopping.wait(), timeout=_WAIT_POLL_SECONDS
+                    )
+                except asyncio.TimeoutError:
+                    continue
+                await _release_claim()
+                await self._skip_interrupted(automation, execution_id)
+                return None
+        except asyncio.CancelledError:
+            await _release_claim()
             await self._skip_interrupted(automation, execution_id)
             raise
 
@@ -993,7 +1238,25 @@ class AutomationExecutor:
             f"[AUTOMATION_EXEC] Starting execution: "
             f"automation_id={automation_id} execution_id={execution_id}"
         )
-        if not await exec_db.transition_execution(
+        is_prune = _should_prune_previous_threads(automation)
+        admission_action = "admitted"
+        if is_prune:
+            admission_action = await exec_db.try_admit_prune_execution(
+                automation_id, execution_id, from_statuses=("pending",)
+            )
+            if admission_action in ("gone", "already_claimed"):
+                logger.warning(
+                    f"[AUTOMATION_EXEC] Not starting: execution_id={execution_id} "
+                    f"was settled before it began"
+                )
+                return
+            if admission_action == "skip_queued":
+                await settle(
+                    automation, execution_id, Outcome.SKIPPED,
+                    skip_reason="thread_busy",
+                )
+                return
+        elif not await exec_db.transition_execution(
             execution_id,
             from_statuses=("pending",),
             to="running",
@@ -1036,6 +1299,20 @@ class AutomationExecutor:
                 # Nothing is resolved yet, so the run takes the automation
                 # as it now stands, its workspace and thread included.
                 firing.automation = fresh
+            elif is_prune:
+                if admission_action == "wait" or (
+                    await _active_prune_busy(automation_id, execution_id) is not None
+                ):
+                    fresh = await self._wait_for_previous_execution(
+                        automation,
+                        execution_id,
+                        wait_deadline,
+                        already_claimed=(admission_action == "admitted"),
+                    )
+                    if fresh is None:
+                        _exec_span.set_attribute("status", "skipped")
+                        return
+                    firing.automation = fresh
 
             # ─── Credential check + credit gate ───────────────────
             has_byok, has_cred = await _credentials(user_id)

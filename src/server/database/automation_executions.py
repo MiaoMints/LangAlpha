@@ -400,6 +400,158 @@ async def has_earlier_waiting_execution(
             return await cur.fetchone() is not None
 
 
+async def get_active_execution(
+    automation_id: str, exclude_execution_id: str
+) -> Optional[Dict[str, Any]]:
+    """The newest still-live firing of this automation, other than this one.
+
+    A firing is live while its row is ``running`` — an earlier row (by
+    creation then id), so two runs that both start with no thread yet do not
+    deadlock, or any running row that already has a thread — or while a run
+    on its thread is still ``in_progress``. None when nothing is live.
+    """
+    async with get_db_connection() as conn:
+        async with conn.cursor(row_factory=dict_row) as cur:
+            await cur.execute("""
+                SELECT e.automation_execution_id, e.conversation_thread_id,
+                       e.conversation_response_id, e.status
+                FROM automation_executions e
+                JOIN automation_executions me
+                  ON me.automation_execution_id = %s
+                WHERE e.automation_id = %s
+                  AND e.automation_execution_id <> %s
+                  AND (
+                        (
+                            e.status = 'running'
+                            AND (
+                                (e.created_at, e.automation_execution_id)
+                                    < (me.created_at, me.automation_execution_id)
+                                OR e.conversation_thread_id IS NOT NULL
+                            )
+                        )
+                        OR EXISTS (
+                            SELECT 1 FROM conversation_responses cr
+                            WHERE cr.conversation_thread_id = e.conversation_thread_id
+                              AND cr.status = 'in_progress'
+                        )
+                  )
+                ORDER BY e.created_at DESC, e.automation_execution_id DESC
+                LIMIT 1
+            """, (exclude_execution_id, automation_id, exclude_execution_id))
+            row = await cur.fetchone()
+            return dict(row) if row else None
+
+
+async def try_admit_prune_execution(
+    automation_id: str,
+    execution_id: str,
+    *,
+    from_statuses: Sequence[str] = ("pending",),
+) -> str:
+    """Atomically claim a 'new' prune firing to run, or send it to the queue.
+
+    Runs under a ``SELECT ... FOR UPDATE`` lock on the automation row, so a
+    firing recovering from ``waiting`` and a freshly started one cannot both
+    pass: whoever holds the lock first decides the state the other reads.
+    A firing may be claimed only once: the caller names the statuses it may
+    start from in ``from_statuses``, the claim is a conditional
+    ``UPDATE ... RETURNING``, and a second call on an already ``running``
+    firing returns ``"already_claimed"`` rather than running it twice.
+    Returns ``"admitted"``, ``"wait"``, ``"skip_queued"``,
+    ``"already_claimed"`` or ``"gone"``.
+    """
+    allowed = list(from_statuses)
+    async with get_db_connection() as conn:
+        async with conn.transaction():
+            async with conn.cursor(row_factory=dict_row) as cur:
+                await cur.execute(
+                    "SELECT automation_id, status FROM automations "
+                    "WHERE automation_id = %s FOR UPDATE",
+                    (automation_id,),
+                )
+                if await cur.fetchone() is None:
+                    return "gone"
+                await cur.execute(
+                    "SELECT automation_execution_id, status, "
+                    "conversation_thread_id, created_at "
+                    "FROM automation_executions "
+                    "WHERE automation_execution_id = %s",
+                    (execution_id,),
+                )
+                me = await cur.fetchone()
+                if me is None:
+                    return "gone"
+                if me["status"] not in allowed:
+                    if me["status"] == "running":
+                        return "already_claimed"
+                    return "gone"
+                me_key = (me["created_at"], me["automation_execution_id"])
+                await cur.execute(
+                    """
+                    SELECT e.automation_execution_id, e.status,
+                           e.conversation_thread_id, e.created_at,
+                           EXISTS (
+                               SELECT 1 FROM conversation_responses cr
+                               WHERE cr.conversation_thread_id = e.conversation_thread_id
+                                 AND cr.status = 'in_progress'
+                           ) AS thread_live
+                    FROM automation_executions e
+                    WHERE e.automation_id = %s
+                      AND e.automation_execution_id <> %s
+                      AND (
+                            e.status IN ('running', 'waiting')
+                            OR EXISTS (
+                                SELECT 1 FROM conversation_responses cr
+                                WHERE cr.conversation_thread_id = e.conversation_thread_id
+                                  AND cr.status = 'in_progress'
+                            )
+                      )
+                    """,
+                    (automation_id, execution_id),
+                )
+                others = await cur.fetchall()
+                older_waiting = [
+                    row
+                    for row in others
+                    if row["status"] == "waiting"
+                    and (row["created_at"], row["automation_execution_id"]) < me_key
+                ]
+                busy = [
+                    row
+                    for row in others
+                    if row["status"] == "running" or row["thread_live"]
+                ]
+                if busy or older_waiting:
+                    # Any wait/skip exit leaves the row waiting, so a
+                    # pending firing settle(SKIPPED) can end it.
+                    if me["status"] != "waiting":
+                        await cur.execute(
+                            "UPDATE automation_executions "
+                            "SET status = 'waiting', "
+                            "started_at = COALESCE(started_at, NOW()) "
+                            "WHERE automation_execution_id = %s "
+                            "AND status = ANY(%s) "
+                            "RETURNING automation_execution_id",
+                            (execution_id, allowed),
+                        )
+                        if await cur.fetchone() is None:
+                            return "gone"
+                    return "skip_queued" if older_waiting else "wait"
+                await cur.execute(
+                    "UPDATE automation_executions "
+                    "SET status = 'running', "
+                    "started_at = COALESCE(started_at, NOW()) "
+                    "WHERE automation_execution_id = %s "
+                    "AND status = ANY(%s) "
+                    "RETURNING automation_execution_id",
+                    (execution_id, allowed),
+                )
+                if await cur.fetchone() is None:
+                    return "already_claimed"
+                return "admitted"
+
+
+
 async def get_execution_status(
     execution_id: str, *, automation_id: Optional[str] = None
 ) -> Optional[str]:
