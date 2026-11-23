@@ -52,7 +52,19 @@ _OVERFLOW_PHRASES = (
 )
 
 
-def _iter_exception_chain(exc: BaseException):
+class UnfinishedReplyError(RuntimeError):
+    """A reply whose stream ended before the response did, refused as an answer.
+
+    Kept, it would name items the server never stored on every later request
+    to that provider, so it is retried instead. Carries no status, so it is
+    retryable, and ``mid_stream`` because the provider accepted the request:
+    stripping its reasoning repairs nothing.
+    """
+
+    mid_stream = True
+
+
+def iter_exception_chain(exc: BaseException):
     seen: set[int] = set()
     current: BaseException | None = exc
     while current is not None and id(current) not in seen:
@@ -61,14 +73,10 @@ def _iter_exception_chain(exc: BaseException):
         current = current.__cause__ or current.__context__
 
 
-def extract_status_code(exc: BaseException) -> int | None:
-    """Best-effort HTTP status extraction from an exception chain.
-
-    Checks ``status_code`` / ``response.status_code`` attributes on every
-    exception in the chain, then falls back to parsing a 4xx/5xx code out of
-    the exception messages.
-    """
-    for current in _iter_exception_chain(exc):
+def sdk_status_code(exc: BaseException) -> int | None:
+    """The status an SDK set on an exception in the chain, or on its response;
+    never one read out of a message."""
+    for current in iter_exception_chain(exc):
         status = getattr(current, "status_code", None)
         if isinstance(status, int):
             return status
@@ -76,8 +84,18 @@ def extract_status_code(exc: BaseException) -> int | None:
         status = getattr(response, "status_code", None) if response is not None else None
         if isinstance(status, int):
             return status
+    return None
 
-    for current in _iter_exception_chain(exc):
+
+def extract_status_code(exc: BaseException) -> int | None:
+    """Best-effort HTTP status extraction from an exception chain.
+
+    The status an SDK set (``sdk_status_code``), else a 4xx/5xx code parsed
+    out of the exception messages.
+    """
+    if (status := sdk_status_code(exc)) is not None:
+        return status
+    for current in iter_exception_chain(exc):
         # A timeout never carries a provider status, and its message can carry
         # numbers that look like one: ``chunks_received=413`` read as a 413
         # would make a stalled stream look like a payload the provider refused.
@@ -104,7 +122,7 @@ def is_stalled_stream(exc: BaseException) -> bool:
     return any(
         isinstance(current, TimeoutError)
         and isinstance(getattr(current, "chunks_received", None), int)
-        for current in _iter_exception_chain(exc)
+        for current in iter_exception_chain(exc)
     )
 
 
@@ -118,8 +136,18 @@ def is_mid_stream_error(exc: BaseException) -> bool:
     """
     return any(
         getattr(current, "mid_stream", False) is True
-        for current in _iter_exception_chain(exc)
+        for current in iter_exception_chain(exc)
     )
+
+
+def refuses_input(exc: BaseException) -> bool:
+    """Whether the provider named the request's ``input`` as what it refused.
+
+    OpenAI's Responses API answers 404 for an item the input names that it
+    does not hold, a reasoning item it never stored among them. Read from the
+    error's ``param``, which the SDK takes from the body, never from prose.
+    """
+    return any(getattr(current, "param", None) == "input" for current in iter_exception_chain(exc))
 
 
 def is_programming_error(exc: BaseException) -> bool:
@@ -130,7 +158,7 @@ def is_programming_error(exc: BaseException) -> bool:
     """
     return any(
         isinstance(current, _PROGRAMMING_ERRORS)
-        for current in _iter_exception_chain(exc)
+        for current in iter_exception_chain(exc)
     )
 
 
@@ -149,7 +177,7 @@ def is_context_overflow(exc: BaseException) -> bool:
     """
     from langchain_core.exceptions import ContextOverflowError
 
-    for current in _iter_exception_chain(exc):
+    for current in iter_exception_chain(exc):
         if isinstance(current, ContextOverflowError):
             return True
         # The status as the SDK set it, on the error or its response, never

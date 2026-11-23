@@ -10,8 +10,12 @@
  * round-trip — matching the `patchWorkspace` pattern in useNavigationData.
  */
 import type { QueryClient } from '@tanstack/react-query';
+import { refreshArtifactThreads } from '@/lib/artifactCache';
+import { registerAuthReset } from '@/lib/authResets';
 import { queryKeys } from '@/lib/queryKeys';
-import { isArchivedThreadsKey, patchThreadRows } from '@/lib/threadRowActions';
+import { isArchivedThreadsKey, mapThreadCacheEntry, patchThreadRows } from '@/lib/threadRowActions';
+import type { SearchThreadHit } from '@/api/search';
+import { pruneThread } from '@/lib/threadLifecycle/store';
 import type { Thread } from '@/types/api';
 
 /**
@@ -32,6 +36,40 @@ export function insertOptimisticThread(queryClient: QueryClient, thread: Thread)
       skipKey: isArchivedThreadsKey,
     },
   );
+}
+
+/**
+ * Read a workspace's thread lists, the recent threads and the palette's
+ * search answers again once the server holds a change to one of their rows.
+ */
+export function refreshThreadLists(queryClient: QueryClient, workspaceId: string): void {
+  void queryClient.invalidateQueries({ queryKey: queryKeys.threads.byWorkspace(workspaceId) });
+  void queryClient.invalidateQueries({ queryKey: queryKeys.threads.recentAll() });
+  void queryClient.invalidateQueries({ queryKey: queryKeys.threads.searchAll() });
+}
+
+/**
+ * A thread left the viewer's view: deleted, archived, or made private by a
+ * colleague who started it. Its rows leave every cached list at once, since
+ * the sidebar's page-0 observers are cache-only and an invalidate would not
+ * reach them; comment destinations and each comment's `thread_hidden` are
+ * read again, so a queued comment for it leaves Send all; the lifecycle store
+ * forgets it. An archived row keeps its archived-view entries.
+ */
+export function dropThreadFromViews(
+  queryClient: QueryClient,
+  threadId: string,
+  workspaceId: string | null | undefined,
+  { keepArchived = false }: { keepArchived?: boolean } = {},
+): void {
+  patchThreadRows<Thread>(
+    queryClient,
+    workspaceId ? queryKeys.threads.byWorkspace(workspaceId) : queryKeys.threads.all,
+    (rows) => (rows.some((t) => t.thread_id === threadId) ? rows.filter((t) => t.thread_id !== threadId) : rows),
+    keepArchived ? { skipKey: isArchivedThreadsKey } : {},
+  );
+  refreshArtifactThreads(queryClient);
+  pruneThread(threadId);
 }
 
 /**
@@ -64,8 +102,12 @@ export function patchThreadTitle(
     const rowTs = Date.parse(row.updated_at);
     return !Number.isNaN(rowTs) && eventTs <= rowTs;
   };
+  // A search hit says whether its title is the thread's own (has_title), its
+  // title otherwise standing for the first message: a title written here is.
   const apply = <T extends Thread>(row: T): T =>
-    isStale(row) ? row : { ...row, title, ...(updatedAt ? { updated_at: updatedAt } : {}) };
+    isStale(row)
+      ? row
+      : { ...row, title, ...('has_title' in row ? { has_title: !!title } : {}), ...(updatedAt ? { updated_at: updatedAt } : {}) };
   patchThreadRows(queryClient, queryKeys.threads.all, (rows) =>
     rows.some((t) => t.thread_id === threadId)
       ? rows.map((t) => (t.thread_id === threadId ? apply(t) : t))
@@ -93,6 +135,103 @@ export function patchThreadTitle(
 }
 
 type LivenessRow = { thread_id: string; title?: string | null };
+
+const titleHolds = new Map<string, () => void>();
+// A hold outlives the cache it watches: the next session's reads must not
+// take a title a signed-out session was saving.
+registerAuthReset(() => {
+  for (const release of [...titleHolds.values()]) release();
+});
+
+/**
+ * Keep a title being saved on the thread's cached rows until its write
+ * answers. A list or detail read that went out before the rename answers with
+ * the title the server held then, and landing it would put the old title back
+ * for as long as the write is out (the gallery's first page, still loading
+ * when the sidebar renames, did exactly that). So while held, a read that
+ * lands is rewritten to the held title before anything renders it. Only
+ * fetched results are rewritten: a patch (a generated title, a refusal's
+ * restore) is someone else's word and stands. A later hold on the thread
+ * replaces this one. The rename ends it once its write settles, before it reads
+ * the lists again: `saved()` after a write that saved, `release()` after one
+ * that failed.
+ */
+export function holdThreadTitle(
+  queryClient: QueryClient,
+  threadId: string,
+  title: string,
+): { saved: () => void; release: () => void } {
+  titleHolds.get(threadId)?.();
+  const retitle = (rows: Thread[]): Thread[] =>
+    rows.some((t) => t.thread_id === threadId && t.title !== title)
+      ? rows.map((t) => (t.thread_id === threadId ? { ...t, title } : t))
+      : rows;
+  // The hand-off cards' and the roster's liveness reads hold a cleared title
+  // as null, as patchThreadTitle writes it. Undefined when nothing differs,
+  // since writing the same rows would restart the cards' poll timers.
+  const held = title || null;
+  const reliven = (data: { liveness?: LivenessRow[] }) => {
+    const rows = data.liveness ?? [];
+    if (!rows.some((r) => r.thread_id === threadId && (r.title ?? null) !== held)) return undefined;
+    return { ...data, liveness: rows.map((r) => (r.thread_id === threadId ? { ...r, title: held } : r)) };
+  };
+  // Set once the write has saved: the reads still out then, each by the
+  // promise of its fetch, and only they.
+  let draining: Map<string, Promise<unknown> | undefined> | null = null;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const unsubscribe = queryClient.getQueryCache().subscribe((event) => {
+    if (event.type !== 'updated') return;
+    const { queryKey, queryHash, state } = event.query;
+    if (queryKey[0] !== queryKeys.threads.all[0]) return;
+    if (draining) {
+      if (!draining.has(queryHash)) return;
+      // An invalidation silently cancels an active query's read and fetches
+      // again under the same hash. That read is after the write, so it is the
+      // server's word, and the one this hold was for is gone.
+      if (event.query.promise !== draining.get(queryHash)) {
+        draining.delete(queryHash);
+        if (draining.size === 0) release();
+        return;
+      }
+    }
+    if (event.action.type === 'success' && !event.action.manual) {
+      const data = state.data as (Thread & { liveness?: LivenessRow[] }) | undefined;
+      const next = data?.thread_id === threadId
+        ? (data.title !== title ? { ...data, title } : undefined)
+        : Array.isArray(data?.liveness)
+          ? reliven(data)
+          : mapThreadCacheEntry(data, retitle);
+      if (next !== undefined) queryClient.setQueryData(queryKey, next);
+    }
+    if (draining && state.fetchStatus === 'idle') {
+      draining.delete(queryHash);
+      if (draining.size === 0) release();
+    }
+  });
+  function release(saved = false) {
+    if (saved && !draining) {
+      // An invalidation cancels an active query's read and fetches again, but
+      // a read with no observer (a prefetch, a list whose view has gone) keeps
+      // going and would land the title from before the rename. Once the write
+      // has saved, the hold lasts until the reads out at that moment settle.
+      // A write that failed lets go at once: a read from before it is right.
+      draining = new Map(
+        queryClient.getQueryCache()
+          .findAll({ queryKey: queryKeys.threads.all, fetchStatus: 'fetching' })
+          .map((q) => [q.queryHash, q.promise]),
+      );
+      if (draining.size > 0) {
+        timer = setTimeout(() => release(), 60_000);
+        return;
+      }
+    }
+    clearTimeout(timer);
+    unsubscribe();
+    if (titleHolds.get(threadId) === release) titleHolds.delete(threadId);
+  }
+  titleHolds.set(threadId, release);
+  return { saved: () => release(true), release: () => release() };
+}
 
 /**
  * Apply a thread's share status to every cached thread list holding the row,
@@ -126,4 +265,32 @@ export function patchThreadSeen(
         )
       : rows,
   );
+}
+
+/**
+ * The rows a cache entry under the `threads` prefix holds, whichever of its two
+ * shapes it is: a plain list (`{threads}`) or the gallery's infinite query
+ * (`{pages: [{threads}]}`). Empty for anything else (a detail entry). The
+ * palette's search keeps its thread hits under the same prefix, and a hit's
+ * `title` is the first message when `has_title` is false.
+ */
+export function threadRowsOf(data: unknown): CachedThreadRow[] {
+  const shaped = data as { threads?: unknown; pages?: Array<{ threads?: CachedThreadRow[] } | null> } | null | undefined;
+  if (Array.isArray(shaped?.pages)) return shaped.pages.flatMap((page) => page?.threads ?? []);
+  return Array.isArray(shaped?.threads) ? (shaped.threads as CachedThreadRow[]) : [];
+}
+
+export type CachedThreadRow = Thread & Partial<Pick<SearchThreadHit, 'has_title'>>;
+
+/** A thread's title from whatever the cache already holds: its detail, or a
+ *  row in any list. A search hit with no title of its own carries the first
+ *  message instead, which is not one. */
+export function cachedThreadTitle(qc: QueryClient, threadId: string): string | undefined {
+  const detail = qc.getQueryData<Thread>(queryKeys.threads.detail(threadId));
+  if (detail?.thread_id === threadId && detail.title) return detail.title;
+  for (const [, data] of qc.getQueriesData<unknown>({ queryKey: queryKeys.threads.all })) {
+    const row = threadRowsOf(data).find((r) => r?.thread_id === threadId && r.has_title !== false);
+    if (row?.title) return row.title;
+  }
+  return undefined;
 }

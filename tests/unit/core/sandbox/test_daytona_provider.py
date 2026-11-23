@@ -270,6 +270,7 @@ class TestDaytonaProvider:
         mock_sandbox.id = "new-123"
         mock_sandbox.state = "started"
         mock_sandbox.get_work_dir = MagicMock(return_value="/home/workspace")
+        mock_sandbox.process.exec = AsyncMock(return_value=SimpleNamespace(result="", exit_code=0))
         client.create = AsyncMock(return_value=mock_sandbox)
 
         mock_existing = MagicMock()
@@ -300,6 +301,187 @@ class TestDaytonaProvider:
 
         assert isinstance(runtime, DaytonaRuntime)
         mock_daytona_client.create.assert_called_once()
+
+    @staticmethod
+    def _sandbox_missing(name: str, missing: str) -> MagicMock:
+        sandbox = MagicMock()
+        sandbox.id = name
+        sandbox.process.exec = AsyncMock(
+            return_value=SimpleNamespace(result=missing, exit_code=0)
+        )
+        return sandbox
+
+    @staticmethod
+    def _bare_provider(client):
+        from ptc_agent.core.sandbox.providers.daytona import DaytonaProvider
+
+        provider = DaytonaProvider.__new__(DaytonaProvider)
+        provider._config = DaytonaConfig(api_key="test-key")
+        provider._working_dir = "/home/workspace"
+        provider._client = client
+        return provider
+
+    @pytest.mark.asyncio
+    async def test_a_sandbox_without_bash_or_python_is_replaced_once(self):
+        """A runner serving the wrong image hands out a sandbox nothing can run
+        in; it is deleted and the create is tried once more."""
+        broken = self._sandbox_missing("broken", "bash\npython3\nuv\n")
+        healthy = self._sandbox_missing("healthy", "")
+        client = AsyncMock()
+        client.create = AsyncMock(side_effect=[broken, healthy])
+        provider = self._bare_provider(client)
+
+        with patch.object(provider, "_ensure_snapshot", return_value=None):
+            runtime = await provider.create()
+
+        assert runtime.id == "healthy"
+        client.delete.assert_awaited_once_with(broken)
+
+    @pytest.mark.asyncio
+    async def test_a_second_broken_sandbox_fails_with_the_reason(self):
+        from ptc_agent.core.sandbox.providers.daytona import SandboxImageBrokenError
+
+        first = self._sandbox_missing("first", "python3\n")
+        second = self._sandbox_missing("second", "python3\n")
+        client = AsyncMock()
+        client.create = AsyncMock(side_effect=[first, second])
+        provider = self._bare_provider(client)
+
+        with patch.object(provider, "_ensure_snapshot", return_value=None):
+            with pytest.raises(SandboxImageBrokenError, match="without python3"):
+                await provider.create()
+
+        assert [c.args[0] for c in client.delete.await_args_list] == [first, second]
+
+    @pytest.mark.asyncio
+    async def test_a_sandbox_whose_check_fails_is_deleted_not_leaked(self):
+        sandbox = MagicMock()
+        sandbox.id = "unchecked"
+        sandbox.process.exec = AsyncMock(side_effect=RuntimeError("Failed to execute command"))
+        client = AsyncMock()
+        client.create = AsyncMock(return_value=sandbox)
+        provider = self._bare_provider(client)
+
+        with patch.object(provider, "_ensure_snapshot", return_value=None):
+            with pytest.raises(RuntimeError, match="Failed to execute command"):
+                await provider.create()
+
+        client.delete.assert_awaited_once_with(sandbox)
+
+    @pytest.mark.asyncio
+    async def test_a_check_that_exits_nonzero_without_output_replaces_the_sandbox(self):
+        failed = MagicMock()
+        failed.id = "failed"
+        failed.process.exec = AsyncMock(return_value=SimpleNamespace(result="", exit_code=127))
+        healthy = self._sandbox_missing("healthy", "")
+        client = AsyncMock()
+        client.create = AsyncMock(side_effect=[failed, healthy])
+        provider = self._bare_provider(client)
+
+        with patch.object(provider, "_ensure_snapshot", return_value=None):
+            runtime = await provider.create()
+
+        assert runtime.id == "healthy"
+        client.delete.assert_awaited_once_with(failed)
+
+    @pytest.mark.asyncio
+    async def test_shell_noise_in_the_check_output_is_not_a_missing_tool(self):
+        sandbox = self._sandbox_missing("noisy", "warning: locale not set\n")
+        client = AsyncMock()
+        client.create = AsyncMock(return_value=sandbox)
+        provider = self._bare_provider(client)
+
+        with patch.object(provider, "_ensure_snapshot", return_value=None):
+            runtime = await provider.create()
+
+        assert runtime.id == "noisy"
+        client.delete.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_a_refused_delete_of_a_broken_sandbox_is_retried(self, monkeypatch):
+        from daytona import DaytonaError
+
+        monkeypatch.setattr("asyncio.sleep", AsyncMock())
+        broken = self._sandbox_missing("broken", "python3\n")
+        healthy = self._sandbox_missing("healthy", "")
+        client = AsyncMock()
+        client.create = AsyncMock(side_effect=[broken, healthy])
+        client.delete = AsyncMock(side_effect=[DaytonaError("busy", status_code=503), None])
+        provider = self._bare_provider(client)
+
+        with patch.object(provider, "_ensure_snapshot", return_value=None):
+            runtime = await provider.create()
+
+        assert runtime.id == "healthy"
+        assert [c.args[0] for c in client.delete.await_args_list] == [broken, broken]
+
+    @pytest.mark.asyncio
+    async def test_a_toolbox_answering_503_keeps_the_sandbox(self, monkeypatch):
+        from daytona import DaytonaError
+
+        monkeypatch.setattr("asyncio.sleep", AsyncMock())
+        sandbox = self._sandbox_missing("busy", "")
+        sandbox.process.exec = AsyncMock(
+            side_effect=[
+                DaytonaError("Failed to execute command: unavailable", status_code=503),
+                SimpleNamespace(result="", exit_code=0),
+            ]
+        )
+        client = AsyncMock()
+        client.create = AsyncMock(return_value=sandbox)
+        provider = self._bare_provider(client)
+
+        with patch.object(provider, "_ensure_snapshot", return_value=None):
+            runtime = await provider.create()
+
+        assert runtime.id == "busy"
+        client.delete.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_a_cancelled_delete_finishes_before_the_cancel_propagates(self):
+        import asyncio
+
+        deleted = asyncio.Event()
+        started = asyncio.Event()
+
+        async def slow_delete(_sandbox):
+            started.set()
+            await asyncio.sleep(0.05)
+            deleted.set()
+
+        client = AsyncMock()
+        client.delete = slow_delete
+        provider = self._bare_provider(client)
+        from ptc_agent.core.sandbox.providers.daytona import _shielded
+
+        task = asyncio.create_task(_shielded(provider._discard(MagicMock(id="x"), "test")))
+        await started.wait()
+        task.cancel()
+
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert deleted.is_set()
+
+    @pytest.mark.asyncio
+    async def test_a_toolbox_not_answering_yet_keeps_the_sandbox(self, monkeypatch):
+        """Create returns at started, which can be before the toolbox answers;
+        that sandbox is healthy and is checked again rather than replaced."""
+        monkeypatch.setattr("asyncio.sleep", AsyncMock())
+        sandbox = MagicMock()
+        sandbox.id = "slow"
+        sandbox.process.exec = AsyncMock(
+            side_effect=[ConnectionResetError("toolbox"), SimpleNamespace(result="", exit_code=0)]
+        )
+        client = AsyncMock()
+        client.create = AsyncMock(return_value=sandbox)
+        provider = self._bare_provider(client)
+
+        with patch.object(provider, "_ensure_snapshot", return_value=None):
+            runtime = await provider.create()
+
+        assert runtime.id == "slow"
+        client.create.assert_awaited_once()
+        client.delete.assert_not_awaited()
 
     @patch("ptc_agent.core.sandbox.providers.daytona.AsyncDaytona")
     @pytest.mark.asyncio
@@ -514,6 +696,46 @@ class TestDaytonaProvider:
         got = await provider._ensure_snapshot(["pkg"], tier=choice.name, resources=resources)
 
         assert got == (name if usable else None)
+
+    @pytest.mark.asyncio
+    async def test_an_inactive_snapshot_is_activated_before_use(self, monkeypatch):
+        """Daytona deactivates a snapshot left unused and refuses to create a
+        sandbox from it."""
+        monkeypatch.setattr("asyncio.sleep", AsyncMock())
+        client = AsyncMock()
+        provider = self._snapshot_provider(client)
+        choice, resources = provider._resolve_tier(None)
+        name = provider.snapshot_name(["pkg"])
+        client.snapshot.list = AsyncMock(
+            return_value=MagicMock(items=[SimpleNamespace(name=name, state="inactive")])
+        )
+        client.snapshot.activate = AsyncMock(return_value=SimpleNamespace(state="pending"))
+        client.snapshot.get = AsyncMock(return_value=SimpleNamespace(state="active"))
+
+        got = await provider._ensure_snapshot(["pkg"], tier=choice.name, resources=resources)
+
+        assert got == name
+        client.snapshot.activate.assert_awaited_once_with(name)
+        client.snapshot.create.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_a_name_another_build_took_that_settles_inactive_is_not_used(
+        self, monkeypatch
+    ):
+        monkeypatch.setattr("asyncio.sleep", AsyncMock())
+        client = AsyncMock()
+        provider = self._snapshot_provider(client)
+        choice, resources = provider._resolve_tier(None)
+        name = provider.snapshot_name(["pkg"])
+        client.snapshot.list = AsyncMock(return_value=MagicMock(items=[]))
+        client.snapshot.create = AsyncMock(
+            side_effect=RuntimeError(f"Snapshot with name {name} already exists")
+        )
+        client.snapshot.get = AsyncMock(return_value=SimpleNamespace(state="inactive"))
+
+        got = await provider._ensure_snapshot(["pkg"], tier=choice.name, resources=resources)
+
+        assert got is None
 
     @patch("ptc_agent.core.sandbox.providers.daytona.AsyncDaytona")
     @pytest.mark.asyncio
@@ -851,3 +1073,97 @@ class TestDaytonaMetricsSince:
 
         assert sample.mem_used_bytes == 2**29
         assert sample.mem_cache_bytes == 2**28
+
+
+class TestDaytonaAllocation:
+    """What the usage ledger costs a run by, read without starting the sandbox."""
+
+    @staticmethod
+    def _provider(**fields):
+        from ptc_agent.core.sandbox.providers.daytona import DaytonaProvider
+
+        values = {
+            "state": SimpleNamespace(value="stopped"),
+            "cpu": 4,
+            "memory": 8,
+            "disk": 10,
+            "auto_archive_interval": 10080,
+            "sandbox_class": "container",
+        }
+        sdk_sandbox = SimpleNamespace(**{**values, **fields}, start=AsyncMock())
+        provider = DaytonaProvider.__new__(DaytonaProvider)
+        provider._client = MagicMock()
+        provider._client.get = AsyncMock(return_value=sdk_sandbox)
+        return provider, sdk_sandbox
+
+    def test_reports_allocation(self):
+        from ptc_agent.core.sandbox.providers.daytona import DaytonaProvider
+
+        assert DaytonaProvider.reports_allocation is True
+
+    @pytest.mark.asyncio
+    async def test_reads_the_sandboxs_own_size_and_archive_interval(self):
+        provider, sdk_sandbox = self._provider()
+
+        found = await provider.allocation("sbx")
+
+        provider._client.get.assert_awaited_once_with("sbx")
+        sdk_sandbox.start.assert_not_awaited()
+        assert found.state is RuntimeState.STOPPED
+        assert (found.cpu, found.memory_gb, found.disk_gb) == (4.0, 8.0, 10.0)
+        assert found.archive_after_s == 7 * 24 * 3600
+
+    @pytest.mark.asyncio
+    async def test_an_archived_sandbox_reads_as_archived(self):
+        provider, _ = self._provider(state=SimpleNamespace(value="archived"))
+
+        assert (await provider.allocation("sbx")).state is RuntimeState.ARCHIVED
+
+    @pytest.mark.asyncio
+    async def test_an_interval_of_0_is_daytonas_longest(self):
+        provider, _ = self._provider(auto_archive_interval=0)
+
+        assert (await provider.allocation("sbx")).archive_after_s == 30 * 86400
+
+    @pytest.mark.asyncio
+    async def test_a_stopped_vm_has_given_up_its_disk_and_is_never_archived(self):
+        provider, _ = self._provider(sandbox_class="linux-vm")
+
+        found = await provider.allocation("sbx")
+
+        assert found.state is RuntimeState.ARCHIVED
+        assert found.archive_after_s is None
+
+    @pytest.mark.asyncio
+    async def test_a_paused_vm_still_holds_its_disk(self):
+        provider, _ = self._provider(
+            sandbox_class="linux-vm", state=SimpleNamespace(value="paused")
+        )
+
+        assert (await provider.allocation("sbx")).state is RuntimeState.STOPPED
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("raw", "state"),
+        [
+            ("paused", RuntimeState.STOPPED),
+            ("pausing", RuntimeState.STOPPING),
+            ("resizing", None),
+            ("destroying", None),
+            ("unknown", None),
+            ("build_failed", RuntimeState.ERROR),
+        ],
+    )
+    async def test_only_a_failure_reads_as_an_error_and_the_unknown_as_nothing(
+        self, raw, state
+    ):
+        provider, _ = self._provider(state=SimpleNamespace(value=raw))
+
+        assert (await provider.allocation("sbx")).state is state
+
+    @pytest.mark.asyncio
+    async def test_a_destroyed_sandbox_is_gone(self):
+        provider, _ = self._provider(state=SimpleNamespace(value="destroyed"))
+
+        with pytest.raises(SandboxGoneError):
+            await provider.allocation("sbx")

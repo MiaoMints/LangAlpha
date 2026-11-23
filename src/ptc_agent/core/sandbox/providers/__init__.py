@@ -8,22 +8,63 @@ from ptc_agent.config.core import (
     DaytonaConfig,
     DockerConfig,
     E2BConfig,
+    LocalConfig,
     PlatformSecretDefinition,
+    SandboxConfig,
     SSHConfig,
 )
 from ptc_agent.core.sandbox.runtime import SandboxProvider
 
-ProviderConfig = DaytonaConfig | DockerConfig | E2BConfig | SSHConfig
+ProviderConfig = DaytonaConfig | DockerConfig | E2BConfig | SSHConfig | LocalConfig
 
 # Imported on first use: each provider module loads its vendor's SDK.
 _PROVIDERS: dict[str, str] = {
     "daytona": "ptc_agent.core.sandbox.providers.daytona:DaytonaProvider",
     "docker": "ptc_agent.core.sandbox.providers.docker:DockerProvider",
     "e2b": "ptc_agent.core.sandbox.providers.e2b:E2BProvider",
+    "local": "ptc_agent.core.sandbox.providers.local:LocalProvider",
     "ssh": "ptc_agent.core.sandbox.providers.ssh:SSHProvider",
 }
 
 PROVIDER_KINDS = tuple(_PROVIDERS)
+
+# The facts the usage ledger asks of every kind at once, kept here so that
+# answering imports no provider module: reading them off each class loaded every
+# vendor's SDK on the event loop (Daytona's alone about 3s) on a deployment that
+# uses none of them. Each class still declares its own (``SandboxProvider.metered``,
+# ``reports_metrics``, ``reports_allocation``) for the callers holding one kind,
+# and a test holds the two equal.
+METERED_KINDS: tuple[str, ...] = ("daytona", "docker", "e2b")
+METRIC_KINDS: tuple[str, ...] = ("daytona", "e2b")
+ALLOCATION_KINDS: tuple[str, ...] = ("daytona", "e2b")
+# Kinds whose provider stops an idle sandbox on its own at ``auto_stop_interval``
+# (Daytona's auto-stop, E2B's pause deadline). The server's idle sweep runs
+# ahead of that only for these; for the rest the setting is the sweep's.
+SELF_STOPPING_KINDS: tuple[str, ...] = ("daytona", "e2b")
+# Two ways to split the kinds, each into a pair, asked without importing a
+# provider module (a turn's admission asks where Home's stand-in may run).
+#
+# By what the computer is. RECREATABLE_KINDS: the cloud computers, which the
+# deployment builds and can build again; a tier sizes them and the idle sweep
+# stops them. A test holds this pair equal to each class's ``recreatable``.
+RECREATABLE_KINDS: tuple[str, ...] = ("daytona", "docker", "e2b")
+# MACHINE_KINDS: every other kind, a whole machine that is there apart from
+# the deployment (one the user brings, or the one the server runs on). It is
+# never rebuilt, never stopped for being idle, is sized by itself, and
+# reports its own system and hardware.
+MACHINE_KINDS: tuple[str, ...] = tuple(
+    kind for kind in _PROVIDERS if kind not in RECREATABLE_KINDS
+)
+# By who supplies the machine. PROVIDED_KINDS: what the deployment makes a computer on without the user
+# bringing a machine: the recreatable kinds, and the server's own machine,
+# which is never rebuilt but is there for as long as the deployment is.
+PROVIDED_KINDS: tuple[str, ...] = (*RECREATABLE_KINDS, "local")
+# BROUGHT_KINDS: the machines their owner brings rather than the deployment
+# providing them, which a policy may keep the user's work off. No cap counts
+# them; the server's own machine is not metered either, but it is provided.
+BROUGHT_KINDS: tuple[str, ...] = tuple(
+    kind for kind in _PROVIDERS if kind not in PROVIDED_KINDS
+)
 
 
 def provider_class(kind: str) -> type[SandboxProvider]:
@@ -48,16 +89,33 @@ def provider_runs_remote(kind: str | None) -> bool:
         return False
 
 
-def may_be_primary(kind: str) -> bool:
-    """Whether a computer of ``kind`` may be the user's primary. Home lives on
-    the primary, which is never removed, so only a machine the deployment can
-    build again may hold it: one the user brought could be wiped or gone for
-    good with Home on it.
+def provider_reaches_host_through_alias(kind: str | None) -> bool:
+    """Whether sandboxes of ``kind`` dial this host by another name than its
+    loopback; an unknown kind reads as a container, as it reads as local."""
+    try:
+        return provider_class(kind).reaches_host_through_alias  # type: ignore[arg-type]
+    except ValueError:
+        return True
+
+
+def is_machine_kind(kind: str) -> bool:
+    """Whether a computer of ``kind`` is a whole machine (``MACHINE_KINDS``),
+    which the deployment never rebuilds nor stops for being idle.
 
     Raises:
         ValueError: If ``kind`` names no known provider.
     """
-    return provider_class(kind).recreatable
+    if not isinstance(kind, str) or kind not in _PROVIDERS:
+        raise ValueError(f"Unknown sandbox provider: {kind!r}")
+    return kind in MACHINE_KINDS
+
+
+def builds_computers(sandbox: SandboxConfig) -> bool:
+    """Whether the deployment can make a user a computer on its own: some kind
+    a new computer may be created on is one it provides. Without one, a
+    user's computers are only the machines they bring.
+    """
+    return any(kind in PROVIDED_KINDS for kind in sandbox.creatable_providers())
 
 
 def build_provider(

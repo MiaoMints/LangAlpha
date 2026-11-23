@@ -650,7 +650,7 @@ async def test_settle_at_a_user_stop_returns_the_users_and_drops_the_rest(
                 thread_id=thread.id,
                 run_id=run_id,
                 final_status="cancelled",
-                user_cancel=True,
+                stopper="user",
             )
 
     user = await _row(db_conn, jobs.user)
@@ -681,7 +681,7 @@ async def test_a_steer_a_stop_answered_without_waits_for_the_users_next_move(
                 thread_id=thread.id,
                 run_id=run_id,
                 final_status="cancelled",
-                user_cancel=True,
+                stopper="user",
             )
 
     row = await _row(db_conn, held)
@@ -706,8 +706,7 @@ async def test_settle_at_an_agent_stop_is_an_error(thread, db_conn):
                 thread_id=thread.id,
                 run_id=run_id,
                 final_status="cancelled",
-                user_cancel=False,
-                agent_stop=True,
+                stopper="agent",
             )
 
     user = await _row(db_conn, jobs.user)
@@ -759,7 +758,7 @@ async def test_an_agent_stop_drops_the_agents_and_keeps_the_users_queued(
     run_id = await _run(thread)
     jobs = await _mixed(thread, run_id)
 
-    intent = await request_run_cancel(run_id, thread_id=thread.id, by_user=False)
+    intent = await request_run_cancel(run_id, thread_id=thread.id, by="agent")
 
     assert intent["state"] == "requested"
     assert intent["returned_steers"] == []
@@ -772,6 +771,87 @@ async def test_an_agent_stop_drops_the_agents_and_keeps_the_users_queued(
     user = await _row(db_conn, jobs.user)
     assert user["status"] == "pending" and user["parked"]
     assert (await _row(db_conn, jobs.chat))["payload"]["outcome"] == "returned"
+    assert [p["content"] for p in await outbox.list_pending_steers(thread.id)] == [
+        "user"
+    ]
+
+
+async def test_a_suspensions_stop_keeps_the_users_queued_and_names_itself(
+    thread, db_conn
+):
+    from src.server.contracts.status import is_suspension_stop, is_user_stop
+    from src.server.database.runs import outbox
+    from src.server.database.runs.lifecycle import (
+        RunOutcome,
+        finalize_run,
+        get_run,
+        request_run_cancel,
+    )
+
+    run_id = await _run(thread)
+    jobs = await _mixed(thread, run_id)
+
+    intent = await request_run_cancel(run_id, thread_id=thread.id, by="suspension")
+
+    assert intent["state"] == "requested"
+    assert intent["returned_steers"] == []
+    assert (await _row(db_conn, jobs.cos))["payload"]["outcome"] == "dropped"
+    assert "outcome" not in (await _row(db_conn, jobs.user))["payload"]
+
+    # Settled by an executor whose own flag says the user's stop.
+    await finalize_run(
+        run_id=run_id,
+        thread_id=thread.id,
+        outcome=RunOutcome(status="cancelled", metadata={"cancelled_by_user": True}),
+    )
+
+    run = await get_run(run_id)
+    assert is_suspension_stop(run) and not is_user_stop(run)
+    user = await _row(db_conn, jobs.user)
+    assert user["status"] == "pending" and user["parked"]
+    assert (await _row(db_conn, jobs.chat))["payload"]["outcome"] == "returned"
+    assert [p["content"] for p in await outbox.list_pending_steers(thread.id)] == [
+        "user"
+    ]
+    # Nor does the safety net make it a turn the suspended account cannot run.
+    assert jobs.user not in await _claimed_ids()
+
+
+async def test_another_members_stop_keeps_the_senders_queued_for_them(
+    thread, db_conn
+):
+    """In a shared workspace a member may stop another's turn; the sender's
+    queued messages stay theirs, kept for their next move, and the stop is
+    still a person's."""
+    from src.server.contracts.status import MEMBER_STOP_META, is_user_stop
+    from src.server.database.runs import outbox
+    from src.server.database.runs.lifecycle import (
+        RunOutcome,
+        finalize_run,
+        get_run,
+        request_run_cancel,
+    )
+
+    run_id = await _run(thread)
+    jobs = await _mixed(thread, run_id)
+
+    intent = await request_run_cancel(run_id, thread_id=thread.id, by="member")
+
+    assert intent["state"] == "requested"
+    assert intent["returned_steers"] == []
+    assert "outcome" not in (await _row(db_conn, jobs.user))["payload"]
+
+    await finalize_run(
+        run_id=run_id,
+        thread_id=thread.id,
+        outcome=RunOutcome(status="cancelled", metadata={"cancelled_by_user": True}),
+    )
+
+    run = await get_run(run_id)
+    assert run["metadata"][MEMBER_STOP_META] is True and is_user_stop(run)
+    assert await outbox.list_returned_steers(run_id) == []
+    user = await _row(db_conn, jobs.user)
+    assert user["status"] == "pending" and user["parked"]
     assert [p["content"] for p in await outbox.list_pending_steers(thread.id)] == [
         "user"
     ]
@@ -998,7 +1078,7 @@ async def test_a_hand_off_no_run_took_is_dropped(thread, ending):
         await _end(thread, sent_to, "error")
     else:
         await request_run_cancel(
-            sent_to, thread_id=thread.id, by_user=ending == "user-stop"
+            sent_to, thread_id=thread.id, by="user" if ending == "user-stop" else "agent"
         )
         await _end(thread, sent_to, "cancelled")
 
@@ -1049,6 +1129,7 @@ async def _claimed_ids() -> set:
         ("completed", {}, True),
         ("cancelled", {}, True),
         ("cancelled", {"cancelled_by_user": True}, False),
+        ("cancelled", {"cancelled_by_user": False, "stopped_by_suspension": True}, False),
         ("error", {}, False),
         ("interrupted", {}, False),
         ("in_progress", {}, False),
@@ -1249,6 +1330,27 @@ async def test_a_released_steer_is_due_to_this_build_alone_through_nack_and_park
     await _assert_hidden_from_main(db_conn, thread)
 
 
+async def test_a_steer_waiting_for_room_is_due_by_its_own_clock(thread, db_conn):
+    """Its thread's latest run completed, so a plain park would be due to the
+    safety net on its next scan."""
+    from src.server.database.runs import outbox
+
+    run_id = await _run(thread)
+    job_id = await _accepted(thread, run_id, "x")
+    await _end(thread, run_id, "completed")
+    assert job_id in await _claimed_ids()
+
+    assert await outbox.defer_claimed_job(job_id, attempts=1, wait_s=60) == "pending"
+    waiting = await _row(db_conn, job_id)
+    assert waiting["status"] == "pending" and waiting["infinity"]
+    assert "due_at" in waiting["payload"] and not waiting["due"]
+    assert job_id not in await _claimed_ids()
+    await _assert_hidden_from_main(db_conn, thread)
+
+    await _backdate_due(db_conn, job_id)
+    assert job_id in await _claimed_ids()
+
+
 async def test_a_due_steer_a_live_turn_holds_is_parked_again(thread, db_conn):
     """The hold takes a due row in and drops its due_at, so the drainer does
     not start a turn for a steer a live run already has in its messages."""
@@ -1409,6 +1511,43 @@ async def test_a_resumed_run_that_keeps_dying_unread_gives_the_steer_up(
     assert row["payload"]["outcome"] == "returned"
     assert row["payload"]["returned_run_id"] == held.resumed
     assert await outbox.list_resumable_task_steers(thread.id, str(uuid.uuid4())) == []
+
+
+@pytest.mark.parametrize("counted", [False, True])
+async def test_a_resume_refused_while_the_computer_is_busy_keeps_its_refusals(
+    thread, db_conn, counted
+):
+    """A steer one refusal short of the cap: a counted refusal closes it, one
+    that lifts by itself (the computer was busy) gives it back as it was."""
+    from src.server.database.runs import outbox
+
+    held = await _resume_held(thread, "narrow it")
+    (job_id,) = held.jobs
+    await db_conn.execute(
+        "UPDATE hook_outbox SET payload = payload || jsonb_build_object("
+        "'resume_refusals', %s::int) WHERE hook_outbox_id = %s",
+        (outbox.MAX_RESUME_REFUSALS - 1, job_id),
+    )
+
+    released, returned = await outbox.release_task_resumes(
+        [job_id],
+        run_id=held.main,
+        max_refusals=outbox.MAX_RESUME_REFUSALS,
+        counted=counted,
+    )
+
+    row = await _row(db_conn, job_id)
+    if counted:
+        assert len(returned) == 1
+        assert row["status"] == "done"
+        assert row["payload"]["outcome"] == "returned"
+        return
+    assert [str(j) for j in released] == [job_id] and returned == []
+    assert row["status"] == "pending"
+    assert row["payload"]["resume_refusals"] == outbox.MAX_RESUME_REFUSALS - 1
+    assert row["payload"]["resume_refused_by"] == held.main
+    resumable = await outbox.list_resumable_task_steers(thread.id, str(uuid.uuid4()))
+    assert [str(r["hook_outbox_id"]) for r in resumable] == [job_id]
 
 
 async def test_a_stopped_resumed_run_returns_the_users_steer_on_its_own_run(
@@ -1938,3 +2077,193 @@ async def test_a_regenerate_leaves_what_the_turn_read_to_its_input_checkpoint(
     assert row["status"] == "done" and row["payload"]["outcome"] == "delivered"
     assert row["run_id"] == first
     assert await outbox.list_takeable_jobs(thread.id, ["steer"], run_id=fork_id) == []
+
+
+async def test_a_steer_that_waited_for_room_keeps_its_own_clock_and_its_tries(thread, db_conn):
+    # Each claim the user's Claude Code turn cap refused grows attempts but
+    # spends nothing: past the ceiling in claims, an expired lease is not
+    # given up and a nack still backs off by its due_at, never by a
+    # next_retry_at a build that cannot run steers would claim.
+    from src.server.database.runs import outbox
+
+    run_id = await _run(thread)
+    job_id = await _accepted(thread, run_id, "hello")
+    await _end(thread, run_id)
+
+    async def claim() -> int:
+        await db_conn.execute(
+            "UPDATE hook_outbox SET next_retry_at = 'infinity',"
+            " payload = payload - 'steered_run_id' || jsonb_build_object('due_at', NOW() - interval '1 second')"
+            " WHERE hook_outbox_id = %s",
+            (job_id,),
+        )
+        [job] = [r for r in await outbox.claim_outbox_jobs(limit=50, max_attempts=5) if str(r["hook_outbox_id"]) == job_id]
+        return job["attempts"]
+
+    attempts = await claim()
+    for _ in range(5):
+        assert await outbox.wait_for_room(job_id, attempts=attempts, wait_s=60)
+        row = await _row(db_conn, job_id)
+        assert (row["status"], row["infinity"], row["due"], "due_at" in row["payload"]) == ("pending", True, False, True)
+        attempts = await claim()
+    assert attempts > 5
+
+    await db_conn.execute(
+        "UPDATE hook_outbox SET lease_expires_at = NOW() - interval '1 second' WHERE hook_outbox_id = %s", (job_id,)
+    )
+    assert job_id not in {str(r["hook_outbox_id"]) for r in await outbox.park_exhausted_jobs(max_attempts=5)}
+    assert (await _row(db_conn, job_id))["status"] == "claimed"
+
+    assert await outbox.nack_outbox_job(job_id, attempts=attempts, max_attempts=5) == "pending"
+    row = await _row(db_conn, job_id)
+    assert (row["infinity"], "due_at" in row["payload"], row["payload"]["waited"]) == (True, True, 5)
+
+
+
+# ---------------------------------------------------------------------------
+# Shared workspaces: a steer names its member
+# ---------------------------------------------------------------------------
+
+
+async def _member_steer(thread, run_id: str, text: str, member: str) -> str:
+    """A message ``member`` queued in a shared workspace's thread."""
+    from src.server.database.runs import outbox
+    from src.server.handlers.chat.steering import steer_payload
+
+    key = str(uuid.uuid4())
+    result = await outbox.admit_steer(
+        thread_id=thread.id,
+        run_id=run_id,
+        payload=steer_payload(
+            text, member, sender="user", platform="web", request_key=key, member=member
+        ),
+        idempotency_key=f"steer:{key}",
+    )
+    assert result["state"] == "accepted", result
+    return result["job_id"]
+
+
+async def _member_run(thread, member: str) -> str:
+    """A turn ``member`` sent, as the send path starts it: the run row names
+    its sender."""
+    from src.server.database.runs.lifecycle import start_run
+
+    run_id = str(uuid.uuid4())
+    await start_run(
+        run_id=run_id,
+        thread_id=thread.id,
+        request_key=str(uuid.uuid4()),
+        metadata={"msg_type": "ptc", "user_id": member},
+        user_id=member,
+    )
+    return run_id
+
+
+async def _member_stop(thread, run_id: str) -> None:
+    from src.server.database.runs.lifecycle import (
+        RunOutcome,
+        finalize_run,
+        request_run_cancel,
+    )
+
+    await request_run_cancel(run_id, thread_id=thread.id, by="member")
+    await finalize_run(
+        run_id=run_id,
+        thread_id=thread.id,
+        outcome=RunOutcome(status="cancelled", metadata={"cancelled_by_user": True}),
+    )
+
+
+@pytest_asyncio.fixture(loop_scope="session")
+async def other_member(thread, db_conn) -> str:
+    member = f"member-{uuid.uuid4().hex[:8]}"
+    await db_conn.execute("INSERT INTO users (user_id) VALUES (%s)", (member,))
+    return member
+
+
+async def test_a_kept_message_is_taken_only_by_its_members_turn(
+    thread, db_conn, other_member
+):
+    """Another member stopped the sender's turn, so the sender's message is
+    kept for them. Another member's turn reads none of it; the sender's next
+    turn does."""
+    from src.server.database.runs import outbox
+
+    first = await _member_run(thread, thread.user_id)
+    job = await _member_steer(thread, first, "mine", thread.user_id)
+    await _member_stop(thread, first)
+
+    theirs = await _member_run(thread, other_member)
+    assert await outbox.list_takeable_jobs(thread.id, ["steer"], run_id=theirs) == []
+    await _end(thread, theirs)
+
+    mine = await _member_run(thread, thread.user_id)
+    taken = await outbox.list_takeable_jobs(thread.id, ["steer"], run_id=mine)
+    assert [str(r["hook_outbox_id"]) for r in taken] == [job]
+
+
+async def test_a_former_members_queued_messages_are_dropped(
+    thread, db_conn, other_member
+):
+    """Only a turn of its own member takes a shared message in, and someone
+    taken out of the workspace sends no more turns there: their queued
+    messages go with their access, kept or still held by a run of theirs.
+    The other members' stay, and each turn still names its sender."""
+    from src.server.database.runs import outbox
+    from src.server.database.conversation.senders import turn_sender
+
+    first = await _member_run(thread, other_member)
+    kept = await _member_steer(thread, first, "theirs, kept", other_member)
+    await _member_stop(thread, first)
+    second = await _member_run(thread, other_member)
+    held = await _member_steer(thread, second, "theirs, held", other_member)
+    assert await outbox.hold_jobs([held], owner=("run", second)) == [held]
+    mine = await _member_steer(thread, second, "mine", thread.user_id)
+
+    cur = await db_conn.execute(
+        "SELECT workspace_id::text AS ws FROM conversation_threads"
+        " WHERE conversation_thread_id = %s",
+        (thread.id,),
+    )
+    workspace_id = (await cur.fetchone())["ws"]
+    assert await outbox.drop_former_member_steers(workspace_id, thread.user_id) == 1
+    assert (await _row(db_conn, mine))["payload"]["outcome"] == "dropped"
+    for job_id in (kept, held):
+        assert (await _row(db_conn, job_id))["status"] == "pending"
+
+    assert await outbox.drop_former_member_steers(workspace_id, other_member) == 2
+    for job_id in (kept, held):
+        row = await _row(db_conn, job_id)
+        assert row["status"] == "done" and row["payload"]["outcome"] == "dropped"
+        assert "steered_run_id" not in row["payload"]
+
+    cur = await db_conn.execute(
+        "SELECT turn_index FROM conversation_responses"
+        " WHERE conversation_response_id = %s",
+        (second,),
+    )
+    turn = (await cur.fetchone())["turn_index"]
+    assert await turn_sender(thread.id, turn) == other_member
+
+
+async def test_another_members_turn_ending_leaves_a_kept_message_kept(
+    thread, db_conn, other_member
+):
+    """A turn's ending makes its thread's queued messages due as a turn of
+    their sender's. In a shared thread it leaves a message another member kept
+    for their next move as it is, and the claim's safety net passes it over
+    while the latest turn is not theirs; their own turn's ending moves it."""
+    first = await _member_run(thread, thread.user_id)
+    job = await _member_steer(thread, first, "mine", thread.user_id)
+    await _member_stop(thread, first)
+
+    theirs = await _member_run(thread, other_member)
+    await _end(thread, theirs)
+
+    row = await _row(db_conn, job)
+    assert row["status"] == "pending" and row["parked"]
+    assert job not in await _claimed_ids()
+
+    mine = await _member_run(thread, thread.user_id)
+    await _end(thread, mine)
+    assert (await _row(db_conn, job))["due"]

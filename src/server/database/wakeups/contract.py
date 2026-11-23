@@ -153,7 +153,7 @@ def attempt_sql(w: str) -> str:
     read carries it rather than reading it after."""
     return (
         "(SELECT jsonb_build_object("
-        "'attempt_id', a.attempt_id, 'vendor', a.vendor, 'mode', a.mode,"
+        "'attempt_id', a.attempt_id, 'vendor', a.vendor, 'mode', a.mode, 'action', a.action,"
         " 'server', a.server, 'tool', a.tool, 'order_json', a.order_json,"
         " 'status', a.status, 'vendor_order_id', a.vendor_order_id,"
         " 'filled_qty', a.filled_qty, 'avg_fill_price', a.avg_fill_price)"
@@ -251,3 +251,11 @@ def as_float(value: Any) -> Optional[float]:
         return float(value) if value is not None else None
     except (TypeError, ValueError):
         return None
+
+def plan_reset_of(hold: Any) -> Optional[datetime]:
+    """When the Claude plan resets that a notice's ``plan_hold`` waits for;
+    None where there is no hold, or Claude named no reset and the hold runs
+    to its own bound."""
+    if not isinstance(hold, dict) or hold.get("known") is False:
+        return None
+    return as_datetime(hold.get("reset_at"))

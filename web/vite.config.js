@@ -2,14 +2,16 @@ import { defineConfig, loadEnv } from 'vite'
 import { reactPlugins } from './scripts/react-plugins.ts'
 import path from 'path'
 import { criticalPathGroups } from './scripts/chunking.ts'
+import { framePolicy } from './scripts/vite-plugins/framePolicy.ts'
 import { localePreload } from './scripts/locale-preload.ts'
 import { monacoVersionDefine } from './scripts/monaco-version.ts'
 import { pdfjsData } from './scripts/vite-plugins/pdfjsData.ts'
+import { sentrySourcemaps } from './scripts/vite-plugins/sentrySourcemaps.ts'
 import { skipEntryPreload } from './scripts/vite-plugins/skipEntryPreload.ts'
 import { versionManifest } from './scripts/vite-plugins/versionManifest.ts'
 
 // https://vitejs.dev/config/
-export default defineConfig(({ mode }) => {
+export default defineConfig(({ command, mode }) => {
   // Load VITE_-prefixed vars from .env files (.env, .env.local, …) so they can
   // be seeded on disk instead of passed inline. loadEnv also merges matching
   // process.env entries, so `VITE_FOO=bar pnpm dev` keeps working too.
@@ -36,6 +38,12 @@ export default defineConfig(({ mode }) => {
       skipEntryPreload(),
       pdfjsData(import.meta.dirname),
       localePreload(path.resolve(import.meta.dirname, 'src/locales')),
+      // Read from the same variable the API client is built with, so the policy
+      // names the origin the app's API frames really load from.
+      framePolicy(env.VITE_API_BASE_URL),
+      // Read with the SENTRY_ prefix, which never reaches the client the way
+      // VITE_ does: the token stays in the build.
+      ...sentrySourcemaps(loadEnv(mode, process.cwd(), ['SENTRY_', 'VITE_SENTRY_']), command),
     ],
     resolve: {
       // `@/` and the tests' `@e2e/` come from the tsconfig projects' `paths`,

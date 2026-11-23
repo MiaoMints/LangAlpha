@@ -1,4 +1,4 @@
-import { useEffect, useId, useRef, useState } from 'react';
+import { Children, useEffect, useId, useRef, useState } from 'react';
 import { AlertTriangle, Check, Copy, ExternalLink } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
 import { Loader } from '@/components/ui/loader';
@@ -8,37 +8,63 @@ import { copyText } from '@/lib/clipboard';
 
 export type AccessStatus = 'connected' | 'needs_reauth' | 'working' | 'unknown';
 
-/** One connection's live state, worded the same on every surface. */
-export function StatusLabel({ status, className }: { status: AccessStatus; className?: string }) {
+/** Each row status but `working` as its word beside a dot, whose colour
+ *  carries what it means: it works, it needs the user (a key a provider
+ *  refused or no longer takes, a sign-in to redo, something that cannot run
+ *  where it is, a Claude plan used up), or it is not connected now (nothing added yet, its computer
+ *  offline, off, no computer it can run on, or not known). */
+const DOTTED = {
+  connected: { key: 'modelAccess.status.connected', color: 'var(--color-success)' },
+  paired: { key: 'modelAccess.status.paired', color: 'var(--color-success)' },
+  needs_reauth: { key: 'modelAccess.status.needsReauth', color: 'var(--color-warning)' },
+  refused: { key: 'modelAccess.status.keyRefused', color: 'var(--color-warning)' },
+  withdrawn: { key: 'modelAccess.status.withdrawn', color: 'var(--color-warning)' },
+  unavailable: { key: 'modelAccess.status.unavailable', color: 'var(--color-warning)' },
+  limit_reached: { key: 'claudeCodePlan.limitReached', color: 'var(--color-warning)' },
+  not_connected: { key: 'modelAccess.status.notConnected', color: 'var(--color-text-quaternary)' },
+  offline: { key: 'modelAccess.status.offline', color: 'var(--color-text-quaternary)' },
+  off: { key: 'modelAccess.status.off', color: 'var(--color-text-quaternary)' },
+  needs_computer: { key: 'modelAccess.status.needsComputer', color: 'var(--color-text-quaternary)' },
+  unknown: { key: 'modelAccess.status.unknown', color: 'var(--color-text-quaternary)' },
+  // Saved, and unused while a rule keeps the user's own access off.
+  not_allowed: { key: 'modelAccess.status.notAllowed', color: 'var(--color-text-quaternary)' },
+} as const;
+
+/** Any row's status. */
+export type RowStatus = AccessStatus | keyof typeof DOTTED;
+
+/** One connection's live state, worded the same on every surface: a glyph
+ *  of one width, the dot or the liveness glyph while it is checked, then
+ *  its word, so every status's word starts at one x. */
+export function StatusLabel({ status, className }: { status: RowStatus; className?: string }) {
   const { t } = useTranslation();
-  if (status === 'working') {
-    return (
-      <span className={cn('inline-flex items-center gap-1.5 text-xs', className)} style={{ color: 'var(--color-text-tertiary)' }}>
-        <Loader size={12} style={{ color: 'var(--color-accent-primary)' }} />
-        {t('modelAccess.status.working')}
-      </span>
-    );
-  }
-  if (status === 'needs_reauth') {
-    return (
-      <span className={cn('inline-flex items-center gap-1 text-xs', className)} style={{ color: 'var(--color-warning)' }}>
-        <AlertTriangle aria-hidden="true" className="h-3 w-3 shrink-0" />
-        {t('modelAccess.status.needsReauth')}
-      </span>
-    );
-  }
-  if (status === 'unknown') {
-    return (
-      <span className={cn('text-xs', className)} style={{ color: 'var(--color-text-tertiary)' }}>
-        {t('modelAccess.status.unknown')}
-      </span>
-    );
-  }
+  const dot = status === 'working' ? null : DOTTED[status];
   return (
     <span className={cn('inline-flex items-center gap-1.5 text-xs', className)} style={{ color: 'var(--color-text-secondary)' }}>
-      <span aria-hidden="true" className="h-1.5 w-1.5 rounded-full" style={{ background: 'var(--color-success)' }} />
-      {t('modelAccess.status.connected')}
+      <span aria-hidden="true" className="flex h-3 w-3 shrink-0 items-center justify-center">
+        {dot
+          ? <span className="h-1.5 w-1.5 rounded-full" style={{ background: dot.color }} />
+          : <Loader size={12} style={{ color: 'var(--color-accent-primary)' }} />}
+      </span>
+      {t(dot ? dot.key : 'modelAccess.status.working')}
     </span>
+  );
+}
+
+/** A secondary button's look in Claude Code's view and token lines: a border
+ *  of the theme's own and no fill, where the outline variant's border is
+ *  near the background and its fill reads as a border on a card in the
+ *  light theme and as a fill in the dark. */
+export const ROW_BUTTON = 'tap-target border-(--color-border-default) bg-transparent';
+
+/** A row's status and its actions at the row's end, laid out alike in
+ *  Settings and on a computer's page. */
+export function StatusActions({ status, children }: { status: RowStatus; children: React.ReactNode }) {
+  return (
+    <div className="ml-auto flex shrink-0 items-center gap-3">
+      <StatusLabel status={status} className="shrink-0" />
+      {children}
+    </div>
   );
 }
 
@@ -141,6 +167,55 @@ export function QuietNote({ children, className }: { children: React.ReactNode; 
     <p className={cn('text-xs', className)} style={{ color: 'var(--color-text-tertiary)' }}>
       {children}
     </p>
+  );
+}
+
+/** A card of rows: an open box in the open card styles, its rows parted by
+ *  a card's divider. */
+export const ROW_CARD = 'shell-box divide-y divide-[color:var(--color-shell-divider,hsl(var(--border)))] [&>*]:[border-style:var(--cs-rule-style,solid)]';
+
+/** A labelled card of rows, as Model access groups its connections; a
+ *  group with no rows says `empty` in their place, or nothing without it. */
+export function Group({ title, children, empty, subgrid = false }: {
+  title?: string;
+  children: React.ReactNode;
+  empty?: string;
+  /** Lays its rows on the columns of the grid it sits in, so the rows of
+   *  cards stacked in that grid line up with each other. */
+  subgrid?: boolean;
+}) {
+  const rows = Children.toArray(children);
+  return (
+    <div className={subgrid ? 'col-span-full grid grid-cols-subgrid gap-y-1.5' : 'flex flex-col gap-1.5'}>
+      {/* A section label, in the open card styles' label voice. */}
+      {title && (
+        <h3
+          className={cn('text-xs font-medium open-style:label-text', subgrid && 'col-span-full')}
+          style={{ color: 'var(--color-shell-label, var(--color-text-tertiary))' }}
+        >
+          {title}
+        </h3>
+      )}
+      {rows.length > 0 ? (
+        <ul className={cn(ROW_CARD, subgrid && 'col-span-full grid grid-cols-subgrid')}>{rows}</ul>
+      ) : empty && (
+        <QuietNote className={cn(subgrid && 'col-span-full')}>{empty}</QuietNote>
+      )}
+    </div>
+  );
+}
+
+/** A step's number in a short list, in a small round badge, or the mark of
+ *  where the step stands. */
+export function StepBadge({ children }: { children: React.ReactNode }) {
+  return (
+    <span
+      aria-hidden="true"
+      className="flex h-5 w-5 shrink-0 items-center justify-center rounded-full text-xs font-medium"
+      style={{ background: 'var(--color-bg-tag)', color: 'var(--color-text-secondary)', fontVariantNumeric: 'tabular-nums' }}
+    >
+      {children}
+    </span>
   );
 }
 

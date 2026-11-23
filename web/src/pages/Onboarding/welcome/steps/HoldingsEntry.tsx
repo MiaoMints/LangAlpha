@@ -6,11 +6,12 @@ import { Input } from '@/components/ui/input';
 import { Loader } from '@/components/ui/loader';
 import { toast } from '@/components/ui/use-toast';
 import { useSymbolSearch } from '@/hooks/useSymbolSearch';
+import { TickerLabel } from '@/components/TickerLogo';
 import type { StockSearchHit } from '@/lib/marketUtils';
+import { asksHoldingCurrency, isCurrencyCode, typedCurrencyCode } from '@/lib/holdingCurrency';
 import { apiErrorReason, apiErrorStatus } from '@/pages/ChatAgent/utils/api';
-import { portfolioHoldingsQuery } from '@/pages/Dashboard/hooks/usePortfolioData';
 import { addPortfolioHolding, deletePortfolioHolding } from '@/pages/Dashboard/utils/portfolio';
-import { watchlistItemsQuery } from '@/pages/Dashboard/hooks/useWatchlistData';
+import { portfolioHoldingsQuery, watchlistItemsQuery } from '@/hooks/membershipQueries';
 import { addWatchlistItem, deleteWatchlistItem } from '@/pages/Dashboard/utils/watchlistItems';
 import { isImeComposing } from '@/lib/ime';
 
@@ -45,6 +46,7 @@ export function HoldingsEntry({ onPreparing }: HoldingsEntryProps) {
   const searchId = useId();
   const listId = useId();
   const quantityId = useId();
+  const currencyId = useId();
   const searchRef = useRef<HTMLInputElement>(null);
   const quantityRef = useRef<HTMLInputElement>(null);
   const [query, setQuery] = useState('');
@@ -52,6 +54,7 @@ export function HoldingsEntry({ onPreparing }: HoldingsEntryProps) {
   const [active, setActive] = useState(0);
   const [picked, setPicked] = useState<StockSearchHit | null>(null);
   const [quantity, setQuantity] = useState('');
+  const [typedCurrency, setTypedCurrency] = useState('');
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -71,6 +74,9 @@ export function HoldingsEntry({ onPreparing }: HoldingsEntryProps) {
 
   const amount = Number(quantity);
   const validQuantity = quantity.trim() !== '' && Number.isFinite(amount) && amount > 0;
+  const asksCurrency = picked !== null && asksHoldingCurrency(picked);
+  const currency = asksCurrency ? typedCurrencyCode(typedCurrency) : picked?.currency;
+  const canHold = validQuantity && (!asksCurrency || isCurrencyCode(currency));
 
   function nameOf(hit: StockSearchHit): string {
     return (zh ? hit.nameLocal || hit.name : hit.name || hit.nameEn || hit.nameLocal) || '';
@@ -88,6 +94,7 @@ export function HoldingsEntry({ onPreparing }: HoldingsEntryProps) {
   function clear() {
     setPicked(null);
     setQuantity('');
+    setTypedCurrency('');
     setError(null);
     requestAnimationFrame(() => searchRef.current?.focus());
   }
@@ -137,7 +144,7 @@ export function HoldingsEntry({ onPreparing }: HoldingsEntryProps) {
     // The form's own submit, which Enter in the quantity field also sends; the
     // flow's Enter-to-continue sees it handled and leaves it.
     event?.preventDefault();
-    if (!picked || !validQuantity || busy) return;
+    if (!picked || !canHold || busy) return;
     const symbol = picked.symbol.toUpperCase();
     setBusy(true);
     setError(null);
@@ -147,7 +154,7 @@ export function HoldingsEntry({ onPreparing }: HoldingsEntryProps) {
         instrument_type: 'stock',
         quantity: amount,
         exchange: picked.exchangeShortName,
-        currency: picked.currency,
+        currency,
       });
       await queryClient.invalidateQueries({ queryKey: portfolioHoldingsQuery.queryKey });
       clear();
@@ -220,7 +227,7 @@ export function HoldingsEntry({ onPreparing }: HoldingsEntryProps) {
           </label>
           {picked ? (
             <div className="flex h-9 items-center gap-2 rounded-md border border-(--color-border-default) pl-3 pr-1.5 text-sm">
-              <span className="font-medium text-(--color-text-primary)">{picked.symbol}</span>
+              <TickerLabel symbol={picked.symbol} className="font-medium text-(--color-text-primary)" />
               <span className="min-w-0 flex-1 truncate text-(--color-text-tertiary)">{nameOf(picked)}</span>
               <button
                 type="button"
@@ -290,7 +297,7 @@ export function HoldingsEntry({ onPreparing }: HoldingsEntryProps) {
                         i === active ? 'bg-(--color-bg-hover)' : ''
                       }`}
                     >
-                      <span className="font-medium text-(--color-text-primary)">{hit.symbol}</span>
+                      <TickerLabel symbol={hit.symbol} className="font-medium text-(--color-text-primary)" />
                       <span className="min-w-0 flex-1 truncate text-(--color-text-secondary)">{nameOf(hit)}</span>
                       {hit.exchangeShortName && (
                         <span className="shrink-0 text-xs text-(--color-text-tertiary)">{hit.exchangeShortName}</span>
@@ -320,9 +327,27 @@ export function HoldingsEntry({ onPreparing }: HoldingsEntryProps) {
                 data-testid="welcome-holdings-quantity"
               />
             </div>
+            {asksCurrency && (
+              <div className="flex flex-col gap-1 sm:w-24">
+                <label htmlFor={currencyId} className="text-xs font-medium text-(--color-text-secondary)">
+                  {t('onboarding.welcome.holdings.currency')}
+                </label>
+                <Input
+                  id={currencyId}
+                  value={typedCurrency}
+                  onChange={(e) => setTypedCurrency(e.target.value)}
+                  placeholder={t('onboarding.welcome.holdings.currencyPlaceholder')}
+                  maxLength={3}
+                  autoComplete="off"
+                  spellCheck={false}
+                  required
+                  data-testid="welcome-holdings-currency"
+                />
+              </div>
+            )}
             <button
               type="submit"
-              disabled={!validQuantity || busy}
+              disabled={!canHold || busy}
               aria-busy={busy || undefined}
               data-testid="welcome-holdings-to-holdings"
               className="inline-flex h-9 shrink-0 items-center justify-center rounded-md border border-(--color-border-default) px-4 text-sm font-medium text-(--color-text-primary) transition-colors hover:bg-(--color-bg-hover) disabled:cursor-not-allowed disabled:opacity-50"
@@ -352,7 +377,7 @@ export function HoldingsEntry({ onPreparing }: HoldingsEntryProps) {
           <ul className="flex flex-wrap gap-1.5" data-testid="welcome-holdings-list">
             {holdings.map((h) => (
               <li key={h.user_portfolio_id} className={chipClass}>
-                <span className="font-medium">{h.symbol}</span>
+                <TickerLabel symbol={h.symbol} className="font-medium" />
                 <span className="text-(--color-text-tertiary)">{h.quantity}</span>
                 <button
                   type="button"
@@ -373,7 +398,7 @@ export function HoldingsEntry({ onPreparing }: HoldingsEntryProps) {
           <ul className="flex flex-wrap gap-1.5" data-testid="welcome-watchlist-list">
             {watchlist.map((w) => (
               <li key={w.watchlist_item_id} className={chipClass}>
-                <span className="font-medium">{w.symbol}</span>
+                <TickerLabel symbol={w.symbol} className="font-medium" />
                 <button
                   type="button"
                   onClick={() => started(removeWatch(w.watchlist_item_id, w.symbol))}

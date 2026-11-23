@@ -15,6 +15,7 @@ from langchain_core.language_models import BaseChatModel
 from langchain_deepseek import ChatDeepSeek
 from langchain_qwq import ChatQwen
 
+from . import claude_code
 from .endpoints import anthropic_sdk_base_url, is_official_openai_endpoint
 from .model_spec import (
     ModelSpec,
@@ -25,11 +26,11 @@ from .model_spec import (
     reasoning_block,
 )
 from .preferences import compaction_profile_for
-from .pricing_utils import get_price_tier
+from .pricing_utils import get_list_rates
 from .provider_compaction import native_compaction_kind
 from .reasoning import apply_reasoning_effort
 from .reasoning_lineage import ROUTE_ENDPOINT_SEP
-from .task_costs import task_cost
+from .task_costs import task_cost, task_cost_baseline, task_cost_estimate
 
 load_dotenv()
 
@@ -194,6 +195,19 @@ class ModelConfig:
         info = self.get_provider_info(provider)
         return info.get("parent_provider", provider)
 
+    def brand_of(self, provider: str) -> str:
+        """The provider whose models and entry ``provider`` is listed under.
+
+        Its parent's, unless it is a top-level entry of the manifest, which is
+        listed as itself: Claude Code names Anthropic as its parent, whose
+        pricing, image rules and task cost its models follow, but is a
+        provider of its own.
+        """
+        info = self.get_provider_info(provider)
+        if info.get("group") == provider:
+            return provider
+        return info.get("parent_provider", provider)
+
     def models_from(self, provider: str) -> str:
         """The provider whose manifest models ``provider`` offers.
 
@@ -305,12 +319,42 @@ class ModelConfig:
                 return key
         return model_name
 
+    def _baseline_list_rates(self) -> Optional[tuple[float, float]]:
+        """The task-cost baseline model's list rates, which an estimate is
+        a multiple of, or None without a baseline or a price for it."""
+        baseline = task_cost_baseline()
+        info = self.llm_config.get(baseline["model"]) if baseline else None
+        if not info:
+            return None
+        return get_list_rates(info.get("model_id", baseline["model"]), info.get("provider"))
+
+    def listed_models(self) -> list[tuple[str, dict[str, Any]]]:
+        """The rows the catalog lists: the visible ones, a Claude Code row only
+        on a deployment that runs Claude Code turns.
+
+        Listing is not resolution: an unlisted row still resolves, so a saved
+        pick or a thread on it is refused with a reason rather than read as
+        removed and cleared.
+        """
+        return [
+            (name, info)
+            for name, info in self.llm_config.items()
+            if info
+            and info.get("visible", False)
+            and self.provider_listed(self.get_provider_info(info.get("provider", "")))
+        ]
+
+    @staticmethod
+    def provider_listed(info: dict[str, Any]) -> bool:
+        """Whether the catalog lists the provider ``info`` describes: a Claude
+        Code one only on a deployment that runs Claude Code turns."""
+        return info.get("sdk") != claude_code.SDK or claude_code.rows_available()
+
     def get_model_metadata(self) -> dict[str, dict[str, Any]]:
-        """Return {model_key: {sdk, provider, access_type, ...}} for all visible models."""
+        """Return {model_key: {sdk, provider, access_type, ...}} for all listed models."""
         result = {}
-        for model_name, model_info in self.llm_config.items():
-            if not model_info or not model_info.get("visible", False):
-                continue
+        baseline_rates = self._baseline_list_rates()
+        for model_name, model_info in self.listed_models():
             provider = model_info.get("provider", "unknown")
             provider_info = self.get_provider_info(provider)
             sdk = provider_info.get("sdk", "unknown")
@@ -368,16 +412,26 @@ class ModelConfig:
             native = native_compaction_kind(model_info, provider_info)
             if native:
                 entry["native_compaction"] = native
-            # Cost tier (1-5) derived live from canonical providers.json pricing —
-            # not stored in models.json, so it auto-syncs when prices change.
-            price_tier = get_price_tier(model_info.get("model_id", model_name), provider)
-            if price_tier is not None:
-                entry["price"] = price_tier
+            # List rates, USD per 1M tokens, read live from providers.json so
+            # they follow every price change.
+            rates = get_list_rates(model_info.get("model_id", model_name), provider)
+            if rates is not None:
+                entry["pricing"] = {
+                    "input": round(rates[0], 4),
+                    "output": round(rates[1], 4),
+                }
             # What a typical benchmark task costs at each level the model
-            # offers, against a baseline model (see task_costs.py).
+            # offers, against a baseline model (see task_costs.py), else the
+            # estimate its list price gives on the same scale.
             costs = task_cost(self._task_cost_key(model_name, model_info, provider_info), efforts)
             if costs is not None:
                 entry["task_cost"] = costs
+            else:
+                estimate = task_cost_estimate(rates, baseline_rates)
+                # A free model, or one too cheap to round above zero, has no
+                # estimate to show: a cost of nothing says nothing.
+                if estimate is not None and round(estimate, 4) > 0:
+                    entry["task_cost_estimate"] = round(estimate, 4)
             # Mark variants that require their own API key (different env_key from parent).
             # e.g. z-ai-cn needs ZAI_CN_API_KEY, not ZAI_API_KEY.
             parent_provider = provider_info.get("parent_provider")
@@ -788,7 +842,12 @@ class LLM:
         - "byok"     — user-provided API key
         - "oauth"    — user-provided OAuth token
         - "platform" — system key (platform pays, credits deducted)
+
+        A Claude Code row is "oauth" with no key: the runtime signs in with
+        the setup token kept for langalpha, on the user's own plan.
         """
+        if self.sdk == claude_code.SDK:
+            return "oauth"
         if self.api_key_override is not None:
             if self.provider_info.get("access_type") == "oauth":
                 return "oauth"
@@ -840,6 +899,8 @@ class LLM:
             client = self._get_anthropic_llm()
         elif self.sdk == "gemini":
             client = self._get_gemini_llm()
+        elif self.sdk == claude_code.SDK:
+            client = claude_code.ClaudeCodeTarget(model=self.model, effort=self.resolved_reasoning_effort)
         else:
             raise ValueError(f"Unsupported SDK: {self.sdk} for provider {self.provider}")
 
@@ -1460,23 +1521,22 @@ def get_llm_by_type(llm_type: str) -> BaseChatModel:
 
 def get_configured_llm_models() -> dict[str, list[str]]:
     """
-    Get visible LLM models grouped by parent provider.
+    Get listed LLM models grouped by the provider each is listed under.
 
-    Only returns models with "visible": true in models.json.
-    Models are grouped by their parent provider (e.g., platform variants → parent).
+    Only returns ``ModelConfig.listed_models()``: the visible rows, less any
+    the deployment cannot run (Claude Code's without its runtime).
+    Models are grouped by ``ModelConfig.brand_of`` (e.g., platform variants → parent).
 
     Returns:
-        Dictionary mapping parent provider to list of visible model names.
+        Dictionary mapping that provider to list of listed model names.
     """
     try:
         config = LLM.get_model_config()  # singleton — no disk I/O
         models: dict[str, list[str]] = {}
 
-        for model_name, model_info in config.llm_config.items():
-            if model_info and model_info.get("visible", False):
-                provider = model_info.get("provider", "unknown")
-                parent = config.get_parent_provider(provider)
-                models.setdefault(parent, []).append(model_name)
+        for model_name, model_info in config.listed_models():
+            provider = model_info.get("provider", "unknown")
+            models.setdefault(config.brand_of(provider), []).append(model_name)
 
         return models
 

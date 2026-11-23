@@ -60,9 +60,11 @@ class SubagentContext:
         return frozenset(c.name for c in self.connectors)
 
     def model_known(self, name: str) -> bool:
-        from src.server.services.llm.availability import model_resolves
+        """Whether a subagent can be pinned to ``name``, a Claude Code row
+        included, which each turn runs where its workspace has Claude Code."""
+        from src.server.services.llm.claude_code import role_resolves
 
-        return model_resolves(self.model_pref, name)
+        return role_resolves(self.model_pref, name, claude_code=True)
 
     async def model_on_plan(self, name: str) -> bool:
         """The turn's own plan check for a model the user chose.
@@ -86,6 +88,7 @@ class SubagentContext:
         The turn finds this only once it builds the role's client, and then
         runs the subagent on the thread's model; the pane says so up front.
         """
+        from src.llms.claude_code import is_claude_code_model
         from src.llms.llm import LLM, platform_key_configured
         from src.server.services.llm import user_models
         from src.server.services.llm.clients import (
@@ -98,6 +101,9 @@ class SubagentContext:
         source, entry = await user_models.classify_model(
             self.user_id, name, _pref_cache=self.model_pref
         )
+        if source == user_models.ModelSource.SYSTEM and is_claude_code_model(name):
+            # It signs in with a setup token, where each turn's workspace has one.
+            return True
         if source == user_models.ModelSource.SYSTEM:
             provider = entry.get("provider")
             if LLM.get_model_config().get_provider_info(provider).get("access_type") != "oauth":
@@ -126,7 +132,7 @@ class SubagentContext:
             return entry["provider"] in self.oauth_accounts
         if not self.is_byok:
             return False
-        found, _, _ = await _resolve_custom_model_byok(
+        found, *_ = await _resolve_custom_model_byok(
             self.user_id, name, entry, LLM.get_model_config(),
             _pref_cache=self.model_pref, _byok_cache=self._byok_cache,
         )
@@ -293,14 +299,23 @@ async def _connectors(
     """Every server the user has, and whether a brokerage is connected.
 
     A brokerage is told apart by its address, never its name, which is the
-    user's to edit; the same join the relay's policy makes.
+    user's to edit; the same join the relay's policy makes. A server of the
+    user's own the policy withholds reads as off, as a turn reads it.
     """
     from src.server.database.mcp_oauth import ConnectionStatus, list_connections
     from src.server.database.mcp_servers import list_catalog_servers
     from src.server.services.brokerage_capabilities import vendor_for_url
     from src.server.services.brokerages import brokerage_for_url
     from src.server.services.mcp_config import account_disabled_builtins
+    from src.server.services.policy import USER_CONNECTORS, governed_by_user_connectors
+    from src.server.services.account import policy_for
 
+    policy = await policy_for(user_id)
+    if policy is None:
+        from src.server.services.platform_client import quota_service_unavailable
+
+        raise quota_service_unavailable()
+    allowed = policy.allows(USER_CONNECTORS)
     disabled, rows, connections = await asyncio.gather(
         account_disabled_builtins(user_id),
         list_catalog_servers(user_id),
@@ -318,7 +333,11 @@ async def _connectors(
     ]
     connected = False
     for row in rows:
-        enabled = bool(row.get("enabled")) and row.get("plugin_enabled") is not False
+        enabled = (
+            bool(row.get("enabled"))
+            and row.get("plugin_enabled") is not False
+            and (allowed or not governed_by_user_connectors(row.get("url")))
+        )
         if vendor_for_url(row.get("url")) is not None:
             brokerage = brokerage_for_url(row.get("url"))
             out.append(Connector(
@@ -355,32 +374,38 @@ async def _oauth_accounts(user_id: str) -> dict[str, str]:
 
 async def load_context(user_id: str) -> SubagentContext:
     """Everything but the rows, for one request."""
-    from src.server.database.api_keys import is_byok_active
+    from src.server.services.policy import OWN_SUBSCRIPTIONS
+    from src.server.services.account import own_access
 
     agent_config = _agent_config()
     # Each read opens its own connection; only the gate waits, for the model settings.
     (
-        gated, is_byok, oauth_accounts, skills, (connectors, connected), (bases, offered)
+        gated, own, oauth_accounts, skills, (connectors, connected), (bases, offered)
     ) = await asyncio.gather(
         _gated(agent_config, user_id),
-        is_byok_active(user_id),
+        own_access(user_id, sign_ins=False),
         _oauth_accounts(user_id),
         _skill_names(user_id),
         _connectors(user_id, agent_config),
         roster(user_id, agent_config.subagents),
     )
     model_pref, permits, search_provider, search_depth = gated
+    # Own access the policy denies is not there, as a turn reads it, and
+    # neither are custom entries under an allow-list.
+    from src.server.services.llm.availability import builtins_only
+
+    model_pref = builtins_only(own.policy, model_pref)
     return SubagentContext(
         user_id=user_id,
         bases=bases,
         offered=offered,
         model_pref=model_pref,
-        is_byok=is_byok,
+        is_byok=own.api_keys,
         permits=permits,
         search_provider=search_provider,
         search_depth=search_depth,
         skills=skills,
         connectors=connectors,
         brokerages_connected=connected,
-        oauth_accounts=oauth_accounts,
+        oauth_accounts=oauth_accounts if own.policy.allows(OWN_SUBSCRIPTIONS) else {},
     )

@@ -26,17 +26,23 @@ have.
 """
 
 import logging
+import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 
 import psycopg
 from psycopg.rows import dict_row
+from psycopg.types.json import Jsonb
+
+from src.server.database.claude_code_hosted import CLAUDE_CODE_TURN, CLI_COMPUTER, STORED_TURN
+from src.server.database.home_workspace import STAND_IN_COMPUTER
 
 from ptc_agent.config.agent import SubagentModel
 from src.server.database import pool
 from src.server.contracts.status import (
     REPORT_BACK_STATUSES,
+    RESTART_STOP_ERROR_TYPE,
     TERMINAL_STATUSES,
 )
 from src.server.utils.pg_sanitize import SafeJson, normalize_uuid
@@ -88,6 +94,22 @@ class PredecessorClaimedError(SubagentRunError):
         )
 
 
+class ClaudeCodeCapError(SubagentRunError):
+    """The run's computer already runs as many Claude Code CLIs as it may,
+    the thread's own turn among them where ``own_turn``."""
+
+    def __init__(self, cap: int, own_turn: bool = False):
+        self.cap = cap
+        self.own_turn = own_turn
+        super().__init__(f"the computer already runs {cap} Claude Code CLIs")
+
+    @property
+    def alone(self) -> bool:
+        """The thread's own turn is all the CLIs the computer runs, so none
+        ending makes room while it lasts."""
+        return self.own_turn and self.cap == 1
+
+
 class TaskRunNotFoundError(SubagentRunError):
     """No run row for the given task_run_id."""
 
@@ -124,10 +146,26 @@ async def start_task_run(
     predecessor_run_id: Optional[str] = None,
     start_checkpoint_id: Optional[str] = None,
     model: Optional[SubagentModel] = None,
+    claude_code: bool = False,
+    stored_token: bool = False,
+    cli_cap: Optional[tuple[str, int]] = None,
+    cli_computer: Optional[str] = None,
+    spending_run_id: Optional[str] = None,
+    model_override: Optional[str] = None,
     conn=None,
 ) -> Dict[str, Any]:
     """The task-run START transaction: task upsert + in_progress run row +
     latest_run_id advance, atomically.
+
+    A run on Claude Code is marked so (``claude_code``), and as one on the
+    setup token the user stored (``STORED_TURN``) when the build that
+    launches it signs in with it (``stored_token``), so it is stopped with the
+    turns when the token goes, and as one whose CLI runs on the own computer
+    ``cli_computer`` for a workspace on another (``CLI_COMPUTER``). With
+    ``cli_cap``, its computer and how many CLIs it runs at once, is refused
+    with ``ClaudeCodeCapError`` when the computer's turns and runs on Claude
+    Code already reach that many. Admissions on one computer count one at a
+    time; a turn's own admission does not wait on them.
 
     Raises TaskRunSlotBusyError / DuplicateLaunchError /
     PredecessorClaimedError — each backed by a DB constraint, so two workers
@@ -135,8 +173,29 @@ async def start_task_run(
 
     ``model`` lands in ``replay_facts`` with the row, since the checkpoint
     never records which model ran and the build that knew is gone by replay.
+    ``model_override``, the catalog name a Task named for the run, lands
+    there too: a resume that names none runs the task on it again, on
+    whichever worker takes it.
+
+    ``spending_run_id`` is the turn that launched the run, whose sender the
+    row's ``user_id`` names: the in-flight spend is summed per account by
+    that column, and the account is the person whose turn it is, not the
+    workspace's owner. A run with no such row (none named, or a row from
+    before ``user_id`` was recorded) names the thread's owner, as before.
     """
     conflict: Optional[str] = None
+    try:
+        # Malformed reads as none, so the start falls back rather than fails.
+        spending_run = str(uuid.UUID(str(spending_run_id))) if spending_run_id else None
+    except ValueError:
+        spending_run = None
+    facts = {
+        **({"model": model} if model else {}),
+        **({"model_override": model_override} if model_override else {}),
+        **({"claude_code": True} if claude_code else {}),
+        **(STORED_TURN if stored_token else {}),
+        **({CLI_COMPUTER: cli_computer} if cli_computer else {}),
+    }
 
     try:
         async with _ledger_connection(conn) as conn:
@@ -153,6 +212,13 @@ async def start_task_run(
                     )
                     if existing:
                         raise DuplicateLaunchError(existing)
+
+                if cli_cap is not None:
+                    await _require_cli_room(conn, *cli_cap, thread_id)
+
+                if parent_run_id:
+                    # It runs where the turn that started it does.
+                    facts.update(await _stand_in_fact(conn, parent_run_id))
 
                 async with conn.cursor() as cur:
                     await cur.execute(
@@ -176,15 +242,20 @@ async def start_task_run(
                             start_checkpoint_id, replay_facts, user_id
                         )
                         VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s,
-                            -- Denormalized owner for the in-flight spend
-                            -- aggregate. Derived here rather than threaded
-                            -- through the agent-side ledger port: the port's
-                            -- callers don't carry user identity, and the
-                            -- thread's owner is one indexed hop away.
-                            (SELECT w.user_id
-                             FROM conversation_threads t
-                             JOIN workspaces w ON w.workspace_id = t.workspace_id
-                             WHERE t.conversation_thread_id = %s)
+                            -- Denormalized account for the in-flight spend
+                            -- aggregate: the sender of the launching turn,
+                            -- read off its own response row rather than
+                            -- threaded through the agent-side ledger port,
+                            -- whose callers carry run ids but no identity.
+                            COALESCE(
+                                (SELECT r.user_id
+                                 FROM conversation_responses r
+                                 WHERE r.conversation_response_id = %s::uuid),
+                                (SELECT w.user_id
+                                 FROM conversation_threads t
+                                 JOIN workspaces w ON w.workspace_id = t.workspace_id
+                                 WHERE t.conversation_thread_id = %s)
+                            )
                         )
                         RETURNING *
                         """,
@@ -197,7 +268,8 @@ async def start_task_run(
                             predecessor_run_id,
                             cause,
                             start_checkpoint_id,
-                            SafeJson({"model": model}) if model else None,
+                            SafeJson(facts) if facts else None,
+                            spending_run,
                             thread_id,
                         ),
                     )
@@ -243,6 +315,134 @@ async def start_task_run(
     raise PredecessorClaimedError(
         str(predecessor_run_id), await find_successor_run(str(predecessor_run_id))
     )
+
+
+async def _stand_in_fact(conn, run_id: str) -> Dict[str, Any]:
+    """The stand-in's computer a turn ran on (``STAND_IN_COMPUTER``), as
+    its run row names it; empty for a turn anywhere else."""
+    async with conn.cursor(row_factory=dict_row) as cur:
+        await cur.execute(
+            "SELECT metadata ->> %s AS computer_id FROM conversation_responses"
+            " WHERE conversation_response_id = %s",
+            (STAND_IN_COMPUTER, run_id),
+        )
+        row = await cur.fetchone()
+    computer_id = row["computer_id"] if row else None
+    return {STAND_IN_COMPUTER: computer_id} if computer_id else {}
+
+
+async def _live_clis(cur, computer_id: str) -> int:
+    """The Claude Code CLIs the computer runs: turns in progress
+    (``CLAUDE_CODE_TURN``) and task runs on Claude Code, each counted on the
+    computer its row names as running its CLI (``CLI_COMPUTER``), else on
+    its workspace's. Driven by the partial indexes on rows in progress."""
+    await cur.execute(
+        """
+        SELECT
+          (SELECT COUNT(*) FROM conversation_responses r
+           JOIN conversation_threads t ON t.conversation_thread_id = r.conversation_thread_id
+           JOIN workspaces w ON w.workspace_id = t.workspace_id
+           WHERE r.status = 'in_progress' AND r.metadata @> %(turn)s
+             AND COALESCE(r.metadata ->> %(key)s, w.computer_id::text) = %(computer)s)
+        + (SELECT COUNT(*) FROM subagent_runs s
+           JOIN conversation_threads t ON t.conversation_thread_id = s.thread_id
+           JOIN workspaces w ON w.workspace_id = t.workspace_id
+           WHERE s.status = 'in_progress' AND s.replay_facts @> %(run)s
+             AND COALESCE(s.replay_facts ->> %(key)s, w.computer_id::text) = %(computer)s) AS live
+        """,
+        {
+            "computer": computer_id, "key": CLI_COMPUTER, "turn": Jsonb(CLAUDE_CODE_TURN),
+            "run": Jsonb({"claude_code": True}),
+        },
+    )
+    return (await cur.fetchone())["live"]
+
+
+async def _require_cli_room(conn, computer_id: str, cap: int, thread_id: str) -> None:
+    """Refuse a Claude Code run once the computer runs ``cap`` CLIs, saying
+    whether the turn of ``thread_id`` launching it is one of them. The
+    lock holds the next admission on the computer until this one's row
+    commits."""
+    async with conn.cursor(row_factory=dict_row) as cur:
+        await cur.execute("SELECT pg_advisory_xact_lock(hashtext('claude_code_cli:' || %s))", (computer_id,))
+        if await _live_clis(cur, computer_id) >= cap:
+            raise ClaudeCodeCapError(cap, own_turn=await _turn_counted(cur, thread_id, computer_id))
+
+
+async def _turn_counted(cur, thread_id: str, computer_id: str) -> bool:
+    """Whether the thread's turn in progress is one of the computer's CLIs,
+    as ``_live_clis`` counts it."""
+    await cur.execute(
+        """
+        SELECT EXISTS (
+          SELECT 1 FROM conversation_responses r
+          JOIN conversation_threads t ON t.conversation_thread_id = r.conversation_thread_id
+          JOIN workspaces w ON w.workspace_id = t.workspace_id
+          WHERE r.conversation_thread_id = %(thread)s AND r.status = 'in_progress' AND r.metadata @> %(turn)s
+            AND COALESCE(r.metadata ->> %(key)s, w.computer_id::text) = %(computer)s) AS counted
+        """,
+        {"thread": thread_id, "computer": computer_id, "key": CLI_COMPUTER, "turn": Jsonb(CLAUDE_CODE_TURN)},
+    )
+    return (await cur.fetchone())["counted"]
+
+
+async def live_clis(computer_id: str) -> int:
+    """How many Claude Code CLIs the computer runs now, as admission counts
+    them, for a caller that only reads."""
+    async with pool.get_db_connection() as conn:
+        async with conn.cursor(row_factory=dict_row) as cur:
+            return await _live_clis(cur, computer_id)
+
+
+async def cancel_requested_task_runs(task_run_ids: List[str]) -> set[str]:
+    """Of ``task_run_ids``, the runs still in progress that carry cancel intent."""
+    if not task_run_ids:
+        return set()
+    async with pool.get_db_connection() as conn:
+        async with conn.cursor(row_factory=dict_row) as cur:
+            await cur.execute(
+                """
+                SELECT task_run_id FROM subagent_runs
+                WHERE task_run_id = ANY(%s::uuid[])
+                  AND status = 'in_progress' AND cancel_requested_at IS NOT NULL
+                """,
+                (task_run_ids,),
+            )
+            return {str(row["task_run_id"]) for row in await cur.fetchall()}
+
+
+async def open_task_runs_of_user(
+    user_id: str, *, started_before: Optional[datetime] = None
+) -> List[Dict[str, Any]]:
+    """The user's subagent runs still in progress, started before
+    ``started_before`` when given: ``thread_id``, ``task_id`` and
+    ``task_run_id`` of each."""
+    async with pool.get_db_connection() as conn:
+        async with conn.cursor(row_factory=dict_row) as cur:
+            await cur.execute(
+                """
+                SELECT thread_id, task_id, task_run_id FROM subagent_runs
+                WHERE user_id = %s AND status = 'in_progress'
+                  AND (%s::timestamptz IS NULL OR started_at < %s::timestamptz)
+                """,
+                (user_id, started_before, started_before),
+            )
+            return [dict(r) for r in await cur.fetchall()]
+
+
+async def ran_on_claude_code(thread_id: str, task_id: str) -> bool:
+    """Whether the task's latest run ran on Claude Code."""
+    async with pool.get_db_connection() as conn:
+        async with conn.cursor(row_factory=dict_row) as cur:
+            await cur.execute(
+                """
+                SELECT COALESCE(replay_facts @> %s, false) AS claude_code FROM subagent_runs
+                WHERE thread_id = %s AND task_id = %s ORDER BY started_at DESC LIMIT 1
+                """,
+                (Jsonb({"claude_code": True}), thread_id, task_id),
+            )
+            row = await cur.fetchone()
+    return bool(row and row["claude_code"])
 
 
 async def _enqueue_report_back_job(conn, run_row: Dict[str, Any]) -> None:
@@ -387,7 +587,8 @@ async def _settle_steers(
     cancel or ends it; ``run_row`` comes back with the returns in its
     ``replay_facts``, which the run's ``steering_returned`` frames are read
     from. A run stopped by anyone (the user, a shutdown, a credit stop) gives
-    the user's back; any other ending leaves them to resume the task with.
+    the user's back; a graceful restart's stop, which is offered back for
+    resume, and any other ending leave them to resume the task with.
     The stamp leaves the rows the run holds for its ending, which confirms
     the ones its checkpoint read, and stamps ``held_steers`` on ``run_row``
     with how many of the user's those are."""
@@ -400,8 +601,11 @@ async def _settle_steers(
         task_id=str(run_row["task_id"]),
         # A cancelled ending counts even unstamped: the stamp is best-effort
         # ahead of a local stop, and a stop never resumes the task.
-        cancelled=run_row.get("cancel_requested_at") is not None
-        or run_row.get("status") == "cancelled",
+        cancelled=(run_row.get("failure") or {}).get("error_type") != RESTART_STOP_ERROR_TYPE
+        and (
+            run_row.get("cancel_requested_at") is not None
+            or run_row.get("status") == "cancelled"
+        ),
         spare_held_by=task_run_id if at_stamp else None,
     )
     if at_stamp:
@@ -708,7 +912,10 @@ async def count_open_runs_for_workspace(workspace_id: str) -> int:
 
 
 async def count_open_runs_for_computer(computer_id: str) -> int:
-    """Live task runs across every workspace bound to the computer.
+    """Live task runs across every workspace bound to the computer, and
+    those whose Claude Code CLI runs on it for a workspace on another
+    (``CLI_COMPUTER``), or that run in Home's stand-in on it
+    (``STAND_IN_COMPUTER``).
 
     The machine-scoped twin of ``count_open_runs_for_workspace``. A join, never
     a denormalised counter: this gates tearing a computer down, so the count has
@@ -716,19 +923,25 @@ async def count_open_runs_for_computer(computer_id: str) -> int:
     workspace per computer the two functions return the same thing.
     """
     async with pool.get_db_connection() as conn:
-        async with conn.cursor() as cur:
+        async with conn.cursor(row_factory=dict_row) as cur:
             await cur.execute(
                 """
-                SELECT COUNT(*)
+                SELECT COUNT(*) AS open
                 FROM subagent_runs r
                 JOIN conversation_threads t
                   ON t.conversation_thread_id = r.thread_id
                 JOIN workspaces w ON w.workspace_id = t.workspace_id
-                WHERE w.computer_id = %s AND r.status = 'in_progress'
+                WHERE r.status = 'in_progress'
+                  AND (w.computer_id = %s OR r.replay_facts @> %s
+                       OR r.replay_facts @> %s)
                 """,
-                (computer_id,),
+                (
+                    computer_id,
+                    Jsonb({CLI_COMPUTER: computer_id}),
+                    Jsonb({STAND_IN_COMPUTER: computer_id}),
+                ),
             )
-            return (await cur.fetchone())[0]
+            return (await cur.fetchone())["open"]
 
 
 async def list_open_task_runs() -> List[Dict[str, Any]]:

@@ -52,8 +52,36 @@ def _jobs(final_status, **kw):
     return build_finalize_jobs(**defaults)(final_status)
 
 
+#: A settle's news jobs have their own table (``test_hook_jobs_push``).
+_NEWS_HOOKS = frozenset({"user_notification", "push"})
+
+
 def _types(jobs):
-    return sorted(j.hook_type for j in jobs)
+    return sorted(j.hook_type for j in jobs if j.hook_type not in _NEWS_HOOKS)
+
+
+@pytest.mark.parametrize("on", [False, True])
+def test_a_completed_turn_owes_the_idle_compaction_job_only_for_a_user_who_opted_in(on):
+    """Off for the turn's user, a turn writes nothing for it; on, only a
+    completed one does."""
+    assert ("idle_compact" in _types(_jobs("completed", idle_compaction=on))) is on
+    assert all(
+        "idle_compact" not in _types(_jobs(status, idle_compaction=True))
+        for status in ("error", "cancelled", "interrupted")
+    )
+
+
+@pytest.mark.parametrize(("meta", "owed"), [({"idle_compaction": True}, True), ({}, False), ({"idle_compaction": "yes"}, False)])
+def test_the_finalize_stamp_on_the_run_row_decides_the_idle_compaction_job(meta, owed):
+    from src.server.database.runs.hook_jobs import build_finalize_jobs_from_run_row
+
+    run = {
+        "conversation_response_id": "run-1",
+        "conversation_thread_id": "ptc-1",
+        "run_seq": 1,
+        "metadata": {"user_id": "u-1", **meta},
+    }
+    assert ("idle_compact" in _types(build_finalize_jobs_from_run_row(run)("completed"))) is owed
 
 
 _RELEASES_ITS_PAIR = {
@@ -207,6 +235,7 @@ class TestBuildFinalizeJobs:
         assert a == b == {
             "run-1:burst_release",
             "run-1:user_feed",
+            "run-1:user_notification",
             "run-1:report_back",
         }
 
@@ -1063,11 +1092,17 @@ class TestAlertSweeps:
             "revive_dead_cleanup_jobs": AsyncMock(return_value=[]),
             "revive_dead_alerts": AsyncMock(return_value=[]),
             "close_unowed_waiting_alerts": AsyncMock(return_value=[]),
+            "release_for_reachable_computers": AsyncMock(return_value=[]),
+            "close_for_lost_computers": AsyncMock(return_value=[]),
             "purge_terminal_jobs": AsyncMock(return_value=0),
             "claim_outbox_jobs": AsyncMock(return_value=[]),
             **overrides,
         }
-        return mocks, [patch.object(outbox_db, name, m) for name, m in mocks.items()]
+        purge_sources = AsyncMock(return_value=0)
+        return mocks, [
+            *(patch.object(outbox_db, name, m) for name, m in mocks.items()),
+            patch("src.server.database.relayed_sources.purge_expired", purge_sources),
+        ]
 
     @staticmethod
     async def _passes(drainer, n: int):
@@ -1105,6 +1140,49 @@ class TestAlertSweeps:
         assert any("a-1" in str(c.args[0]) for c in warning.call_args_list)
 
     @pytest.mark.asyncio
+    async def test_notifications_parked_for_a_computer_are_released_on_their_own_clock(self):
+        """A machine connecting again is read off its tunnel's row on every
+        worker, every COMPUTER_RELEASE_INTERVAL, and what it releases is
+        claimed on the same pass."""
+        import contextlib
+
+        drainer = HookOutboxDrainer()
+        calls = []
+        mocks, patches = self._sweeps(
+            release_for_reachable_computers=AsyncMock(
+                side_effect=lambda: calls.append("release")
+                or [{"hook_outbox_id": "w-1", "hook_type": "wakeup"}]
+            ),
+            claim_outbox_jobs=AsyncMock(
+                side_effect=lambda **_: calls.append("claim") or []
+            ),
+        )
+        with contextlib.ExitStack() as stack:
+            for p in patches:
+                stack.enter_context(p)
+            await self._passes(drainer, 3)
+        mocks["release_for_reachable_computers"].assert_awaited_once()
+        assert calls[:2] == ["release", "claim"]
+
+    @pytest.mark.asyncio
+    async def test_notifications_for_a_machine_that_never_comes_back_are_given_up(self):
+        """Parked for good otherwise: the close sweep gives them up once the
+        machine has been gone as long as a command's notice is kept."""
+        import contextlib
+
+        drainer = HookOutboxDrainer()
+        mocks, patches = self._sweeps(
+            close_for_lost_computers=AsyncMock(
+                return_value=[{"hook_outbox_id": "r-1", "hook_type": "subagent_report_back"}]
+            ),
+        )
+        with contextlib.ExitStack() as stack:
+            for p in patches:
+                stack.enter_context(p)
+            await self._passes(drainer, 3)
+        mocks["close_for_lost_computers"].assert_awaited_once()
+
+    @pytest.mark.asyncio
     async def test_the_close_runs_on_a_shorter_clock_than_the_revive(self):
         """A dead alert must stay dead ten minutes before it qualifies, so
         the revive runs every ten minutes; the close keeps its minute."""
@@ -1118,7 +1196,7 @@ class TestAlertSweeps:
             passes[0] += 1
             if passes[0] == 1:
                 # A minute on: the close is due again, the revive is not.
-                drainer._next_alert_close = 0.0
+                drainer._due["alert close"] = 0.0
             else:
                 drainer._stopping.set()
 
@@ -1131,7 +1209,7 @@ class TestAlertSweeps:
         mocks["revive_dead_alerts"].assert_awaited_once()
         assert hook_outbox.ALERT_CLOSE_INTERVAL == 60.0
         assert hook_outbox.ALERT_REVIVE_INTERVAL == 600.0
-        assert drainer._next_alert_revive - drainer._next_alert_close == pytest.approx(
+        assert drainer._due["alert revive"] - drainer._due["alert close"] == pytest.approx(
             hook_outbox.ALERT_REVIVE_INTERVAL - hook_outbox.ALERT_CLOSE_INTERVAL, abs=5
         )
 

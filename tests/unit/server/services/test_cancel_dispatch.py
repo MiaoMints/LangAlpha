@@ -110,6 +110,45 @@ def _patch_common(
 
 
 @pytest.mark.asyncio
+async def test_a_stop_publishes_the_comments_its_steers_gave_back():
+    """Only the stamp that returned them: a repeated stop reads the same steers
+    back for its own answer and has nothing new to tell the other tabs."""
+    from src.server.services.cancel_dispatch import cancel_workflow
+
+    patches, _, _, _, _, request_run_cancel = _patch_common(
+        manager_cancel_returns=True, active_run=_active_run()
+    )
+    returned = [{"content": "note"}]
+    request_run_cancel.return_value = {
+        "state": "requested",
+        "run": _active_run(),
+        "returned_steers": returned,
+    }
+    published = AsyncMock()
+    patches.append(
+        patch(
+            "src.server.services.artifacts.comments.publish_returned_comments",
+            new=published,
+        )
+    )
+    for p in patches:
+        p.start()
+    try:
+        result = await cancel_workflow("t-1")
+        request_run_cancel.return_value = {
+            "state": "already_requested",
+            "run": _active_run(),
+        }
+        await cancel_workflow("t-1")
+    finally:
+        for p in patches:
+            p.stop()
+
+    assert result["returned_steers"] == returned
+    published.assert_awaited_once_with("t-1", returned)
+
+
+@pytest.mark.asyncio
 async def test_cancel_with_active_task_is_signal_only():
     """When a task is active (manager.signal_cancel → True), the handler
     records durable intent and signals the task, but must NOT call
@@ -131,7 +170,7 @@ async def test_cancel_with_active_task_is_signal_only():
     assert result["cancelled"] is True
     # Durable intent recorded on the resolved active run (no eager terminal write).
     get_active_run.assert_awaited_once_with("t-1")
-    request_run_cancel.assert_awaited_once_with("run-A", thread_id="t-1", by_user=True)
+    request_run_cancel.assert_awaited_once_with("run-A", thread_id="t-1", by="user")
     # The local signal targets the SAME run the intent was stamped on — an
     # untargeted (None) signal could cancel a newer run that started after
     # the resolved one finalized.
@@ -165,7 +204,7 @@ async def test_cancel_with_no_active_task_runs_safety_net():
             p.stop()
 
     assert result["cancelled"] is True
-    request_run_cancel.assert_awaited_once_with("run-A", thread_id="t-1", by_user=True)
+    request_run_cancel.assert_awaited_once_with("run-A", thread_id="t-1", by="user")
     registry_store.cancel_run_tasks.assert_awaited_once_with(
         "t-1", "run-A", force=True
     )
@@ -194,7 +233,7 @@ async def test_run_targeted_miss_with_other_active_task_skips_safety_net():
     assert result["cancelled"] is True
     # Explicit run_id targets the stopped run directly — no active-run lookup.
     get_active_run.assert_not_awaited()
-    request_run_cancel.assert_awaited_once_with("run-A", thread_id="t-1", by_user=True)
+    request_run_cancel.assert_awaited_once_with("run-A", thread_id="t-1", by="user")
     # run_id threaded through to the manager so it targets the stopped run.
     manager.signal_cancel.assert_awaited_once_with("t-1", "run-A")
     # Another turn owns the thread → safety net must be skipped.
@@ -268,7 +307,7 @@ async def test_a_stop_naming_a_run_never_stops_a_manual_mutation():
             p.stop()
 
     runner.request_stop.assert_not_awaited()
-    request_run_cancel.assert_awaited_once_with("run-DONE", thread_id="t-1", by_user=True)
+    request_run_cancel.assert_awaited_once_with("run-DONE", thread_id="t-1", by="user")
     assert result["cancelled"] is False
     assert result["state"] == "already_finished"
 
@@ -339,7 +378,7 @@ async def test_cancel_active_run_records_durable_intent():
 
     assert result["cancelled"] is True
     get_active_run.assert_awaited_once_with("t-1")
-    request_run_cancel.assert_awaited_once_with("run-XYZ", thread_id="t-1", by_user=True)
+    request_run_cancel.assert_awaited_once_with("run-XYZ", thread_id="t-1", by="user")
     # Signal targets the resolved run, not the thread's current pick.
     manager.signal_cancel.assert_awaited_once_with("t-1", "run-XYZ")
 
@@ -369,7 +408,7 @@ async def test_cancel_already_terminal_run_returns_already_finished():
 
     assert result["cancelled"] is False
     assert result["state"] == "already_finished"
-    request_run_cancel.assert_awaited_once_with("run-DONE", thread_id="t-1", by_user=True)
+    request_run_cancel.assert_awaited_once_with("run-DONE", thread_id="t-1", by="user")
 
 
 @pytest.mark.asyncio
@@ -422,7 +461,7 @@ async def test_remote_run_cancel_never_wipes_local_registry():
             p.stop()
 
     assert result["cancelled"] is True
-    request_run_cancel.assert_awaited_once_with("run-REMOTE", thread_id="t-1", by_user=True)
+    request_run_cancel.assert_awaited_once_with("run-REMOTE", thread_id="t-1", by="user")
     registry_store.cancel_and_clear.assert_not_awaited()
     registry_store.cancel_run_tasks.assert_awaited_once_with(
         "t-1", "run-REMOTE", force=True
@@ -586,7 +625,7 @@ async def _cancel_with_steers(
         stack.enter_context(
             patch("src.server.services.runs.cancel.publish_cancel_nudge", AsyncMock())
         )
-        result = await cancel_workflow("t-1", run_id, by_user=by_user)
+        result = await cancel_workflow("t-1", run_id, by="user" if by_user else "agent")
     return result, request_run_cancel, listed, stop_hand_offs
 
 
@@ -626,7 +665,7 @@ async def test_an_agent_stop_gives_back_no_steers():
 
     assert result["cancelled"] is True
     assert result["returned_steers"] == []
-    intent.assert_awaited_once_with("run-A", thread_id="t-1", by_user=False)
+    intent.assert_awaited_once_with("run-A", thread_id="t-1", by="agent")
     listed.assert_not_awaited()
 
 
@@ -645,7 +684,7 @@ async def test_an_agent_stop_of_an_ended_run_stops_the_run_that_took_its_hand_of
 
     stop_hand_offs.assert_awaited_once_with("t-1", "run-DONE")
     assert [c.args[0] for c in intent.await_args_list] == ["run-DONE", "run-LATER"]
-    assert all(c.kwargs["by_user"] is False for c in intent.await_args_list)
+    assert all(c.kwargs["by"] == "agent" for c in intent.await_args_list)
     assert result["cancelled"] is True
     assert "state" not in result
     assert result["returned_steers"] == []
@@ -785,7 +824,9 @@ async def test_task_cancel_local_owner_short_circuits():
             p.stop()
 
     assert result["cancelled"] is True
-    registry_store.cancel_task.assert_awaited_once_with("t-1", "abc123")
+    registry_store.cancel_task.assert_awaited_once_with(
+        "t-1", "abc123", task_run_id=None
+    )
     get_active.assert_not_awaited()
     nudge.assert_not_awaited()
 
@@ -808,7 +849,33 @@ async def test_task_cancel_foreign_owner_stamps_intent_and_nudges():
 
     assert result["cancelled"] is True
     intent.assert_awaited_once_with("tr-9", thread_id="t-1")
-    nudge.assert_awaited_once_with("t-1", None, task_id="abc123")
+    # The run it stamped: a resume racing the nudge leaves the next run be.
+    nudge.assert_awaited_once_with("t-1", None, task_id="abc123", task_run_id="tr-9")
+
+
+@pytest.mark.asyncio
+async def test_a_stop_of_one_run_leaves_the_tasks_next_run_running():
+    """The run it names ended before the stop reached it, and the task was
+    resumed since: nothing is stopped."""
+    from src.server.services.cancel_dispatch import cancel_subagent_task
+
+    patches, store, _get_active, intent, nudge = _patch_task_cancel(
+        local_cancel_returns=False,
+        active_task_run={"task_run_id": "tr-9"},
+        latest_statuses={"abc123": "in_progress"},
+    )
+    for p in patches:
+        p.start()
+    try:
+        result = await cancel_subagent_task("t-1", "abc123", task_run_id="tr-1")
+    finally:
+        for p in patches:
+            p.stop()
+
+    assert result["cancelled"] is False
+    store.cancel_task.assert_awaited_once_with("t-1", "abc123", task_run_id="tr-1")
+    intent.assert_not_awaited()
+    nudge.assert_not_awaited()
 
 
 @pytest.mark.asyncio

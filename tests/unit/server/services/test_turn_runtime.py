@@ -50,7 +50,7 @@ def home():
 
 
 def test_a_workspace_turn_runs_its_analyst_there():
-    assert turn_route(USER, PROJECT) == TurnRoute("proj-ws", "analyst")
+    assert turn_route(USER, PROJECT) == TurnRoute("proj-ws", "analyst", USER)
 
 
 @pytest.mark.parametrize(
@@ -60,7 +60,7 @@ def test_a_workspace_turn_runs_its_analyst_there():
 )
 def test_every_other_turn_runs_the_chief_of_staff_in_home(workspace):
     """A former Home runs in the user's own Home, where its threads went."""
-    assert turn_route(USER, workspace) == TurnRoute(HOME, "chief_of_staff")
+    assert turn_route(USER, workspace) == TurnRoute(HOME, "chief_of_staff", USER)
 
 
 @pytest.mark.asyncio
@@ -72,11 +72,41 @@ def test_every_other_turn_runs_the_chief_of_staff_in_home(workspace):
 async def test_binding_a_route_puts_only_home_on_the_computer(workspace, binds):
     """An analyst's workspace is on its computer already; Home gets the row
     the caller read, which spares the upsert."""
-    with patch(
-        "src.server.services.turn_runtime.ensure_home", new=AsyncMock()
-    ) as ensure:
-        await turn_route(USER, workspace).bind(USER, workspace)
+    with (
+        patch("src.server.services.turn_runtime.ensure_home", new=AsyncMock()) as ensure,
+        patch(
+            "src.server.services.home_placement.place_home_turn",
+            new=AsyncMock(return_value=None),
+        ) as place,
+    ):
+        route = await turn_route(USER, workspace).bind(USER, workspace)
     assert ensure.await_args_list == ([call(USER, workspace)] if binds else [])
+    assert place.await_count == (1 if binds else 0)
+    assert route.runs_in == route.workspace_id
+
+
+@pytest.mark.asyncio
+async def test_a_home_turn_on_its_stand_in_runs_there_for_home():
+    """The thread and its records stay Home's; the folder and computer are
+    the stand-in's."""
+    from src.server.database.home_workspace import get_home_stand_in_id
+    from ptc_agent.agent.middleware.runtime_context import HomeAway
+
+    away = HomeAway(get_home_stand_in_id(USER), "mac", "Mac", "cloud", "Cloud")
+    with (
+        patch("src.server.services.turn_runtime.ensure_home", new=AsyncMock()),
+        patch(
+            "src.server.services.home_placement.place_home_turn",
+            new=AsyncMock(return_value=away),
+        ),
+    ):
+        route = await turn_route(USER, None).bind(USER, None)
+        unplaced = await turn_route(USER, None).bind(USER, None, place=False)
+
+    assert route.workspace_id == HOME
+    assert route.runs_in == get_home_stand_in_id(USER)
+    assert route.away is away
+    assert unplaced.runs_in == HOME and unplaced.away is None
 
 
 @pytest.mark.asyncio
@@ -121,3 +151,36 @@ async def test_a_new_thread_naming_no_workspace_is_refused():
     assert refused.value.detail.startswith(
         "workspace_id is required to start a thread"
     )
+
+
+def test_the_owner_is_the_workspace_rows_and_home_is_the_senders():
+    """The two accounts a turn has only part where a workspace is not the
+    sender's: the route names the row's owner, never the sender, for it."""
+    held = {**PROJECT, "user_id": "user-2"}
+    assert turn_route(USER, held).owner_id == "user-2"
+    assert turn_route(USER, PROJECT).owner_id == USER
+    assert turn_route(USER, None).owner_id == USER
+    assert turn_route(USER, BOUND_HOME).owner_id == USER
+
+
+@pytest.mark.asyncio
+async def test_a_client_cannot_open_a_thread_in_the_home_stand_in():
+    """The stand-in is where a Home turn runs, not a workspace to open threads
+    in; naming it would run an analyst with no away mark."""
+    from src.server.database.home_workspace import HOME_STAND_IN_KEY, get_home_stand_in_id
+
+    row = {
+        "workspace_id": get_home_stand_in_id(USER),
+        "user_id": USER,
+        "config": {HOME_STAND_IN_KEY: True},
+    }
+    with patch("src.server.database.workspace.get_workspace", AsyncMock(return_value=row)):
+        with pytest.raises(HTTPException) as refused:
+            await requested_workspace(USER, row["workspace_id"])
+    assert (refused.value.status_code, refused.value.detail) == (404, "Workspace not found")
+
+
+@pytest.mark.asyncio
+async def test_home_with_no_row_is_still_accepted():
+    with patch("src.server.database.workspace.get_workspace", AsyncMock(return_value=None)):
+        assert await requested_workspace(USER, HOME) is None

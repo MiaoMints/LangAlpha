@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import posixpath
 import shlex
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
@@ -18,6 +19,12 @@ from typing import TYPE_CHECKING, Any, Protocol
 from ptc_agent.core.mcp_sanitize import is_untrusted_server
 from ptc_agent.core.sandbox._defaults import (
     DEFAULT_DEPENDENCIES,
+    SANDBOX_AGENT_BROWSER_BIN,
+    SANDBOX_AGENT_BROWSER_SHA256,
+    SANDBOX_AGENT_BROWSER_VERSION,
+    SANDBOX_CHROME_BIN,
+    SANDBOX_CHROME_POLICY,
+    SANDBOX_CHROME_POLICY_PATH,
     SANDBOX_FALLBACK_CPU,
     SANDBOX_IMAGE_ENV,
     SANDBOX_NODE_VERSION,
@@ -232,17 +239,10 @@ def image_steps(
         Env(sandbox_thread_env(cpu)),
         Run(
             (
-                # yfinance pins curl_cffi<0.14 but scrapling[all] requires >=0.14.
-                # Override resolves the conflict (tested, yfinance works with 0.14+).
-                # Written in the same command: E2B's builder does not carry /tmp
-                # from a cached step into the next one.
                 # uv writes no bytecode by default, so every new sandbox would
                 # compile pandas, yfinance and the rest on its first import.
-                "echo 'curl_cffi>=0.14' > /tmp/overrides.txt"
-                " && uv pip install --system --compile-bytecode"
-                " --override /tmp/overrides.txt "
-                + " ".join(dependencies)
-                + " && rm /tmp/overrides.txt"
+                "uv pip install --system --compile-bytecode "
+                + " ".join(shlex.quote(d) for d in dependencies)
                 + " && uv cache clean && rm -rf /root/.cache/pip",
                 # Scrapling browser setup (Camoufox for StealthyFetcher). Its
                 # Chromium is the one npx already placed in the shared
@@ -268,5 +268,34 @@ def image_steps(
                 '"',
             )
         ),
+        Run(_browser_commands(browsers_path)),
         Workdir(working_dir),
     ]
+
+
+def _browser_commands(browsers_path: str) -> tuple[str, ...]:
+    """The agent's browser: its one pinned binary, a stable name for the Chrome
+    Playwright baked in, and that Chrome's policy.
+
+    Its own step, after the heavy ones, so a new pin rebuilds one small layer.
+    """
+    digests = " ".join(
+        f"{arch}) AB_SHA={digest};;" for arch, digest in sorted(SANDBOX_AGENT_BROWSER_SHA256.items())
+    )
+    release = (
+        "https://github.com/vercel-labs/agent-browser/releases/download/"
+        f"v{SANDBOX_AGENT_BROWSER_VERSION}"
+    )
+    return (
+        f'AB_ARCH=$(dpkg --print-architecture); case "$AB_ARCH" in {digests} esac'
+        ' && AB_PLAT=$([ "$AB_ARCH" = "arm64" ] && echo arm64 || echo x64)'
+        f' && curl -fsSL "{release}/agent-browser-linux-$AB_PLAT" -o /tmp/agent-browser'
+        ' && echo "$AB_SHA  /tmp/agent-browser" | sha256sum -c -'
+        f" && install -D -m 0755 /tmp/agent-browser {SANDBOX_AGENT_BROWSER_BIN}"
+        " && rm /tmp/agent-browser",
+        f'ln -sf "$(ls -d {browsers_path}/chromium-*/chrome-linux*/chrome)"'
+        f" {SANDBOX_CHROME_BIN} && [ -x {SANDBOX_CHROME_BIN} ]",
+        f"mkdir -p {posixpath.dirname(SANDBOX_CHROME_POLICY_PATH)}"
+        f" && echo {shlex.quote(json.dumps(SANDBOX_CHROME_POLICY, sort_keys=True))}"
+        f" > {SANDBOX_CHROME_POLICY_PATH}",
+    )

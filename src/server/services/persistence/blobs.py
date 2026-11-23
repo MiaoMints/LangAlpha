@@ -42,6 +42,7 @@ from src.server.services.persistence.transfer import (
     PACK_STAGE_MAX_BYTES,
     SINGLE_PUT_MAX_BYTES,
     ByteBudget,
+    Layout,
     pack_direct,
     unlink_direct,
     ScanEntry,
@@ -65,7 +66,7 @@ from src.utils.storage import (
 RELAY_CONCURRENCY = 8
 
 
-def _entry_abs_path(entry: ScanEntry, layout: WorkspaceLayout) -> str:
+def _entry_abs_path(entry: ScanEntry, layout: Layout) -> str:
     """Where a scanned entry lives in the sandbox.
 
     A user's file is relative to the project folder it was scanned under.
@@ -77,7 +78,7 @@ def _entry_abs_path(entry: ScanEntry, layout: WorkspaceLayout) -> str:
     return f"{layout.workspace}/{entry.path}"
 
 
-def _machine_layout(layout: WorkspaceLayout) -> WorkspaceLayout:
+def _machine_layout(layout: Layout) -> WorkspaceLayout:
     """The computer's own root, which is where pack chunks are staged."""
     return WorkspaceLayout(layout.root)
 
@@ -100,7 +101,7 @@ async def _persist_blobs(
     entries: list[ScanEntry],
     *,
     unlink_after: bool = False,
-    layout: WorkspaceLayout,
+    layout: Layout,
 ) -> tuple[list[dict[str, Any]], list[UnsavedFile]]:
     """Make sure every entry's digest has an object, then build its row.
 
@@ -448,7 +449,7 @@ async def _push_direct(
     need: set[str],
     *,
     unlink_after: bool = False,
-    layout: WorkspaceLayout,
+    layout: Layout,
 ) -> DirectPush | None:
     """Presign an upload per missing digest and let the sandbox move the bytes.
 
@@ -536,7 +537,7 @@ async def _relay_blobs(
     need: set[str],
     *,
     unlink_after: bool = False,
-    layout: WorkspaceLayout,
+    layout: Layout,
 ) -> tuple[set[str], set[str]]:
     """Copy missing digests through this process: download, hash, PUT."""
     representative: dict[str, ScanEntry] = {}
@@ -601,7 +602,7 @@ async def _relay_blobs(
 
 
 async def _unlink_chunks(
-    sandbox: Any, paths: list[str], workspace_id: str, layout: WorkspaceLayout
+    sandbox: Any, paths: list[str], workspace_id: str, layout: Layout
 ) -> None:
     try:
         await unlink_direct(sandbox, paths, layout=layout)
@@ -619,7 +620,7 @@ async def _persist_packed(
     *,
     may_prune: bool = True,
     withheld: frozenset[str] = frozenset(),
-    layout: WorkspaceLayout,
+    layout: Layout,
 ) -> tuple[list[dict[str, Any]], list[UnsavedFile], int]:
     """Rows for every small file, via the pack set. Returns (rows, unsaved, skipped).
 
@@ -806,8 +807,9 @@ async def _persist_inline(
     sandbox: Any,
     entries: list[ScanEntry],
     *,
-    layout: WorkspaceLayout,
+    layout: Layout,
     conn: Any,
+    exact: bool = False,
 ) -> tuple[int, list[UnsavedFile]]:
     """No object store: bytes go into the manifest row itself.
 
@@ -816,6 +818,9 @@ async def _persist_inline(
     make the peak the whole changed working set, which is exactly what
     bounding in-flight bytes is supposed to prevent. Each batch's rows are
     released as soon as they are stored, so the bound is the batch.
+
+    ``exact`` refuses bytes that differ from what the scan hashed, as
+    ``changed``: a file of a repository has to be the one its scan saw.
     """
     synced = 0
     unsaved: list[UnsavedFile] = []
@@ -831,6 +836,8 @@ async def _persist_inline(
             # come from the download even if the scan saw an earlier
             # version of the file.
             content_hash = hashlib.sha256(content).hexdigest()
+            if exact and content_hash != entry.sha256:
+                return UnsavedFile(entry.path, "changed", entry.size)
             is_binary = _detect_is_binary(entry.path, content)
             content_text = None
             content_binary = None

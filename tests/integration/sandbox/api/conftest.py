@@ -15,6 +15,14 @@ import pytest
 import pytest_asyncio
 from httpx import ASGITransport, AsyncClient
 
+# Imported before the fixtures below patch src.server.database.workspace:
+# a module first imported while that patch is live (``patch`` imports its
+# target) binds the mock for the rest of the session, and a later test that
+# reaches the real database, such as test_message_hot_path, gets this file's
+# workspace row instead.
+import src.server.app.workspace_files.crud  # noqa: F401
+import src.server.services.warm_files  # noqa: F401
+import src.server.services.workspace_files  # noqa: F401
 from tests.conftest import create_test_app
 from tests.integration.sandbox.conftest import _make_core_config
 from tests.integration.sandbox.memory_provider import MemoryProvider
@@ -130,7 +138,7 @@ async def files_client(mock_session, sandbox):
             "src.server.services.workspace_files.WorkspaceManager"
         ) as MockWMShared,
         patch(
-            "src.server.app.workspace_files.serve.WorkspaceManager"
+            "src.server.services.warm_files.WorkspaceManager"
         ) as MockWMServe,
     ):
         MockWM.get_instance.return_value = mock_manager
@@ -197,6 +205,9 @@ async def computers_client():
         ),
         patch(
             "src.server.app.computers._computer_manager", return_value=manager
+        ),
+        patch(
+            "src.server.app.computers._stand_in_host", AsyncMock(return_value=None)
         ),
     ):
         async with AsyncClient(

@@ -23,10 +23,20 @@ import contextlib
 import logging
 from typing import Literal, Optional
 
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, HTTPException, Query, Request
 from fastapi.responses import Response, StreamingResponse
 
 from src.server.services.persistence.sync_result import BackupIncomplete
+from src.server.dependencies import cli_approval
+from src.server.dependencies.principal import (
+    ReadPrincipal,
+    ReadUserId,
+    WorkspaceDeletePrincipal,
+    WorkspaceWritePrincipal,
+    WorkspaceWriteUserId,
+)
+from src.server.services.shared_workspaces import service as shared_service
+from src.server.services.shared_workspaces.access import workspace_access
 from src.server.utils.api import CurrentUserId, require_workspace_owner
 from src.server.dependencies.usage_limits import (
     COMPUTER_COUNT_QUOTA,
@@ -35,18 +45,24 @@ from src.server.dependencies.usage_limits import (
     get_entitlement_statuses,
 )
 from src.server.services.background_starts import schedule_start
+from src.server.services.computer_usage.causes import computer_cause, warm_reason
+from src.server.models.computer_cause import StartCause
 from src.server.app.status_stream import (
     SSE_HEADERS,
     sse_status_event,
     status_event_stream,
 )
-from src.server.database.workspace import HomeWorkspaceTaken, WorkspaceBusyError
+from src.server.database.workspace import WorkspaceBusyError
 from src.server.database.workspace_folders import WorkspaceFolderMoving
 from src.server.database.workspace_names import (
     WorkspaceNameInvalid,
     WorkspaceNameTaken,
 )
-from src.server.database.home_workspace import is_home_row, is_unbound
+from src.server.database.home_workspace import (
+    is_home_row,
+    is_reserved_row,
+    is_unbound,
+)
 from src.server.database.workspace_move import (
     cancel_workspace_move as db_cancel_workspace_move,
     get_latest_workspace_move,
@@ -55,7 +71,6 @@ from src.server.database.workspace import (
     get_workspace as db_get_workspace,
     get_workspaces_for_user,
     update_workspace as db_update_workspace,
-    get_or_create_home_workspace,
     batch_update_sort_order,
 )
 from src.server.models.workspace import (
@@ -77,6 +92,7 @@ from src.server.services.workspace_move import move_error_detail, move_from_row
 from src.server.services.computer_errors import (
     ComputerNotFoundError,
     ComputerPreparingError,
+    NeedsComputer,
     UnknownResourceTier,
 )
 from ptc_agent.core.sandbox.providers.ssh_errors import connect_failure
@@ -84,8 +100,10 @@ from ptc_agent.core.sandbox.runtime import SandboxGoneError, SandboxTransientErr
 from src.server.utils.error_sanitization import sandbox_failure_http
 from src.server.models.workspace_refresh import WorkspaceRefreshResponse
 from src.server.services.turn_runtime import ensure_home
+from src.server.services.ssh_computers import computer_away
 from src.server.services.workspace_manager import WorkspaceManager
 from src.server.services.workspace_status_pubsub import subscribe_to_status
+from src.server.services.shared_workspaces.feed import publish_workspace_changed
 
 logger = logging.getLogger(__name__)
 
@@ -115,12 +133,12 @@ async def _workspace_action_errors(action: str, workspace_id: str):
     """Shared error mapping for workspace action routes.
 
     Re-raises HTTPException so ``require_workspace_owner``'s 403/404 pass
-    through, maps ValueError→404 and RuntimeError→400, and turns anything
+    through, and NeedsComputer for the app's one answer to it, maps ValueError→404 and RuntimeError→400, and turns anything
     else into a logged 500.
     """
     try:
         yield
-    except HTTPException:
+    except (HTTPException, NeedsComputer):
         raise
     except (SandboxGoneError, SandboxTransientError) as e:
         # Before the RuntimeError arm, which these subclass. An unreachable
@@ -165,8 +183,7 @@ async def _workspace_action_errors(action: str, workspace_id: str):
 # implementation while both paths are live rather than two that can drift.
 
 
-def _workspace_to_response(workspace: dict) -> WorkspaceResponse:
-    """Convert workspace dict to response model."""
+def workspace_response(workspace: dict) -> WorkspaceResponse:
     computer_id = workspace.get("computer_id")
     return WorkspaceResponse(
         workspace_id=str(workspace["workspace_id"]),
@@ -175,6 +192,7 @@ def _workspace_to_response(workspace: dict) -> WorkspaceResponse:
         description=workspace.get("description"),
         sandbox_id=workspace.get("sandbox_id"),
         computer_id=str(computer_id) if computer_id else None,
+        computer_name=workspace.get("computer_name") or None,
         dir_name=workspace.get("dir_name"),
         previous_dir_names=list(workspace.get("previous_dir_names") or ()),
         root_dir=workspace.get("computer_root_dir") or None,
@@ -199,10 +217,11 @@ def _workspace_to_response(workspace: dict) -> WorkspaceResponse:
 @router.post("", response_model=WorkspaceResponse, status_code=201)
 async def create_workspace(
     request: WorkspaceCreate,
-    x_user_id: CurrentUserId,
+    principal: WorkspaceWritePrincipal,
+    http_request: Request,
 ):
     """
-    Create a workspace on the caller's computer.
+    Create a workspace on one of the user's computers.
 
     Returns as soon as the row is written: the workspace is bound to the
     user's computer and owns a folder on it, and the machine itself is brought
@@ -221,22 +240,29 @@ async def create_workspace(
     Returns:
         Created workspace details
     """
+    x_user_id = principal.user_id
+    computer_id = str(request.computer_id) if request.computer_id else None
     try:
-        manager = WorkspaceManager.get_instance()
-        workspace = await manager.create_workspace(
-            user_id=x_user_id,
-            name=request.name,
-            description=request.description,
-            config=request.config,
-            computer_id=str(request.computer_id) if request.computer_id else None,
+        computer_id = (
+            await cli_approval.workspace_create(http_request, principal, request)
+            or computer_id
         )
+        manager = WorkspaceManager.get_instance()
+        with computer_cause("create"):
+            workspace = await manager.create_workspace(
+                user_id=x_user_id,
+                name=request.name,
+                description=request.description,
+                config=request.config,
+                computer_id=computer_id,
+            )
 
         logger.info(
             f"Created workspace {workspace['workspace_id']} for user {x_user_id}"
         )
-        return _workspace_to_response(workspace)
+        return workspace_response(workspace)
 
-    except HTTPException:
+    except (HTTPException, NeedsComputer):
         raise
     except (WorkspaceNameTaken, WorkspaceNameInvalid) as e:
         raise _name_error(e) from None
@@ -251,26 +277,6 @@ async def create_workspace(
     except Exception as e:
         logger.exception(f"Error creating workspace: {e}")
         raise HTTPException(status_code=500, detail="Failed to create workspace")
-
-
-@router.post("/home", response_model=WorkspaceResponse)
-async def get_home_workspace(x_user_id: CurrentUserId):
-    """Get or create the user's Home, where work in no particular workspace runs.
-
-    Its id derives from the user id, so it never changes and a client may keep
-    it. Idempotent, and safe to call on every app load. The row is made here;
-    Home joins the user's computer on its first start or turn.
-    """
-    try:
-        workspace = await get_or_create_home_workspace(x_user_id)
-        return _workspace_to_response(workspace)
-    except HomeWorkspaceTaken:
-        # The owner check's answer for a row another account holds; no retry
-        # makes this one the caller's.
-        raise HTTPException(status_code=403, detail="Forbidden") from None
-    except Exception as e:
-        logger.exception(f"Error ensuring Home: {e}")
-        raise HTTPException(status_code=500, detail="Failed to ensure Home")
 
 
 @router.post("/reorder", status_code=204)
@@ -295,7 +301,7 @@ async def reorder_workspaces(
 
 @router.get("", response_model=WorkspaceListResponse)
 async def list_workspaces(
-    x_user_id: CurrentUserId,
+    principal: ReadPrincipal,
     limit: int = Query(20, ge=1, le=100, description="Maximum results"),
     offset: int = Query(0, ge=0, description="Number to skip"),
     sort_by: Literal["activity", "name", "custom"] = Query(
@@ -318,7 +324,7 @@ async def list_workspaces(
     """
     try:
         workspaces, total = await get_workspaces_for_user(
-            user_id=x_user_id,
+            user_id=principal.user_id,
             limit=limit,
             offset=offset,
             sort_by=sort_by,
@@ -326,7 +332,7 @@ async def list_workspaces(
         )
 
         return WorkspaceListResponse(
-            workspaces=[_workspace_to_response(w) for w in workspaces],
+            workspaces=[workspace_response(w) for w in workspaces],
             total=total,
             limit=limit,
             offset=offset,
@@ -339,7 +345,12 @@ async def list_workspaces(
 
 # Declared before the `/{workspace_id}` routes so `/quota` isn't captured as an id.
 @router.get("/quota", response_model=WorkspaceQuotaResponse)
-async def get_workspace_quota(x_user_id: CurrentUserId):
+async def get_workspace_quota(
+    x_user_id: ReadUserId,
+    plan_changed: bool = Query(
+        False, description="The client is back from the plan page: read the plan's scopes again."
+    ),
+):
     """Per-capability count quotas for the spec pickers, always-on and New computer.
 
     Platform mode only — every field is null in OSS mode, so the UI just omits the
@@ -347,7 +358,7 @@ async def get_workspace_quota(x_user_id: CurrentUserId):
     back null rather than erroring the whole call.
     """
     statuses, computers = await asyncio.gather(
-        get_entitlement_statuses(x_user_id, DISPLAYED_ENTITLEMENTS),
+        get_entitlement_statuses(x_user_id, DISPLAYED_ENTITLEMENTS, plan_changed=plan_changed),
         get_capacity_status(x_user_id, COMPUTER_COUNT_QUOTA),
     )
     return WorkspaceQuotaResponse(
@@ -360,7 +371,7 @@ async def get_workspace_quota(x_user_id: CurrentUserId):
 
 
 @router.get("/{workspace_id}/events")
-async def workspace_status_events(workspace_id: str, x_user_id: CurrentUserId):
+async def workspace_status_events(workspace_id: str, x_user_id: ReadUserId):
     """Push workspace lifecycle status changes to the client via SSE.
 
     Replaces the previous 4-second interval polling on the frontend. The
@@ -375,7 +386,7 @@ async def workspace_status_events(workspace_id: str, x_user_id: CurrentUserId):
     it runs on from the stream itself.
     """
     workspace = await db_get_workspace(workspace_id)
-    require_workspace_owner(workspace, user_id=x_user_id)
+    await workspace_access(workspace, x_user_id)
 
     computer_id = (
         str(workspace["computer_id"]) if workspace.get("computer_id") else None
@@ -423,7 +434,7 @@ async def workspace_status_events(workspace_id: str, x_user_id: CurrentUserId):
 
 
 @router.get("/{workspace_id}", response_model=WorkspaceResponse)
-async def get_workspace(workspace_id: str, x_user_id: CurrentUserId):
+async def get_workspace(workspace_id: str, x_user_id: ReadUserId):
     """
     Get workspace details.
 
@@ -436,9 +447,9 @@ async def get_workspace(workspace_id: str, x_user_id: CurrentUserId):
     """
     try:
         workspace = await db_get_workspace(workspace_id)
-        require_workspace_owner(workspace, user_id=x_user_id)
+        await workspace_access(workspace, x_user_id)
 
-        return _workspace_to_response(workspace)
+        return workspace_response(workspace)
 
     except HTTPException:
         raise
@@ -451,7 +462,7 @@ async def get_workspace(workspace_id: str, x_user_id: CurrentUserId):
 async def update_workspace(
     workspace_id: str,
     request: WorkspaceUpdate,
-    x_user_id: CurrentUserId,
+    x_user_id: WorkspaceWriteUserId,
 ):
     """
     Update workspace metadata.
@@ -465,11 +476,12 @@ async def update_workspace(
         Updated workspace details
     """
     try:
-        # Check workspace exists and ownership
+        # Check workspace exists and ownership; a shared workspace's
+        # managers change it, for everyone in it.
         workspace = await db_get_workspace(workspace_id)
-        require_workspace_owner(workspace, user_id=x_user_id)
+        access = await workspace_access(workspace, x_user_id, manage=True)
         if (
-            is_home_row(workspace)
+            is_reserved_row(workspace)
             and request.name is not None
             and request.name != workspace.get("name")
         ):
@@ -495,8 +507,12 @@ async def update_workspace(
 
         if not updated:
             raise HTTPException(status_code=404, detail="Workspace not found")
+        if access.is_shared:
+            await publish_workspace_changed(
+                access.org_id, workspace_id, "updated"
+            )
 
-        return _workspace_to_response(updated)
+        return workspace_response(updated)
 
     except HTTPException:
         raise
@@ -516,7 +532,11 @@ async def update_workspace(
 
 
 def _schedule_warm_restart(
-    manager: WorkspaceManager, workspace_id: str, user_id: str
+    manager: WorkspaceManager,
+    workspace_id: str,
+    user_id: str,
+    cause: StartCause = "warm",
+    detail: Optional[str] = None,
 ) -> None:
     """Start a workspace in the background, keyed by the project.
 
@@ -527,16 +547,23 @@ def _schedule_warm_restart(
     uncreated. The chat path dedupes against this via the manager's
     per-workspace locks.
     """
-    schedule_start(
-        f"workspace:{workspace_id}",
-        lambda: manager.get_session_for_workspace(workspace_id, user_id=user_id),
-    )
+    with computer_cause(cause, detail=detail):
+        schedule_start(
+            f"workspace:{workspace_id}",
+            lambda: manager.get_session_for_workspace(workspace_id, user_id=user_id),
+        )
+
+
+def _blocking_start_cause(reason: Optional[str]) -> StartCause:
+    """A blocking start is the create modal's (before its uploads) or a
+    button's."""
+    return "create" if reason == "create" else "button"
 
 
 @router.post("/{workspace_id}/start", response_model=WorkspaceActionResponse)
 async def start_workspace(
     workspace_id: str,
-    x_user_id: CurrentUserId,
+    x_user_id: WorkspaceWriteUserId,
     lazy: bool = Query(
         False,
         description=(
@@ -544,6 +571,10 @@ async def start_workspace(
             "immediately with status='starting'. If false (default), block "
             "until the session is ready and return status='running'."
         ),
+    ),
+    reason: Optional[str] = Query(
+        None,
+        description="What prompted the start (input, workspace_open, create, ...); telemetry only.",
     ),
 ):
     """
@@ -576,7 +607,9 @@ async def start_workspace(
         if not workspace:
             raise HTTPException(status_code=404, detail="Workspace not found")
 
-        require_workspace_owner(workspace, user_id=x_user_id)
+        # Any member of a shared workspace starts its computer: their turn
+        # would. Its tokens are kept for the caller (``user_id`` below).
+        await workspace_access(workspace, x_user_id)
 
         if is_unbound(workspace):
             # Home before its first turn: the warm puts it on the computer, as
@@ -588,10 +621,33 @@ async def start_workspace(
                 # its threads are there now, and the id is gone for every read.
                 raise HTTPException(status_code=404, detail="Workspace not found")
 
+        # Opening Home warms the computer its next turn would run on: Home's
+        # stand-in while the machine Home lives on can't be reached. Placing
+        # its row is cheap and builds nothing; the response still names Home.
+        from src.server.services.home_placement import runs_in
+
+        warm_id = await runs_in(x_user_id, workspace_id, make=True)
+        if warm_id != workspace_id:
+            workspace = await db_get_workspace(warm_id)
+            if not workspace:
+                raise HTTPException(status_code=404, detail="Workspace not found")
+
         if workspace["status"] == "stopping":
             await manager.reconcile_stopping_computer(str(workspace["computer_id"]))
-            workspace = await db_get_workspace(workspace_id)
-            require_workspace_owner(workspace, user_id=x_user_id)
+            workspace = await db_get_workspace(warm_id)
+            await workspace_access(workspace, x_user_id)
+
+        if lazy and workspace["status"] in {"stopped", "running"}:
+            # A warm opens a workspace; nobody asked for a start. On a machine
+            # that is asleep or offline it could only fail, show a start beside
+            # the card saying the machine is away, and record that failure on
+            # the computer. The machine connects by itself once awake.
+            if await computer_away(warm_id):
+                return WorkspaceActionResponse(
+                    workspace_id=workspace_id,
+                    status=workspace["status"],
+                    message="The workspace's computer can't be reached",
+                )
 
         def _warm_in_background() -> Response:
             """202 now, the attach in a background task.
@@ -599,8 +655,10 @@ async def start_workspace(
             Workspace-keyed, not machine-keyed: starting the machine alone
             attaches whichever live sibling it finds, and this project would
             still have no folder when the caller came back."""
-            _schedule_warm_restart(manager, workspace_id, x_user_id)
-            logger.info(f"Scheduled warm restart for workspace {workspace_id}")
+            _schedule_warm_restart(
+                manager, warm_id, x_user_id, detail=warm_reason(reason)
+            )
+            logger.info(f"Scheduled warm restart for workspace {warm_id}")
             payload = WorkspaceActionResponse(
                 workspace_id=workspace_id,
                 status="starting",
@@ -619,7 +677,8 @@ async def start_workspace(
             # here without one sends the caller to a path nothing has created.
             if lazy:
                 return _warm_in_background()
-            await manager.get_session_for_workspace(workspace_id, user_id=x_user_id)
+            with computer_cause(_blocking_start_cause(reason)):
+                await manager.get_session_for_workspace(warm_id, user_id=x_user_id)
             return WorkspaceActionResponse(
                 workspace_id=workspace_id,
                 status="running",
@@ -648,7 +707,8 @@ async def start_workspace(
         # Blocking path. An acquisition for this workspace brings the same
         # machine up as the computer route would and materialises this project
         # on it.
-        await manager.get_session_for_workspace(workspace_id, user_id=x_user_id)
+        with computer_cause(_blocking_start_cause(reason)):
+            await manager.get_session_for_workspace(warm_id, user_id=x_user_id)
 
         logger.info(f"Started workspace {workspace_id}")
         return WorkspaceActionResponse(
@@ -661,7 +721,7 @@ async def start_workspace(
 @router.post("/{workspace_id}/archive", response_model=WorkspaceActionResponse)
 async def archive_workspace(
     workspace_id: str,
-    x_user_id: CurrentUserId,
+    x_user_id: WorkspaceWriteUserId,
 ):
     """
     Archive a stopped workspace (moves sandbox to object storage).
@@ -677,9 +737,10 @@ async def archive_workspace(
     """
     async with _workspace_action_errors("archive", workspace_id):
         workspace = await db_get_workspace(workspace_id)
-        require_workspace_owner(workspace, user_id=x_user_id)
+        await workspace_access(workspace, x_user_id, manage=True)
 
-        await WorkspaceManager.get_instance().archive_workspace(workspace_id)
+        with computer_cause("archive"):
+            await WorkspaceManager.get_instance().archive_workspace(workspace_id)
 
         logger.info(f"Archived workspace {workspace_id}")
         return WorkspaceActionResponse(
@@ -715,14 +776,15 @@ async def set_workspace_spec(
     async with _workspace_action_errors("set spec for", workspace_id):
         workspace = await db_get_workspace(workspace_id)
         require_workspace_owner(workspace, user_id=x_user_id)
-        updated = await WorkspaceManager.get_instance().set_workspace_spec(
-            workspace_id, request.tier, user_id=x_user_id
-        )
+        with computer_cause("spec_change"):
+            updated = await WorkspaceManager.get_instance().set_workspace_spec(
+                workspace_id, request.tier, user_id=x_user_id
+            )
 
         logger.info(
             f"Set workspace {workspace_id} spec to {request.tier!r} for user {x_user_id}"
         )
-        return _workspace_to_response(updated)
+        return workspace_response(updated)
 
 
 @router.post("/{workspace_id}/always-on", response_model=WorkspaceResponse)
@@ -751,9 +813,10 @@ async def set_workspace_always_on(
     async with _workspace_action_errors("set always-on for", workspace_id):
         workspace = await db_get_workspace(workspace_id)
         require_workspace_owner(workspace, user_id=x_user_id)
-        updated = await WorkspaceManager.get_instance().set_workspace_always_on(
-            workspace_id, request.enabled, user_id=x_user_id
-        )
+        with computer_cause("always_on"):
+            updated = await WorkspaceManager.get_instance().set_workspace_always_on(
+                workspace_id, request.enabled, user_id=x_user_id
+            )
 
         # Always-on means the sandbox should be up 24/7, so enabling it on a
         # stopped workspace starts it now rather than deferring to the next
@@ -768,7 +831,10 @@ async def set_workspace_always_on(
             # sibling it finds, which would leave this project's folder
             # uncreated on a machine its own row calls running.
             _schedule_warm_restart(
-                WorkspaceManager.get_instance(), workspace_id, x_user_id
+                WorkspaceManager.get_instance(),
+                workspace_id,
+                x_user_id,
+                cause="always_on",
             )
             logger.info(
                 f"Always-on enabled: scheduled warm start for {workspace_id}"
@@ -779,7 +845,7 @@ async def set_workspace_always_on(
             f"Set workspace {workspace_id} always-on to {request.enabled} "
             f"for user {x_user_id}"
         )
-        return _workspace_to_response(updated)
+        return workspace_response(updated)
 
 
 @router.post(
@@ -809,13 +875,14 @@ async def duplicate_workspace(
         require_workspace_owner(workspace, user_id=x_user_id)
 
         manager = WorkspaceManager.get_instance()
-        new_workspace = await manager.duplicate_workspace(workspace_id, x_user_id)
+        with computer_cause("duplicate"):
+            new_workspace = await manager.duplicate_workspace(workspace_id, x_user_id)
 
         logger.info(
             f"Duplicated workspace {workspace_id} to "
             f"{new_workspace['workspace_id']} for user {x_user_id}"
         )
-        return _workspace_to_response(new_workspace)
+        return workspace_response(new_workspace)
 
 
 @router.post(
@@ -859,9 +926,10 @@ async def choose_files_restore(
     workspace = await db_get_workspace(workspace_id)
     require_workspace_owner(workspace, user_id=x_user_id)
     try:
-        settled = await WorkspaceManager.get_instance().settle_files_restore_offer(
-            workspace_id, user_id=x_user_id, restore=request.restore
-        )
+        with computer_cause("restore"):
+            settled = await WorkspaceManager.get_instance().settle_files_restore_offer(
+                workspace_id, user_id=x_user_id, restore=request.restore
+            )
     except Exception as e:
         logger.warning(f"Restore choice for workspace {workspace_id} failed: {e}")
         raise sandbox_failure_http(e) from None
@@ -870,7 +938,7 @@ async def choose_files_restore(
             status_code=409,
             detail="No restore is waiting on a choice for this workspace.",
         )
-    return _workspace_to_response(await db_get_workspace(workspace_id) or workspace)
+    return workspace_response(await db_get_workspace(workspace_id) or workspace)
 
 
 @router.get("/{workspace_id}/move", response_model=Optional[WorkspaceMoveOut])
@@ -910,17 +978,19 @@ async def refresh_workspace(
     """Refresh sandbox skills + tool modules.
 
     Intended for long-lived/reconnected sandboxes where tool module generation
-    is skipped during reconnect.
+    is skipped during reconnect. Any member of a shared workspace may, as any
+    member may start its computer.
     """
 
     manager = WorkspaceManager.get_instance()
     workspace = await db_get_workspace(workspace_id)
-    require_workspace_owner(workspace, user_id=x_user_id)
+    await workspace_access(workspace, x_user_id)
 
     try:
-        session = await manager.get_session_for_workspace(
-            workspace_id, user_id=x_user_id
-        )
+        with computer_cause("refresh"):
+            session = await manager.get_session_for_workspace(
+                workspace_id, user_id=x_user_id
+            )
     except (SandboxGoneError, SandboxTransientError):
         # Same reasoning as _workspace_action_errors above: re-raise for the
         # app-level handler that owns both the wording and the sanitizing,
@@ -941,9 +1011,7 @@ async def refresh_workspace(
     # acquisition can leave this route as the machine's first sync, so it has
     # to be the same call the acquisition path makes.
     try:
-        result = await manager.refresh_project_assets(
-            workspace_id, x_user_id, sandbox
-        )
+        result = await manager.refresh_project_assets(workspace_id, sandbox)
     except Exception as e:
         logger.exception(f"Refresh failed for workspace {workspace_id}: {e}")
         raise HTTPException(status_code=500, detail="Failed to refresh sandbox assets")
@@ -975,7 +1043,8 @@ async def refresh_workspace(
 @router.delete("/{workspace_id}", status_code=204)
 async def delete_workspace(
     workspace_id: str,
-    x_user_id: CurrentUserId,
+    principal: WorkspaceDeletePrincipal,
+    http_request: Request,
     delete_files: bool = Query(
         False,
         description=(
@@ -993,14 +1062,21 @@ async def delete_workspace(
 
     Args:
         workspace_id: Workspace UUID
-        x_user_id: Authenticated user ID
         delete_files: Also delete the folder from the user's own machine
     """
     try:
         workspace = await db_get_workspace(workspace_id)
-        if is_home_row(workspace):
+        if is_reserved_row(workspace):
             raise HTTPException(status_code=400, detail="Cannot delete Home")
-        require_workspace_owner(workspace, user_id=x_user_id)
+        access = await workspace_access(workspace, principal.user_id, manage=True)
+        if access.is_shared:
+            # A computer's token never gets here (``require_scopes``).
+            # With its computer, which is the workspace's alone.
+            await shared_service.delete(workspace_id, principal.user_id)
+            return
+        await cli_approval.workspace_delete(
+            http_request, principal, workspace, delete_files=delete_files
+        )
 
         manager = WorkspaceManager.get_instance()
         await manager.delete_workspace(workspace_id, delete_files=delete_files)

@@ -23,11 +23,16 @@ from src.server.models.news import (
 )
 from src.server.services.cache.news_cache_service import NewsCacheService, news_cache_key
 from src.server.services.news_body import read_article_body
-from src.server.utils.api import CurrentUserId
+from src.server.dependencies.principal import DataReadUserId
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/v1/news", tags=["News"])
+
+_DATE_FILTER_DESCRIPTION = (
+    "ISO 8601 date filter. Providers that cannot filter by time scan a bounded "
+    "range; an empty page with a next_cursor means keep paging."
+)
 
 _cache = NewsCacheService()
 
@@ -182,12 +187,12 @@ def _compact(article: dict) -> NewsArticleCompact | None:
 @router.get("", response_model=NewsCompactResponse)
 async def get_news(
     request: Request,
-    user_id: CurrentUserId,
+    user_id: DataReadUserId,
     tickers: str | None = Query(None, description="Comma-separated ticker symbols"),
     limit: int = Query(20, ge=1, le=100),
     cursor: str | None = Query(None, description="Pagination cursor"),
-    published_after: str | None = Query(None, description="ISO 8601 date filter"),
-    published_before: str | None = Query(None, description="ISO 8601 date filter"),
+    published_after: str | None = Query(None, description=_DATE_FILTER_DESCRIPTION),
+    published_before: str | None = Query(None, description=_DATE_FILTER_DESCRIPTION),
     order: str | None = Query(None, description="Sort order: asc or desc"),
     sort: str | None = Query(None, description="Sort field, e.g. published_utc"),
     provider: str | None = Query(
@@ -302,7 +307,7 @@ async def _with_body(article: dict) -> NewsArticle:
 
 
 @router.get("/{article_id}", response_model=NewsArticle)
-async def get_news_article(article_id: str, request: Request, user_id: CurrentUserId):
+async def get_news_article(article_id: str, request: Request, user_id: DataReadUserId):
     not_found = HTTPException(status_code=404, detail="Article not found")
 
     # An id a gated source claims is that feed's content, and ids travel in

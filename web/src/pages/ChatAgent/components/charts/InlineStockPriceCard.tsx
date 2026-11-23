@@ -6,7 +6,7 @@ import { compactNumber, formatCalendarDayRange, formatCalendarMonthDay, grouped2
 import { readStockPrices, type InlineCardProps } from './cardReaders';
 import { FreshnessBadge } from './FreshnessBadge';
 import { TermCard, TermChange, TermPriceLine, TermStats } from './TermCard';
-import { changeDirection } from './termChange';
+import { changeDirection } from '@/lib/priceMove';
 import { useCardNarrow } from './termContext';
 
 function downsample<T>(arr: readonly T[], maxPoints = 60): readonly T[] {
@@ -38,14 +38,15 @@ export function InlineStockPriceCard({ artifact, onClick }: InlineCardProps): Re
   if (!sent) return null;
 
   const closes = downsample(days).map((bar) => bar.close);
-  const money = (n: number): string => formatMoney(n, prices.currency, locale);
+  const money = (n: number): string => formatMoney(n, prices.currency, locale, { upTo: prices.places });
   const { first, mid, last } = sent;
 
   return (
-    <TermCard title={symbol} meta={first && last ? formatCalendarDayRange(first, last, locale) : undefined} onClick={onClick}>
+    <TermCard title={symbol} symbol={symbol} meta={first && last ? formatCalendarDayRange(first, last, locale) : undefined} onClick={onClick}>
       <div className="term-line term-plot-lead">
         {sent.lastClose != null && <span className="term-big">{money(sent.lastClose)}</span>}
         <TermChange value={prices.changePct} />
+        {prices.changePct != null && <span className="term-t3 term-label">{t('toolArtifact.period')}</span>}
         {/* Publisher and lag of the plotted series live behind this tag. */}
         {prices.freshness && <FreshnessBadge freshness={prices.freshness} source={prices.source} chartSymbol={symbol ?? ''} />}
       </div>

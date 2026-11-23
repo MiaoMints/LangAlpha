@@ -43,6 +43,7 @@ from src.llms.reasoning_lineage import (
 )
 from src.llms.reasoning_payload import (
     drop_if_empty,
+    is_unfinished_reply,
     pad_tool_turn,
     strip_item_ids,
     strip_reasoning,
@@ -85,6 +86,11 @@ def _target_route(model: Any) -> str | None:
     return route if isinstance(route, str) and route else None
 
 
+def model_lineage(model: Any) -> str:
+    """The lineage of the route a call to ``model`` goes out on."""
+    return lineage_for_route(_target_route(model))
+
+
 def message_lineage(msg: AIMessage) -> str:
     meta = msg.response_metadata or {}
     origin = meta.get(ORIGIN_KEY)
@@ -99,8 +105,9 @@ def message_lineage(msg: AIMessage) -> str:
 def _origin_gate(msg: AIMessage, stats: SanitizeStats) -> AIMessage | None:
     """Gate A: drop the reasoning and item ids another lineage minted.
 
-    The caller establishes that the lineages differ; unattributable history
-    resolves to ``UNKNOWN_LINEAGE``, which matches nothing and so fails closed.
+    The caller establishes that the lineages differ, or that the message is a
+    reply cut off mid-stream; unattributable history resolves to
+    ``UNKNOWN_LINEAGE``, which matches nothing and so fails closed.
     """
     stripped = strip_reasoning(msg)
     if stripped is not msg:
@@ -198,7 +205,11 @@ def _sanitize(
             continue
 
         new_msg: AIMessage | None = msg
-        if origin_gate and message_lineage(msg) != target_lineage:
+        # A reply cut off mid-stream names items its own server never kept, so
+        # no target can take them back, its own and an unattributed one included.
+        if is_unfinished_reply(msg) or (
+            origin_gate and message_lineage(msg) != target_lineage
+        ):
             new_msg = _origin_gate(msg, stats)
         if new_msg is not None:
             new_msg = _structure_gate(new_msg, stats, drop_unsigned=drop_unsigned)

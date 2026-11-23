@@ -2,10 +2,12 @@ import React, { useState, useEffect, useLayoutEffect, useMemo, useCallback, memo
 import ActivityBlock from '../ActivityBlock';
 import type { ActivityItem } from './activityTypes';
 import { INLINE_ARTIFACT_MAP, openCardTarget } from '../charts/InlineArtifactCards';
+import { InlineChartLayerCard } from '../charts/InlineChartLayerCard';
 import { PILL_ROW_CLASS } from '../charts/pillArtifacts';
 import type { OpenFileHandler } from '../../utils/fileLocation';
 import UserQuestionCard from '../UserQuestionCard';
 import CreateWorkspaceCard from '../CreateWorkspaceCard';
+import { WorkspaceCreatedSlip } from './WorkspaceCreatedSlip';
 import StartQuestionCard from '../StartQuestionCard';
 import SecretaryConfirmCard from '../SecretaryConfirmCard';
 import CreditPauseCard from '../CreditPauseCard';
@@ -14,6 +16,7 @@ import PastPlanCard from '../PastPlanCard';
 import WorkflowRunCard from '../WorkflowRunCard';
 import SubagentRun, { type SubagentRunMember } from './SubagentRun';
 import AnalystHandoffRun, { type AnalystHandoffMember } from './AnalystHandoffRun';
+import { ArtifactCommentReplyLines, type CommentReplyMember } from '../artifactComments/ArtifactCommentReplyLine';
 import { WORKFLOW_TASK_TYPE } from '../../session/subagents/workflowRunState';
 import { SubagentStopNotices } from '../SubagentStopNotice';
 import type { CreditPauseState, PendingToolCallChunk, PTCAgentProposalState, SubagentTaskRecord, ToolApprovalState } from '@/types/chat';
@@ -21,7 +24,7 @@ import TextMessageContent from '../TextMessageContent';
 import { visibleParagraphPrefix } from '@/lib/paragraphGate';
 import { useTranscriptDisplay } from '@/lib/transcriptDisplay';
 import InlineWidget from '../viewers/InlineWidget';
-import { NotificationDivider } from './NotificationDivider';
+import { renderNotification } from './notices';
 import { normalizeSubagentText } from './normalizeSubagentText';
 import StructuredResultBlock from './StructuredResultBlock';
 import { parseStructuredResult } from '../../utils/structuredResult';
@@ -31,7 +34,7 @@ import { FoldPanel } from './FoldPanel';
 import { CardArrivals, type ArrivingCard } from './CardArrivals';
 import { useMotionSafe } from '@/lib/reducedMotion';
 import { useProseReport } from './proseTyping';
-import { projectContent, blockIsProcess, blockVisible, streamingTextBlockIndex, type ContentProjection } from './contentProjection';
+import { projectContent, blockIsProcess, blockVisible, replyStartKey, streamingTextBlockIndex, type ContentProjection } from './contentProjection';
 import { EMPTY_OBJ } from './types';
 import type { ContentSegmentRecord, FoldState, ToolCallProcessRecord } from './types';
 import type {
@@ -57,7 +60,6 @@ interface MessageContentSegmentsProps {
   contentProjection?: ContentProjection;
   reasoningProcesses: Record<string, Record<string, unknown>>;
   toolCallProcesses: Record<string, ToolCallProcessRecord>;
-  todoListProcesses: Record<string, Record<string, unknown>>;
   subagentTasks: Record<string, SubagentTaskRecord>;
   userQuestions?: Record<string, Record<string, unknown>>;
   workspaceProposals?: Record<string, Record<string, unknown>>;
@@ -66,10 +68,16 @@ interface MessageContentSegmentsProps {
   isStreaming?: boolean;
   /** How much of the turn this bubble draws; `unfolded` is the full transcript. */
   fold?: FoldState;
-  /** The last visible bubble of its backend turn: the only one with an answer. */
+  /** The last visible bubble of its backend turn. */
   isTurnTail?: boolean;
+  /** The bubble closes a reply (`computeReplyEnds`), so a fold keeps its last
+   *  text: the turn's tail, or the last bubble before a steer. */
+  endsReply?: boolean;
   isSubagentView?: boolean;
   readOnly?: boolean;
+  /** A shared workspace's turn another member sent: its questions and
+   *  approvals are theirs to answer, so they draw without actions. */
+  othersPause?: boolean;
   ptcAgentProposals?: Record<string, PTCAgentProposalState>;
   secretaryActionProposals?: Record<string, Record<string, unknown>>;
   creditPauses?: Record<string, CreditPauseState>;
@@ -84,7 +92,7 @@ interface TextBlockProps {
   block: TextRenderBlock;
   isStreaming: boolean;
   isSubagentView: boolean;
-  /** The message's last prose block: where a turn-end landing puts the viewport top. */
+  /** Where a turn-end landing puts the viewport top (`replyStartKey`). */
   isReplyStart: boolean;
   onOpenFile?: OpenFileHandler;
   onRevealed?: (key: string, done: boolean) => void;
@@ -103,8 +111,10 @@ interface TextBlockProps {
  *  did. Nothing is held past the turn either: the hold only applies while the
  *  message streams, so a settle or an error releases it. */
 const HOLDS_FOR_PROSE = new Set<RenderBlock['type']>([
-  'activity', 'subagent_task', 'html_widget', 'compact_artifact', 'notification',
+  'activity', 'subagent_task', 'html_widget', 'compact_artifact', 'chart_layers', 'notification',
 ]);
+
+type RunKind = 'pill' | 'line' | 'subagent' | 'analyst';
 
 /** Whitespace between two blocks, such as the "\n\n" a model writes between
  *  two tool calls. It draws nothing, so it is treated as nothing: it neither
@@ -156,7 +166,7 @@ function TextBlock({ block, isStreaming, isSubagentView, isReplyStart, onOpenFil
   return isReplyStart && rendersNow ? <div data-reply-start="">{textEl}</div> : textEl;
 }
 
-export const MessageContentSegments = memo(function MessageContentSegments({ segments, contentProjection, reasoningProcesses, toolCallProcesses, todoListProcesses: _todoListProcesses, subagentTasks, userQuestions = EMPTY_OBJ, workspaceProposals = EMPTY_OBJ, questionProposals = EMPTY_OBJ, pendingToolCallChunks = EMPTY_OBJ, isStreaming, fold = 'unfolded', isTurnTail = false, isSubagentView = false, readOnly = false, ptcAgentProposals = EMPTY_OBJ, secretaryActionProposals = EMPTY_OBJ, creditPauses = EMPTY_OBJ, toolApprovals = EMPTY_OBJ, htmlWidgetProcesses = EMPTY_OBJ, dispatcherContext, messageId }: MessageContentSegmentsProps): React.ReactElement {
+export const MessageContentSegments = memo(function MessageContentSegments({ segments, contentProjection, reasoningProcesses, toolCallProcesses, subagentTasks, userQuestions = EMPTY_OBJ, workspaceProposals = EMPTY_OBJ, questionProposals = EMPTY_OBJ, pendingToolCallChunks = EMPTY_OBJ, isStreaming, fold = 'unfolded', isTurnTail = false, endsReply = isTurnTail, isSubagentView = false, readOnly = false, othersPause = false, ptcAgentProposals = EMPTY_OBJ, secretaryActionProposals = EMPTY_OBJ, creditPauses = EMPTY_OBJ, toolApprovals = EMPTY_OBJ, htmlWidgetProcesses = EMPTY_OBJ, dispatcherContext, messageId }: MessageContentSegmentsProps): React.ReactElement {
   const { turnDisplay } = useTranscriptDisplay();
   const motionSafe = useMotionSafe();
   const {
@@ -196,7 +206,10 @@ export const MessageContentSegments = memo(function MessageContentSegments({ seg
 
   const projection = useMemo(() => {
     if (contentProjection && (contentProjection.nextExpiry === null || contentProjection.nextExpiry > now)) return contentProjection;
-    return projectContent({ segments, reasoningProcesses, toolCallProcesses, isStreaming, isSubagentView, pendingToolCallChunks, now, root }, contentProjection);
+    return projectContent({
+      segments, reasoningProcesses, toolCallProcesses, isStreaming, isSubagentView, pendingToolCallChunks, now, root,
+      cardedCharts: contentProjection?.cardedCharts,
+    }, contentProjection);
   }, [contentProjection, segments, reasoningProcesses, toolCallProcesses, isStreaming, isSubagentView, pendingToolCallChunks, now, root]);
   const { blocks: renderBlocks, preparingToolCall, nextExpiry } = projection;
 
@@ -257,12 +270,18 @@ export const MessageContentSegments = memo(function MessageContentSegments({ seg
     }
   }
 
+  // Whether this viewer answers the turn's pauses: never on a read-only
+  // surface, nor on another member's turn, whose cards draw without actions.
+  const answers = !readOnly && !othersPause;
   const proposalOf = (block: PTCAgentRenderBlock): PTCAgentProposalState | undefined =>
     block.proposal ?? ptcAgentProposals[block.segment.proposalId!];
 
   /** Blocks drawn as one row or group with their like neighbours. */
-  const runKind = (block: RenderBlock): 'pill' | 'subagent' | 'analyst' | null => {
-    if (block.type === 'compact_artifact') return block.card?.kind === 'pill' ? 'pill' : null;
+  const runKind = (block: RenderBlock): RunKind | null => {
+    if (block.type === 'compact_artifact') {
+      const kind = block.card?.kind;
+      return kind === 'pill' || kind === 'line' ? kind : null;
+    }
     if (block.type === 'subagent_task') {
       const id = block.segment.subagentId;
       // A workflow run has a card of its own and breaks a run of spawns.
@@ -272,8 +291,9 @@ export const MessageContentSegments = memo(function MessageContentSegments({ seg
     return null;
   };
 
-  const blockIsVisible = renderBlocks.map((block) => blockVisible(projection, block, fold, isTurnTail));
-  const blockFolds = renderBlocks.map((block) => fold !== 'unfolded' && blockIsProcess(projection, block, isTurnTail));
+  const blockIsVisible = renderBlocks.map((block) => blockVisible(projection, block, fold, endsReply));
+  const replyStart = replyStartKey(projection, fold, endsReply);
+  const blockFolds = renderBlocks.map((block) => fold !== 'unfolded' && blockIsProcess(projection, block, endsReply));
 
   // A lookup's card draws one box with the lookup card of its type above it:
   // a series of quotes or charts reads as one, but a search under a chart
@@ -293,12 +313,51 @@ export const MessageContentSegments = memo(function MessageContentSegments({ seg
     above = i;
   }
 
-  // The cards a row can hand its place to as its call lands.
+  // What the message draws, in order: one element per block, except that a
+  // run of consecutive blocks of one kind (pills, reply lines, subagent
+  // spawns, analyst hand-offs) sharing a fold and visibility state is gathered
+  // into one element.
+  const drawn: Array<{ kind: RunKind | null; members: number[] }> = [];
+  for (let i = 0; i < renderBlocks.length; i++) {
+    if (heldForProse[i] || isBlankText(renderBlocks[i])) continue;
+    const kind = runKind(renderBlocks[i]);
+    const members = [i];
+    for (let j = i + 1; kind && j < renderBlocks.length; j++) {
+      if (isBlankText(renderBlocks[j])) continue;
+      if (
+        runKind(renderBlocks[j]) !== kind
+        || heldForProse[j]
+        || blockFolds[j] !== blockFolds[i]
+        || blockIsVisible[j] !== blockIsVisible[i]
+      ) break;
+      members.push(j);
+    }
+    drawn.push({ kind, members });
+    i = members[members.length - 1];
+  }
+
+  // The cards a row can hand its place to as its call lands: a call's own
+  // card, and a run of reply lines, in the place of its first reply's row. A
+  // reply joining a line already drawn changes that line's sentence instead,
+  // and its row leaves as rows leave, or, as its block's only item, its
+  // block's space closes into the line (CardArrivals, `joins`).
   const arrivingCards: ArrivingCard[] = [];
-  renderBlocks.forEach((block, i) => {
-    if (heldForProse[i] || !blockIsVisible[i] || block.type !== 'compact_artifact' || block.card?.kind !== 'call') return;
-    arrivingCards.push({ key: block.key, call: block.toolCallId, settledAt: block.proc._settledAt as number | undefined });
-  });
+  for (const { kind, members } of drawn) {
+    const [first] = members;
+    const block = renderBlocks[first];
+    if (!blockIsVisible[first] || block.type !== 'compact_artifact') continue;
+    if (kind === 'line' || (kind === null && block.card?.kind === 'call')) {
+      const joins = kind === 'line'
+        ? members.slice(1).flatMap((idx) => {
+          const member = renderBlocks[idx];
+          return member.type === 'compact_artifact'
+            ? [{ call: member.toolCallId, settledAt: member.proc._settledAt as number | undefined }]
+            : [];
+        })
+        : undefined;
+      arrivingCards.push({ key: block.key, call: block.toolCallId, settledAt: block.proc._settledAt as number | undefined, joins });
+    }
+  }
 
   const renderBlock = (block: RenderBlock, blockIdx: number): React.ReactElement | null => {
 
@@ -344,11 +403,16 @@ export const MessageContentSegments = memo(function MessageContentSegments({ seg
           );
         }
 
-        if (block.type === 'notification') {
-          const notifSeg = (block as NotificationRenderBlock).segment;
+        if (block.type === 'chart_layers') {
           return (
-            <NotificationDivider key={block.key} content={notifSeg.content} fallback={notifSeg.fallback} detail={notifSeg.detail} detailKind={notifSeg.detailKind} />
+            <div key={block.key}>
+              <InlineChartLayerCard card={block.card} />
+            </div>
           );
+        }
+
+        if (block.type === 'notification') {
+          return <React.Fragment key={block.key}>{renderNotification((block as NotificationRenderBlock).segment)}</React.Fragment>;
         }
 
         if (block.type === 'text') {
@@ -357,7 +421,7 @@ export const MessageContentSegments = memo(function MessageContentSegments({ seg
               key={block.key}
               block={block as TextRenderBlock}
               isStreaming={blockIdx === streamingTextIdx}
-              isReplyStart={block.key === projection.lastTextKey}
+              isReplyStart={block.key === replyStart}
               isSubagentView={isSubagentView}
               onOpenFile={onOpenFile}
               onRevealed={onRevealed}
@@ -414,22 +478,34 @@ export const MessageContentSegments = memo(function MessageContentSegments({ seg
             <UserQuestionCard
               key={block.key}
               questionData={qd as any} // TODO: type properly, QuestionData not exported
-              onAnswer={readOnly ? undefined : (answer: string) => onAnswerQuestion!(answer, (block as UserQuestionRenderBlock).segment.questionId!, qd.interruptId as string)}
-              onSkip={readOnly ? undefined : () => onSkipQuestion!((block as UserQuestionRenderBlock).segment.questionId!, qd.interruptId as string)}
+              onAnswer={answers ? (answer: string) => onAnswerQuestion!(answer, (block as UserQuestionRenderBlock).segment.questionId!, qd.interruptId as string) : undefined}
+              onSkip={answers ? () => onSkipQuestion!((block as UserQuestionRenderBlock).segment.questionId!, qd.interruptId as string) : undefined}
             />
           );
         }
 
         if (block.type === 'create_workspace') {
           if (readOnly) return null;
-          const wd = (block as CreateWorkspaceRenderBlock).proposal ?? workspaceProposals[(block as CreateWorkspaceRenderBlock).segment.proposalId!];
+          const made = (block as CreateWorkspaceRenderBlock).proposal;
+          // Made without a card in the chat: the workspace, on a line of its own.
+          if (made && made.workspace_name) {
+            return (
+              <WorkspaceCreatedSlip
+                key={block.key}
+                name={String(made.workspace_name ?? '')}
+                workspaceId={typeof made.workspace_id === 'string' ? made.workspace_id : undefined}
+                description={typeof made.workspace_description === 'string' ? made.workspace_description : undefined}
+              />
+            );
+          }
+          const wd = made ?? workspaceProposals[(block as CreateWorkspaceRenderBlock).segment.proposalId!];
           if (!wd) return null;
           return (
             <CreateWorkspaceCard
               key={block.key}
               proposalData={wd as any} // TODO: type properly, ProposalData not exported
-              onApprove={onApproveCreateWorkspace ? () => onApproveCreateWorkspace(wd) : undefined}
-              onReject={onRejectCreateWorkspace ? () => onRejectCreateWorkspace(wd) : undefined}
+              onApprove={answers && onApproveCreateWorkspace ? () => onApproveCreateWorkspace(wd) : undefined}
+              onReject={answers && onRejectCreateWorkspace ? () => onRejectCreateWorkspace(wd) : undefined}
             />
           );
         }
@@ -442,8 +518,8 @@ export const MessageContentSegments = memo(function MessageContentSegments({ seg
             <StartQuestionCard
               key={block.key}
               proposalData={sqd as any} // TODO: type properly, ProposalData not exported
-              onApprove={onApproveStartQuestion ? () => onApproveStartQuestion(sqd) : undefined}
-              onReject={onRejectStartQuestion ? () => onRejectStartQuestion(sqd) : undefined}
+              onApprove={answers && onApproveStartQuestion ? () => onApproveStartQuestion(sqd) : undefined}
+              onReject={answers && onRejectStartQuestion ? () => onRejectStartQuestion(sqd) : undefined}
             />
           );
         }
@@ -456,8 +532,8 @@ export const MessageContentSegments = memo(function MessageContentSegments({ seg
             <SecretaryConfirmCard
               key={block.key}
               proposalData={sad as any}
-              onApprove={onApproveSecretaryAction ? () => onApproveSecretaryAction(sad) : undefined}
-              onReject={onRejectSecretaryAction ? () => onRejectSecretaryAction(sad) : undefined}
+              onApprove={answers && onApproveSecretaryAction ? () => onApproveSecretaryAction(sad) : undefined}
+              onReject={answers && onRejectSecretaryAction ? () => onRejectSecretaryAction(sad) : undefined}
             />
           );
         }
@@ -475,7 +551,7 @@ export const MessageContentSegments = memo(function MessageContentSegments({ seg
             <CreditPauseCard
               key={block.key}
               pauseData={cpd}
-              onResume={!readOnly && onResumeCreditPause ? () => onResumeCreditPause(pauseId, cpd.interruptId) : undefined}
+              onResume={answers && onResumeCreditPause ? () => onResumeCreditPause(pauseId, cpd.interruptId) : undefined}
             />
           );
         }
@@ -507,8 +583,8 @@ export const MessageContentSegments = memo(function MessageContentSegments({ seg
               data={ta}
               resultPending={resultPending}
               resultLost={resultLost}
-              onApprove={!readOnly && onApproveToolCall && interruptId ? () => onApproveToolCall(approvalId, interruptId, position, attemptId) : undefined}
-              onReject={!readOnly && onRejectToolCall && interruptId ? (message?: string) => onRejectToolCall(approvalId, interruptId, position, message, attemptId) : undefined}
+              onApprove={answers && onApproveToolCall && interruptId ? () => onApproveToolCall(approvalId, interruptId, position, attemptId) : undefined}
+              onReject={answers && onRejectToolCall && interruptId ? (message?: string) => onRejectToolCall(approvalId, interruptId, position, message, attemptId) : undefined}
             />
           );
         }
@@ -526,9 +602,6 @@ export const MessageContentSegments = memo(function MessageContentSegments({ seg
   return (
     <CardArrivals cards={arrivingCards} live={fold === 'live' || !!isStreaming} motionSafe={motionSafe} className="sibling-space-y-3">
       {(() => {
-        // One element per block, except that a run of consecutive blocks of
-        // one kind (pills, subagent spawns, analyst hand-offs) sharing a fold
-        // and visibility state is gathered into one element.
         const wrap = (blockIdx: number, content: React.ReactElement) => {
           const key = renderBlocks[blockIdx].key;
           if (blockFolds[blockIdx]) {
@@ -537,26 +610,8 @@ export const MessageContentSegments = memo(function MessageContentSegments({ seg
           return blockIsVisible[blockIdx] ? content : null;
         };
         const out: React.ReactNode[] = [];
-        for (let blockIdx = 0; blockIdx < renderBlocks.length; blockIdx++) {
-          if (heldForProse[blockIdx]) continue;
-          const block = renderBlocks[blockIdx];
-          if (isBlankText(block)) continue;
-          const kind = runKind(block);
+        for (const { kind, members: run } of drawn) {
           if (kind) {
-            const first = blockIdx;
-            const run: number[] = [];
-            let j = first;
-            for (; j < renderBlocks.length; j++) {
-              if (isBlankText(renderBlocks[j])) continue;
-              if (
-                runKind(renderBlocks[j]) !== kind
-                || heldForProse[j]
-                || blockFolds[j] !== blockFolds[first]
-                || blockIsVisible[j] !== blockIsVisible[first]
-              ) break;
-              run.push(j);
-            }
-            blockIdx = j - 1;
             // Keyed by the first member, so a block joining the run later grows
             // it without remounting the ones already there.
             const firstKey = renderBlocks[run[0]].key;
@@ -574,6 +629,19 @@ export const MessageContentSegments = memo(function MessageContentSegments({ seg
                   onOpen={readOnly ? undefined : onOpenSubagentTask}
                 />
               );
+            } else if (kind === 'line') {
+              const members: CommentReplyMember[] = run.flatMap((idx) => {
+                const b = renderBlocks[idx];
+                return b.type === 'compact_artifact' && b.card?.kind === 'line'
+                  ? [{ key: b.key, reply: b.card.reply, openCall: () => onToolCallDetailClick?.(b.toolCallId) }]
+                  : [];
+              });
+              // The run arrives in its first reply's row's place (CardArrivals).
+              content = (
+                <div key={firstKey} data-card-arrival={firstKey}>
+                  <ArtifactCommentReplyLines members={members} />
+                </div>
+              );
             } else if (kind === 'analyst') {
               const members: AnalystHandoffMember[] = run.map((idx) => {
                 const b = renderBlocks[idx] as PTCAgentRenderBlock;
@@ -583,8 +651,8 @@ export const MessageContentSegments = memo(function MessageContentSegments({ seg
                 <AnalystHandoffRun
                   key={firstKey}
                   members={members}
-                  onApprove={onApprovePTCAgent}
-                  onReject={onRejectPTCAgent}
+                  onApprove={answers ? onApprovePTCAgent : undefined}
+                  onReject={answers ? onRejectPTCAgent : undefined}
                   dispatcherContext={dispatcherContext}
                 />
               );
@@ -599,7 +667,8 @@ export const MessageContentSegments = memo(function MessageContentSegments({ seg
             if (content) out.push(wrap(run[0], content));
             continue;
           }
-          const content = renderBlock(block, blockIdx);
+          const [blockIdx] = run;
+          const content = renderBlock(renderBlocks[blockIdx], blockIdx);
           // Missing artifact renderers and pending proposals must not leave a
           // spaced fold shell behind when they have nothing to display.
           if (content === null) continue;

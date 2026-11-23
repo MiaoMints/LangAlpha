@@ -14,8 +14,9 @@ from langchain.agents import create_agent
 from langchain.agents.middleware.types import AgentMiddleware
 from langchain_core.callbacks import BaseCallbackHandler
 from langchain_core.language_models.fake_chat_models import GenericFakeChatModel
-from langchain_core.messages import AIMessage, HumanMessage
+from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 from langchain_core.runnables.config import var_child_runnable_config
+from langchain_core.tools import StructuredTool
 
 from ptc_agent.agent.middleware import model_resilience
 from ptc_agent.agent.middleware.compaction import (
@@ -23,11 +24,21 @@ from ptc_agent.agent.middleware.compaction import (
     NoCompaction,
     Compaction,
     HandOff,
+    Measure,
+    Parts,
+    WriteBrief,
     ask_between_turns,
+    record_offloads,
 )
 from ptc_agent.agent.middleware.compaction.compact import Summarizer
 from ptc_agent.agent.middleware.compaction.middleware import CompactionMiddleware
-from ptc_agent.agent.middleware.compaction.summary_request import summary_prompt
+from ptc_agent.agent.middleware.compaction.rebuild import (
+    LAST_ANSWER_KEY,
+    TurnStartRebuilds,
+    next_summary,
+    offloaded_reading,
+)
+from ptc_agent.agent.middleware.compaction.summary_request import _SUMMARY_END, summary_prompt
 from ptc_agent.agent.middleware.compaction.utils import (
     build_summary_message,
     handed_off,
@@ -35,6 +46,8 @@ from ptc_agent.agent.middleware.compaction.utils import (
     with_summary_text,
 )
 from src.llms.provider_compaction import SIDECAR_KEY
+
+import time
 
 pytestmark = pytest.mark.asyncio
 
@@ -62,13 +75,19 @@ def _model(*answers: AIMessage) -> GenericFakeChatModel:
     return GenericFakeChatModel(messages=iter(answers))
 
 
-def _agent(model, *, summary="the summarizer's summary", compaction=True, keep_tokens=2, notes_dir=None):
+def _agent(
+    model, *, summary="the summarizer's summary", compaction=True, keep_tokens=2, notes_dir=None, main=False
+):
+    """``main`` builds the main agent's stack, which reads its prompt cache
+    as lapsed once it is (``TurnStartRebuilds``); a subagent's never does."""
     sent = _Sent()
     middleware = []
     if compaction:
         summarizer = Summarizer(_model(AIMessage(summary)), limit=100_000, counter=len)
         # Never past the threshold: only an ask summarizes.
         compaction_mw = CompactionMiddleware(summarizer, token_threshold=10**9, keep_tokens=keep_tokens)
+        if main:
+            compaction_mw = compaction_mw.with_turn_start_rebuilds(TurnStartRebuilds(0))
         middleware.append(compaction_mw.with_scratchpad_notes(notes_dir) if notes_dir else compaction_mw)
     agent = create_agent(model=model, tools=[], middleware=[*middleware, sent])
     return agent, sent
@@ -111,6 +130,61 @@ def _opaque(**kwargs) -> HumanMessage:
     )
 
 
+class TestWriteBrief:
+    """Who writes the brief a thread hands Claude Code: the agent's model
+    from its own request while that is cheap, else the compaction model,
+    else nobody, and Claude reads the thread itself."""
+
+    async def test_on_a_warm_cache_the_agents_model_writes_it_from_its_own_request(self):
+        agent, sent = _agent(_model(AIMessage(f"the agent's own brief\n{_SUMMARY_END}")), main=True)
+        state = {"messages": _history(), "_last_model_response_at": time.time()}
+
+        answer = await ask_between_turns(agent, state, WriteBrief(), thread_id="t-1")
+
+        assert (answer.summary.source, answer.summary.text) == ("self", "the agent's own brief")
+        assert len(sent.requests) == 1
+
+    async def test_on_a_cold_cache_the_compaction_model_writes_it(self):
+        agent, sent = _agent(_model(), main=True)
+        state = {"messages": _history(), "_last_model_response_at": time.time() - 3600}
+
+        answer = await ask_between_turns(agent, state, WriteBrief(), thread_id="t-1")
+
+        assert (answer.summary.source, answer.summary.text) == ("model", "the summarizer's summary")
+        assert sent.requests == []
+
+    async def test_a_writer_that_may_not_use_its_own_request_leaves_it_to_the_compaction_model(self):
+        agent, sent = _agent(_model(), main=True)
+        state = {"messages": _history(), "_last_model_response_at": time.time()}
+
+        answer = await ask_between_turns(agent, state, WriteBrief(by_own=False), thread_id="t-1")
+
+        assert answer.summary.source == "model" and sent.requests == []
+
+    async def test_a_summary_only_another_provider_can_read_does_not_make_this_models_read_cheap(self):
+        agent, sent = _agent(_model(), main=True)
+        state = {**_summarized(_opaque()), "_last_model_response_at": time.time() - 3600}
+
+        await ask_between_turns(agent, state, WriteBrief(), thread_id="t-1")
+
+        assert sent.requests == []
+
+    async def test_when_no_model_writes_it_claude_is_handed_the_thread_itself(self):
+        sent = _Sent()
+        failing = Summarizer(_model(), limit=100_000, counter=len)
+        compaction_mw = CompactionMiddleware(failing, token_threshold=10**9, keep_tokens=2)
+        agent = create_agent(
+            model=_model(), tools=[], middleware=[compaction_mw.with_turn_start_rebuilds(TurnStartRebuilds(0)), sent]
+        )
+        state = {"messages": _history()}
+
+        answer = await ask_between_turns(agent, state, WriteBrief(), thread_id="t-1")
+
+        assert answer.summary.source == "thread"
+        assert "Human: q0" in answer.summary.text and "AI: r2" in answer.summary.text
+        assert sent.requests == []
+
+
 class TestCompact:
     async def test_the_summary_is_written_without_calling_the_agents_model(self):
         agent, sent = _agent(_model())
@@ -126,6 +200,24 @@ class TestCompact:
         assert answer.event["anchor_message_id"] == "h2"
         # Nothing is written: the caller installs the answer.
         assert "_summarization_event" not in state
+
+    async def test_the_summary_lists_no_plan(self, monkeypatch):
+        """The next turn may open a new request, which starts with no plan,
+        so a plan listed here would be one it can no longer move."""
+        given: list = []
+        compact = Summarizer.compact
+
+        async def spy(self, *args, **kwargs):
+            given.append(kwargs.get("plan"))
+            return await compact(self, *args, **kwargs)
+
+        monkeypatch.setattr(Summarizer, "compact", spy)
+        agent, _ = _agent(_model())
+        state = {"messages": _history(), "plan": [{"title": "Chart it", "status": "in_progress"}]}
+
+        await ask_between_turns(agent, state, Compact(), thread_id="t-1")
+
+        assert given == [()]
 
     async def test_a_view_no_longer_than_what_is_kept_has_nothing_to_compact(self):
         agent, sent = _agent(_model(), keep_tokens=6)
@@ -280,3 +372,104 @@ class TestHandOff:
 
         with pytest.raises(ValueError, match="no hand-off summary"):
             await ask_between_turns(agent, _summarized(_opaque()), HandOff(), thread_id="t-1")
+
+
+def _chars(messages) -> int:
+    return sum(len(str(m.content)) for m in messages)
+
+
+class TestMeasure:
+    """What an offload leaves of the context, read as the next turn start
+    reads it, which the composer's hint reads while the offload has zeroed
+    the measurement."""
+
+    def _thread(self, kept: str) -> dict:
+        read = AIMessage("", id="a0", tool_calls=[{"name": "Read", "args": {"file_path": "/w/data.csv"}, "id": "r1"}])
+        return {
+            "messages": [
+                HumanMessage("q0", id="h0"),
+                read,
+                ToolMessage("x" * 5_000, tool_call_id="r1", name="Read", id="t0"),
+                AIMessage("r0", id="a1"),
+                HumanMessage(kept, id="h1"),
+                AIMessage("r1", id="a2"),
+            ],
+            "_last_model_response_at": 1_000.0,
+            LAST_ANSWER_KEY: {
+                "threshold": 2_000,
+                "claude": True,
+                "claude_model": True,
+                "written_ttl": 300,
+                "route_ttl": 300,
+                "cold_tokens": 1_000,
+                "floor_tokens": 0,
+            },
+        }
+
+    async def _offloaded(self, state: dict, *, tools=(), baseline: str = "") -> dict:
+        summarizer = Summarizer(_model(), limit=100_000, counter=_chars)
+        compaction = CompactionMiddleware(summarizer, token_threshold=10**9, keep_tokens=2)
+        if baseline:
+            compaction = compaction.with_baseline(lambda state: {"workspace": baseline})
+        agent = create_agent(model=_model(), tools=list(tools), middleware=[compaction])
+        after = {**state, **record_offloads(state, set(), {"r1"})}
+        tokens = await ask_between_turns(agent, after, Measure(), thread_id="t-1")
+        return {**after, LAST_ANSWER_KEY: offloaded_reading(after, tokens)}
+
+    @pytest.mark.parametrize(
+        ("kept", "told"),
+        [
+            ("y" * 3_000, {"reason": "threshold"}),
+            ("y" * 1_500, {"reason": "cold", "at": 1_300.0}),
+            ("q1", None),
+        ],
+        ids=["still_over", "still_cold", "under"],
+    )
+    async def test_the_hint_reads_what_the_offload_left(self, kept, told):
+        after = await self._offloaded(self._thread(kept))
+
+        assert after["_cached_input_tokens"] == 0
+        assert after[LAST_ANSWER_KEY]["offloaded"]["tokens"] < 5_000
+        assert next_summary(after, settled_at=None) == told
+
+    @pytest.mark.parametrize("ahead", ["tools", "baseline"])
+    async def test_the_hint_counts_what_the_next_call_sends_ahead_of_the_messages(self, ahead):
+        # The messages alone are under the 2,000 threshold (the ``under``
+        # case above); the next call is sent the tool schemas and the
+        # baseline block as input too, each enough to put it over.
+        lookup = StructuredTool.from_function(lambda query: query, name="lookup", description="d" * 2_500)
+        after = await self._offloaded(
+            self._thread("q1"),
+            tools=[lookup] if ahead == "tools" else (),
+            baseline="b" * 2_500 if ahead == "baseline" else "",
+        )
+
+        assert after[LAST_ANSWER_KEY]["offloaded"]["tokens"] > 2_500
+        assert next_summary(after, settled_at=None) == {"reason": "threshold"}
+
+    async def test_a_summary_since_the_offload_drops_what_it_left(self):
+        after = await self._offloaded(self._thread("y" * 3_000))
+        summarized = {**after, "_summarization_event": {"summary_message": HumanMessage("s", id="s-1"), "cutoff_index": 4}}
+
+        assert next_summary(summarized, settled_at=None) is None
+
+
+class TestParts:
+    """The context panel's count of what the next call sends ahead of its
+    messages, asked for between turns and answered without a model call."""
+
+    async def test_the_parts_are_counted_from_the_agents_own_request(self):
+        lookup = StructuredTool.from_function(lambda query: query, name="lookup", description="d" * 300)
+        summarizer = Summarizer(_model(), limit=100_000, counter=_chars)
+        compaction = CompactionMiddleware(summarizer, token_threshold=10**9, keep_tokens=2)
+        compaction = compaction.with_baseline(lambda state: {"workspace": "w" * 40, "skills": "k" * 70})
+        model = _model(AIMessage("never sent for"))
+        agent = create_agent(model=model, tools=[lookup], system_prompt="s" * 200, middleware=[compaction])
+        state = {"messages": [HumanMessage("q0", id="h0"), AIMessage("r0", id="a0")]}
+
+        parts = await ask_between_turns(agent, state, Parts(), thread_id="t-1")
+
+        assert list(parts) == ["system", "tools", "skills", "environment"]
+        assert parts["tools"] > 300
+        # Nothing was sent to the model for it.
+        assert len(list(model.messages)) == 1

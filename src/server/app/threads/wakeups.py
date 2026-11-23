@@ -15,16 +15,16 @@ from src.server.models.wakeup import (
 )
 from src.server.services.wakeups import cancel as wakeups_cancel
 from src.server.services.wakeups.listing import thread_wakeups, thread_wakeups_response
-from src.server.utils import api as auth_api
+from src.server.services.shared_workspaces.access import thread_access
 from src.server.utils.api import CurrentUserId
 
 from ._deps import logger, router
 
 
-async def _cancel(thread_id: str, ids: Optional[List[str]]) -> WakeupCancelResponse:
+async def _cancel(thread_id: str, ids: Optional[List[str]], user_id: str) -> WakeupCancelResponse:
     outcomes: List[CancelOutcome] = await wakeups_cancel.user_cancel(thread_id, ids)
     try:
-        wakeups = await thread_wakeups(thread_id)
+        wakeups = await thread_wakeups(thread_id, user_id)
     except Exception:
         # The cancel has committed, so a 500 would have the user retry what
         # is done; without a listing the client reads it again.
@@ -44,19 +44,19 @@ async def _cancel(thread_id: str, ids: Optional[List[str]]) -> WakeupCancelRespo
 async def list_wakeups(thread_id: str, x_user_id: CurrentUserId):
     """Open wakeups, those that ended in the last day, and the thread's price
     targets from before wakeups."""
-    await auth_api.require_thread_owner(thread_id, x_user_id)
+    await thread_access(thread_id, x_user_id)
     return await thread_wakeups_response(thread_id, x_user_id)
 
 
 @router.delete("/{thread_id}/wakeups/{wakeup_id}", response_model=WakeupCancelResponse)
 async def cancel_wakeup(thread_id: str, wakeup_id: str, x_user_id: CurrentUserId):
-    await auth_api.require_thread_owner(thread_id, x_user_id)
-    return await _cancel(thread_id, [wakeup_id])
+    await thread_access(thread_id, x_user_id)
+    return await _cancel(thread_id, [wakeup_id], x_user_id)
 
 
 @router.post("/{thread_id}/wakeups/cancel", response_model=WakeupCancelResponse)
 async def cancel_wakeups(
     thread_id: str, request: WakeupCancelRequest, x_user_id: CurrentUserId
 ):
-    await auth_api.require_thread_owner(thread_id, x_user_id)
-    return await _cancel(thread_id, None if request.all else request.wakeup_ids)
+    await thread_access(thread_id, x_user_id)
+    return await _cancel(thread_id, None if request.all else request.wakeup_ids, x_user_id)

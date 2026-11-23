@@ -7,17 +7,17 @@ This module creates a PTC agent that:
 - Supports sub-agent delegation for specialized tasks
 """
 
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import replace
 from datetime import UTC, datetime
 from functools import partial
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import structlog
 from langchain.agents import create_agent
 
 from ptc_agent.agent.backends import SandboxBackend
-from ptc_agent.core.paths import SandboxLayout, WorkspaceLayout
+from ptc_agent.core.paths import LANGALPHA_CONFIG_SPELLINGS, SandboxLayout, WorkspaceLayout
 from ptc_agent.core.project_context import ProjectContext
 from ptc_agent.agent.limits import UNBOUNDED_RECURSION_LIMIT
 from ptc_agent.agent.main_state import MainAgentState
@@ -32,6 +32,7 @@ from ptc_agent.agent.middleware import (
     MultimodalStripMiddleware,
     CodeValidationMiddleware,
     ComputerArgumentGuardMiddleware,
+    ComputerUnreachableStopMiddleware,
     CreditGateMiddleware,
     EmptyToolCallRetryMiddleware,
     LeakDetectionMiddleware,
@@ -40,7 +41,6 @@ from ptc_agent.agent.middleware import (
     ToolErrorHandlingMiddleware,
     ToolResultNormalizationMiddleware,
     FileOperationMiddleware,
-    TodoWriteMiddleware,
     ProvenanceMiddleware,
     SkillsMiddleware,
     CompactionMiddleware,
@@ -56,6 +56,10 @@ from ptc_agent.agent.middleware.background_subagent import (
     SubagentEventCaptureMiddleware,
     SubagentToolResultCaptureMiddleware,
 )
+from ptc_agent.agent.middleware.background_subagent.subagent import (
+    ClaudeCodeSubagent,
+    run_on_by_type,
+)
 from ptc_agent.agent.transcript.classify import MARKET_ALERT_SENDER, WAKEUP_SENDER
 from ptc_agent.agent.middleware.compaction.notes import (
     NotesDueMiddleware,
@@ -63,13 +67,14 @@ from ptc_agent.agent.middleware.compaction.notes import (
     ThreadScratchpad,
     notes_window_carry,
 )
+from ptc_agent.agent.middleware.compaction.rebuild import TurnStartRebuilds
 from ptc_agent.agent.middleware.compaction.window import WindowCoverage
 from ptc_agent.agent.middleware.direct_mcp import (
     DirectToolSet,
     direct_tool_middleware,
     direct_tool_summary,
 )
-from ptc_agent.agent.middleware.order_governance import OrderLedger
+from ptc_agent.agent.middleware.order_governance import OrderLedger, places_order
 from ptc_agent.agent.middleware.subagent_switch import (
     SubagentSwitchMiddleware,
     SubagentSwitchReader,
@@ -96,6 +101,7 @@ from ptc_agent.agent.middleware.system_prompt_caching import SystemPromptCacheMi
 from ptc_agent.agent.middleware.tool_surface import ToolSurfaceMiddleware
 from ptc_agent.agent.middleware.runtime_context.frozen_prompt import SystemPinMiddleware
 from ptc_agent.agent.middleware.runtime_context import (
+    BaselineContextMiddleware,
     FrozenPromptMiddleware,
     RowCarrierMiddleware,
     TimeUpToolStopMiddleware,
@@ -104,6 +110,7 @@ from ptc_agent.agent.middleware.runtime_context import (
 )
 from ptc_agent.agent.middleware.runtime_context.epoch import Workspace
 from ptc_agent.agent.middleware.runtime_context.profile import ProfileSwitches
+from ptc_agent.agent.middleware.sender_naming import SenderNamingMiddleware
 from ptc_agent.agent.middleware.background_subagent.registry import (
     BackgroundTaskRegistry,
 )
@@ -120,7 +127,9 @@ from ptc_agent.agent.prompts import (
     guidance_template_vars,
     workspace_path_vars,
 )
-from ptc_agent.agent.subagents.assembly import compile_subagents, task_middleware
+from ptc_agent.agent.subagents import create_subagents
+from ptc_agent.agent.subagents.assembly import subagent_compiler, task_middleware
+from ptc_agent.agent.subagents.merge import turn_roster
 from ptc_agent.agent.tools import (
     create_execute_bash_tool,
     create_execute_code_tool,
@@ -129,7 +138,14 @@ from ptc_agent.agent.tools import (
     create_grep_tool,
     create_preview_url_tool,
     create_show_widget_tool,
-    TodoWrite,
+)
+from ptc_agent.agent.tools.context_file_policy import agent_md_for
+from ptc_agent.agent.tools.copy_file import create_copy_file_tool
+from ptc_agent.agent.middleware.member_context import (
+    MemberContext,
+    MemberContextMiddleware,
+    close_members,
+    member_memory,
 )
 from ptc_agent.agent.tools.computer_reach import (
     REACHABLE_TOOLS,
@@ -137,10 +153,12 @@ from ptc_agent.agent.tools.computer_reach import (
     ComputerTarget,
     ComputerTools,
 )
+from ptc_agent.agent.tools.artifact_comments import create_reply_to_comment_tool
+from src.llms.claude_code import ClaudeCodeTarget
 from src.tools.web.search import get_web_search_tool
 from src.tools.web.fetch import web_fetch_tool
 from src.tools.web.crawl import create_crawl_tools
-from src.tools.sec.tool import get_sec_filing
+from src.tools.sec.tool import create_sec_filing_tool
 from src.tools.market_data.tool import (
     get_daily_prices,
     get_company_overview,
@@ -150,17 +168,24 @@ from src.tools.market_data.tool import (
     screen_stocks,
 )
 from src.tools.market_watch import watch_market
-from src.tools.chart_annotation import CHART_ANNOTATION_TOOLS
+from src.tools.chart_annotation import CHART_LAYER_TOOLS
 from src.tools.messaging import build_messaging_tools, messaging_enabled
 from src.tools.wakeups.tool import build_schedule_wakeup_tool
 from src.tools.thread_status.tool import build_thread_status_tool
+from ptc_agent.agent.tools.plan import build_update_plan_tool
+from ptc_agent.agent.middleware.plan import PlanOffMiddleware, PlanStateMiddleware
+from ptc_agent.agent.middleware.plan_close_out import PlanCloseOutMiddleware
 from ptc_agent.config import AgentConfig
+from ptc_agent.config.agent import Admitted, TaskModel
 from ptc_agent.core.mcp_registry import MCPRegistry
 from ptc_agent.core.sandbox import PTCSandbox
-from ptc_agent.core.sandbox.livefs_mount import CallContext
+from ptc_agent.core.sandbox.livefs_mount import CallContext, HistoryFiles
 from ptc_agent.agent.tools.command_handoff import HandOff
 
 from ptc_agent.agent.turn import build_model_resilience_middleware, turn_model
+
+if TYPE_CHECKING:
+    from ptc_agent.agent.claude_code.launcher import Launcher
 
 try:
     from langgraph.types import Checkpointer
@@ -189,15 +214,17 @@ class PTCAgent:
 
     def _build_system_prompt(
         self,
-        subagent_summary: str,
         guidance: str,
         thread_id: str | None = None,
         memory_enabled: bool = True,
         memo_enabled: bool = True,
-        todo_enabled: bool = False,
+        user_memory_enabled: bool = True,
+        user_data_enabled: bool = True,
+        plan_enabled: bool = False,
         crawl_enabled: bool = False,
         scratchpad_enabled: bool = False,
         direct_tool_summary: str = "",
+        order_skill: bool = False,
         workspace: WorkspaceLayout | None = None,
         legacy_layout: bool = False,
         files_mounted: bool = False,
@@ -205,6 +232,7 @@ class PTCAgent:
         chart_annotation_enabled: bool = True,
         role: AgentRole = "analyst",
         channels_enabled: bool = False,
+        claude_code: bool = False,
     ) -> str:
         """Build the static system prompt (excludes time/profile for cacheability).
 
@@ -216,7 +244,11 @@ class PTCAgent:
         deployment's messaging service and the turn having a user, neither of
         which moves between a thread's turns. ``history_files`` says the file
         tools read past threads with no mount, which follows the computer's
-        kind, so it does not move between them either.
+        kind, so it does not move between them either. ``claude_code`` asks
+        for one question per call, since a Claude Code turn holds one call for
+        the user at a time. ``user_memory_enabled`` and ``user_data_enabled``
+        are ``IdentityGates.prompt_vars``: a shared workspace's prompt points
+        at no memory tier or data of one member's, since none is there.
         """
         loader = get_loader()
         return loader.get_system_prompt(
@@ -226,7 +258,6 @@ class PTCAgent:
                 root=self.config.filesystem.working_directory,
                 legacy_layout=legacy_layout,
             ),
-            subagent_summary=subagent_summary,
             max_concurrent_task_units=DEFAULT_MAX_CONCURRENT_TASK_UNITS,
             ask_user_enabled=True,
             include_examples=True,
@@ -234,16 +265,20 @@ class PTCAgent:
             thread_id=thread_id or "",
             memory_enabled=memory_enabled,
             memo_enabled=memo_enabled,
+            user_memory_enabled=user_memory_enabled,
+            user_data_enabled=user_data_enabled,
             market_watch_enabled=self.config.feature_enabled("market_watch"),
-            todo_enabled=todo_enabled,
+            plan_enabled=plan_enabled,
             crawl_enabled=crawl_enabled,
             scratchpad_enabled=scratchpad_enabled,
             direct_tool_summary=direct_tool_summary,
+            order_skill=order_skill,
             files_mounted=files_mounted,
             history_files=history_files,
             chart_annotation_enabled=chart_annotation_enabled,
             role=role,
             channels_enabled=channels_enabled,
+            claude_code=claude_code,
         )
 
     def _get_tool_summary(self, mcp_registry: MCPRegistry) -> str:
@@ -271,6 +306,8 @@ class PTCAgent:
         on_signed_url: Any | None = None,
         vault_secrets: dict[str, str] | None = None,
         user_id: str | None = None,
+        owner_id: str | None = None,
+        own_data: bool = True,
         user_data_counts: dict[str, Any] | None = None,
         tool_summary: str | None = None,
         disable_subagents: bool = False,
@@ -284,6 +321,9 @@ class PTCAgent:
         window_coverage: WindowCoverage | None = None,
         cancel_notices: CancelNotices | None = None,
         computers: ComputerReach | None = None,
+        claude_code_launcher: "Callable[..., Launcher] | None" = None,
+        thread_history: HistoryFiles | None = None,
+        member_context: MemberContext | None = None,
     ) -> Any:
         """Create a deepagent with PTC pattern capabilities.
 
@@ -296,9 +336,17 @@ class PTCAgent:
                 WriterGuard). None = no fence (single-writer deployment).
             thread_id: First 8 chars used as thread directory name under
                 ``.agents/threads/{id}/``.
-            user_id: First component of memory-namespace tuples. When ``None``,
-                memory is disabled entirely rather than falling back to a shared
-                namespace that would cross-pollinate unauthenticated sessions.
+            user_id: The turn's sender: whose commands, wakeups, approvals
+                and Claude Code session these are.
+            owner_id: The workspace's owner, the first component of the
+                memory-namespace tuples and whose files the file tools mount.
+                Without one, memory is disabled entirely rather than falling
+                back to a shared namespace that would cross-pollinate
+                unauthenticated sessions.
+            own_data: Whether the build may use the sender's own data (their
+                memory, memos, profile and automation files, workflows, chat
+                apps). False where other people read what the agent says and
+                steer it, as in a shared workspace.
             on_agent_md_write: Invalidates the Session's agent.md cache on write
                 and records the write's last-writer stamp.
             turn_context: What this turn knows about itself (when the previous
@@ -330,11 +378,33 @@ class PTCAgent:
             computers: The user's other computers, which the Chief of Staff's
                 own Bash, ExecuteCode and file tools take a ``computer`` to run
                 on. None leaves every tool on this computer.
+            claude_code_launcher: Where a Claude Code CLI runs, given the
+                sandbox and what admission let it run on (``Admitted``): the
+                turn's (``claude_code_admitted``), or its subagents' Claude
+                Code pins' on a turn of another model (``claude_code_pins``);
+                the server picks it, and the token it signs in with.
+            thread_history: The thread's own transcript, served to the file
+                tools in process where what serves the computer's past threads
+                leaves this thread out (a thread kept private in a shared
+                workspace); the agent's transcripts are saved and pointed at
+                there. Its subagents share it, as they share the computer's.
+            member_context: In a shared workspace whose member's organization
+                lets their own context reach it, the member this turn is for:
+                the main agent alone is given their answer preferences and
+                memory index on their messages (``MemberContextMiddleware``).
+                None for every other build.
 
         Returns:
             Configured BackgroundSubagentOrchestrator wrapping the deepagent.
         """
         turn = turn_model(self.config, llm, self.llm, background=False)
+        claude_code = isinstance(turn.client, ClaudeCodeTarget)
+        # Where a Claude Code CLI here runs and what it signs in with: the
+        # turn's own, else its subagents' Claude Code pins' on a turn of
+        # another model.
+        claude_code_cli = self.config.claude_code_admitted if claude_code else self.config.claude_code_pins
+        if claude_code_cli is not None and claude_code_launcher is None:
+            raise RuntimeError("a Claude Code CLI needs a claude_code_launcher")
 
         # Freeze current time for this request (refreshes on each new query)
         request_time = datetime.now(tz=UTC)
@@ -351,6 +421,7 @@ class PTCAgent:
             sandbox,
             operation_callback=operation_callback,
             preview_owner=preview_owner,
+            history=thread_history,
         )
         # The one workspace root this build uses, read off the live computer
         # root plus the turn's folder rather than the config default.
@@ -365,11 +436,15 @@ class PTCAgent:
         # than falling back to a shared namespace that would cross-pollinate
         # unauthenticated sessions. The workspace comes from the project: the
         # session is per computer and several workspaces share it, so its own
-        # id names whichever one acquired it first.
-        workspace_id_for_memory = project.workspace_id if project else None
+        # id names whichever one acquired it first. It is the one the turn
+        # works for (Home, for a Home turn in its stand-in); the folder's own
+        # id is what commands and transcripts are found by on its computer.
+        workspace_id_for_memory = project.owner_id if project else None
+        folder_workspace_id = project.workspace_id if project else None
         gates = resolve_identity_gates(
             store=store,
-            user_id=user_id,
+            user_id=owner_id,
+            own_data=own_data,
             workspace_id=workspace_id_for_memory,
             disable_subagents=disable_subagents,
             channels=messaging_enabled(),
@@ -377,7 +452,7 @@ class PTCAgent:
         if store is not None and not gates.memory:
             logger.warning(
                 "memory disabled due to missing identity",
-                user_id_present=bool(user_id),
+                user_id_present=bool(owner_id),
                 workspace_id_present=bool(workspace_id_for_memory),
             )
 
@@ -392,32 +467,83 @@ class PTCAgent:
         # mount ever serves; where one may, its links show them instead.
         history = None if sandbox.mounts_livefs else sandbox.history
         history_routes = history.routes(backend) if history is not None else []
+        if thread_history is not None:
+            history_routes = [*history_routes, *thread_history.routes(backend)]
         filesystem_backend, baseline_store_sources = build_filesystem_backend(
             backend=backend,
             gates=gates,
             store=store,
-            user_id=user_id,
+            user_id=owner_id,
             workspace_id=workspace_id_for_memory,
             layout=workspace_layout,
             call=call_context,
             history_routes=history_routes,
         )
 
+        # No member's memory is on a shared workspace's computer: its folder
+        # is closed to every agent of the turn, so nothing left on the disk
+        # there passes for one (``MembersClosed``). It reads nothing from the
+        # store, so it closes the folder when the store is down too.
+        if not own_data:
+            filesystem_backend = close_members(
+                filesystem_backend, store=store, sandbox=backend, layout=workspace_layout
+            )
+
+        # A member's own context never rides a Claude Code turn, whose
+        # runtime takes no per-call context: no block to add, no read to fill
+        # back in.
+        if claude_code:
+            member_context = None
+        # A shared workspace member's own memory, read-only to the main
+        # agent's own file tools on their turn alone, every entry under an
+        # alias; every other tool, a subagent's among them, is built over
+        # ``filesystem_backend``, which does not have it.
+        member_mount = (
+            member_memory(
+                member_context,
+                store=store,
+                files=filesystem_backend,
+                sandbox=backend,
+                layout=workspace_layout,
+                operation_callback=operation_callback,
+                agent_md=agent_md_for(role),
+            )
+            if member_context is not None and store is not None
+            else None
+        )
+
         # The folders only the file tools reach, which Bash and code refuse.
-        file_tools_only = (SandboxLayout.CHANNELS_DIR,) if gates.channels else ()
+        file_tools_only = (
+            *((SandboxLayout.CHANNELS_DIR,) if gates.channels else ()),
+            *((WorkspaceLayout.MEMBERS_DIR,) if not own_data else ()),
+        )
 
         # The main agent's Bash and ExecuteCode hand a command still running at
         # their wait to the thread, which needs a thread, a user and a
         # workspace to record it under; without them a call waits until its
         # command ends, as a subagent's does.
+        away = turn_context.home_away if turn_context else None
         hand_off = (
             HandOff(
                 thread_id=thread_id,
                 user_id=str(user_id),
-                workspace_id=workspace_id_for_memory,
+                # A command runs, and is found again, on the computer the
+                # folder is on.
+                workspace_id=folder_workspace_id,
                 wakeups=wakeups_on,
+                # In Home's stand-in, the log stays on the stand-in's
+                # computer, which Home's later turns reach by name.
+                **(
+                    {
+                        "computer": away.cloud_name,
+                        "computer_id": away.cloud_computer_id,
+                        "whole": True,
+                    }
+                    if away
+                    else {}
+                ),
             )
-            if thread_id and user_id and workspace_id_for_memory
+            if thread_id and user_id and folder_workspace_id
             else None
         )
 
@@ -463,21 +589,16 @@ class PTCAgent:
         # subagent's wait (sub_code_tool, sub_bash_tool).
         shared_tools: list[Any] = [preview_url_tool, show_widget_tool]
 
-        # Opt-in while the tool is on its way out: a default build binds no
-        # todo tool, so neither the main agent nor a subagent that lists the
-        # "todo" set is given one.
-        todo_tools: list[Any] = (
-            [TodoWrite] if self.config.feature_enabled("todo_write") else []
-        )
-        shared_tools.extend(todo_tools)
-
         # Create custom filesystem tools (override deepagents middleware tools).
         # `filesystem_backend` is the composite when a store is wired; otherwise
         # it's the plain sandbox backend. Tools see a uniform rich-method
         # surface either way.
+        agent_md = agent_md_for(role)
         read_file, write_file, edit_file = create_filesystem_tools(
             filesystem_backend,
             operation_callback=operation_callback,
+            record_creators=True,
+            agent_md=agent_md,
         )
         search_tools = [
             create_glob_tool(filesystem_backend),  # overrides middleware glob
@@ -497,7 +618,12 @@ class PTCAgent:
             filesystem_tools
             if subagent_files is filesystem_backend
             else [
-                *create_filesystem_tools(subagent_files, operation_callback=operation_callback),
+                *create_filesystem_tools(
+                    subagent_files,
+                    operation_callback=operation_callback,
+                    record_creators=True,
+                    agent_md=agent_md,
+                ),
                 *search_tools,
             ]
         )
@@ -521,7 +647,7 @@ class PTCAgent:
             shared_tools.extend(crawl_tools)
 
         finance_tools = [
-            get_sec_filing,  # SEC filing extraction (10-K, 10-Q, 8-K)
+            create_sec_filing_tool(filesystem_backend),  # SEC filings; full text to data/sec/
             get_quote,  # Real-time quotes (cheap — price freshness)
             get_daily_prices,  # Stock OHLCV price data
             get_company_overview,  # Company investment analysis (includes real-time quote)
@@ -549,10 +675,22 @@ class PTCAgent:
                 # Ahead of every tool wrapper below, so a call it refuses as
                 # a repeat reaches none of them.
                 RepeatCallGuardMiddleware(),
+                # Outside the error handler below, which would turn its stop
+                # back into a tool result. Only on a turn nobody watches.
+                *(
+                    [
+                        ComputerUnreachableStopMiddleware(
+                            sandbox, computer_id=getattr(session, "computer_id", None)
+                        )
+                    ]
+                    if turn_context is not None and turn_context.unwatched
+                    else []
+                ),
                 ToolArgumentParsingMiddleware(),
                 ComputerArgumentGuardMiddleware(),
                 ProtectedPathMiddleware(
                     denied_directories=self.config.filesystem.denied_directories,
+                    denied_patterns=(LANGALPHA_CONFIG_SPELLINGS,),
                 ),
                 CodeValidationMiddleware(),
                 ToolErrorHandlingMiddleware(),
@@ -576,11 +714,11 @@ class PTCAgent:
         # never sees (provenance fingerprints the raw result/artifact).
         shared_middleware.append(
             ProvenanceMiddleware(
-                redactor=leak_detection.redact, sandbox_root=sandbox.working_dir
+                redactor=leak_detection.redact,
+                sandbox_root=sandbox.working_dir,
+                user_id=user_id,
             )
         )
-        if todo_tools:
-            shared_middleware.append(TodoWriteMiddleware())
 
         # The computer's own skills folder: the sync delivers to it under the
         # live root, which a root the deployment default does not name moves.
@@ -603,12 +741,27 @@ class PTCAgent:
             user_skills=self.config.user_skills,
             user_skill_dir=self.config.user_skill_dir,
             workspace_skill_dir=self.config.workspace_skill_dir,
+            withheld=self.config.withheld_skills,
         )
         # RunWorkflow is skill-gated: the run-workflow skill hides the tool from
         # model requests until the agent reads its SKILL.md. Drop the skill on
         # any build that registers no tool for it to gate.
         if not gates.workflow_tool:
             skill_registry.pop("run-workflow", None)
+        # The order guide is read before a brokerage tool is used, and only the
+        # direct path binds one, so a build without an order tool has no use
+        # for it.
+        direct_tools = list(direct_mcp.tools) if direct_mcp is not None else []
+        if user_profile and user_profile.get("trading_permission"):
+            # The trading block names the skill once for every order tool, and
+            # moves with the user's switch, not with which tools this turn bound.
+            user_profile = {
+                **user_profile,
+                "trading_order_skill": "order-execution" in skill_registry,
+            }
+        if not any(places_order(t) for t in direct_tools):
+            skill_registry.pop("order-execution", None)
+        order_skill = "order-execution" in skill_registry
         # The chart-annotation skill no longer gates its tools, but its switch
         # still does: a user who turned it off, or the plugin that ships it,
         # gets neither the tools nor the prompt line naming them.
@@ -631,7 +784,9 @@ class PTCAgent:
             sources=skill_sources,
             known_skills=known_skills,
             skill_dirs=self.config.skills.local_skill_dirs(),
-            disabled_skills=self.config.disabled_skills,
+            # A shipped skill the registry does not know reaches the manifest
+            # through the filesystem scan, which only this set keeps it out of.
+            disabled_skills=self.config.disabled_skills | self.config.withheld_skills,
         )
         skill_loader_middleware = skills_middleware(
             skill_registry=skill_registry, inject_manifest=False
@@ -649,15 +804,19 @@ class PTCAgent:
         # middleware, and its tool hook must wrap the Task interceptor so a
         # resume it calls settles on that call's result. Without subagents
         # there is no TaskOutput to read a task report's result with, nor a
-        # task to resume, so only steers are taken in.
-        main_only_middleware.append(
-            SteeringMiddleware(
-                report_inbox=_bg_registry.report_inbox,
-                kinds=(
-                    ("steer",) if disable_subagents else ("report", "steer", "resume")
-                ),
-            )
+        # task to resume, so only steers are taken in. A Claude Code turn
+        # takes the other reports in either way (a command's end, a wakeup,
+        # an alert), which its tool hook hands Claude mid-turn, and resumes
+        # only as it opens.
+        steering = SteeringMiddleware(
+            report_inbox=_bg_registry.report_inbox,
+            kinds=(
+                ("report", "steer") if claude_code and disable_subagents
+                else ("steer",) if disable_subagents
+                else ("report", "steer", "resume")
+            ),
         )
+        main_only_middleware.append(steering)
 
         # The user's cancels of wakeups the agent set, after the steers that
         # reached this call. Whether or not wakeups are on, so the row saying
@@ -675,16 +834,14 @@ class PTCAgent:
 
         # Consent is re-read per call and an order is put to the user against
         # a durable attempt, which is what execution then reads.
-        direct_tools = list(direct_mcp.tools) if direct_mcp is not None else []
         main_only_middleware.extend(direct_tool_middleware(direct_mcp, order_ledger))
 
-        # Recursion gate: no subagents compiled, none advertised in the
-        # prompt ("No sub-agents configured."), no Task tool below.
+        # Recursion gate: no subagents compiled, a <subagents> block that says
+        # "No sub-agents configured.", no Task tool below.
         subagents: list[dict[str, Any]] = []
         if not disable_subagents:
-            subagents = compile_subagents(
+            compiler = subagent_compiler(
                 self.config,
-                role,
                 sandbox=sandbox,
                 mcp_registry=mcp_registry,
                 execute_code=sub_code_tool,
@@ -692,7 +849,6 @@ class PTCAgent:
                 filesystem=subagent_filesystem_tools,
                 web=[web_search_tool, web_fetch_tool],
                 finance=finance_tools,
-                todo=todo_tools,
                 search_tool=search_tool,
                 sandbox_tools=lambda allowed: [
                     code_tool(allowed_servers=allowed),
@@ -709,7 +865,11 @@ class PTCAgent:
                 or "",
                 skill_registry=subagent_skill_registry,
                 scratchpad=scratchpad.folder if scratchpad is not None else None,
+                model=turn.label,
+                prompt_vars=gates.prompt_vars(),
+                shared=not own_data,
             )
+            subagents = create_subagents(turn_roster(self.config.subagents), compiler, role)
             subagents.extend(additional_subagents or [])
 
         background_middleware = BackgroundSubagentMiddleware(
@@ -719,7 +879,11 @@ class PTCAgent:
             registry=_bg_registry,
             checkpointer=checkpointer,
             namespace_owner=namespace_owner,
-            subagent_models=self.config.subagent_models,
+            run_on=run_on_by_type(
+                subagents, default_model=turn.client, models=self.config.subagent_models,
+                claude_code=claude_code_cli,
+            ),
+            task_models=self.config.task_models,
         )
         main_only_middleware.append(background_middleware)
         if not disable_subagents:
@@ -727,9 +891,39 @@ class PTCAgent:
 
         ask_user_middleware = AskUserMiddleware()
         main_only_middleware.append(ask_user_middleware)
+
+        # Holds the plan UpdatePlan resolves its ``advance`` against, and
+        # checks in when a running step stops moving. Wraps no tool call, so
+        # it sits clear of the steering and Task interceptor chain above.
+        # Main agent only, as is the tool (bound below): a subagent's steps
+        # show under its own card.
+        # Off, a plan an earlier turn left is taken away instead, so nothing
+        # lists one the agent can no longer move.
+        plan_on = self.config.feature_enabled("agent_plan")
+        plan_state = (
+            PlanStateMiddleware(continues=bool(turn_context and turn_context.continues_request))
+            if plan_on
+            else PlanOffMiddleware()
+        )
+        main_only_middleware.append(plan_state)
+        # After a final answer that left plan steps unfinished, one silent call
+        # to mark what was done, unless something will report back to the
+        # thread and bring the agent to the plan later. Needs the thread to
+        # read what is pending. Mounted by the quiet guard below.
+        plan_close_out = (
+            PlanCloseOutMiddleware.for_thread(
+                str(thread_id),
+                str(user_id) if user_id else None,
+                analysts=role == "chief_of_staff",
+            )
+            if plan_on and thread_id
+            else None
+        )
         shared_tools.extend(ask_user_middleware.tools)
 
         tools: list[Any] = [execute_code_tool, bash_tool, *shared_tools]
+        if member_mount is not None:
+            tools = member_mount.over(tools)
 
         def tools_on(target: ComputerTarget) -> dict[str, Any]:
             """The machine tools over another computer's session. Each command
@@ -768,6 +962,7 @@ class PTCAgent:
                 computer_tools.wrap(tool) if tool.name in REACHABLE_TOOLS else tool
                 for tool in tools
             ]
+            tools.append(create_copy_file_tool(reach))
 
         if role == "chief_of_staff":
             from src.tools.secretary.approvals import StandingApprovalMiddleware
@@ -784,7 +979,11 @@ class PTCAgent:
         # then rebuild the block on every turn.
         if tool_summary is None:
             tool_summary = self._get_tool_summary(mcp_registry)
-        subagent_summary = format_subagent_summary(subagents)
+        # The roster the baseline freezes into <subagents>, resolved here for
+        # the same reason. Not the static prompt: a user's edit to their own
+        # subagent, or a request naming the ones it runs, would move the
+        # cached prefix there.
+        subagent_roster = format_subagent_summary(subagents)
 
         eviction_dir = (
             WorkspaceLayout.large_results_subdir(short_thread_id)
@@ -794,20 +993,22 @@ class PTCAgent:
 
         render_prompt = partial(
             self._build_system_prompt,
-            subagent_summary,
             turn.guidance,
             thread_id=short_thread_id,
             memory_enabled=gates.memory,
             memo_enabled=gates.memo,
-            todo_enabled=bool(todo_tools),
+            **gates.prompt_vars(),
+            plan_enabled=plan_on,
             crawl_enabled=bool(crawl_tools),
             scratchpad_enabled=scratchpad is not None,
             direct_tool_summary=direct_tool_summary(direct_tools),
+            order_skill=order_skill,
             workspace=workspace_layout,
             legacy_layout=bool(project is not None and project.layout_origin == 3),
             chart_annotation_enabled=chart_annotation,
             role=role,
             channels_enabled=gates.channels,
+            claude_code=claude_code,
         )
         # Read once: the baseline freezes this value per epoch, and the
         # prompt is sent with the frozen one (FrozenPromptMiddleware).
@@ -848,9 +1049,13 @@ class PTCAgent:
         compaction = CompactionMiddleware.for_agent(
             self.config,
             backend=backend,
-            workspace_id=workspace_id_for_memory,
+            # The folder a transcript pointer is read from, which the mount
+            # serves: the stand-in's on a Home turn there.
+            workspace_id=folder_workspace_id,
             receives=multimodal_strip.receives,
             page_tokens=multimodal_strip.pdf_page_tokens,
+            large_results_dir=eviction_dir,
+            shared=not own_data,
         )
         # The main agent is asked to update its scratchpad notes before each
         # summary, and its summaries name them; a subagent's do not. Without
@@ -873,6 +1078,18 @@ class PTCAgent:
                     wakeup_cancels_window_carry,
                 ],
             )
+        if main_compaction is not None:
+            main_compaction = main_compaction.with_turn_start_rebuilds(
+                TurnStartRebuilds(
+                    self.config.compaction.rebuild_floor_tokens,
+                    settled_at=turn_context.previous_run_settled_at if turn_context else None,
+                    cold_tokens=self.config.compaction.cold_compact_tokens,
+                    idle_tokens=self.config.compaction.idle_tokens,
+                    idle_compaction=self.config.feature_enabled("idle_compaction"),
+                    keep_full_context=bool(turn_context and turn_context.keep_full_context),
+                    sent_at=turn_context.sent_at if turn_context else None,
+                )
+            )
 
         model_resilience = [build_model_resilience_middleware(self.config, turn)]
 
@@ -885,10 +1102,15 @@ class PTCAgent:
         )
 
         # SubagentSteeringMiddleware must be first so follow-up messages are visible before other middleware.
+        subagent_steering = SubagentSteeringMiddleware(registry=background_middleware.registry)
+        subagent_turn_context = TurnContextMiddleware(
+            timezone=timezone_str or "UTC",
+            is_subagent=True,
+        )
         subagent_middleware = [
             m
             for m in [
-                SubagentSteeringMiddleware(registry=background_middleware.registry),
+                subagent_steering,
                 # Outermost of the tool wrappers, so each result streams as
                 # the checkpoint keeps it, the time-up refusal included, and
                 # live agrees with replay. It acts only on what comes back,
@@ -908,10 +1130,7 @@ class PTCAgent:
                 # is injected: this stack is built once per parent turn and run
                 # for every subagent, so the row reads the clock when its own
                 # turn opens.
-                TurnContextMiddleware(
-                    timezone=timezone_str or "UTC",
-                    is_subagent=True,
-                ),
+                subagent_turn_context,
                 LargeResultEvictionMiddleware(
                     backend=backend, eviction_dir=eviction_dir
                 ),
@@ -961,6 +1180,7 @@ class PTCAgent:
             files_mounted=files_mounted,
             switches=ProfileSwitches(channels=gates.channels, wakeups=wakeups_on),
             blocks={
+                "model": lambda _state, label=turn.label: label,
                 "mcp_servers": lambda _state: tool_summary,
                 "skills": lambda state: skill_loader_middleware.build_manifest(state)
                 or "",
@@ -974,9 +1194,24 @@ class PTCAgent:
                     if scratchpad is not None
                     else {}
                 ),
+                # Always, so the prompt's pointer at <subagents> finds it:
+                # an agent with none says so there.
+                "subagents": lambda _state: subagent_roster,
             },
             user_data_counts=user_data_counts,
             role=role,
+            # A build without the sender's own data is a shared workspace's.
+            shared=not own_data,
+        )
+        if main_compaction is not None:
+            main_compaction = main_compaction.with_baseline(context.baseline.sent_sections)
+
+        # A shared workspace member's own context, on their messages alone:
+        # their preferences always, their memory where it is mounted.
+        member_middleware = (
+            MemberContextMiddleware(member_context, mount=member_mount)
+            if member_context is not None
+            else None
         )
 
         # Compiled subagent graphs live on this middleware; the RunWorkflow
@@ -987,6 +1222,54 @@ class PTCAgent:
         # provider of the Task tool, so skipping it (plus the TaskOutput extend
         # above) makes a notification turn structurally unable to spawn
         # subagents, and RunWorkflow drops with it below.
+        # A subagent on a Claude Code row runs each of its runs in a Claude
+        # Code CLI of its own, where a Claude Code turn runs its CLI. As that
+        # turn does, it takes its prompt, tools and stack from its compiled
+        # agent, opens with the hooks that write its rows, and takes in what
+        # is sent into its task between calls.
+        claude_code_launcher_for = (
+            partial(claude_code_launcher, sandbox, claude_code_cli)
+            if claude_code_cli is not None and claude_code_launcher is not None
+            else None
+        )
+
+        def claude_code_subagent(admitted: Admitted) -> ClaudeCodeSubagent:
+            launcher_for = partial(claude_code_launcher, sandbox, admitted)
+
+            def build(compiled: Any, spec: Any, target: ClaudeCodeTarget) -> Any:
+                from ptc_agent.agent.claude_code.agent import claude_code_graph
+                from ptc_agent.agent.claude_code.compaction import CompactionRules
+                from ptc_agent.agent.claude_code.mid_turn import TaskSteering
+                from ptc_agent.agent.claude_code.ssh_launcher import SUBAGENT_CLI_SLOT_WAIT_S
+
+                own = list(spec.get("middleware") or [])
+                baseline = next((m for m in own if isinstance(m, BaselineContextMiddleware)), None)
+                return claude_code_graph(
+                    compiled, system_prompt=spec["system_prompt"], target=target,
+                    user_id=user_id, checkpointer=checkpointer,
+                    # Not told of its waits: a subagent waits briefly, under the
+                    # count its launch was admitted by, and shows none.
+                    launcher=lambda _waits: launcher_for(slot_wait_s=SUBAGENT_CLI_SLOT_WAIT_S),
+                    entry=(subagent_skill_middleware, subagent_turn_context, *own),
+                    middleware=[*subagent_middleware, *own],
+                    baseline=baseline.frozen_block if baseline is not None else None,
+                    steering=TaskSteering(subagent_steering),
+                    shared=not own_data,
+                    compaction=CompactionRules.of_subagent(self.config.compaction, backend=backend,
+                                                          workspace_id=folder_workspace_id,
+                                                          shared=not own_data),
+                )
+
+            return build
+
+        def compile_on(subagent_type: str, on: TaskModel) -> dict[str, Any]:
+            """A type's spec on the model a Task names, compiled from its
+            definition so its prompt is scaffolded for that model."""
+            return compiler.compile(
+                turn_roster(self.config.subagents).definitions[subagent_type],
+                client=on.client, guidance=on.guidance,
+            )
+
         subagent_task_middleware = (
             task_middleware(
                 subagents,
@@ -995,6 +1278,13 @@ class PTCAgent:
                 middleware=subagent_middleware,
                 registry=background_middleware.registry,
                 checkpointer=checkpointer,
+                claude_code=(
+                    claude_code_subagent(claude_code_cli)
+                    if claude_code_launcher_for is not None
+                    else None
+                ),
+                compile_on=compile_on if self.config.task_models is not None else None,
+                claude_code_on=claude_code_subagent if claude_code_launcher is not None else None,
             )
             if not disable_subagents
             else None
@@ -1022,28 +1312,45 @@ class PTCAgent:
                 thread_id=thread_id or "",
                 short_thread_id=short_thread_id,
                 store=store,
-                user_id=user_id,
+                # The workflow store the file tools mount (``workflow_fs``).
+                user_id=owner_id,
                 prebuilt_workflows=get_prebuilt_workflows(),
             )
             tools.append(run_workflow_tool)
 
-        # Chart annotations, main agent only: appended after the subagent
+        # The chart-layer tool, main agent only: appended after the subagent
         # snapshot above, which the default general-purpose subagent is built
         # from. A drawing is part of the reply the user sees, and a subagent
         # answers the main agent, not the user.
         if chart_annotation:
-            tools.extend(CHART_ANNOTATION_TOOLS)
+            tools.extend(CHART_LAYER_TOOLS)
 
         # Messaging the user (send_message, list_message_targets), present only
         # when a channel gateway is configured. Main agent only, added after the
         # subagent snapshot: a subagent reports to its parent, never to a person.
-        tools.extend(build_messaging_tools(role, computers=reach))
+        # Never without the sender's own data: the tools act as the sender on
+        # their own chats, and in a shared workspace other members write what
+        # steers this agent.
+        if own_data:
+            tools.extend(build_messaging_tools(role, computers=reach))
 
         # The agent's own follow-ups on this thread, main agent only and
         # added after the subagent snapshot: a wakeup comes back to the
         # thread, and a subagent has no thread of its own to come back to.
         if wakeups_on:
-            tools.append(build_schedule_wakeup_tool())
+            tools.append(build_schedule_wakeup_tool(watch_elsewhere=own_data))
+
+        # The plan the user follows while the agent works, main agent only:
+        # it is drawn in the thread's chat, which a subagent has no part of.
+        if plan_on:
+            tools.append(build_update_plan_tool())
+
+        # Answering the user's comments on files, main agent only and added
+        # after the subagent snapshot: comments are sent to a thread, and a
+        # subagent has no thread of its own. On every turn, not only those
+        # carrying comments, so the tool list holds still for the prompt cache.
+        if thread_id:
+            tools.append(create_reply_to_comment_tool())
 
         # What will report back to the thread, main agent only for the same
         # reason: a subagent's own commands wait, and its result covers them.
@@ -1063,9 +1370,9 @@ class PTCAgent:
         #     SystemPromptCacheMiddleware (prompt_cache_breakpoint for OpenAI,
         #     cache_control for Claude over OpenRouter) each place their
         #     provider's breakpoint on the last system message block they
-        #     see, which is the static prompt's own: the skills manifest and the
-        #     MCP roster ride in the baseline now. Each no-ops for other
-        #     providers.
+        #     see, which is the static prompt's own: the skills manifest, the
+        #     MCP roster and the subagent roster ride in the baseline now.
+        #     Each no-ops for other providers.
         #   - TurnContextMiddleware runs before BaselineContextMiddleware so
         #     the turn row is written into history ahead of the change rows.
         #   - BaselineContextMiddleware is innermost on the system message: it
@@ -1110,6 +1417,13 @@ class PTCAgent:
                 # the context rows run, so a call that never happens takes in
                 # nothing and writes nothing. Only with the tool that sets it.
                 WakeupQuietGuardMiddleware() if wakeups_on else None,
+                # Ends the run once the plan's close-out has run, for the same
+                # reason and so in the same place. That also makes it the
+                # outermost after-model hook: it runs once every other one has
+                # read the answer (approvals and orders first, which must see
+                # the model's own message newest), and its jump back to the
+                # model then skips none.
+                plan_close_out,
                 *shared_middleware,
                 skill_loader_middleware,
                 *main_only_middleware,
@@ -1128,15 +1442,26 @@ class PTCAgent:
                 context.baseline,
                 notes_rows,
                 # Market watch (main agent only): writes the <market-watch>
-                # price stamp into history as a row before each model call
-                # while a watched venue is open, re-stamping the cached block
-                # between fetches. Its before_model runs after every other row
-                # writer, so a turn's stamp follows its anchor.
+                # price stamp into history as a row while a watched venue is
+                # open. Inside the refresh window nothing is written while the
+                # last stamp for the same watch list is in view; once a summary
+                # took it, the cached block is written again. Its before_model
+                # runs after every other row writer, so a turn's stamp follows
+                # its anchor.
                 *(
                     [MarketWatchMiddleware(guidance=turn.guidance)]
                     if self.config.feature_enabled("market_watch")
                     else []
                 ),
+                # A shared workspace's member messages open with their
+                # writer's tag, outside the carrier so the request it
+                # composes is named. Only there: no other message has one.
+                SenderNamingMiddleware() if not own_data else None,
+                # Inside the naming, so the block it adds to a streak's first
+                # message follows that message's tag, and just outside the
+                # carrier, so what it adds is composed into the request copy
+                # and never reaches the checkpoint.
+                member_middleware,
                 context.tail,
                 SystemPinMiddleware(),
                 ReasoningCompatibilityMiddleware(),
@@ -1164,16 +1489,42 @@ class PTCAgent:
             state_schema=MainAgentState,
         ).with_config({"recursion_limit": UNBOUNDED_RECURSION_LIMIT})
 
+        alert_senders = frozenset(
+            sender
+            for sender, on in (
+                (MARKET_ALERT_SENDER, self.config.feature_enabled("market_watch")),
+                (WAKEUP_SENDER, wakeups_on),
+            )
+            if on
+        )
+        if claude_code:
+            from ptc_agent.agent.claude_code.agent import claude_code_graph
+            from ptc_agent.agent.claude_code.agent_plan import AgentPlan
+            from ptc_agent.agent.claude_code.compaction import CompactionRules
+
+            return claude_code_graph(
+                agent, system_prompt=system_prompt, target=turn.client,
+                user_id=user_id, checkpointer=checkpointer,
+                launcher=claude_code_launcher_for,
+                # The plan's turn entry clears a plan an earlier request left,
+                # so ``advance`` cannot move it here either. Its check-in,
+                # nudge and close-out are model-call hooks, which Claude
+                # Code's own loop never runs: the runtime asks them itself
+                # (``claude_code/agent_plan.py``).
+                entry=(skill_loader_middleware, context.turn, context.baseline, plan_state),
+                plan=AgentPlan(plan_close_out) if plan_on else None,
+                shared=not own_data,
+                middleware=deepagent_middleware,
+                baseline=context.baseline.frozen_block,
+                steering=steering,
+                alert_senders=alert_senders,
+                compaction=CompactionRules.of(self.config.compaction, turn_context, backend=backend,
+                                              workspace_id=folder_workspace_id, shared=not own_data),
+            )
+
         return BackgroundSubagentOrchestrator(
             agent=agent,
             middleware=background_middleware,
             auto_wait=self.config.background_auto_wait,
-            alert_senders=frozenset(
-                sender
-                for sender, on in (
-                    (MARKET_ALERT_SENDER, self.config.feature_enabled("market_watch")),
-                    (WAKEUP_SENDER, wakeups_on),
-                )
-                if on
-            ),
+            alert_senders=alert_senders,
         )

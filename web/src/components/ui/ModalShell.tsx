@@ -1,4 +1,4 @@
-import React, { useEffect, useLayoutEffect, useRef } from 'react';
+import React, { useEffect, useId, useLayoutEffect, useRef } from 'react';
 import { useTranslation } from 'react-i18next';
 import { animate, motion, useMotionValue, useReducedMotion } from '@/lib/framer';
 import { X } from 'lucide-react';
@@ -30,6 +30,8 @@ const WIDTH = {
   narrow: 'max-w-md',
   standard: 'max-w-lg',
   wide: 'max-w-2xl',
+  /** A table of a few columns beside each row's status and actions. */
+  table: 'max-w-3xl',
 } as const;
 
 /**
@@ -147,6 +149,10 @@ export function ModalShell({
   const isMobile = useIsMobile();
   const space = DENSITY[density];
   const layer = zIndex ?? (stacked ? 1020 : 1010);
+  // The subtitle says what the dialog is for, a warning at times, so it is
+  // read as the dialog's description when it opens.
+  const subtitleId = useId();
+  const describedBy = !header && subtitle ? subtitleId : undefined;
   useScrollLock();
 
   // The panel follows the measured height of its content.
@@ -213,8 +219,10 @@ export function ModalShell({
       <motion.div
         ref={setPanelRef}
         role="dialog"
+        data-slot="dialog"
         aria-modal="true"
         aria-labelledby={labelId}
+        aria-describedby={describedBy}
         tabIndex={-1}
         inert={covered}
         // Clipped, not hidden: an overflow-hidden box can still be scrolled
@@ -224,10 +232,13 @@ export function ModalShell({
           WIDTH[width],
           isMobile ? 'rounded-t-3xl' : 'rounded-lg',
         )}
+        // The open card styles float it on the page's ground inside their
+        // edge, Terminal without the shadow. Neither is a value framer
+        // animates, so a var() is safe here.
         style={{
-          backgroundColor: 'var(--color-bg-elevated)',
-          border: '1px solid var(--color-border-muted)',
-          boxShadow: 'var(--shadow-card)',
+          backgroundColor: 'var(--color-shell-float, var(--color-bg-elevated))',
+          border: '1px solid var(--color-shell-edge, var(--color-border-muted))',
+          boxShadow: 'var(--cs-float-shadow, var(--shadow-card))',
           height,
         }}
         {...panelMotion}
@@ -267,16 +278,18 @@ export function ModalShell({
             </button>
           )}
           {header ? (
-            <div className={cn('shrink-0 pt-5 pb-4', space.x)} style={{ borderBottom: '1px solid var(--color-border-muted)' }}>
+            <div data-slot="dialog-header" className={cn('rule-b shrink-0 pt-5 pb-4', space.x)}>
               {header}
             </div>
           ) : (
-            <div className={cn('shrink-0 pt-5 pb-3 pr-12', space.x)}>
-              <h3 id={labelId} className="text-lg font-semibold" style={{ color: 'var(--color-text-primary)' }}>
+            // The close button's room is set after the density's padding,
+            // which would otherwise win over it and run a long title under it.
+            <div data-slot="dialog-header" className={cn('shrink-0 pt-5 pb-3', space.x, 'pr-12')}>
+              <h3 id={labelId} data-slot="dialog-title" data-bracket="title" className="text-lg font-semibold" style={{ color: 'var(--color-text-primary)' }}>
                 {title}
               </h3>
               {subtitle && (
-                <p className="text-xs mt-1" style={{ color: 'var(--color-text-tertiary)' }}>
+                <p id={subtitleId} data-slot="dialog-desc" className="text-xs mt-1" style={{ color: 'var(--color-text-tertiary)' }}>
                   {subtitle}
                 </p>
               )}
@@ -291,8 +304,8 @@ export function ModalShell({
           </div>
           {footer && (
             <div
-              className={cn('shrink-0', space.x, space.footer)}
-              style={{ borderTop: '1px solid var(--color-border-muted)' }}
+              data-slot="dialog-footer"
+              className={cn('rule-t shrink-0', space.x, space.footer)}
             >
               {footer}
             </div>

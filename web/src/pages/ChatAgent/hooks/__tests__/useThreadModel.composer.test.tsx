@@ -1,5 +1,5 @@
 /**
- * The composer and the fallback pill driven by `useThreadModel`, the way the
+ * The composer and the fallback notice driven by `useThreadModel`, the way the
  * chat view and the market panel wire them. Pins the two overlapping-pick
  * races end to end, on what the user sees and what the next send names: a
  * stale failure must never put the pill back on an older model while the row
@@ -12,11 +12,13 @@ import { useState } from 'react';
 import { MemoryRouter } from 'react-router';
 import { QueryClientProvider, type QueryClient } from '@tanstack/react-query';
 import ChatInput from '@/components/ui/chat-input';
+import { NoticeHeader } from '@/components/ui/chat-input.notices';
+import type { ComposerSend } from '@/components/ui/chat-input.types';
 import { ChatInputRegistry, ContextBus } from '@/lib/contextBus';
 import { queryKeys } from '@/lib/queryKeys';
 import { createTestQueryClient } from '@/test/utils';
 import type { Thread } from '@/types/api';
-import { FallbackSuggestionPill } from '../../components/chatView/FallbackSuggestionPill';
+import { useComposerNotices } from '../../components/chatView/useComposerNotices';
 import type { FallbackSuggestion } from '../../session/types';
 import { useThreadModel } from '../useThreadModel';
 
@@ -81,7 +83,6 @@ vi.mock('@/components/ui/chat-input.modelMenu', () => ({
       <button type="button" onClick={() => onSelectModel('model-y')}>pick-y</button>
     </>
   ),
-  ChatInputEffortMenu: () => null,
   ModelTriggerMeasure: () => null,
 }));
 
@@ -101,30 +102,33 @@ function deferred<T>() {
 
 const failure = () => Object.assign(new Error('400'), { response: { status: 400 } });
 
+const NO_SUBAGENTS = { offer: null, closeOffer: () => {}, expireOffer: () => {} };
+
 /** A thread host as the chat view builds one: the hook owns the model, the
- *  composer is controlled by it, and the fallback pill's switch is a pick
- *  that clears the suggestion once saved. */
-function Host({ threadId, onSend }: { threadId: string; onSend: (...args: unknown[]) => void }) {
+ *  composer is controlled by it, and the fallback notice's switch is a pick
+ *  that clears the suggestion once saved. The menu is stubbed, so the notice
+ *  is drawn beside it rather than in its popover. */
+function Host({ threadId, onSend }: { threadId: string; onSend: (send: ComposerSend) => void }) {
   const threadModel = useThreadModel({ threadId, isLoading: false });
   const [suggestion, setSuggestion] = useState<FallbackSuggestion | null>(SUGGESTION);
-  const { pickModel } = threadModel;
+  const notices = useComposerNotices({
+    threadId,
+    threadModel,
+    subagents: NO_SUBAGENTS,
+    chat: { fallbackSuggestion: suggestion, clearFallbackSuggestion: () => setSuggestion(null), isLoading: false },
+    workspaceId: null,
+  });
   return (
     <>
-      <FallbackSuggestionPill
-        fallbackSuggestion={suggestion}
-        isLoading={false}
-        composerModel={threadModel.model}
-        onSwitchModel={(model) => { void pickModel(model).then((ok) => { if (ok) setSuggestion(null); }); }}
-        onDismiss={() => setSuggestion(null)}
-      />
-      <ChatInput model={threadModel.model} onPickModel={pickModel} onSend={onSend} />
+      {notices.model && <NoticeHeader notice={notices.model} onClose={() => {}} />}
+      <ChatInput model={threadModel.model} onPickModel={threadModel.pickModel} onSend={onSend} />
     </>
   );
 }
 
 let queryClient: QueryClient;
 
-function renderHost(threadId: string, onSend = vi.fn()) {
+function renderHost(threadId: string, onSend = vi.fn<(send: ComposerSend) => void>()) {
   render(
     <QueryClientProvider client={queryClient}>
       <MemoryRouter>
@@ -183,11 +187,12 @@ describe('the composer on a thread-owned model', () => {
     expect(screen.getByText('pill:model-y')).toBeInTheDocument();
     expect(cachedModel()).toBe('model-y');
     expect(mocks.toast).not.toHaveBeenCalled();
-    // The suggestion still stands, and the composer is off its model.
-    expect(screen.getByRole('button', { name: 'Switch to Model Fallback' })).toBeInTheDocument();
+    // The suggestion is not cleared, but it is about a send on the troubled
+    // model, so it says nothing while the composer names another.
+    expect(screen.queryByRole('button', { name: 'Switch to Model Fallback' })).toBeNull();
 
     send('next');
-    expect(onSend.mock.calls[0][3]).toMatchObject({ model: 'model-y' });
+    expect(onSend.mock.calls[0][0].modelOptions).toMatchObject({ model: 'model-y' });
 
     await waitFor(() => expect(mocks.updateThread).toHaveBeenLastCalledWith(THREAD, { llm_model: 'model-y' }));
     await act(async () => { y.resolve(row('model-y')); });
@@ -214,7 +219,7 @@ describe('the composer on a thread-owned model', () => {
     await act(async () => { x1.reject(failure()); });
     expect(screen.getByText('pill:model-x')).toBeInTheDocument();
     send('next');
-    expect(onSend.mock.calls[0][3]).toMatchObject({ model: 'model-x' });
+    expect(onSend.mock.calls[0][0].modelOptions).toMatchObject({ model: 'model-x' });
 
     await waitFor(() => expect(mocks.updateThread).toHaveBeenCalledTimes(2));
     await act(async () => { y.resolve(row('model-y')); });
@@ -234,7 +239,7 @@ describe('the composer on a thread-owned model', () => {
     expect(screen.getByText('pill:model-y')).toBeInTheDocument();
     send('start a thread');
 
-    expect(onSend.mock.calls[0][3]).toMatchObject({ model: 'model-y' });
+    expect(onSend.mock.calls[0][0].modelOptions).toMatchObject({ model: 'model-y' });
     expect(mocks.updateThread).not.toHaveBeenCalled();
   });
 });

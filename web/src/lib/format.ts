@@ -67,6 +67,13 @@ export function formatTimestamp(ts: string | null | undefined, locale: string): 
 }
 
 const listFormat = perLocale((locale) => new Intl.ListFormat(locale, { type: 'conjunction' }));
+// Not `type: 'unit'`, which Chinese joins with no separator at all.
+const bareListFormat = perLocale((locale) => new Intl.ListFormat(locale, { type: 'conjunction', style: 'narrow' }));
+
+/** Names listed with no conjunction, as the locale says "A, B, C". */
+export function formatUnitList(items: readonly string[], locale: string): string {
+  return bareListFormat(locale).format(items);
+}
 
 /** Names joined as the locale says "A, B and C". A Chinese conjunction is a
  *  word and is spaced from a Latin name or a number beside it (`moomoo 和
@@ -127,6 +134,8 @@ export const compactNumber = createFormatter({ notation: 'compact', maximumFract
 export const grouped = createFormatter({ maximumFractionDigits: 3 });
 export const grouped2 = createFormatter({ minimumFractionDigits: 2, maximumFractionDigits: 2 });
 export const integer = createFormatter({ maximumFractionDigits: 0 });
+// A share as a whole percent, from a ratio: `0.284 → "28%"`.
+export const percent = createFormatter({ style: 'percent', maximumFractionDigits: 0 });
 
 // The quote-strip variants. Two fixed decimals so a column of figures keeps
 // its width from one tick to the next; grouping off because a stock price
@@ -135,6 +144,8 @@ export const integer = createFormatter({ maximumFractionDigits: 0 });
 export const fixed2 = createFormatter({ minimumFractionDigits: 2, maximumFractionDigits: 2, useGrouping: false });
 // `exceptZero` rather than `always`: a flat or sub-cent move prints `0.00`, not `-0.00`.
 export const signedFixed2 = createFormatter({ minimumFractionDigits: 2, maximumFractionDigits: 2, useGrouping: false, signDisplay: 'exceptZero' });
+/** The placeholder a quote figure prints while it has no value. */
+export const DASH = '—';
 export const compactNumberFixed2 = createFormatter({ notation: 'compact', minimumFractionDigits: 2, maximumFractionDigits: 2 });
 
 // Calendar days, as a market's daily bar is dated: a `YYYY-MM-DD` with no
@@ -171,6 +182,18 @@ export function formatCalendarDayRange(from: string, to: string, locale: string)
   if (!a || !b) return [from, to].filter(Boolean).join(' – ');
   // Older engines throw on a reversed range rather than printing it.
   return a <= b ? calendarDayRange(locale).formatRange(a, b) : calendarDayRange(locale).formatRange(b, a);
+}
+
+// A chart's wall clock: seconds that write the exchange's local time as if it
+// were UTC (an intraday bar's time), so printed in UTC to keep the clock.
+const wallClockRange = perLocale((locale) => new Intl.DateTimeFormat(locale, {
+  month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit', timeZone: 'UTC',
+}));
+
+/** "Mar 31, 10:30 AM – 3:00 PM" for two wall-clock times in chart seconds. */
+export function formatWallClockRange(fromSecs: number, toSecs: number, locale: string): string {
+  const [a, b] = fromSecs <= toSecs ? [fromSecs, toSecs] : [toSecs, fromSecs];
+  return wallClockRange(locale).formatRange(new Date(a * 1000), new Date(b * 1000));
 }
 
 const byteAmount = createFormatter({ maximumFractionDigits: 1 });
@@ -265,4 +288,26 @@ export function chatTime(ms: number, locale: string, now: number): string {
   return new Date(ms).getFullYear() === new Date(now).getFullYear()
     ? monthDayClockTime(ms, locale)
     : fullMonthDayClockTime(ms, locale);
+}
+
+const usdWhole = createFormatter({ style: 'currency', currency: 'USD', maximumFractionDigits: 0 });
+const usdCents = createFormatter({ style: 'currency', currency: 'USD', minimumFractionDigits: 2, maximumFractionDigits: 2 });
+
+const usdSmall = new Map<number, (n: number, locale: string) => string>();
+
+/** A list price in USD per 1M tokens: whole dollars where it has no cents
+ *  ("$2"), cents where it has them or is under a dollar ("$0.30", "$1.25").
+ *  Under a dime, cents would misstate it ("$0.075" as "$0.08") or zero it, so
+ *  it takes up to three decimals and always one significant digit. */
+export function formatTokenPrice(value: number, locale: string): string {
+  if (value > 0 && value < 0.1) {
+    const digits = Math.min(20, Math.max(3, Math.ceil(-Math.log10(value))));
+    let format = usdSmall.get(digits);
+    if (!format) {
+      format = createFormatter({ style: 'currency', currency: 'USD', minimumFractionDigits: 2, maximumFractionDigits: digits });
+      usdSmall.set(digits, format);
+    }
+    return format(value, locale);
+  }
+  return (value < 1 || !Number.isInteger(value) ? usdCents : usdWhole)(value, locale);
 }

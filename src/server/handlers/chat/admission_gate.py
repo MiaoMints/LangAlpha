@@ -25,8 +25,9 @@ from src.server.services.runs.admission import (
 )
 
 if TYPE_CHECKING:
+    from ptc_agent.agent.transcript.sender import MemberSender
     from src.server.handlers.chat.request_prep import HandOffSteered
-    from src.server.models.chat import ChatRequest
+    from src.server.models.chat import ChatRequest, ShownSend
     from src.server.services.runs.executor import LocalRunExecutor
 
 
@@ -53,6 +54,10 @@ ADMISSION_CONFLICT_CODES = {
     "steer_taken",
     # START refused because the workspace is moving to another computer.
     "workspace_moving",
+    # A send of file comments that another send, or a delete, left empty.
+    "comments_unavailable",
+    # A shared workspace's thread whose running turn another member sent.
+    "another_member",
 }
 
 
@@ -110,12 +115,31 @@ def steer_allowed(
     it), a fork (an edit or a regenerate replaces a turn, which a message
     added to the running one cannot do) and a non-steerable caller (an
     automation's instruction is a turn of its own) meet a running peer with a
-    409 instead.
+    409 instead. A hand-off naming a model rides only a turn running on it
+    (``wait_or_steer``'s ``on_model``).
     """
     if dispatched:
         return steerable and _is_agent_hand_off(request)
     is_fork = request.fork_from_turn is not None and bool(request.checkpoint_id)
-    return steerable and request.retry_of_run_id is None and not is_fork
+    return (
+        steerable
+        and request.retry_of_run_id is None
+        and not is_fork
+        and not _names_uploaded_files(request)
+    )
+
+
+def _run_model(row: dict) -> str | None:
+    return (row.get("metadata") or {}).get("llm_model")
+
+
+def _names_uploaded_files(request: ChatRequest) -> bool:
+    """A steer carries its text alone, so files uploaded for the message would
+    never reach the agent; it waits for a turn of its own instead."""
+    return any(
+        getattr(ctx, "attachment_id", None) is not None
+        for ctx in request.additional_context or ()
+    )
 
 
 def _is_agent_hand_off(request: ChatRequest) -> bool:
@@ -193,6 +217,11 @@ async def wait_or_steer(
     workspace_id: str | None = None,
     steer_job_id: str | None = None,
     agent: AgentSteer | None = None,
+    artifact_comments: ShownSend | None = None,
+    shared: bool = False,
+    written_by: MemberSender | None = None,
+    checked_computer_id: str | None = None,
+    on_model: str | None = None,
 ) -> tuple[bool, str | HandOffSteered | None]:
     """Admit a new turn, steer the running one, or 409.
 
@@ -226,6 +255,14 @@ async def wait_or_steer(
     ``HandOffSteered``, naming the run and the steer, for the dispatch
     primer, which has no SSE reader, as does a copy of it that finds its
     steer still one; a run that reports to another Home thread is a 409.
+    ``artifact_comments`` rides a steer of a send carrying file comments, for
+    the reader to be shown them rather than the message. ``shared`` marks a
+    shared workspace's thread, whose steer is taken in only by a turn of its
+    sender's, and ``written_by`` that sender as the steer names them.
+    ``on_model`` is the model a hand-off names: it steers only a run
+    started on that model, read off the run here rather than by the sender
+    before its approval wait, and meets any other run with a 409, since a
+    running turn keeps its model.
 
     Admission states (see ``LocalRunExecutor.wait_for_admission``):
     - ``"fresh"``     → start a new turn ``(True, None)``; with ``steer_only``,
@@ -257,9 +294,25 @@ async def wait_or_steer(
         # every other non-fresh state, and every request ``steer_allowed``
         # refuses, is a conflict. Steering mid-stopping would start a second
         # checkpoint writer; mid-compaction would corrupt the context rewrite.
-        if state != "running" or not can_steer or active_row is None:
+        if (
+            state != "running"
+            or not can_steer
+            or active_row is None
+            or (on_model and _run_model(active_row) != on_model)
+        ):
             raise HTTPException(
                 status_code=409, detail=admission_conflict_detail(state)
+            )
+
+        running_sender = active_row.get("user_id")
+        if running_sender is not None and running_sender != user_id:
+            # Only in a shared workspace: everywhere else every turn of a
+            # thread is its owner's. Read off the same admission row, so no
+            # worker steers one member's message into another's turn.
+            from src.server.services.shared_workspaces.turns import another_member_detail
+
+            raise HTTPException(
+                status_code=409, detail=await another_member_detail(running_sender)
             )
 
         active_run_id = str(active_row["conversation_response_id"])
@@ -271,6 +324,11 @@ async def wait_or_steer(
             platform=platform,
             request_key=request_key,
             origin=agent.origin if agent else None,
+            artifact_comments=artifact_comments,
+            member=user_id if shared else None,
+            written_by=written_by,
+            checked_computer_id=checked_computer_id,
+            llm_model=on_model,
         )
         if agent is not None:
             idempotency_key = agent.idempotency_key
@@ -290,13 +348,16 @@ async def wait_or_steer(
 
             return False, HandOffSteered(active_run_id, result["job_id"])
         if result["state"] == "accepted":
-            event_data = json.dumps(
-                {
-                    "thread_id": thread_id,
-                    "content": payload["content"],
-                    "position": result["position"],
-                }
-            )
+            accepted = {
+                "thread_id": thread_id,
+                "content": payload["content"],
+                "position": result["position"],
+            }
+            if artifact_comments is not None:
+                accepted["artifact_comments"] = artifact_comments.model_dump(
+                    mode="json"
+                )
+            event_data = json.dumps(accepted)
             return False, f"event: steering_accepted\ndata: {event_data}\n\n"
         if result["state"] == "duplicate":
             # Another copy of this send steered between the recheck and here.

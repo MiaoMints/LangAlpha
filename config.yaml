@@ -40,6 +40,14 @@ redis_warm_on_startup: true
 # turns it on in its APP_ENV overlay.
 brokerage_marks_warm_on_startup: false
 langsmith_tracing: false
+# Off: a middleware hook's LangSmith run keeps its name, timing, outputs and
+# errors but not its inputs, and a graph node's run records how many messages
+# its state held rather than the messages, which the model call's own run
+# already holds. Each copy is the whole stored conversation, about 70 per model
+# call, and they were 96% of what a turn uploaded. On restores both, for
+# debugging a middleware, except where a middleware sets its own trace policy
+# (deepagents' PatchToolCallsMiddleware always omits its inputs).
+langsmith_full_payloads: false
 
 # User-facing product features. Each entry overrides the code catalog
 # (src/config/features.py) for this deployment; unset fields inherit the
@@ -52,11 +60,72 @@ langsmith_tracing: false
 #                opt_out — on unless the user opts out (Settings toggle)
 #                plan    — requires a platform plan with access tier >=
 #                          min_tier (OSS deployments bypass plan gates)
+#                grant   — off unless granted to the user, which the user
+#                          cannot set (a migration or the server writes it)
 #   min_tier:  plan gate only — minimum platform access tier
 features:
   market_watch:
     enabled: true
     gate: opt_in
+
+# What every user of this deployment may do. Unset allows everything. An
+# organization's own policy (from the auth service) can only narrow it. A key
+# or value this version does not know fails startup rather than being ignored.
+#   models.allowed:                  the models a turn may run, for every role
+#                                    (main, background, compaction, fetch,
+#                                    fallbacks, subagents); null allows any.
+#                                    Where the deployment's default is not
+#                                    allowed, the first model listed that the
+#                                    user can be served is their default (the
+#                                    organization's order when it sets a list).
+#                                    A user's custom models are refused under
+#                                    a list, whatever they are named.
+#   own_model_access.api_keys:       the user's own provider API keys, custom
+#                                    models and custom providers (default true)
+#   own_model_access.subscriptions:  the user's own model sign-ins and a
+#                                    connected Claude Code subscription
+#                                    (default true)
+#   public_links:                    links to the user's threads and files
+#                                    that open without signing in as them
+#                                    (default true). False refuses sharing
+#                                    one, and links shared before stop
+#                                    opening for anyone but the owner while
+#                                    it stands; they open again unchanged
+#                                    once it is lifted.
+#   trading:                         the agent placing, changing or
+#                                    cancelling a live order for the user
+#                                    (default true). False leaves those tools
+#                                    unbound and refused at every call, an
+#                                    approved order included, and refuses
+#                                    granting them; paper, preview and staged
+#                                    orders stay.
+#   own_machines:                    the user's work running on a machine
+#                                    they bring: an SSH computer, including
+#                                    one reached through the tunnel gateway
+#                                    or the desktop helper (default true).
+#                                    False refuses adding one and starting or
+#                                    using one already added; stopping,
+#                                    renaming and removing it still work.
+#   user_connectors:                 MCP servers the user adds themselves,
+#                                    by hand, by import or from a plugin
+#                                    (default true). False refuses adding or
+#                                    turning one on, and the ones already
+#                                    added are not used while it stands;
+#                                    they come back unchanged once it is
+#                                    lifted. Turning one off or deleting it
+#                                    still works. A plugin's skills still
+#                                    install. Brokerages are governed by
+#                                    trading instead.
+# policy:
+#   models:
+#     allowed: [claude-sonnet-5-5, claude-haiku-5-5]
+#   own_model_access:
+#     api_keys: false
+#     subscriptions: false
+#   public_links: false
+#   trading: false
+#   own_machines: false
+#   user_connectors: false
 
 # SSE Event Logging
 sse_event_log_enabled: false
@@ -176,15 +245,10 @@ redis:
       "4hour": 16200
       "1day": 86400
 
-  # Cache Invalidation
-  cache_invalidate_on_write: true  # Invalidate cache on writes
-
   # Stale-While-Revalidate (SWR) Configuration
   # SWR returns stale data immediately while refreshing in background
   swr:
-    enabled: true  # Enable SWR for cache reads
     soft_ttl_ratio: 0.6  # Used by OHLCV cache envelope _needs_refresh()
-    warm_after_invalidation: true  # Pre-populate cache after invalidation
 
 
 # =============================================================================
@@ -254,6 +318,16 @@ order_reconcile:
   batch_limit: 50                 # Attempts examined per pass
   match_window_seconds: 900       # How long after the attempt a listed order may be placed
 
+# Conversation search: each turn is indexed as it settles; this sweep finds the
+# recent turns that missed it, and a process's first pass backfills the ones
+# from before search existed. One worker sweeps at a time. Off, turns are
+# still indexed as they settle.
+thread_search:
+  enabled: true
+  interval_seconds: 120   # How often a worker looks for turns left unindexed
+  batch_threads: 10       # Threads per batch; the backfill walks newest first
+  pause_seconds: 0.5      # Least rest between backfill slices (each rests as long as it worked)
+
 # RunWorkflow programmatic subagent orchestration
 workflow:
   enabled: true                  # Expose the RunWorkflow tool to the PTC main agent
@@ -283,6 +357,45 @@ market_watch:
   max_symbols: 10
   max_targets: 10              # Armed price targets per thread
   target_warning_minutes: 60   # Tell the thread this long before a target lapses
+
+
+# =============================================================================
+# CLAUDE CODE ON CLOUD COMPUTERS
+# =============================================================================
+# The runtime's own switch is features.claude_code_runtime above. With
+# sandbox_placement on, a turn on a cloud computer runs its Claude Code CLI
+# inside that computer's own sandbox, on Medium computers or larger; with it
+# off, a self-hosted server runs it in the worker that owns the turn, and the
+# platform runs none there.
+claude_code:
+  stored_custody: false        # Run them on a setup token the user lets the server store
+  sandbox_placement: false     # Run the CLI inside the cloud computer's own sandbox
+  hosted_turns_per_user: 3     # Turns one user runs at once on cloud computers
+  # Memory (MB) each Claude Code CLI on a cloud computer is counted at; the
+  # computer's memory over this is how many CLIs it runs at once, its turns'
+  # and their subagents' together. A CLI peaks near 240 MB RSS, but the turns
+  # it runs share the sandbox with their own commands and code, so the default
+  # leaves room for them. A computer of the user's own counts its own number,
+  # set in Settings.
+  cli_memory_mb: 800
+  # The day (YYYY-MM-DD) the Claude sign-in stops working on this deployment.
+  # Set, the app marks the sign-in legacy, tells the users signed in with it
+  # and points them at Claude Code; unset, it says nothing.
+  claude_oauth_ends_on: null
+
+
+# =============================================================================
+# APPROVALS FOR WHAT A COMPUTER'S `la` ASKS TO DO
+# =============================================================================
+# Deleting a thread, workspace or automation, creating a workspace, or
+# removing a computer through a computer's token waits for the user's OK in
+# the app. One request holds open this long for the answer (keep it under the
+# edge's limit on one request); the CLI asks again until the request expires.
+cli_approvals:
+  hold_seconds: 50
+  pending_minutes: 30          # A request with no answer expires after this
+  approved_minutes: 5          # An approval its command never used expires after this
+  max_pending: 5               # Requests one user may have waiting at once
 
 
 # =============================================================================

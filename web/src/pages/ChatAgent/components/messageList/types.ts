@@ -1,4 +1,5 @@
-import type { ModelFallbackNotice, TextChunkMark } from '@/types/chat';
+import type { NotificationSegment, TextChunkMark } from '@/types/chat';
+import type { ThreadFeedback } from '../../utils/api/feedback';
 
 // Stable empty object to avoid defeating React.memo with fresh `|| {}` fallbacks
 export const EMPTY_OBJ = {} as Record<string, never>;
@@ -14,8 +15,9 @@ export type FoldState = 'unfolded' | 'live' | 'collapsed' | 'process' | 'expande
 
 export type { ToolCallProcessRecord } from '../ToolCallDetailView';
 
-/** Content segment from message data */
-export interface ContentSegmentRecord {
+/** Content segment from message data. A notification's own fields
+ *  (`notice`, `detail`, …) are `NotificationSegment`'s. */
+export interface ContentSegmentRecord extends Partial<Omit<NotificationSegment, 'type' | 'order'>> {
   type: string;
   content?: string;
   order: number;
@@ -23,17 +25,10 @@ export interface ContentSegmentRecord {
   chunks?: TextChunkMark;
   reasoningId?: string;
   toolCallId?: string;
-  todoListId?: string;
   subagentId?: string;
   questionId?: string;
   proposalId?: string;
   widgetId?: string;
-  /** Notification-only: a model switch, labeled when shown. */
-  fallback?: ModelFallbackNotice;
-  /** Notification-only: longer text (compaction summary / fallback error) shown under toggle. */
-  detail?: string;
-  /** Notification-only: expander toggle label flavor. */
-  detailKind?: 'summary' | 'error';
 }
 
 /** Subagent info for opening subagent task tabs */
@@ -44,8 +39,6 @@ export interface SubagentInfo {
   status?: string;
 }
 
-/** Feedback result from API */
-export interface FeedbackResult {
-  rating: string | null;
-  [key: string]: unknown;
-}
+/** A turn's rating as a bubble reads it: the server's row, or only the
+ *  rating a click settled on. */
+export type FeedbackResult = { rating: string | null } & Partial<Omit<ThreadFeedback, 'rating'>>;

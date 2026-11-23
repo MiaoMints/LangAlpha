@@ -9,10 +9,12 @@ import { api } from '@/api/client';
 import type {
   Computer,
   ComputerActionResponse,
+  ComputerBrowser,
   ComputerCreate,
   ComputerProvidersResponse,
   ComputerReconnectTarget,
   ComputerReinstall,
+  ComputerRemoval,
   ComputerRemoveResponse,
   ComputerStorage,
   ComputersResponse,
@@ -54,7 +56,9 @@ export async function getComputerProviders(): Promise<ComputerProvidersResponse>
 
 /**
  * Create a computer. The tier is picked here because it is the machine's
- * property, not a workspace's. In platform mode this is the metered route: a
+ * property, not a workspace's, and is sent only when given: a tier sent marks
+ * the size as the owner's choice, which then stops following the plan, so a
+ * caller whose user picked none leaves it to the server. In platform mode this is the metered route: a
  * refusal arrives as a 429 whose `detail.message` is the platform's own
  * wording, which the shared API client puts on `err.rateLimitInfo`, or as a
  * 403 when the plan lacks the tier or the provider. With no name the server
@@ -65,10 +69,11 @@ export async function createComputer(body: ComputerCreate = {}): Promise<Compute
     '/api/v1/computers',
     {
       ...(body.name ? { name: body.name } : {}),
-      resource_tier: body.resource_tier ?? 'standard',
+      ...(body.resource_tier ? { resource_tier: body.resource_tier } : {}),
       ...(body.kind ? { kind: body.kind } : {}),
       ...(body.ssh ? { ssh: body.ssh } : {}),
       ...(body.files_backup !== undefined ? { files_backup: body.files_backup } : {}),
+      ...(body.make_primary !== undefined ? { make_primary: body.make_primary } : {}),
     },
     { timeout: COMPUTER_MUTATION_TIMEOUT_MS },
   );
@@ -170,14 +175,15 @@ export function specConflictDetail(err: unknown): SpecConflictDetail | null {
  * from the computer. A 200 means the machine is already at that tier. Up-front
  * refusals arrive as 403/429 (plan and quota, platform mode), or as a 409 with
  * a `SpecConflictDetail` (a turn running, a change or other operation already
- * in progress, a backup that could not finish).
+ * in progress, a backup that could not finish). `planChanged`: the user is back
+ * from the plan page, so the server reads the plan again before it refuses.
  */
-export async function setComputerSpec(computerId: string, tier: ResourceTier): Promise<Computer> {
+export async function setComputerSpec(computerId: string, tier: ResourceTier, planChanged = false): Promise<Computer> {
   if (!computerId) throw new Error('Computer ID is required');
   const { data } = await api.post<Computer>(
     `/api/v1/computers/${computerId}/spec`,
     { tier },
-    { timeout: COMPUTER_MUTATION_TIMEOUT_MS },
+    { params: planChanged ? { plan_changed: true } : undefined, timeout: COMPUTER_MUTATION_TIMEOUT_MS },
   );
   return data;
 }
@@ -196,9 +202,16 @@ export async function setComputerSpec(computerId: string, tier: ResourceTier): P
  * answers which went: one moved off it meanwhile still exists.
  * `deleteFiles`, on an SSH computer, also deletes LangAlpha's files from its
  * machine, the named workspaces' folders among them. It refuses
- * with a 409 whose `detail.code` says why: `primary`, `has_workspaces`, or
- * `busy` (moving between states, being prepared, changing spec, a workspace
- * moving, or held by another action).
+ * with a 409 whose `detail.code` says why: `primary` (make another computer
+ * primary first, which moves Home there), `only_computer` (the user's only
+ * computer; another has to be added first), `has_workspaces`, `handback_owed`
+ * (files written here while Home's own machine was away are still to be
+ * copied back into Home), or `busy` (moving between states, being prepared,
+ * changing spec, a workspace moving, or held by another action).
+ * `homeTo`, on the primary, names where Home goes: Home moves there as Make
+ * primary moves it, refused with Make primary's codes, and a 202 carries
+ * that move's `move_id`; the computer goes once the move is done, and its
+ * `removal` says how a removal that did not happen ended.
  */
 /** As many ids as a request line keeps well under the 8 KB proxies allow. */
 const QUERY_WORKSPACES_MAX = 30;
@@ -209,11 +222,13 @@ export async function deleteComputer(
     removeKey,
     deleteWorkspaces = [],
     deleteFiles = false,
-  }: { removeKey: boolean; deleteWorkspaces?: readonly string[]; deleteFiles?: boolean },
+    homeTo = null,
+  }: { removeKey: boolean; deleteWorkspaces?: readonly string[]; deleteFiles?: boolean; homeTo?: string | null },
 ): Promise<ComputerRemoveResponse> {
   if (!computerId) throw new Error('Computer ID is required');
   const params = new URLSearchParams({ remove_key: String(removeKey) });
   if (deleteFiles) params.set('delete_files', 'true');
+  if (homeTo) params.set('home_to', homeTo);
   if (deleteWorkspaces.length <= QUERY_WORKSPACES_MAX) {
     for (const id of deleteWorkspaces) params.append('delete_workspaces', id);
   }
@@ -226,18 +241,34 @@ export async function deleteComputer(
   return data;
 }
 
+/** How a remove that waited on Home's move off the computer ended, read even once it is gone. */
+export async function getComputerRemoval(computerId: string): Promise<ComputerRemoval> {
+  const { data } = await api.get<ComputerRemoval>(`/api/v1/computers/${computerId}/removal`);
+  return data;
+}
+
 /**
  * Make this the computer new workspaces and Home land on. A 200 means the
  * flip landed now (Home was on no computer yet, or already on this one). A
  * 202 means Home's files move first: `move` is that move, read back like any
- * other, and the flip lands when it commits. Refusals are a 409 in the move's
- * error shape (`moveRefusal`).
+ * other, and the flip lands when it commits. `fromBackup` lays Home on it
+ * from Home's last backup, for when Home's computer can't be reached.
+ * `turnOnBackup` turns this computer's file backup on first, in the same
+ * request, so one with it off can take Home. Refusals are a 409 in the
+ * move's error shape (`moveRefusal`), among them `not_backed_up` (this
+ * computer's file backup is off) and `no_backup`.
  */
-export async function makeComputerPrimary(computerId: string): Promise<MakePrimaryResponse> {
+export async function makeComputerPrimary(
+  computerId: string,
+  { fromBackup = false, turnOnBackup = false }: { fromBackup?: boolean; turnOnBackup?: boolean } = {},
+): Promise<MakePrimaryResponse> {
   if (!computerId) throw new Error('Computer ID is required');
-  const { data } = await api.post<MakePrimaryResponse>(`/api/v1/computers/${computerId}/make-primary`, null, {
-    timeout: COMPUTER_MUTATION_TIMEOUT_MS,
-  });
+  const body = { ...(fromBackup && { from_backup: true }), ...(turnOnBackup && { turn_on_backup: true }) };
+  const { data } = await api.post<MakePrimaryResponse>(
+    `/api/v1/computers/${computerId}/make-primary`,
+    Object.keys(body).length ? body : null,
+    { timeout: COMPUTER_MUTATION_TIMEOUT_MS },
+  );
   return data;
 }
 
@@ -248,6 +279,92 @@ export async function setComputerAlwaysOn(computerId: string, enabled: boolean):
     `/api/v1/computers/${computerId}/always-on`,
     { enabled },
     { timeout: COMPUTER_MUTATION_TIMEOUT_MS },
+  );
+  return data;
+}
+
+export type { BrowserQuality } from '@/types/api';
+
+/** The choices a save may change; only the keys present are sent. */
+export type BrowserChoices = Partial<Pick<ComputerBrowser, 'quality' | 'window' | 'signins'>>;
+
+/** `applied` is false when the machine is running and did not take the save,
+ *  which then waits for the computer's next use. */
+export interface BrowserChoicesSaved {
+  browser: ComputerBrowser;
+  applied: boolean;
+}
+
+/**
+ * Change what the computer's browser is set to. A null quality follows the
+ * computer's size. The open browser keeps the way it started, since changing it
+ * would restart the browser, so a change applies the next time it opens. Every
+ * save of `signins` signs the browser out of every site, so saving it as it is
+ * signs out. Only a Mac under remote control can show a window.
+ */
+export async function setComputerBrowser(computerId: string, patch: BrowserChoices): Promise<BrowserChoicesSaved> {
+  if (!computerId) throw new Error('Computer ID is required');
+  const { data } = await api.patch<BrowserChoicesSaved>(
+    `/api/v1/computers/${computerId}/browser`,
+    patch,
+    { timeout: COMPUTER_MUTATION_TIMEOUT_MS },
+  );
+  return data;
+}
+
+/** One profile of a browser the person uses on their own machine. */
+export interface BrowserSigninSource {
+  browser: string;
+  name: string;
+  profile: string;
+  profile_name: string;
+}
+
+/** Why a machine lists no browsers, or brought nothing in. */
+export type BrowserSigninRefusal =
+  | 'unavailable'
+  | 'not_running'
+  | 'not_kept'
+  | 'not_found'
+  | 'keychain'
+  | 'low_memory'
+  | 'failed';
+
+export interface BrowserSigninSources {
+  sources: BrowserSigninSource[];
+  reason: BrowserSigninRefusal | null;
+}
+
+export interface BrowserSigninsBrought {
+  done: boolean;
+  count: number;
+  skipped: number;
+  reason: BrowserSigninRefusal | null;
+}
+
+/**
+ * The browsers on the computer's machine whose sign-ins can be brought into
+ * its own browser. A computer that is not running is not started to ask.
+ */
+export async function listBrowserSigninSources(computerId: string): Promise<BrowserSigninSources> {
+  if (!computerId) throw new Error('Computer ID is required');
+  const { data } = await api.get<BrowserSigninSources>(`/api/v1/computers/${computerId}/browser-signins/sources`);
+  return data;
+}
+
+// The machine may wait on the person to let a Mac's keychain be read.
+const BRING_SIGNINS_TIMEOUT_MS = 200000;
+
+/** Bring one browser profile's sign-ins into the computer's browser, on the machine. */
+export async function bringBrowserSignins(
+  computerId: string,
+  source: Pick<BrowserSigninSource, 'browser' | 'profile'>,
+): Promise<BrowserSigninsBrought> {
+  if (!computerId) throw new Error('Computer ID is required');
+  const { data } = await api.post<BrowserSigninsBrought>(
+    `/api/v1/computers/${computerId}/browser-signins/bring`,
+    { browser: source.browser, profile: source.profile },
+    { timeout: BRING_SIGNINS_TIMEOUT_MS },
   );
   return data;
 }

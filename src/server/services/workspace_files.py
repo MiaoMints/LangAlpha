@@ -2,22 +2,34 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
-from collections.abc import AsyncIterator, Mapping, Sequence
-from contextlib import AsyncExitStack, asynccontextmanager
-from typing import Any
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterator, Mapping, Sequence
+from contextlib import AsyncExitStack, asynccontextmanager, contextmanager
+from dataclasses import dataclass
+from typing import Any, TypeVar
 
 from fastapi import HTTPException
 
 from ptc_agent.core.paths import WorkspaceLayout
+from ptc_agent.core.sandbox.providers.ssh_errors import SSHConnectError
+from ptc_agent.core.sandbox.unreachable import unanswered_code
 from src.observability import safe_record, workspace_fs_bytes
 from src.server.database.home_workspace import is_unbound
+from src.server.database.shared_workspaces import is_holder
+from src.server.database.workspace import computer_backs_up_files
 from src.server.database.workspace import get_workspace as db_get_workspace
+from src.server.database.workspace_file import workspace_has_backup
 from src.server.database.workspace_folders import (
     WorkspaceFolderMoving,
     is_top_level,
     workspace_folder_in_use,
 )
+from src.server.services.computer_usage.causes import computer_cause
+from src.server.models.computer_cause import StartCause
+from src.server.models.workspace import served_from_mirror
+from src.server.services.shared_workspaces.access import Access, workspace_access
+from src.server.services.ssh_computers import refuse_if_tunnel_down
 from src.server.services.workspace_file_containment import (
     contained_absolute_path,
     contained_sandbox_path,
@@ -28,7 +40,6 @@ from src.server.services.workspace_layout import (
     layout_from_binding,
 )
 from src.server.services.workspace_manager import WorkspaceManager
-from src.server.utils.api import require_workspace_owner
 from src.server.utils.error_sanitization import (
     sandbox_failure_http,
     sandbox_unreachable_detail,
@@ -36,6 +47,8 @@ from src.server.utils.error_sanitization import (
 )
 
 logger = logging.getLogger(__name__)
+
+T = TypeVar("T")
 
 
 # Home joins the user's computer on its first start or turn (ensure_home);
@@ -45,17 +58,25 @@ HOME_NOT_ON_COMPUTER = "Home is not on a computer yet"
 HOME_NOT_ON_COMPUTER_REASON = "home_not_on_computer"
 
 
-async def owned_workspace_on_computer(workspace_id: str, user_id: str) -> dict[str, Any]:
-    """The caller's workspace, for a route that reaches its files or sandbox.
-
-    Refused as any owner check refuses, and with a 400 while it is Home not
-    yet on a computer.
-    """
+async def reached_workspace_on_computer(
+    workspace_id: str, user_id: str
+) -> tuple[dict[str, Any], Access]:
+    """The workspace, for a route that reaches its files or sandbox: its
+    owner's, or a shared workspace's members', who all see its files.
+    Refused as the access check refuses, and with a 400 while it is Home not
+    yet on a computer. The row's ``user_id`` is whose rows the workspace's
+    are (the holder's, for a shared one), never the caller's."""
     workspace = await db_get_workspace(workspace_id)
-    require_workspace_owner(workspace, user_id=user_id)
+    access = await workspace_access(workspace, user_id)
     if is_unbound(workspace):
         raise HTTPException(status_code=400, detail=HOME_NOT_ON_COMPUTER)
-    return workspace
+    return workspace, access
+
+
+def preview_viewer(workspace: dict[str, Any], user_id: str) -> str | None:
+    """The member a shared workspace's preview is minted for; None for the
+    owner's own workspace, whose previews are as before."""
+    return user_id if is_holder(workspace.get("user_id")) else None
 
 
 def not_running_for_upload(workspace: dict[str, Any]) -> HTTPException:
@@ -67,7 +88,7 @@ def not_running_for_upload(workspace: dict[str, Any]) -> HTTPException:
 
 
 async def acquire_sandbox(
-    workspace_id: str, user_id: str
+    workspace_id: str, user_id: str, cause: StartCause = "files"
 ) -> tuple[Any, dict[str, Any]]:
     """A ready sandbox and the workspace row as the acquisition left it, or the
     failure's answer: 503, or 422 when an owner's SSH machine refused.
@@ -80,7 +101,8 @@ async def acquire_sandbox(
     """
     manager = WorkspaceManager.get_instance()
     try:
-        session = await manager.get_session_for_workspace(workspace_id, user_id=user_id)
+        with computer_cause(cause):
+            session = await manager.get_session_for_workspace(workspace_id, user_id=user_id)
     except Exception as e:
         # The app-level handler's answer, status and wording: the file panel
         # categorizes on the 503's detail, whose "starting" sub-case has to
@@ -88,7 +110,8 @@ async def acquire_sandbox(
         logger.warning(
             f"Sandbox unreachable for workspace {workspace_id}: {single_line(str(e))}"
         )
-        raise sandbox_failure_http(e) from None
+        # Chained, so a read falling back to the backup finds the connect code.
+        raise sandbox_failure_http(e) from e
 
     sandbox = getattr(session, "sandbox", None)
     if sandbox is None:
@@ -102,9 +125,22 @@ async def acquire_sandbox(
     return sandbox, workspace
 
 
+async def sandbox_if_running(workspace_id: str, user_id: str) -> Any | None:
+    """The workspace's sandbox while its computer is running, else None, for a
+    read that must never start it. The caller has checked ownership."""
+    try:
+        session = await WorkspaceManager.get_instance().get_session_if_running(
+            workspace_id, user_id=user_id
+        )
+    except Exception as e:
+        logger.warning(f"Workspace {workspace_id} could not be reached: {e}")
+        raise sandbox_failure_http(e) from None
+    return getattr(session, "sandbox", None)
+
+
 @asynccontextmanager
 async def acquire_sandbox_to_change(
-    workspace_id: str, user_id: str
+    workspace_id: str, user_id: str, cause: StartCause = "files"
 ) -> AsyncIterator[tuple[Any, dict[str, Any]]]:
     """``acquire_sandbox`` for a route that touches files by path: the folder
     stays put until the block ends, and the row is read under that hold.
@@ -113,9 +149,111 @@ async def acquire_sandbox_to_change(
     the sandbox read is gone, or is a sibling's that landed on the old name,
     whose files would answer as this workspace's.
     """
-    sandbox, _ = await acquire_sandbox(workspace_id, user_id)
+    sandbox, _ = await acquire_sandbox(workspace_id, user_id, cause)
     async with held_workspace_row(workspace_id) as workspace:
         yield sandbox, workspace
+
+
+@dataclass(frozen=True)
+class FromBackup:
+    """Files answered from the backup rather than the machine.
+
+    ``unreachable`` is the connect code of a machine that did not answer, None
+    for a stopped workspace. ``failure`` is that machine's answer, which a
+    file the backup lacks gets instead of a 404: written since the last
+    backup, it may well be on the machine.
+    """
+
+    unreachable: str | None = None
+    failure: HTTPException | None = None
+
+    @property
+    def marks(self) -> dict[str, str]:
+        """What an answer from the backup carries: its source, and why."""
+        if self.unreachable is None:
+            return {"source": "database"}
+        return {"source": "database", "unreachable": self.unreachable}
+
+    @contextmanager
+    def missing_is_away(self) -> Iterator[None]:
+        try:
+            yield
+        except HTTPException as e:
+            if e.status_code != 404 or self.failure is None:
+                raise
+            raise self.failure from None
+
+
+async def files_from(
+    workspace_id: str,
+    workspace: Mapping[str, Any],
+    live: Callable[[], Awaitable[T]],
+    backup: Callable[[FromBackup], Awaitable[T]],
+    *,
+    away_ok: bool,
+    stopped: bool = True,
+) -> T:
+    """``live()``, or ``backup()`` where the backup stands in for the machine.
+
+    The one place a file read decides where its files come from. A stopped
+    workspace (unless ``stopped`` is False, a read that starts it) and a
+    machine whose tunnel is down are known before any dial, from Postgres. A
+    machine the server dials directly is known not to answer only by trying,
+    so its failure is caught.
+
+    A machine that is away is answered from the backup only with ``away_ok``,
+    a client that says it shows the backup read-only. Its workspace still
+    runs, so its saves are taken, and a client that ignores the marks would
+    edit the older backed-up text and save it over the file once the machine
+    is back; for it the machine's failure stands.
+    """
+    if stopped and served_from_mirror(workspace.get("status")):
+        return await backup(FromBackup())
+    try:
+        if away_ok:
+            await _refuse_away(workspace)
+        return await live()
+    except Exception as e:
+        source = await _backup_after(workspace_id, e) if away_ok else None
+        if source is None:
+            raise
+    return await backup(source)
+
+
+async def _refuse_away(workspace: Mapping[str, Any]) -> None:
+    """The failure a dial would get, for a machine whose tunnel is down."""
+    try:
+        await refuse_if_tunnel_down(
+            workspace.get("computer_id"),
+            workspace.get("computer_kind"),
+            workspace.get("computer_provider_config"),
+        )
+    except SSHConnectError as e:
+        raise sandbox_failure_http(e) from e
+
+
+async def _backup_after(workspace_id: str, exc: BaseException) -> FromBackup | None:
+    code = unanswered_code(exc)
+    if code is None:
+        return None
+    failure = exc if isinstance(exc, HTTPException) else sandbox_failure_http(exc)
+    return await _backup_kept(workspace_id, code, failure)
+
+
+async def _backup_kept(
+    workspace_id: str, code: str, failure: HTTPException
+) -> FromBackup | None:
+    """The backup standing in for a machine that is away, where one is kept.
+
+    A machine asleep or offline still reads as running, so the status check
+    never sends its reads to the backup, though its files are there as of the
+    last backup. Not where backups are off or none has run: an empty or
+    abandoned copy would read as the folder's real contents.
+    """
+    backs_up, has_backup = await asyncio.gather(
+        computer_backs_up_files(workspace_id), workspace_has_backup(workspace_id)
+    )
+    return FromBackup(code, failure) if backs_up and has_backup else None
 
 
 @asynccontextmanager
@@ -176,6 +314,37 @@ def owner_layout(workspace: dict[str, Any], *, manager: Any = None) -> Workspace
         raise HTTPException(
             status_code=503, detail="Workspace files are not available yet"
         ) from None
+
+
+def owner_work_dir(workspace: dict[str, Any], *, manager: Any = None) -> str:
+    return owner_layout(workspace, manager=manager).workspace
+
+
+def to_client_path(
+    sandbox: Any, absolute_path: str, work_dir: str | None = None
+) -> str:
+    """Convert an absolute sandbox path into a virtual client path.
+
+    The CLI and web UX prefer paths like "work/task/foo.txt" (no leading slash),
+    while still preserving true absolute /tmp paths. *work_dir* is the workspace
+    folder the route serves: a client path is relative to that folder, not to
+    the computer root the sandbox handle folds against.
+    """
+
+    if work_dir and absolute_path.startswith(f"{work_dir.rstrip('/')}/"):
+        return absolute_path[len(work_dir.rstrip("/")) + 1:]
+
+    virtual_path = sandbox.virtualize_path(absolute_path)
+
+    # Keep /tmp paths absolute.
+    if virtual_path.startswith("/tmp/"):
+        return virtual_path
+
+    # Strip the leading slash for working-directory paths.
+    if virtual_path.startswith("/"):
+        return virtual_path[1:]
+
+    return virtual_path
 
 
 def previous_dir_names_of(workspace: Mapping[str, Any] | None) -> tuple[str, ...]:

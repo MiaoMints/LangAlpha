@@ -13,6 +13,8 @@ import asyncio
 import logging
 import uuid
 
+from src.server.services.report_back._owner import turn_owner
+
 logger = logging.getLogger(__name__)
 
 _LOG = "[STEER]"
@@ -65,6 +67,9 @@ async def _agent_steer_body(
         "origin_dispatch_gen": gen if home else None,
         "request_key": steer_request_key(job_id),
         "steer_job_id": job_id,
+        # The model the hand-off named, which the turn it was admitted into
+        # ran on; the thread's own may have changed since.
+        **({"llm_model": model} if (model := payload.get("llm_model")) else {}),
     }
 
 
@@ -75,7 +80,8 @@ async def execute_steer(job: dict) -> None:
     from src.server.database.runs import outbox as outbox_db
     from src.server.services.hook_outbox import LEASE_SECONDS, MAX_ATTEMPTS
     from src.server.services.report_back.notify_turn import (
-        park_while_thread_busy,
+        TURN_ROOM_WAIT_S,
+        park_unless_ready,
         post_notification_turn,
     )
 
@@ -119,14 +125,22 @@ async def execute_steer(job: dict) -> None:
             await repark()
             return
 
-    if await park_while_thread_busy(
-        job_id, attempts, thread_id, log_prefix=_LOG, subject=subject
-    ):
-        return
-
-    user_id, workspace_id = await _owner(payload, thread_id)
+    user_id, workspace_id = await turn_owner(payload, thread_id)
     if not user_id:
         await finish("dropped")
+        return
+    # Another agent's message runs as a turn nobody watches, so it waits for
+    # a machine of the user's own that is asleep. The user's own steer is
+    # theirs to see fail and retry.
+    if await park_unless_ready(
+        job_id,
+        attempts,
+        thread_id,
+        workspace_id=workspace_id,
+        log_prefix=_LOG,
+        subject=subject,
+        wait_for_computer=sender != "user",
+    ):
         return
 
     if sender == "user":
@@ -138,12 +152,16 @@ async def execute_steer(job: dict) -> None:
             "platform": payload.get("platform"),
             "request_key": payload.get("request_key") or steer_request_key(job_id),
             "steer_job_id": job_id,
+            "artifact_comments": payload.get("artifact_comments"),
         }
     else:
         body = await _agent_steer_body(payload, job_id, workspace_id, thread_id)
         if body is None:
             await finish("dropped")
             return
+    if payload.get("checked_computer_id"):
+        # Its send was checked to run there; the START holds it to that.
+        body["checked_computer_id"] = payload["checked_computer_id"]
 
     async def fence() -> bool:
         return await outbox_db.extend_job_lease(
@@ -162,14 +180,30 @@ async def execute_steer(job: dict) -> None:
         log_prefix=_LOG,
         subject=subject,
         still_due=still_due,
+        room_fails_fast=True,
     )
     if outcome in ("lost", "superseded", "taken"):
+        return
+    if outcome == "full":
+        await outbox_db.wait_for_room(job_id, attempts=attempts, wait_s=TURN_ROOM_WAIT_S)
         return
     if outcome == "cap":
         await repark()
         return
     if outcome in ("deleted", "drop"):
         await finish("dropped")
+        if payload.get("artifact_comments") and payload.get("request_key"):
+            from src.server.database.conversation import get_thread_owner_id
+            from src.server.services.artifacts.comments import give_back_unread
+
+            # The comments are the thread's workspace owner's rows: the
+            # sender's, or a shared workspace's holder's.
+            owner = await get_thread_owner_id(thread_id) if thread_id else None
+            await give_back_unread(
+                user_id=owner or user_id,
+                thread_id=thread_id,
+                request_key=payload["request_key"],
+            )
         return
     await _settle_dispatched(job, attempts, run_id, fence, finish)
 
@@ -209,27 +243,6 @@ async def _settle_dispatched(job: dict, attempts: int, run_id, fence, finish) ->
                 f"never started; nacking to re-post under the same request key"
             )
         await asyncio.sleep(_START_POLL)
-
-
-async def _owner(payload: dict, thread_id: str) -> tuple[str | None, str | None]:
-    """The user and workspace the turn runs for: the payload's, else the
-    thread's."""
-    user_id = payload.get("user_id")
-    workspace_id = payload.get("workspace_id")
-    if user_id and workspace_id:
-        return str(user_id), str(workspace_id)
-    from src.server.database import conversation as conv_db
-
-    if not user_id:
-        meta = await conv_db.get_thread_auth_meta(thread_id)
-        user_id = meta.get("user_id") if meta else None
-    if not workspace_id:
-        row = await conv_db.get_thread_by_id(thread_id)
-        workspace_id = row.get("workspace_id") if row else None
-    return (
-        str(user_id) if user_id else None,
-        str(workspace_id) if workspace_id else None,
-    )
 
 
 async def _execute_task_steer(job: dict) -> None:

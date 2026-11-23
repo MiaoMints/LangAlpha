@@ -24,6 +24,7 @@ from ptc_agent.agent.middleware.order_governance import (
     OrderGovernanceMiddleware,
     Proposed,
     Refusal,
+    Settled,
     execution_token,
 )
 
@@ -81,6 +82,7 @@ class _FakeLedger:
         self.consumed: list[str] = []
         self.completed: list[tuple[str, ToolMessage]] = []
         self.proposed_args: list[dict] = []
+        self.note: str | None = None
         self._n = 0
 
     async def propose(self, message_id, tool_call_id, tool_name, stamp, args) -> Proposed:
@@ -123,12 +125,12 @@ class _FakeLedger:
         self.status[attempt_id] = "submitting"
         return ExecutionGrant(token=f"{attempt_id}.9999.sig")
 
-    async def complete(self, attempt_id, result) -> dict[str, Any]:
+    async def complete(self, attempt_id, result) -> Settled:
         self.completed.append((attempt_id, result))
         self.status[attempt_id] = (
             "failed" if result.status == "error" else "submitted"
         )
-        return self._receipt(attempt_id)
+        return Settled(self._receipt(attempt_id), self.note)
 
     async def refuse(self, attempt_id, reason) -> dict[str, Any] | None:
         self.refused.append((attempt_id, reason))
@@ -331,6 +333,27 @@ async def test_an_error_result_still_settles_its_attempt(monkeypatch):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "content",
+    ['{"order_id": "OID-1"}', [{"type": "text", "text": '{"order_id": "OID-1"}'}]],
+)
+async def test_the_ledgers_note_follows_the_vendors_answer(content):
+    ledger = _FakeLedger(approval_required=False)
+    ledger.note = "Order ledger: order OID-1 is working and has not filled yet."
+    mw = OrderGovernanceMiddleware(ledger, [_tool()])
+    await mw.aafter_model(_state(), None)
+
+    handler = _Handler(result=ToolMessage(content=content, tool_call_id="call-1"))
+    result = await mw.awrap_tool_call(_Request(), handler)
+
+    if isinstance(content, str):
+        assert result.content == f"{content}\n\n{ledger.note}"
+    else:
+        assert result.content == [*content, {"type": "text", "text": ledger.note}]
+    assert result.artifact[RECEIPT_KEY]["outcome"]["status"] == "submitted"
+
+
+@pytest.mark.asyncio
 async def test_a_call_with_no_attempt_on_this_turn_is_refused():
     ledger = _FakeLedger()
     mw = OrderGovernanceMiddleware(ledger, [_tool()])
@@ -395,6 +418,19 @@ async def test_a_tool_the_binder_did_not_stamp_as_an_order_passes_through():
     assert handler.calls == ["call-1"]
     assert out.artifact is None
     assert ledger.attempts == {}
+
+
+@pytest.mark.asyncio
+async def test_an_order_call_already_answered_is_not_put_to_the_user(monkeypatch):
+    """A Claude Code turn answers every call of a batch but the one it holds
+    for the user before this runs."""
+    seen = _answer(monkeypatch, {"decisions": [{"type": "approve"}]})
+    mw = OrderGovernanceMiddleware(_FakeLedger(), [_tool()])
+    ai = AIMessage(content="", id="msg-1", tool_calls=[
+        {"id": call, "name": TOOL_NAME, "args": dict(ARGS), "type": "tool_call"} for call in ("call-1", "call-2")
+    ])
+    await mw.aafter_model({"messages": [ai, ToolMessage("Not run.", tool_call_id="call-2")]}, None)
+    assert [r["tool_call_id"] for r in seen[0]["action_requests"]] == ["call-1"]
 
 
 def test_the_sync_path_refuses_every_order():

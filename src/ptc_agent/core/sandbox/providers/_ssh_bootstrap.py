@@ -21,13 +21,22 @@ nothing left to do.
 
 The script reports each phase as ``__phase <name> <epoch seconds>`` when it
 begins, and ``__phase end`` when done, so the caller can time them.
+
+A computer on the machine the server runs on may leave out what its owner does
+not want (``INSTALL_GROUPS``). A changed selection reinstalls by the same layer
+hashes, and ``uv pip install`` only adds: taking a group out of the selection
+leaves its packages, and any Chromium, in place until the runtime is removed.
+Naming no groups installs everything but Chromium, as it always has, and hashes
+as it always has, so no machine reinstalls.
 """
 
 from __future__ import annotations
 
 import hashlib
 import json
+import re
 import shlex
+from collections.abc import Iterable
 from dataclasses import dataclass
 
 from ptc_agent.core.sandbox._defaults import (
@@ -57,14 +66,52 @@ _RIPGREP_SHA256 = {
     "x86_64-apple-darwin": "af7825fcc69a2afc7a7aea55fc9af90e26421d8f20fe59df32e233c0b8a231c1",
     "aarch64-apple-darwin": "3750b2e93f37e0c692657da574d7019a101c0084da05a790c83fd335bad973e4",
 }
-# yfinance pins curl_cffi<0.14 but scrapling[all] requires >=0.14, as in the
-# sandbox image.
-_OVERRIDES = ("curl_cffi>=0.14",)
 # What the sandbox image's OS provides and a machine may not. uv's Python reads
 # time zones from the OS's zoneinfo, which minimal images leave out, and
 # zoneinfo falls back to this package.
 _MACHINE_PACKAGES = ("tzdata",)
 _PACKAGES = (*DEFAULT_DEPENDENCIES, *_MACHINE_PACKAGES)
+
+# What the owner of a computer on the server's own machine picks at setup.
+# ``core`` is everything no group names, and its sizes count uv, ripgrep and
+# Python. Sizes are what a Mac on Apple silicon measured, to show the owner the
+# order of what they are choosing; Linux wheels differ.
+INSTALL_GROUPS: dict[str, dict[str, bool | int]] = {
+    "core": {"required": True, "default": True, "download_mb": 218, "disk_mb": 875},
+    "browsing": {"required": False, "default": True, "download_mb": 117, "disk_mb": 410},
+    "documents": {"required": False, "default": True, "download_mb": 55, "disk_mb": 170},
+    # Playwright's own Chromium in place of the launcher below that runs the
+    # machine's browser.
+    "chromium": {"required": False, "default": False, "download_mb": 300, "disk_mb": 570},
+}
+# By distribution name, so a pin moved in DEFAULT_DEPENDENCIES stays in its
+# group. Only the scrape server, its skill and browser code read the first; only
+# the office skills the second. pandas reads Excel, so those two stay in core.
+_GROUP_DISTRIBUTIONS: dict[str, frozenset[str]] = {
+    "browsing": frozenset(
+        {
+            "scrapling",
+            "html-to-markdown",
+            "trafilatura",
+            "youtube-transcript-api",
+            "playwright",
+        }
+    ),
+    "documents": frozenset(
+        {
+            "python-docx",
+            "pypdf",
+            "defusedxml",
+            "pdfplumber",
+            "reportlab",
+            "python-pptx",
+            "ironcalc",
+            "firecrawl-anydoc",
+            "markitdown",
+        }
+    ),
+}
+_CHROMIUM_INSTALL = "playwright install chromium"
 
 # The scrape server rewords a launch that fails with this (_NO_BROWSER there).
 NO_OWN_BROWSER = (
@@ -113,7 +160,13 @@ with sync_playwright() as p:
 # file on descriptor 9 and then calls ``lock <seconds to wait>``.
 LOCK_FILE = ".bootstrap.lock"
 LOCK_SH = """lock() {
-  if command -v flock >/dev/null 2>&1; then flock -w "$1" 9; return; fi
+  if command -v flock >/dev/null 2>&1; then
+    if flock --help 2>&1 | grep -q -- -w; then flock -w "$1" 9; return; fi
+    # BusyBox flock has no -w: try again each second until the wait is up.
+    _lock_end=$(( $(date +%s) + $1 ))
+    until flock -n 9; do [ "$(date +%s)" -lt "$_lock_end" ] || return 1; sleep 1; done
+    return
+  fi
   # macOS has no flock(1). Perl takes the same flock(2) lock on descriptor 9,
   # and the lock stays with this shell's copy of it after perl exits.
   perl -MFcntl=:flock -e 'open(my $f, ">&=", 9) or exit 1; my $end = time + shift;
@@ -122,15 +175,49 @@ LOCK_SH = """lock() {
 """
 
 
-def recipe_hash() -> str:
+def default_groups() -> frozenset[str]:
+    """The groups a computer installs when its owner picked none."""
+    return frozenset(g for g, facts in INSTALL_GROUPS.items() if facts["default"])
+
+
+def selected_groups(names: Iterable[str]) -> frozenset[str]:
+    """*names* as what they install: required groups always, and Playwright
+    wherever its Chromium is wanted.
+
+    Raises:
+        ValueError: A name is no group.
+    """
+    named = {name for name in names if name}
+    unknown = sorted(named - INSTALL_GROUPS.keys())
+    if unknown:
+        raise ValueError(f"Unknown install group: {unknown[0]!r}")
+    required = {g for g, facts in INSTALL_GROUPS.items() if facts["required"]}
+    return frozenset(
+        named | required | ({"browsing"} if "chromium" in named else set())
+    )
+
+
+def _distribution(requirement: str) -> str:
+    return re.split(r"[\[=<>!~; ]", requirement, maxsplit=1)[0].lower()
+
+
+def _packages(groups: frozenset[str] | None) -> tuple[str, ...]:
+    if groups is None:
+        return _PACKAGES
+    left_out = frozenset().union(
+        *(d for g, d in _GROUP_DISTRIBUTIONS.items() if g not in groups)
+    )
+    return tuple(p for p in _PACKAGES if _distribution(p) not in left_out)
+
+
+def recipe_hash(groups: frozenset[str] | None = None) -> str:
     """Changes exactly when what the bootstrap installs changes."""
     recipe = {
         "uv": [UV_VERSION, _UV_SHA256],
         "python": PYTHON_VERSION,
-        "packages": _PACKAGES,
-        "overrides": _OVERRIDES,
+        "packages": _packages(groups),
         "ripgrep": [RIPGREP_VERSION, _RIPGREP_SHA256],
-        "browsers": layer_hashes()["browsers"],
+        "browsers": layer_hashes(groups)["browsers"],
         "revision": 2,
     }
     return hashlib.sha256(json.dumps(recipe, sort_keys=True).encode()).hexdigest()[:16]
@@ -140,13 +227,16 @@ def _hash(*parts: object) -> str:
     return hashlib.sha256(json.dumps(parts, sort_keys=True).encode()).hexdigest()[:16]
 
 
-def layer_hashes() -> dict[str, str]:
+def layer_hashes(groups: frozenset[str] | None = None) -> dict[str, str]:
     """What each stamped layer was installed from; a layer reinstalls when its
-    hash changes."""
-    return {
-        "packages": _hash(_PACKAGES, _OVERRIDES),
-        "browsers": _hash(SANDBOX_PLAYWRIGHT_VERSION, _LAUNCHER, _MISSING_BROWSERS),
-    }
+    hash changes. ``browsers`` is empty where there is no Playwright to set up."""
+    if groups is not None and "browsing" not in groups:
+        browsers = ""
+    elif groups is not None and "chromium" in groups:
+        browsers = _hash(SANDBOX_PLAYWRIGHT_VERSION, _CHROMIUM_INSTALL)
+    else:
+        browsers = _hash(SANDBOX_PLAYWRIGHT_VERSION, _LAUNCHER, _MISSING_BROWSERS)
+    return {"packages": _hash(_packages(groups)), "browsers": browsers}
 
 
 def phase_seconds(output: str) -> dict[str, float]:
@@ -171,6 +261,13 @@ def last_phase(output: str) -> str | None:
         if line.startswith(PHASE_MARK):
             return line[len(PHASE_MARK) :].partition(" ")[0]
     return None
+
+
+def failure_tail(output: str) -> str:
+    """The end of a failed install's output, its phase marks taken out."""
+    return "\n".join(
+        line for line in output.splitlines() if not line.startswith(PHASE_MARK)
+    ).strip()[-2000:]
 
 
 @dataclass(frozen=True)
@@ -208,18 +305,104 @@ def paths(home: str) -> RuntimePaths:
     return RuntimePaths.under(f"{home}/{STATE_DIR}")
 
 
-def bootstrap_script(*, lock_wait_s: int) -> str:
+def _mac_exclusions_sh(base: str) -> str:
+    """Shell keeping the runtime and caches under *base*, which a reinstall
+    rebuilds, out of Time Machine and Spotlight on a Mac.
+
+    Run at every stamp check as well as at an install, so a machine whose
+    install is already current gets it too. Best effort, never failing either.
+    The exclusion is marked done only once tmutil takes it, since over SSH it
+    may need Full Disk Access the login gets later.
+    """
+    return (
+        f'if [ -d "{base}" ] && [ "$(uname -s)" = Darwin ]; then\n'
+        f'  [ -e "{base}/.metadata_never_index" ] || '
+        f'touch "{base}/.metadata_never_index" 2>/dev/null || true\n'
+        f'  [ -e "{base}/.tm-excluded" ] || {{ tmutil addexclusion "{base}" '
+        f'>/dev/null 2>&1 && touch "{base}/.tm-excluded"; }} || true\n'
+        "fi\n"
+    )
+
+
+def _launcher_steps(p: RuntimePaths, recorded: str) -> str:
+    """Leaves the launcher where Playwright looks for its browser."""
+    return f"""  # Left unstamped when it fails, so the next start tries it again, and
+  # never failing the install: browsing alone goes without. set -e does not
+  # reach into an if's condition, so each write's failure is checked. The
+  # mark goes first, so a launcher left half written is cleared as one.
+  if missing=$(PLAYWRIGHT_BROWSERS_PATH="$B" "{p.venv_bin}/python" -c {shlex.quote(_MISSING_BROWSERS)}) &&
+    printf '%s\\n' "$missing" | while IFS= read -r f; do
+      case "$f" in "$B"/*) ;; *) continue ;; esac
+      rel="${{f#"$B"/}}"
+      {{ mkdir -p "$(dirname "$f")" && : > "$B/${{rel%%/*}}/.langalpha-launcher" &&
+        printf '%s' {shlex.quote(_LAUNCHER)} > "$f" && chmod 755 "$f"; }} || exit 1
+    done; then
+    record browsers {recorded}
+  else
+    echo "Playwright's browser launcher was not set up." >&2
+  fi
+"""
+
+
+def _chromium_steps(p: RuntimePaths, recorded: str) -> str:
+    """Downloads Playwright's own Chromium, unstamped and not failing the
+    install when the download does, as the launcher's steps are."""
+    return f"""  if PLAYWRIGHT_BROWSERS_PATH="$B" "{p.venv_bin}/python" -m {_CHROMIUM_INSTALL}; then
+    record browsers {recorded}
+  else
+    echo "Playwright's Chromium was not downloaded." >&2
+  fi
+"""
+
+
+def _browsers_layer(p: RuntimePaths, groups: frozenset[str] | None, recorded: str) -> str:
+    if not recorded:
+        return ""
+    steps = (
+        _chromium_steps(p, recorded)
+        if groups is not None and "chromium" in groups
+        else _launcher_steps(p, recorded)
+    )
+    return f"""if ! current browsers {recorded}; then
+  phase browsers
+  B="{p.browsers}"
+  mkdir -p "$B"
+  # Whatever was installed is about to go, so neither the stamp nor the record
+  # may say it is there until these steps put it back.
+  rm -f "$L/.bootstrap"
+  record browsers ""
+  # Launchers from an earlier install go first, so the probe sees only
+  # Playwright's own browsers. One that `playwright install` has since
+  # replaced with the real build, marked complete, stays.
+  for d in "$B"/*/; do
+    if [ -f "$d.langalpha-launcher" ] && [ ! -f "${{d}}INSTALLATION_COMPLETE" ]; then rm -rf "$d"; fi
+  done
+{steps}fi
+"""
+
+
+def _stamp(want: str, browsers: str) -> str:
+    write = f'echo {want} > "$L/.bootstrap.new" && mv "$L/.bootstrap.new" "$L/.bootstrap"'
+    if not browsers:
+        return write
+    # A browsers layer that did not install leaves the stamp unwritten, so the
+    # next start runs the script again and retries it.
+    return f"if current browsers {browsers}; then\n  {write}\nfi"
+
+
+def bootstrap_script(
+    *, lock_wait_s: int, groups: frozenset[str] | None = None
+) -> str:
     """Bash that installs the runtime once, safe to run again at any time.
 
     Exits 0 at once when the stamp is current. Another install holding the
     lock is waited on for up to *lock_wait_s*, and usually leaves nothing to do.
     """
-    want = recipe_hash()
-    layers = layer_hashes()
+    want = recipe_hash(groups)
+    layers = layer_hashes(groups)
     uv_sha = " ".join(f"{a}={s}" for a, s in _UV_SHA256.items())
     rg_sha = " ".join(f"{a}={s}" for a, s in _RIPGREP_SHA256.items())
-    packages = " ".join(shlex.quote(p) for p in _PACKAGES)
-    overrides = "\\n".join(_OVERRIDES)
+    packages = " ".join(shlex.quote(p) for p in _packages(groups))
     # The script names its folders under $L, which it sets to the base.
     p = RuntimePaths.under("$L")
     return f"""set -euo pipefail
@@ -228,7 +411,7 @@ now() {{ if [ -n "${{EPOCHREALTIME:-}}" ]; then echo "${{EPOCHREALTIME/,/.}}"; e
 phase() {{ echo "{PHASE_MARK}$1 $(now)"; }}
 mkdir -p "{p.bin}" "{p.cache}"
 chmod 700 "$L"
-exec 9>"$L/{LOCK_FILE}"
+{_mac_exclusions_sh("$L")}exec 9>"$L/{LOCK_FILE}"
 {LOCK_SH}phase lock
 lock {int(lock_wait_s)} || {{ echo "Another install of the runtime is still running." >&2; exit 75; }}
 # Again, under the lock: a removal that held it may have taken them.
@@ -298,39 +481,11 @@ fi
 if ! current packages {layers["packages"]}; then
   phase packages
   echo "Installing packages"
-  printf '{overrides}\\n' > "$t/overrides.txt"
-  "{p.bin}/uv" pip install --python "{p.venv_bin}/python" --compile-bytecode \\
-    --override "$t/overrides.txt" {packages}
+  "{p.bin}/uv" pip install --python "{p.venv_bin}/python" --compile-bytecode {packages}
   record packages {layers["packages"]}
 fi
 
-if ! current browsers {layers["browsers"]}; then
-  phase browsers
-  B="{p.browsers}"
-  mkdir -p "$B"
-  # Launchers from an earlier install go first, so the probe sees only
-  # Playwright's own browsers. One that `playwright install` has since
-  # replaced with the real build, marked complete, stays.
-  for d in "$B"/*/; do
-    if [ -f "$d.langalpha-launcher" ] && [ ! -f "${{d}}INSTALLATION_COMPLETE" ]; then rm -rf "$d"; fi
-  done
-  # Left unstamped when it fails, so the next reinstall tries it again, and
-  # never failing the install: browsing alone goes without. set -e does not
-  # reach into an if's condition, so each write's failure is checked. The
-  # mark goes first, so a launcher left half written is cleared as one.
-  if missing=$(PLAYWRIGHT_BROWSERS_PATH="$B" "{p.venv_bin}/python" -c {shlex.quote(_MISSING_BROWSERS)}) &&
-    printf '%s\\n' "$missing" | while IFS= read -r f; do
-      case "$f" in "$B"/*) ;; *) continue ;; esac
-      rel="${{f#"$B"/}}"
-      {{ mkdir -p "$(dirname "$f")" && : > "$B/${{rel%%/*}}/.langalpha-launcher" &&
-        printf '%s' {shlex.quote(_LAUNCHER)} > "$f" && chmod 755 "$f"; }} || exit 1
-    done; then
-    record browsers {layers["browsers"]}
-  else
-    echo "Playwright's browser launcher was not set up." >&2
-  fi
-fi
-
+{_browsers_layer(p, groups, layers["browsers"])}
 if [ "$(uname -s)" = Darwin ]; then
   phase fonts
   # matplotlib 3.11 lists a Mac's fonts with system_profiler, which returns
@@ -351,15 +506,16 @@ fi
 
 phase prune
 "{p.bin}/uv" cache prune >/dev/null 2>&1 || true
-echo {want} > "$L/.bootstrap.new" && mv "$L/.bootstrap.new" "$L/.bootstrap"
+{_stamp(want, layers["browsers"])}
 phase end
 echo "Runtime ready"
 """
 
 
-def stamp_check_script() -> str:
+def stamp_check_script(groups: frozenset[str] | None = None) -> str:
     """Prints ``current`` when the installed runtime matches this recipe."""
     return (
-        f'[ "$(cat "$HOME/{STAMP}" 2>/dev/null)" = {recipe_hash()} ] '
+        _mac_exclusions_sh(paths("$HOME").base)
+        + f'[ "$(cat "$HOME/{STAMP}" 2>/dev/null)" = {recipe_hash(groups)} ] '
         "&& echo current || echo stale\n"
     )

@@ -4,9 +4,10 @@ Pydantic models for infrastructure configuration.
 These models define the schema for config.yaml (infrastructure settings).
 """
 
+from datetime import date
 from typing import Dict, List, Literal, Optional
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, StrictBool, StrictStr, model_validator
 
 
 class BackgroundExecutionConfig(BaseModel):
@@ -164,13 +165,9 @@ class RedisTTLConfig(BaseModel):
 class RedisSWRConfig(BaseModel):
     """Stale-While-Revalidate configuration for Redis cache."""
 
-    enabled: bool = Field(default=True, description="Enable SWR for cache reads")
     soft_ttl_ratio: float = Field(
         default=0.6,
         description="Refresh when remaining TTL < this ratio of original",
-    )
-    warm_after_invalidation: bool = Field(
-        default=True, description="Pre-populate cache after invalidation"
     )
 
 
@@ -207,9 +204,6 @@ class RedisConfig(BaseModel):
         default=5, description="Redis socket connect timeout in seconds"
     )
     ttl: RedisTTLConfig = Field(default_factory=RedisTTLConfig)
-    cache_invalidate_on_write: bool = Field(
-        default=True, description="Invalidate cache on writes"
-    )
     swr: RedisSWRConfig = Field(default_factory=RedisSWRConfig)
 
 
@@ -311,6 +305,26 @@ class McpDescriptionsConfig(BaseModel):
     interval_seconds: int = Field(default=20, ge=5)
 
 
+class ThreadSearchConfig(BaseModel):
+    """The sweep that keeps conversation search's index whole.
+
+    A turn is indexed as it settles, in the process that ran it; each pass
+    finds the recently settled turns that trigger missed (a worker lost, a
+    deploy) and retries the answers whose read failed, and the deployment
+    walks every thread, the backfill for turns that settled before search
+    existed, then again each day. One worker sweeps at a time. Each batch
+    takes ``batch_threads`` threads; the walk goes in slices of a few
+    seconds' work, each resting at least as long as it took and never less
+    than ``pause_seconds``, so a backfill never holds the database or the
+    checkpoint reader for long. Off, turns are still indexed as they settle.
+    """
+
+    enabled: bool = Field(default=True)
+    interval_seconds: int = Field(default=120, ge=10)
+    batch_threads: int = Field(default=10, ge=1, le=200)
+    pause_seconds: float = Field(default=0.5, ge=0)
+
+
 class FeatureFlagOverride(BaseModel):
     """Deployment override for a code-declared feature (src/config/features.py).
 
@@ -321,15 +335,91 @@ class FeatureFlagOverride(BaseModel):
     enabled: Optional[bool] = Field(
         default=None, description="Kill switch: false turns the feature off for everyone"
     )
-    gate: Optional[Literal["none", "opt_in", "opt_out", "plan"]] = Field(
+    gate: Optional[Literal["none", "opt_in", "opt_out", "plan", "grant"]] = Field(
         default=None,
         description=(
             "Access model while enabled: everyone / user opt-in / user opt-out "
-            "/ platform plan tier"
+            "/ platform plan tier / granted to the user"
         ),
     )
     min_tier: Optional[int] = Field(
         default=None, description="Plan gate only: minimum platform access tier"
+    )
+
+
+class ModelsPolicy(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    allowed: Optional[List[StrictStr]] = Field(
+        default=None, description="The models a turn may run; null allows any"
+    )
+
+
+class OwnModelAccessPolicy(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    api_keys: StrictBool = Field(
+        default=True,
+        description="The user's own provider API keys, custom models and custom providers",
+    )
+    subscriptions: StrictBool = Field(
+        default=True,
+        description="The user's own model sign-ins and a connected Claude Code subscription",
+    )
+
+
+class OrgLibraryPolicy(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    publish: StrictBool = Field(
+        default=True,
+        description="Publishing the user's threads, files and skills to their organization's library",
+    )
+
+
+class SharedWorkspacesPolicy(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    create: StrictBool = Field(
+        default=True,
+        description="Creating a workspace shared with others in the user's organization",
+    )
+
+
+class PolicyLayer(BaseModel):
+    """Restrictions on what users may do, one layer of the effective policy.
+
+    The deployment's (``policy:`` in config.yaml) and an organization's share
+    this schema. Closed and strictly typed at every level: a key or a value
+    this version cannot enforce must fail loudly, never read as no restriction.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    models: ModelsPolicy = Field(default_factory=ModelsPolicy)
+    own_model_access: OwnModelAccessPolicy = Field(default_factory=OwnModelAccessPolicy)
+    public_links: StrictBool = Field(
+        default=True,
+        description="Links to the user's threads and files that open without signing in as them",
+    )
+    trading: StrictBool = Field(
+        default=True,
+        description="The agent placing, changing or cancelling a live order for the user",
+    )
+    own_machines: StrictBool = Field(
+        default=True,
+        description="The user's work running on a machine the user brings (an SSH computer)",
+    )
+    user_connectors: StrictBool = Field(
+        default=True,
+        description=(
+            "MCP servers the user adds themselves, from a plugin or an import "
+            "included; a brokerage is governed by trading instead"
+        ),
+    )
+    org_library: OrgLibraryPolicy = Field(default_factory=OrgLibraryPolicy)
+    shared_workspaces: SharedWorkspacesPolicy = Field(
+        default_factory=SharedWorkspacesPolicy
     )
 
 
@@ -345,6 +435,36 @@ class MarketWatchConfig(BaseModel):
         ge=1,
         le=720,
         description="Minutes before a target lapses that the thread is told",
+    )
+
+
+class ClaudeCodeConfig(BaseModel):
+    """Claude Code on cloud computers (the runtime's own switch is the
+    ``claude_code_runtime`` feature). With ``sandbox_placement`` the CLI of a
+    turn on a cloud computer runs inside that computer's own sandbox, and only
+    on Medium computers or larger (``hosted.SANDBOX_MIN_TIER``)."""
+
+    stored_custody: bool = Field(
+        default=False,
+        description="Run Claude Code turns on cloud computers on a setup token the user lets the server store",
+    )
+    sandbox_placement: bool = Field(
+        default=False,
+        description="Run a cloud computer's Claude Code CLI inside the computer's own sandbox, not in the worker",
+    )
+    hosted_turns_per_user: int = Field(
+        default=3, ge=1, description="Claude Code turns one user runs at once on cloud computers"
+    )
+    cli_memory_mb: int = Field(
+        default=800,
+        ge=256,
+        description="Memory each Claude Code CLI on a cloud computer is counted at: its size's memory over this "
+        "is how many it runs at once",
+    )
+    claude_oauth_ends_on: Optional[date] = Field(
+        default=None,
+        description="The day the Claude sign-in (claude-oauth) stops working on this deployment; set, the app "
+        "marks it legacy and asks the users signed in with it to move to Claude Code",
     )
 
 
@@ -461,6 +581,20 @@ class WorkflowOrchestrationConfig(BaseModel):
         return self
 
 
+class SharedWorkspacesConfig(BaseModel):
+    """Limits on shared workspaces (the on/off flag lives in the features
+    registry)."""
+
+    max_per_organization: int = Field(
+        default=20,
+        ge=0,
+        description=(
+            "Live shared workspaces one organization may hold; each has a "
+            "computer of its own that counts against no member's limit"
+        ),
+    )
+
+
 class PromptConfig(BaseModel):
     """Deployment-wide prompt settings."""
 
@@ -473,6 +607,34 @@ class PromptConfig(BaseModel):
             "profile for the running model first, then the account-wide value."
         ),
     )
+
+
+class CliApprovalsConfig(BaseModel):
+    """How long what a computer's ``la`` asks the user to approve waits.
+
+    A request holds open for ``hold_seconds`` for the answer, under the
+    edge's limit on one request, and the CLI asks again until the request
+    expires."""
+
+    hold_seconds: float = Field(
+        default=50.0, gt=0, le=90, description="How long one request waits for the user's answer"
+    )
+    pending_minutes: int = Field(
+        default=30, ge=1, description="How long a request waits for an answer before it expires"
+    )
+    approved_minutes: int = Field(
+        default=5, ge=1, description="How long an approval waits for its command to use it"
+    )
+    max_pending: int = Field(
+        default=5, ge=1, description="Requests one user may have waiting at once"
+    )
+
+    @model_validator(mode="after")
+    def _a_hold_ends_before_its_request(self) -> "CliApprovalsConfig":
+        # A request that expired mid-hold would be asked again under a new id.
+        if self.hold_seconds >= self.pending_minutes * 60:
+            raise ValueError("hold_seconds must be shorter than pending_minutes")
+        return self
 
 
 class InfrastructureConfig(BaseModel):
@@ -500,12 +662,26 @@ class InfrastructureConfig(BaseModel):
         default=False, description="Fetch the built-in brokerages' logos on startup"
     )
     langsmith_tracing: bool = Field(default=False, description="Enable LangSmith tracing")
+    langsmith_full_payloads: bool = Field(
+        default=False,
+        description="Trace middleware inputs and graph nodes' messages to LangSmith",
+    )
     market_watch: MarketWatchConfig = Field(default_factory=MarketWatchConfig)
+    claude_code: ClaudeCodeConfig = Field(default_factory=ClaudeCodeConfig)
+    cli_approvals: CliApprovalsConfig = Field(default_factory=CliApprovalsConfig)
 
     # User-facing product features (deployment overrides of the code catalog
     # in src/config/features.py). Distinct from the infra toggles above, which
     # are operator-only and never exposed to users.
     features: Dict[str, FeatureFlagOverride] = Field(default_factory=dict)
+
+    # What every user of this deployment is restricted to; an organization's
+    # policy can only narrow it (src/server/services/policy.py).
+    policy: Optional[PolicyLayer] = None
+
+    shared_workspaces: SharedWorkspacesConfig = Field(
+        default_factory=SharedWorkspacesConfig
+    )
 
     # SSE Event Logging
     sse_event_log_enabled: bool = Field(default=True, description="Enable SSE event logging")
@@ -549,3 +725,5 @@ class InfrastructureConfig(BaseModel):
     order_reconcile: OrderReconcileConfig = Field(
         default_factory=OrderReconcileConfig
     )
+    # Conversation search index sweep
+    thread_search: ThreadSearchConfig = Field(default_factory=ThreadSearchConfig)

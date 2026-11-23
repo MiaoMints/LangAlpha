@@ -182,6 +182,25 @@ class TestKeepAlive:
         assert seconds > 7200
 
     @pytest.mark.asyncio
+    async def test_a_shorter_window_keeps_the_deadline_work_needs(self):
+        """Applied outright, a lowered auto-stop paused a command in flight."""
+        client = _client(_info(left_s=7200))
+        runtime = self._runtime(client)
+
+        await runtime.set_autostop_interval(10)
+
+        client.AsyncSandbox.set_timeout.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_a_longer_window_extends_the_deadline(self):
+        client = _client(_info(left_s=600))
+        runtime = self._runtime(client)
+
+        await runtime.set_autostop_interval(0)
+
+        client.AsyncSandbox.set_timeout.assert_awaited_once_with("sbx-1", 86400)
+
+    @pytest.mark.asyncio
     async def test_a_sandbox_paused_under_a_held_handle_is_not_renewed(self):
         client = _client(_info("paused", left_s=0))
         runtime = self._runtime(client)
@@ -275,6 +294,10 @@ class TestExitStatus:
             (-1, "signal: segmentation fault", 139),
             (-1, "signal: terminated", 143),
             (-1, "signal: segmentation fault (core dumped)", 139),
+            (-1, "signal: broken pipe", 141),
+            (-1, "signal: user defined signal 1", 138),
+            (-1, "signal: bad system call (core dumped)", 159),
+            (-1, "signal: signal 34", 162),
             (-1, "signal: weird", -1),
             (-1, None, -1),
             (3, "exit status 3", 3),
@@ -865,3 +888,37 @@ class TestMetricsSince:
         with pytest.raises(SandboxNotFoundException):
             await provider.metrics_since("sbx-1", self.T0)
         client.AsyncSandbox.connect.assert_not_awaited()
+
+
+class TestAllocation:
+    """A lookup, so a paused sandbox stays paused while the ledger reads its size."""
+
+    def test_reports_allocation(self):
+        assert E2BProvider.reports_allocation is True
+
+    @pytest.mark.asyncio
+    async def test_a_paused_sandbox_reads_as_stopped_with_its_template_size(self):
+        info = _info(state="paused")
+        info.cpu_count, info.memory_mb = 2, 4096
+        client = _client(info)
+        client.AsyncSandbox.get_metrics = AsyncMock(
+            return_value=[SimpleNamespace(disk_total=20 * 2**30)]
+        )
+
+        found = await _provider(client).allocation("sbx-1")
+
+        client.AsyncSandbox.get_info.assert_awaited_once_with("sbx-1")
+        client.AsyncSandbox.get_metrics.assert_awaited_once_with("sbx-1")
+        client.AsyncSandbox.connect.assert_not_awaited()
+        assert found.state is RuntimeState.STOPPED
+        assert (found.cpu, found.memory_gb, found.disk_gb) == (2.0, 4.0, 20.0)
+        assert found.archive_after_s is None
+
+    @pytest.mark.asyncio
+    async def test_a_disk_size_it_cannot_read_leaves_the_size_unreported(self):
+        client = _client()
+        client.AsyncSandbox.get_metrics = AsyncMock(side_effect=RuntimeError("down"))
+
+        found = await _provider(client).allocation("sbx-1")
+
+        assert found.cpu == 1.0 and found.disk_gb is None

@@ -29,6 +29,7 @@ from .repeat_guard import RepeatCallGuardMiddleware
 from .tool import (
     CodeValidationMiddleware,
     ComputerArgumentGuardMiddleware,
+    ComputerUnreachableStopMiddleware,
     EmptyToolCallRetryMiddleware,
     LeakDetectionMiddleware,
     ProtectedPathMiddleware,
@@ -50,11 +51,6 @@ from .file_operations import (
     FileOperationState,
     MultimodalMiddleware,
     MultimodalStripMiddleware,
-)
-
-# Todo operations middleware
-from .todo_operations import (
-    TodoWriteMiddleware,
 )
 
 # Provenance middleware (data-access tracing → provenance SSE events)
@@ -81,8 +77,8 @@ from .large_result_eviction import (
 )
 
 # Runtime context: the per-thread baseline block plus the tail envelope carried
-# on every model call. Imported ahead of market_watch, which contributes a
-# per-call row to the envelope.
+# on every model call. Imported ahead of market_watch, which contributes its
+# price rows to the envelope.
 from .runtime_context import (
     BaselineContextMiddleware,
     RowCarrierMiddleware,
@@ -140,6 +136,7 @@ __all__ = [
     # Tool middleware
     "CodeValidationMiddleware",
     "ComputerArgumentGuardMiddleware",
+    "ComputerUnreachableStopMiddleware",
     "EmptyToolCallRetryMiddleware",
     "LeakDetectionMiddleware",
     "ProtectedPathMiddleware",
@@ -153,8 +150,6 @@ __all__ = [
     # File operations
     "FileOperationMiddleware",
     "FileOperationState",
-    # Todo operations
-    "TodoWriteMiddleware",
     # Provenance
     "ProvenanceMiddleware",
     # Compaction

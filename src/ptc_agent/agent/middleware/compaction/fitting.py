@@ -23,6 +23,7 @@ from ptc_agent.agent.middleware.compaction.measure import Estimate
 from ptc_agent.agent.middleware.compaction.offloading import removed_attachments
 from ptc_agent.agent.middleware.thinking_binding import (
     checked_thinking_end,
+    holds_bound_thinking,
     thinking_after,
     unsent_thinking,
     without_thinking,
@@ -53,13 +54,15 @@ def reported_usage(response: ModelResponse) -> tuple[AIMessage, int, int] | None
 class Fitted(NamedTuple):
     """A fitted send: its response, the ids of the messages that lose their
     attachments and of the answers whose thinking goes with them (see
-    ``thinking_after``), and what the provider counted for the ones this send
-    still carried (see ``Fit._measured``)."""
+    ``thinking_after``), what the provider counted for the ones this send
+    still carried (see ``Fit._measured``), and whether what it sent held bound
+    thinking, which decides whether the pin takes a new system message."""
 
     response: ModelResponse
     removed: set[str]
     unsent: set[str]
     spared: int
+    sent_bound_thinking: bool
 
     def update(self, state: Mapping[str, Any]) -> dict[str, Any]:
         """The update recording ``removed`` and ``unsent`` beside what
@@ -75,7 +78,8 @@ class Fitted(NamedTuple):
 @dataclass(frozen=True)
 class Fit:
     """How a call's messages are fitted under ``threshold``, counted by
-    ``estimate`` with ``system`` before them.
+    ``estimate`` with the ``ahead`` tokens the call sends before them, its
+    system message and tool schemas (``sent_ahead``).
 
     ``lossless`` is for Claude through its own compaction, whose kept turns
     keep their thinking valid only while they are sent as they were: an
@@ -85,9 +89,13 @@ class Fit:
     """
 
     threshold: int
-    system: list[Any]
+    ahead: int
     estimate: Estimate
     lossless: bool = False
+
+    def _sent(self, messages: list[AnyMessage]) -> int:
+        """What a call sending ``messages`` costs, by estimate."""
+        return self.ahead + self.estimate(messages)
 
     def cut(self, view: list[AnyMessage], cutoff: int, tokens: int, *, refused: bool) -> int:
         """Where a summary of ``view`` ends on Claude: at the latest point at
@@ -106,7 +114,7 @@ class Fit:
         ratio = (
             math.inf
             if refused
-            else max(1.0, tokens / max(self.estimate([*self.system, *view]), 1))
+            else max(1.0, tokens / max(self._sent(view), 1))
         )
         if cutoff <= 0 and self._fits(view, ratio):
             return cutoff
@@ -127,7 +135,7 @@ class Fit:
         safe = checked_thinking_end(messages)
         if not attachment_tokens(messages[:safe], self.estimate.cost):
             return True
-        kept = self.estimate([*self.system, *messages]) - attachment_tokens(
+        kept = self._sent(messages) - attachment_tokens(
             messages[safe:], self.estimate.cost
         )
         return ratio * kept < self.threshold
@@ -161,22 +169,21 @@ class Fit:
         if refusal is None:
             removed = self._to_remove(messages, everything=False, start=start)
             unsent = thinking_after(messages, removed)
+            sent = _without(messages, removed, unsent)
             try:
-                response = await handler(
-                    request.override(messages=_without(messages, removed, unsent))
-                )
+                response = await handler(request.override(messages=sent))
             except Exception as exc:
                 if not is_context_overflow(exc):
                     raise
                 refusal = exc
             else:
                 if self.lossless:
-                    return Fitted(response, removed, unsent, 0)
+                    return Fitted(response, removed, unsent, 0, holds_bound_thinking(sent))
                 more, spared = self._measured(response, messages, removed)
                 if more:
                     answered = [*messages, *ensure_message_ids(list(response.result or ()))]
                     unsent |= thinking_after(answered, more)
-                return Fitted(response, removed | more, unsent, spared)
+                return Fitted(response, removed | more, unsent, spared, holds_bound_thinking(sent))
         everything = self._to_remove(messages, everything=True, start=start)
         if everything == removed:
             everything = self._to_remove(messages, everything=True)
@@ -184,10 +191,9 @@ class Fit:
             raise refusal
         logger.warning("[Compaction] Context overflow, removing every attachment kept")
         unsent = thinking_after(messages, everything)
-        response = await handler(
-            request.override(messages=_without(messages, everything, unsent))
-        )
-        return Fitted(response, everything, unsent, 0)
+        sent = _without(messages, everything, unsent)
+        response = await handler(request.override(messages=sent))
+        return Fitted(response, everything, unsent, 0, holds_bound_thinking(sent))
 
     def _measured(
         self, response: ModelResponse, messages: list[AnyMessage], removed: set[str]
@@ -197,7 +203,7 @@ class Fit:
         the tokens they took.
 
         The estimate can fall short of the provider's count, which includes
-        the tool schemas and a PDF's real pages. Left over the threshold, the
+        a PDF's real pages. Left over the threshold, the
         next call would summarize again and remove nothing, and so would each
         one after. The measurement corrects the estimate: each attachment
         counts at its estimate times measured over estimated for the view
@@ -210,7 +216,7 @@ class Fit:
         over = input_tokens + output_tokens - self.threshold
         if over < 0:
             return set(), 0
-        estimated = self.estimate([*self.system, *_without(messages, removed)])
+        estimated = self._sent(_without(messages, removed))
         if estimated <= 0:
             return set(), 0
         more: set[str] = set()
@@ -242,7 +248,7 @@ class Fit:
         costs = [(msg_id, tokens) for msg_id, tokens in costs if tokens and msg_id]
         if everything:
             return {msg_id for msg_id, _ in costs}
-        over = self.estimate([*self.system, *messages]) - self.threshold
+        over = self._sent(messages) - self.threshold
         removed: set[str] = set()
         for msg_id, tokens in costs:
             if over < 0:

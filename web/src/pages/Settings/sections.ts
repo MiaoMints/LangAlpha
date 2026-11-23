@@ -1,18 +1,23 @@
 import type { ComponentType } from 'react';
 import {
+  AppWindow,
   Bot,
   CandlestickChart,
   CircleUser,
   Cpu,
   CreditCard,
   FlaskConical,
+  Globe,
   MessageSquare,
   Palette,
   PieChart,
   Plug,
+  Server,
+  ServerCog,
   SlidersHorizontal,
 } from 'lucide-react';
 import { isPlatformMode } from '@/config/hostMode';
+import { canDesktopSettings } from '@/lib/desktop';
 import { TRADING_PERMISSION_ANCHOR } from '@/lib/tradingPermission';
 
 interface SectionMeta {
@@ -22,6 +27,10 @@ interface SectionMeta {
   icon: ComponentType<{ className?: string }>;
   /** Points into the hosted account console, which a self-hosted build has none of. */
   platformOnly?: boolean;
+  /** Settings the desktop shell keeps, so drawn only in a shell that can read and write them. */
+  desktopOnly?: boolean;
+  /** What a hosted server's operator decides, so only a self-hosted build shows it. */
+  selfHostedOnly?: boolean;
 }
 
 /**
@@ -36,8 +45,14 @@ export const SECTIONS = {
   general: { labelKey: 'settings.section.general', descKey: 'settings.definition.general', icon: SlidersHorizontal },
   appearance: { labelKey: 'settings.section.appearance', descKey: 'settings.definition.appearance', icon: Palette },
   chat: { labelKey: 'settings.section.chat', descKey: 'settings.definition.chat', icon: MessageSquare },
+  // An HTML file's glyph everywhere else in the app (`fileKindIcon('page')`).
+  artifacts: { labelKey: 'settings.section.artifacts', descKey: 'settings.definition.artifacts', icon: Globe },
+  desktop: { labelKey: 'settings.section.desktop', descKey: 'settings.definition.desktop', icon: AppWindow, desktopOnly: true },
   agent: { labelKey: 'settings.section.agent', descKey: 'settings.definition.agent', icon: Bot },
+  // The glyph the workspace gallery's computer menu names them by.
+  computers: { labelKey: 'settings.section.computers', descKey: 'settings.definition.computers', icon: Server },
   model: { labelKey: 'settings.section.model', descKey: 'settings.definition.model', icon: Cpu },
+  server: { labelKey: 'settings.section.server', descKey: 'settings.definition.server', icon: ServerCog, selfHostedOnly: true },
   integrations: { labelKey: 'settings.section.integrations', descKey: 'settings.definition.integrations', icon: Plug, platformOnly: true },
   trading: { labelKey: 'settings.section.trading', descKey: 'settings.definition.trading', icon: CandlestickChart },
   experiments: { labelKey: 'settings.section.experiments', descKey: 'settings.definition.experiments', icon: FlaskConical },
@@ -48,13 +63,14 @@ export type Section = keyof typeof SECTIONS;
 /** Whether this build draws the section. */
 export function sectionShown(section: Section): boolean {
   const meta: SectionMeta = SECTIONS[section];
-  return isPlatformMode || !meta.platformOnly;
+  if (meta.desktopOnly && !canDesktopSettings()) return false;
+  return isPlatformMode ? !meta.selfHostedOnly : !meta.platformOnly;
 }
 
 export const GROUPS: readonly { labelKey: string; sections: readonly Section[] }[] = [
   { labelKey: 'settings.group.account', sections: ['account', 'preferences', 'plan'] },
-  { labelKey: 'settings.group.app', sections: ['general', 'appearance', 'chat'] },
-  { labelKey: 'settings.group.agent', sections: ['agent', 'model', 'integrations', 'trading'] },
+  { labelKey: 'settings.group.app', sections: ['general', 'appearance', 'chat', 'artifacts', 'desktop'] },
+  { labelKey: 'settings.group.agent', sections: ['agent', 'computers', 'model', 'server', 'integrations', 'trading'] },
   { labelKey: 'settings.group.labs', sections: ['experiments'] },
 ];
 
@@ -68,12 +84,16 @@ export interface SettingEntry {
   anchor: string;
   labelKey: string;
   descKey?: string;
-  /** Drawn only in the desktop app, so only found there. */
+  /** Drawn only in the desktop app, so only found there. A whole section's
+   *  rows are kept out by the section's own flag. */
   desktopOnly?: boolean;
   /** Drawn only in the Models section's advanced view, which opening it turns on. */
   advanced?: boolean;
-  /** Names of rows drawn only some of the time beside this one, which a
-   *  search finds here so it never opens on a row that is not there. */
+  /** Drawn only while this feature flag is on, so only found then. */
+  feature?: string;
+  /** Other names the search finds this row by, though the row does not show
+   *  them: rows drawn only some of the time beside it, so a search never opens
+   *  on a row that is not there, or the name of the group the row sits in. */
   alsoKeys?: readonly string[];
 }
 
@@ -91,21 +111,61 @@ export const SETTINGS = {
   timezone: { section: 'general', anchor: 'timezone', labelKey: 'settings.timezone', descKey: 'settings.timezoneDesc' },
   linkTarget: { section: 'general', anchor: 'link-target', labelKey: 'settings.shareLinkOpen', descKey: 'settings.shareLinkOpenDesc', desktopOnly: true },
   guides: { section: 'general', anchor: 'guides', labelKey: 'onboarding.settings.sectionTitle', descKey: 'onboarding.settings.description' },
-  theme: { section: 'appearance', anchor: 'theme', labelKey: 'settings.theme', descKey: 'settings.themeDesc' },
+  // Drawn as Mode under the Theme heading, and still looked for as the theme.
+  theme: { section: 'appearance', anchor: 'theme', labelKey: 'settings.themeMode', descKey: 'settings.themeDesc', alsoKeys: ['settings.theme'] },
   fontSize: { section: 'appearance', anchor: 'font-size', labelKey: 'settings.fontSize', descKey: 'settings.fontSizeDesc' },
   cardStyle: { section: 'appearance', anchor: 'card-style', labelKey: 'settings.cardStyle', descKey: 'settings.cardStyleDesc' },
   turnDisplay: { section: 'chat', anchor: 'stream-reasoning', labelKey: 'settings.turnDisplay', descKey: 'settings.turnDisplayDesc' },
   streamingMode: { section: 'chat', anchor: 'response-delivery', labelKey: 'settings.streamingMode', descKey: 'settings.streamingModeDesc' },
   toolCallLayout: { section: 'chat', anchor: 'tool-calls', labelKey: 'settings.toolCallLayout', descKey: 'settings.toolCallLayoutDesc' },
   turnEndScroll: { section: 'chat', anchor: 'turn-end', labelKey: 'settings.turnEndScroll', descKey: 'settings.turnEndScrollDesc' },
+  composerTray: { section: 'chat', anchor: 'composer-tray', labelKey: 'settings.composerTray', descKey: 'settings.composerTrayDesc' },
   voiceInput: { section: 'chat', anchor: 'voice-input', labelKey: 'settings.voiceInput', descKey: 'settings.voiceInputDesc' },
+  commentDestination: { section: 'artifacts', anchor: 'comment-destination', labelKey: 'settings.artifacts.destination', descKey: 'settings.artifacts.destinationDesc' },
+  commentEnter: { section: 'artifacts', anchor: 'comment-enter', labelKey: 'settings.artifacts.enter', descKey: 'settings.artifacts.enterDesc' },
+  artifactAnswers: { section: 'artifacts', anchor: 'artifact-answers', labelKey: 'settings.artifacts.answers', descKey: 'settings.artifacts.answersDesc' },
+  notifyTurn: { section: 'desktop', anchor: 'notify-turn', labelKey: 'settings.desktop.notifyTurn', descKey: 'settings.desktop.notifyTurnDesc', alsoKeys: ['settings.desktop.notificationsGroup'] },
+  notifyNeedsInput: { section: 'desktop', anchor: 'notify-needs-input', labelKey: 'settings.desktop.notifyNeedsInput', descKey: 'settings.desktop.notifyNeedsInputDesc', alsoKeys: ['settings.desktop.notificationsGroup'] },
+  notifyWakeup: { section: 'desktop', anchor: 'notify-wakeup', labelKey: 'settings.desktop.notifyWakeup', descKey: 'settings.desktop.notifyWakeupDesc', alsoKeys: ['settings.desktop.notificationsGroup'] },
+  notifyAutomation: { section: 'desktop', anchor: 'notify-automation', labelKey: 'settings.desktop.notifyAutomation', descKey: 'settings.desktop.notifyAutomationDesc', alsoKeys: ['settings.desktop.notificationsGroup'] },
+  notifyStarted: { section: 'desktop', anchor: 'notify-started', labelKey: 'settings.desktop.notifyStarted', descKey: 'settings.desktop.notifyStartedDesc', alsoKeys: ['settings.desktop.notificationsGroup'] },
+  // The rows under it are drawn only where the platform can do them.
+  menubarIcon: { section: 'desktop', anchor: 'menubar-icon', labelKey: 'settings.desktop.menubarIcon', descKey: 'settings.desktop.menubarIconDesc', alsoKeys: ['settings.desktop.shortcut', 'settings.desktop.keepRunning', 'settings.desktop.openAtLogin'] },
+  // Drawn while the icon is on, which it is by default. Rotate / side by side
+  // is drawn only where the text sits beside the icon (macOS), so it is found
+  // through the list it lays out.
+  menubarItems: { section: 'desktop', anchor: 'menubar-items', labelKey: 'settings.desktop.menubarItems', descKey: 'settings.desktop.menubarItemsDesc', alsoKeys: ['settings.desktop.menubarStyle', 'settings.desktop.menubarStyleRotate', 'settings.desktop.menubarStyleSide', 'settings.desktop.addSymbol'] },
+  menubarShow: { section: 'desktop', anchor: 'menubar-show', labelKey: 'settings.desktop.menubarShow', descKey: 'settings.desktop.menubarShowDesc', alsoKeys: ['settings.desktop.menubarGroup'] },
+  menubarExtendedHours: { section: 'desktop', anchor: 'menubar-extended-hours', labelKey: 'settings.desktop.menubarExtended', descKey: 'settings.desktop.menubarExtendedDesc', alsoKeys: ['settings.desktop.menubarGroup'] },
+  panelSections: { section: 'desktop', anchor: 'panel-sections', labelKey: 'settings.desktop.panelSections', descKey: 'settings.desktop.panelSectionsDesc', alsoKeys: ['settings.desktop.panelGroup'] },
+  panelTiles: { section: 'desktop', anchor: 'panel-tiles', labelKey: 'settings.desktop.panelTiles', descKey: 'settings.desktop.panelTilesDesc', alsoKeys: ['settings.desktop.panelGroup'] },
+  panelWatchlist: { section: 'desktop', anchor: 'panel-watchlist', labelKey: 'settings.desktop.panelWatchlist', descKey: 'settings.desktop.panelWatchlistDesc', alsoKeys: ['settings.desktop.panelGroup'] },
   outputFormat: { section: 'agent', anchor: 'output-format', labelKey: 'settings.outputFormat', descKey: 'settings.outputFormatDesc' },
   researchDepth: { section: 'agent', anchor: 'research-depth', labelKey: 'settings.researchDepth', descKey: 'settings.researchDepthDesc' },
   reachingOut: { section: 'agent', anchor: 'reaching-out', labelKey: 'settings.reachingOut', descKey: 'settings.reachingOutDesc' },
   subagents: { section: 'agent', anchor: 'subagents', labelKey: 'settings.subagentsDefault', descKey: 'settings.subagentsDefaultDesc' },
+  ownContext: { section: 'agent', anchor: 'own-context', labelKey: 'settings.ownContext', descKey: 'settings.ownContextDesc', feature: 'shared_workspaces_member_context' },
   approveHandoffs: { section: 'agent', anchor: 'approve-handoffs', labelKey: 'settings.autoApproveHandoffs', descKey: 'settings.autoApproveHandoffsDesc' },
   approveWorkspaces: { section: 'agent', anchor: 'approve-workspaces', labelKey: 'settings.autoApproveWorkspaceCreation', descKey: 'settings.autoApproveWorkspaceCreationDesc' },
   searchProvider: { section: 'agent', anchor: 'search-provider', labelKey: 'settings.searchProvider', descKey: 'settings.searchProviderDesc', alsoKeys: ['settings.searchDepth'] },
+  // A machine's own settings are in the Computers panel each row opens, so
+  // the list is what a search for one of them lands on.
+  computers: {
+    section: 'computers',
+    anchor: 'computers',
+    labelKey: 'settings.computers.list',
+    descKey: 'computer.computersDesc',
+    alsoKeys: [
+      'computer.card.spec',
+      'computer.card.storage',
+      'computer.alwaysOn',
+      'computer.filesBackup.label',
+      'computer.browserQuality.label',
+      'computer.makePrimary.button',
+      'computer.rename',
+    ],
+  },
+  newComputer: { section: 'computers', anchor: 'new-computer', labelKey: 'computer.newComputer' },
   modelAccess: { section: 'model', anchor: 'model-access', labelKey: 'modelAccess.title', descKey: 'modelAccess.description' },
   defaultModels: { section: 'model', anchor: 'default-models', labelKey: 'settings.defaultModels', descKey: 'settings.defaultModelsDesc' },
   defaultModelScope: { section: 'model', anchor: 'default-model-scope', labelKey: 'settings.defaultModelChange.scopeLabel', descKey: 'settings.defaultModelChange.scopeDesc' },
@@ -114,6 +174,9 @@ export const SETTINGS = {
   accountDefaults: { section: 'model', anchor: 'account-defaults', labelKey: 'settings.modelTuning.sectionDefaults', advanced: true },
   perModel: { section: 'model', anchor: 'per-model', labelKey: 'settings.modelTuning.perModel', descKey: 'settings.modelTuning.perModelDesc', advanced: true },
   routing: { section: 'model', anchor: 'routing', labelKey: 'settings.modelTuning.sectionRouting', descKey: 'settings.fallbackModels', advanced: true },
+  agentLocation: { section: 'server', anchor: 'agent-location', labelKey: 'settings.server.location', descKey: 'settings.server.locationDesc' },
+  marketDataKeys: { section: 'server', anchor: 'market-data', labelKey: 'setup.services.marketData', descKey: 'settings.server.marketDataDesc' },
+  webSearchKeys: { section: 'server', anchor: 'web-search', labelKey: 'setup.services.webSearch', descKey: 'settings.server.webSearchDesc' },
   chatApps: { section: 'integrations', anchor: 'chat-apps', labelKey: 'settings.integrations.chatApps', descKey: 'settings.integrations.chatAppsDesc' },
   connectedApps: { section: 'integrations', anchor: 'connected-apps', labelKey: 'settings.integrations.connectedApps', descKey: 'settings.integrations.connectedAppsDesc' },
   tradingPermission: { section: 'trading', anchor: TRADING_PERMISSION_ANCHOR, labelKey: 'settings.tradingPermission.title', descKey: 'settings.tradingPermission.desc' },
@@ -129,8 +192,30 @@ export function settingAt(hash: string): SettingEntry | undefined {
 }
 
 /** Every setting the search can find on this surface. */
-export function searchableSettings(desktop: boolean): SettingEntry[] {
-  return ENTRIES.filter((entry) => (desktop || !entry.desktopOnly) && sectionShown(entry.section));
+export function searchableSettings(
+  desktop: boolean,
+  featureOn: (key: string) => boolean = () => true,
+): SettingEntry[] {
+  return ENTRIES.filter(
+    (entry) =>
+      (desktop || !entry.desktopOnly) &&
+      (!entry.feature || featureOn(entry.feature)) &&
+      sectionShown(entry.section),
+  );
+}
+
+/**
+ * The words a setting is found by: its name, what it does, its aliases and the
+ * section it sits in. One list for every search over settings, so the page's
+ * rail and the command palette find the same setting for the same words.
+ */
+export function settingSearchText(entry: SettingEntry, t: (key: string) => string): string {
+  return [
+    t(entry.labelKey),
+    entry.descKey ? t(entry.descKey) : '',
+    ...(entry.alsoKeys ?? []).map((key) => t(key)),
+    t(SECTIONS[entry.section].labelKey),
+  ].join(' ');
 }
 
 function asSection(param: string | null): Section | null {

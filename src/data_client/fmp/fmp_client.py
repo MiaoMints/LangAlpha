@@ -1,29 +1,29 @@
-"""FMP (Financial Modeling Prep) async client — targets the stable API.
-
-Responses pass through unchanged except for the sector performance snapshot;
-see :func:`_format_sector_change_pct`.
-"""
+"""FMP (Financial Modeling Prep) async client — targets the stable API."""
 
 import asyncio
 import json
+import math
 import os
 from collections import OrderedDict
 from datetime import date, datetime, timedelta, timezone
-from typing import Any, Dict, List, Optional, Union
+from email.utils import parsedate_to_datetime
+from typing import Any, Dict, List, NamedTuple, Optional, Union
 
 import httpx
 from market_protocol import display_spelling, vendor_spelling
 
-_CACHE_MAX_SIZE = 512
+from . import walk
+from .walk import Walk
 
-# Stable's ``economic-indicators`` answers at most this many days ending at
-# ``to``, so an indicator is read back in windows of that span from today in
-# UTC. Another implementation of this tool surface should walk the same windows
-# with the same caps and batches, so both serve the same rows.
-_INDICATOR_WINDOW_DAYS = 91
-_INDICATOR_MAX_WINDOWS = 64
-_INDICATOR_MAX_EMPTY_RUN = 16
-_INDICATOR_MAX_BATCH = 8
+_CACHE_MAX_SIZE = 512
+# A dropped connection or a 5xx is retried on a fresh attempt, a refusal never:
+# a walk makes up to 64 calls, and one transient failure fails the read. A
+# timeout is not retried, so a hung FMP still fails a call in one timeout.
+# ginlix-data's FMP client retries a dropped connection and a 5xx the same
+# number of times, and a timeout too.
+_RETRIES = 2
+_BACKOFF_S = 0.25
+_TRANSIENT = frozenset({500, 502, 503, 504})
 
 
 def _vendor_symbol_params(params: Dict[str, Any]) -> Dict[str, Any]:
@@ -69,9 +69,33 @@ class FMPRequestError(Exception):
     request URL or headers; the key travels in the ``apikey`` header.
     """
 
-    def __init__(self, message: str, *, status_code: Optional[int] = None):
+    def __init__(
+        self,
+        message: str,
+        *,
+        status_code: Optional[int] = None,
+        retry_after: Optional[float] = None,
+    ):
         super().__init__(message)
         self.status_code = status_code
+        self.retry_after = retry_after
+
+
+def _retry_after(value: Optional[str]) -> Optional[float]:
+    """Seconds a ``Retry-After`` header asks for, in either of its forms."""
+    if not value:
+        return None
+    try:
+        seconds = float(value)
+    except ValueError:
+        try:
+            when = parsedate_to_datetime(value)
+        except (TypeError, ValueError):
+            return None
+        if when.tzinfo is None:
+            when = when.replace(tzinfo=timezone.utc)
+        seconds = (when - datetime.now(timezone.utc)).total_seconds()
+    return max(seconds, 0.0) if math.isfinite(seconds) else None
 
 
 def _today_utc() -> date:
@@ -79,23 +103,12 @@ def _today_utc() -> date:
     return datetime.now(timezone.utc).date()
 
 
-def _format_sector_change_pct(row: Dict[str, Any]) -> Dict[str, Any]:
-    """Render sector snapshot's ``averageChange`` as a percentage string.
+class CallDate(NamedTuple):
+    """One FMP earnings-call listing: the fiscal label and the day it was held."""
 
-    Stable returns ``averageChange`` as a float already in percent units (e.g.
-    ``1.42832`` means 1.43%, not 142%); the canonical shape downstream parses
-    is the same value as a percentage string under ``changePctStr`` (e.g.
-    ``"1.42832%"``). The numeric copy survives on the artifact under
-    ``changePercentage``, so string and numeric live alongside without ambiguity.
-
-    Returns a fresh dict — the source row may be held by the LRU cache, so
-    in-place mutation would leak the derived field back into cached responses.
-    """
-    if "averageChange" not in row or "changePctStr" in row:
-        return row
-    val = row["averageChange"]
-    formatted = f"{val:.5f}%" if isinstance(val, (int, float)) else str(val)
-    return {**row, "changePctStr": formatted}
+    quarter: int
+    fiscal_year: int
+    date: date
 
 
 class FMPClient:
@@ -105,7 +118,12 @@ class FMPClient:
     STABLE_BASE = "https://financialmodelingprep.com/stable"
     DEFAULT_VERSION = "stable"
 
-    def __init__(self, api_key: Optional[str] = None, cache_ttl: int = 300):
+    def __init__(
+        self,
+        api_key: Optional[str] = None,
+        cache_ttl: int = 300,
+        event_hooks: Optional[Dict[str, List[Any]]] = None,
+    ):
         self.api_key = api_key or os.getenv("FMP_API_KEY")
         if not self.api_key:
             raise ValueError(
@@ -113,9 +131,12 @@ class FMPClient:
             )
 
         self.cache_ttl = cache_ttl
+        self._event_hooks = event_hooks
         self._client: Optional[httpx.AsyncClient] = None
         self._cache: OrderedDict[str, Any] = OrderedDict()
         self._cache_timestamps: Dict[str, datetime] = {}
+        self._in_flight = 0
+        self._retired = False
 
     async def _get_client(self) -> httpx.AsyncClient:
         if self._client is None or self._client.is_closed:
@@ -123,12 +144,21 @@ class FMPClient:
                 http2=True,
                 timeout=30.0,
                 limits=httpx.Limits(max_keepalive_connections=10),
+                event_hooks=self._event_hooks,
             )
         return self._client
 
     async def close(self):
         if self._client and not self._client.is_closed:
             await self._client.aclose()
+
+    async def retire(self) -> None:
+        """Close once no request runs on this client, now or later: a caller
+        still holding it reopens the connection pool, and its last request
+        closes it again."""
+        self._retired = True
+        if not self._in_flight:
+            await self.close()
 
     async def __aenter__(self):
         return self
@@ -166,12 +196,34 @@ class FMPClient:
             return self._cache[cache_key]
 
         url = self._build_url(endpoint, version)
+        self._in_flight += 1
+        try:
+            return await self._request(url, params, cache_key, use_cache)
+        finally:
+            self._in_flight -= 1
+            if self._retired and not self._in_flight:
+                await self.close()
+
+    async def _request(
+        self, url: str, params: Dict[str, Any], cache_key: str, use_cache: bool
+    ) -> Union[Dict, List]:
         client = await self._get_client()
 
         try:
-            response = await client.get(
-                url, params=params, headers={"apikey": self.api_key}
-            )
+            for attempt in range(_RETRIES + 1):
+                try:
+                    response = await client.get(
+                        url, params=params, headers={"apikey": self.api_key}
+                    )
+                except httpx.TimeoutException:
+                    raise
+                except httpx.TransportError:
+                    if attempt == _RETRIES:
+                        raise
+                else:
+                    if response.status_code not in _TRANSIENT or attempt == _RETRIES:
+                        break
+                await asyncio.sleep(_BACKOFF_S * 2**attempt)
             response.raise_for_status()
             data = _own_symbol_rows(response.json())
 
@@ -190,6 +242,7 @@ class FMPClient:
             raise FMPRequestError(
                 f"FMP API request failed ({e.response.status_code})",
                 status_code=e.response.status_code,
+                retry_after=_retry_after(e.response.headers.get("Retry-After")),
             )
         except httpx.TimeoutException:
             raise FMPRequestError("FMP API request timed out")
@@ -490,6 +543,16 @@ class FMPClient:
             "grades", params={"symbol": symbol, "limit": limit}
         )
 
+    async def get_grades_historical(self, symbol: str, limit: int = 100) -> List[Dict]:
+        return await self._make_request(
+            "grades-historical", params={"symbol": symbol, "limit": limit}
+        )
+
+    async def get_price_target_news(self, symbol: str, limit: int = 100) -> List[Dict]:
+        return await self._make_request(
+            "price-target-news", params={"symbol": symbol, "limit": limit}
+        )
+
     async def get_grades_summary(self, symbol: str) -> List[Dict]:
         return await self._make_request(
             "grades-consensus", params={"symbol": symbol}
@@ -508,59 +571,27 @@ class FMPClient:
             params={"symbol": symbol, "year": year, "quarter": quarter},
         )
 
-    async def get_earnings_call_dates(self, symbol: str) -> List[List]:
-        """All earnings-call transcript dates for ``symbol``.
+    async def get_earnings_call_dates(self, symbol: str) -> List[CallDate]:
+        """All earnings-call transcript dates for ``symbol``, one per FMP label.
 
-        Stable returns ``[{quarter, fiscalYear, date}, ...]``; callers
-        historically iterate as ``[quarter, fiscal_year, date]`` triples
-        (see :func:`src.tools.sec.earnings_call.fetch_matching_earnings_call`),
-        so we reshape to that form.
+        Rows missing a label or a parseable date are dropped.
         """
         data = await self._make_request(
             "earning-call-transcript-dates", params={"symbol": symbol}
         )
-        result: List[List] = []
-        for row in (data or []):
-            if not isinstance(row, dict):
+        if isinstance(data, dict):
+            raise FMPRequestError("FMP API returned an error")
+        calls: List[CallDate] = []
+        for row in data or []:
+            try:
+                calls.append(CallDate(
+                    int(row["quarter"]),
+                    int(row.get("fiscalYear") or row["year"]),
+                    datetime.strptime(row["date"][:10], "%Y-%m-%d").date(),
+                ))
+            except (KeyError, TypeError, ValueError):
                 continue
-            quarter = row.get("quarter")
-            fiscal_year = row.get("fiscalYear") or row.get("year")
-            call_date = row.get("date")
-            if quarter is None or fiscal_year is None or call_date is None:
-                continue
-            result.append([quarter, fiscal_year, call_date])
-        return result
-
-    async def get_sec_filings(
-        self,
-        symbol: str,
-        filing_type: Optional[str] = None,
-        limit: int = 20,
-        from_date: Optional[str] = None,
-        to_date: Optional[str] = None,
-    ) -> List[Dict]:
-        """SEC filings for a company.
-
-        Stable's ``sec-filings-search/symbol`` requires ``from`` and ``to``
-        dates; when omitted we default to "last 5 years → today" so the
-        contract still works for callers that only pass ``symbol``.
-        Param ``type`` was renamed to ``formType``.
-        """
-        if not from_date:
-            from_date = (_today_utc() - timedelta(days=365 * 5)).isoformat()
-        if not to_date:
-            to_date = _today_utc().isoformat()
-
-        params: Dict[str, Any] = {
-            "symbol": symbol,
-            "limit": limit,
-            "from": from_date,
-            "to": to_date,
-        }
-        if filing_type:
-            params["formType"] = filing_type
-
-        return await self._make_request("sec-filings-search/symbol", params=params)
+        return calls
 
     async def get_historical_earnings_calendar(
         self, symbol: str, limit: int = 20
@@ -721,41 +752,6 @@ class FMPClient:
         return await self._make_request("company-screener", params=params)
 
     # =====================================================================
-    # Sector Performance
-    # =====================================================================
-
-    async def get_sector_performance(
-        self, target_date: Optional[str] = None
-    ) -> List[Dict]:
-        """Daily snapshot of US sector performance (NASDAQ-listed names).
-
-        Stable's ``sector-performance-snapshot?date=`` requires a date and
-        returns ``[]`` on weekends/holidays; when no date is supplied we walk
-        back up to 7 calendar days to find the most recent trading day, which
-        matches v3's implicit "latest available" behaviour. The numeric
-        ``averageChange`` is rendered as a percentage string under
-        ``changePctStr`` (see :func:`_format_sector_change_pct`).
-
-        The endpoint is per-exchange and defaults to NASDAQ-listed constituents
-        only — the same scope v3's ``sectors-performance`` returned.
-        """
-        if target_date:
-            data = await self._make_request(
-                "sector-performance-snapshot", params={"date": target_date}
-            )
-            return [_format_sector_change_pct(row) for row in (data or [])]
-
-        today = _today_utc()
-        for offset in range(7):
-            probe = (today - timedelta(days=offset)).isoformat()
-            data = await self._make_request(
-                "sector-performance-snapshot", params={"date": probe}
-            )
-            if data:
-                return [_format_sector_change_pct(row) for row in data]
-        return []
-
-    # =====================================================================
     # Technical Indicators
     # =====================================================================
 
@@ -835,8 +831,16 @@ class FMPClient:
         elif isinstance(to_date, date):
             to_date = to_date.isoformat()
 
-        return await self._make_request(
+        rows = await self._make_request(
             "historical-price-eod/full",
+            params={"symbol": symbol, "from": from_date, "to": to_date},
+        )
+        return walk.eod_answer(rows, from_date)
+
+    async def get_eod_closes(self, symbol: str, from_date: str, to_date: str) -> List[Dict]:
+        """Daily closes only (``date``, ``price``), the light form of the EOD series."""
+        return await self._make_request(
+            "historical-price-eod/light",
             params={"symbol": symbol, "from": from_date, "to": to_date},
         )
 
@@ -853,9 +857,8 @@ class FMPClient:
         if to_date:
             params["to"] = to_date
 
-        return await self._make_request(
-            f"historical-chart/{interval}", params=params
-        )
+        rows = await self._make_request(f"historical-chart/{interval}", params=params)
+        return walk.intraday_answer(rows, interval, from_date, to_date, _today_utc())
 
     async def get_commodity_price(
         self,
@@ -913,11 +916,14 @@ class FMPClient:
     # =====================================================================
 
     async def search_stocks(self, query: str, limit: int = 50) -> List[Dict]:
-        """Search across symbols AND company names.
+        """Search across symbols AND company names, up to *limit* from each.
 
         v3 ``search`` matched both. Stable splits this into ``search-symbol``
         (symbol prefix match) and ``search-name`` (company name match);
-        we call both in parallel and merge by symbol.
+        we call both in parallel and merge by symbol. The union is not cut
+        back to *limit*: ``search-symbol`` fills it on a short prefix in its
+        own order (``nv`` leaves out NVDA), and the name matches are what
+        bring the listing back for the caller to rank.
         """
         sym_task = self._make_request(
             "search-symbol", params={"query": query, "limit": limit}
@@ -937,69 +943,39 @@ class FMPClient:
                 sym = row.get("symbol")
                 if sym and sym not in merged:
                     merged[sym] = row
-        return list(merged.values())[:limit]
+        return list(merged.values())
 
     # =====================================================================
     # Macro & Economic Data
     # =====================================================================
 
     async def get_economic_indicators(self, name: str, limit: int = 50) -> List[Dict]:
-        """The newest ``limit`` observations of an indicator, newest first.
+        """The newest ``limit`` observations of an indicator, newest first, read
+        back from today in UTC (:func:`walk.read_indicator`)."""
+        return await walk.read_indicator(self._make_request, name, limit, _today_utc())
 
-        Stable ignores ``limit`` and answers at most the 91 days ending at
-        ``to``, clamping a longer range without a word, so a quarterly series
-        such as GDP has nothing in its default window. The series is read back
-        a window at a time instead, the first alone and then a widening batch,
-        until ``limit`` rows are in hand. An answer that is not a list is FMP's
-        refusal and is returned as it came, as the single read returned it.
-        """
-        found: Dict[str, Dict] = {}
-        end = _today_utc()
-        batch, walked, empty_run = 1, 0, 0
-        while walked < _INDICATOR_MAX_WINDOWS:
-            spans = []
-            for _ in range(min(batch, _INDICATOR_MAX_WINDOWS - walked)):
-                start = end - timedelta(days=_INDICATOR_WINDOW_DAYS - 1)
-                spans.append((start.isoformat(), end.isoformat()))
-                end = start - timedelta(days=1)
-            walked += len(spans)
-            answers = await asyncio.gather(
-                *(
-                    self._make_request(
-                        "economic-indicators",
-                        params={"name": name, "from": lo, "to": hi},
-                    )
-                    for lo, hi in spans
-                ),
-                return_exceptions=True,
-            )
-            # Newest first, in window order rather than completion order: a
-            # window older than the rows already in hand, or past the empty run
-            # that ends the series, is not needed, and neither is its failure.
-            for (lo, hi), answer in zip(spans, answers):
-                if len(found) >= limit or empty_run >= _INDICATOR_MAX_EMPTY_RUN:
-                    break
-                if isinstance(answer, BaseException):
-                    raise answer
-                if not isinstance(answer, list):
-                    return answer
-                inside = [
-                    row
-                    for row in answer
-                    if isinstance(row, dict) and lo <= str(row.get("date"))[:10] <= hi
-                ]
-                for row in inside:
-                    found.setdefault(row["date"], row)
-                empty_run = 0 if inside else empty_run + 1
-            if len(found) >= limit or empty_run >= _INDICATOR_MAX_EMPTY_RUN:
-                break
-            batch = min(batch * 2, _INDICATOR_MAX_BATCH)
-        rows = sorted(found.values(), key=lambda row: row["date"], reverse=True)
-        return rows[: max(limit, 0)]
+    async def _range(
+        self, endpoint: str, from_date: str, to_date: str, **walk_kwargs: Any
+    ) -> Union[Walk, Dict]:
+        """A range read back by :func:`walk.read_range`."""
+
+        async def request(params: Dict[str, Any]) -> Any:
+            return await self._make_request(endpoint, params=params)
+
+        return await walk.read_range(request, from_date, to_date, **walk_kwargs)
 
     async def get_economic_calendar(
         self, from_date: Optional[str] = None, to_date: Optional[str] = None
     ) -> List[Dict]:
+        """Events in the range; with both bounds a :class:`Walk` (see :meth:`_range`).
+
+        A lone bound is one read: the calendar holds upcoming dates, so where
+        its range ends is FMP's to say.
+        """
+        if from_date and to_date:
+            return await self._range(
+                "economic-calendar", from_date, to_date, from_start=True
+            )
         params: Dict[str, Any] = {}
         if from_date:
             params["from"] = from_date
@@ -1010,9 +986,15 @@ class FMPClient:
     async def get_treasury_rates(
         self, from_date: Optional[str] = None, to_date: Optional[str] = None
     ) -> List[Dict]:
-        params: Dict[str, Any] = {}
+        """Daily rates; with a start, a :class:`Walk` to ``to_date`` or today in UTC.
+
+        No rate lies ahead, so a lone start leaves no doubt where the range
+        ends. Without a start it is one read, FMP's own recent window.
+        """
         if from_date:
-            params["from"] = from_date
+            to_date = to_date or _today_utc().isoformat()
+            return await self._range("treasury-rates", from_date, to_date)
+        params: Dict[str, Any] = {}
         if to_date:
             params["to"] = to_date
         return await self._make_request("treasury-rates", params=params)
@@ -1023,9 +1005,25 @@ class FMPClient:
     async def get_earnings_calendar_by_date(
         self, from_date: Optional[str] = None, to_date: Optional[str] = None
     ) -> List[Dict]:
+        """Reporters in the range; with both bounds a :class:`Walk` (see
+        :meth:`_range`), paged past FMP's 4,000-row answer. A lone bound is one
+        read, as the economic calendar's is, sorted oldest first as the range
+        read is."""
+        if from_date and to_date:
+            return await self._range(
+                "earnings-calendar",
+                from_date,
+                to_date,
+                page_rows=walk.EARNINGS_PAGE_ROWS,
+                window_days=walk.EARNINGS_WINDOW_DAYS,
+                from_start=True,
+            )
         params: Dict[str, Any] = {}
         if from_date:
             params["from"] = from_date
         if to_date:
             params["to"] = to_date
-        return await self._make_request("earnings-calendar", params=params)
+        rows = await self._make_request("earnings-calendar", params=params)
+        if not isinstance(rows, list):
+            return rows
+        return Walk(sorted(rows, key=lambda row: str(row.get("date"))))

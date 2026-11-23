@@ -17,6 +17,9 @@ export interface ModelMetadataEntry {
   access_type?: string;
   /** "true" when variant needs its own API key (different env_key from parent). */
   requires_own_key?: string;
+  /** The manifest's 1 to 5 ratings, highest best. Absent = not rated. */
+  intelligence?: number;
+  speed?: number;
   /** Numeric tier for platform-served access. Absent = 0. */
   tier?: number;
   /** OAuth-plan allowlist — the connected subscription's plan_type must be
@@ -42,6 +45,17 @@ export interface ModelMetadataEntry {
    *  of the models API's `task_cost_baseline`; "any" for a model measured
    *  without a level. Absent = never measured. */
   task_cost?: Record<string, TaskCost>;
+  /** For a model with no `task_cost`, its list price as a multiple of the
+   *  baseline model's, on the same scale. Absent = measured, or no price. */
+  task_cost_estimate?: number;
+  /** List price in USD per million tokens. Absent = no price known. */
+  pricing?: { input: number; output: number };
+}
+
+/** The model and level every `task_cost` figure is a multiple of. */
+export interface TaskCostBaseline {
+  model: string;
+  effort: string;
 }
 
 export interface TaskCost {
@@ -420,19 +434,31 @@ export function withCustomModels(
   const metadata: Record<string, ModelMetadataEntry> = { ...rawMetadata };
   for (const cm of customModels) {
     const sdk = sdkOf(cm.provider);
+    const shadowed = metadata[cm.name];
     const {
       display_name: _shadowedLabel,
       native_compaction: _shadowedNative,
+      pricing,
+      task_cost: measured,
+      task_cost_estimate: estimate,
       ...declared
-    } = metadata[cm.name] ?? {
+    } = shadowed ?? {
       provider: cm.provider,
       is_custom_model: true,
       ...(sdk ? { sdk } : {}),
       ...gatewayTuning(cm, rawMetadata, gateway),
     };
     const ladder = declaredLadder(cm);
+    // A price is its provider's, and so is a cost per task, measured or
+    // estimated: reached through another provider (a proxy, a reseller), the
+    // same model may cost anything, and another model id is another model.
+    const sameModel = !!shadowed && shadowed.provider === cm.provider
+      && (cm.model_id || cm.name) === (shadowed.model_id ?? cm.name);
     metadata[cm.name] = {
       ...declared,
+      ...(sameModel && pricing ? { pricing } : {}),
+      ...(sameModel && measured ? { task_cost: measured } : {}),
+      ...(sameModel && estimate !== undefined ? { task_cost_estimate: estimate } : {}),
       ...('efforts' in ladder ? { reasoning_efforts: ladder.efforts } : {}),
       ...('effortDefault' in ladder ? { reasoning_effort_default: ladder.effortDefault } : {}),
       ...('prompt_guidance' in cm ? { prompt_guidance: cm.prompt_guidance } : {}),
@@ -452,6 +478,10 @@ export interface BuildVisibleModelsResult {
   rawModels: Record<string, ProviderModelsData>;
   /** Flat set of all model names in the filtered result. */
   validModelNames: Set<string>;
+  /** Model names some group still lists after the drops that are confirmed
+   *  (shadowing, a plan read as excluding it, a credential's own list) and
+   *  before the access filter, which also drops a connection not read yet. */
+  listedModelNames: Set<string>;
   /** (group, name) pairs the user explicitly added via custom_models. Used by
    *  the badge map to render "byok" instead of "platform" for custom-pair
    *  entries that shadow a built-in name. */
@@ -555,6 +585,7 @@ export function buildVisibleModels(
 
   // 3c. What the connected credentials' own lists say they cannot run.
   const listed = dropMissingModels(normalized, metadata, missingByProvider, customPairs, routedPairs);
+  const listedModelNames = new Set(Object.values(listed).flatMap((g) => g.models ?? []));
 
   // 4. Filter
   let filtered: Record<string, ProviderModelsData>;
@@ -574,6 +605,6 @@ export function buildVisibleModels(
     }
   }
 
-  return { models: filtered, metadata, rawModels, validModelNames, customPairs };
+  return { models: filtered, metadata, rawModels, validModelNames, listedModelNames, customPairs };
 }
 

@@ -5,7 +5,8 @@ from typing import Literal, Optional
 from uuid import UUID
 
 
-from fastapi import HTTPException, Query
+from fastapi import HTTPException, Query, Request
+from fastapi.encoders import jsonable_encoder
 from pydantic import BaseModel, Field
 
 from src.server.database.market_targets import cancel_targets, list_thread_targets
@@ -30,14 +31,22 @@ from src.server.services.thread_lifecycle_feed import (
     publish_thread_unarchived,
 )
 from src.server.services.workspace_manager import prune_thread_dirs_soon
+from src.server.dependencies import cli_approval
+from src.server.dependencies.principal import (
+    ReadPrincipal,
+    ReadUserId,
+    WorkspaceDeletePrincipal,
+    WorkspaceWriteUserId,
+)
 # require_thread_owner is called through the module (auth_api.…) so a single
 # definition-site patch governs every route — a consumer-site patch that stops
 # intercepting after a move would silently bypass auth in tests.
 from src.server.utils import api as auth_api
+from src.server.services.shared_workspaces import thread_visibility
+from src.server.services.shared_workspaces.access import thread_access, workspace_access
 from src.server.utils.api import (
     CurrentUserId,
     StampThreadAuth,
-    require_workspace_owner,
 )
 from src.utils.market_watch import get_watchlist
 from src.server.models.conversation import (
@@ -46,6 +55,7 @@ from src.server.models.conversation import (
     ThreadUpdateRequest,
     ThreadExternalIdRequest,
     ThreadDeleteResponse,
+    ThreadVisibilityRequest,
 )
 from src.server.database.conversation import (
     ExternalIdConflictError,
@@ -58,8 +68,21 @@ from src.server.database.conversation import (
     get_thread_auth_meta,
     get_thread_by_id,
 )
+from src.server.database.conversation.shared_thread_reads import (
+    set_member_pin,
+    stamp_member_seen,
+)
+from src.server.database.conversation.viewer_threads import (
+    get_thread_for_viewer,
+    threads_with_shared,
+    workspace_threads_for_member,
+)
+from src.server.services.shared_workspaces.viewer import name_thread_senders
 
 from ._deps import logger, router
+from src.server.services.shared_workspaces.feed import reach_of
+from src.server.database.conversation import thread_reach
+from src.server.database.conversation.senders import thread_creator
 
 
 def _lifecycle_fields(row: dict) -> dict:
@@ -78,7 +101,7 @@ def _lifecycle_fields(row: dict) -> dict:
 
 @router.get("", response_model=WorkspaceThreadsListResponse)
 async def list_threads(
-    x_user_id: CurrentUserId,
+    principal: ReadPrincipal,
     workspace_id: Optional[str] = Query(None, description="Filter by workspace ID"),
     limit: int = Query(20, ge=1, le=100, description="Max threads per page"),
     offset: int = Query(0, ge=0, description="Pagination offset"),
@@ -104,6 +127,16 @@ async def list_threads(
     When workspace_id is provided, returns threads for that workspace.
     Otherwise returns all threads for the authenticated user.
     """
+    x_user_id = principal.user_id
+    shared_list = False
+    shared_ids: list[str] = []
+    page = dict(
+        limit=limit,
+        offset=offset,
+        sort_by=sort_by,
+        sort_order=sort_order,
+        platform_prefix=platform_prefix,
+    )
     try:
         if archived and not workspace_id:
             raise HTTPException(
@@ -114,25 +147,27 @@ async def list_threads(
             from src.server.database.workspace import get_workspace as db_get_workspace
 
             workspace = await db_get_workspace(workspace_id)
-            require_workspace_owner(workspace, user_id=x_user_id)
-            threads, total = await get_workspace_threads(
-                workspace_id=workspace_id,
-                limit=limit,
-                offset=offset,
-                sort_by=sort_by,
-                sort_order=sort_order,
-                platform_prefix=platform_prefix,
-                archived=archived,
-            )
+            access = await workspace_access(workspace, x_user_id)
+            shared_list = access.is_shared
+            if shared_list:
+                threads, total = await workspace_threads_for_member(
+                    workspace_id, x_user_id, archived=archived, **page
+                )
+            else:
+                threads, total = await get_workspace_threads(
+                    workspace_id=workspace_id, archived=archived, **page
+                )
         else:
-            threads, total = await get_threads_for_user(
-                user_id=x_user_id,
-                limit=limit,
-                offset=offset,
-                sort_by=sort_by,
-                sort_order=sort_order,
-                platform_prefix=platform_prefix,
-            )
+            # The recent threads across workspaces include the shared ones
+            # the caller reaches now; a computer's token reaches none, as
+            # ``require_scopes`` refuses it a filter naming one.
+            if principal.computer_id is None:
+                reach = await reach_of(x_user_id)
+                shared_ids = sorted(reach.workspace_ids) if reach else []
+            if shared_ids:
+                threads, total = await threads_with_shared(x_user_id, shared_ids, **page)
+            else:
+                threads, total = await get_threads_for_user(user_id=x_user_id, **page)
 
         thread_items = [
             WorkspaceThreadListItem(
@@ -149,6 +184,7 @@ async def list_threads(
                 is_pinned=bool(thread.get("is_pinned", False)),
                 archived_at=thread.get("archived_at"),
                 llm_model=thread.get("llm_model"),
+                latest_run_model=thread.get("latest_run_model") or None,
                 subagents_allowed=thread["subagents_allowed"],
                 reasoning_effort=thread.get("reasoning_effort"),
                 fast_mode=thread.get("fast_mode"),
@@ -159,6 +195,13 @@ async def list_threads(
             )
             for thread in threads
         ]
+        if shared_list:
+            await name_thread_senders(thread_items, x_user_id)
+        elif shared_ids:
+            reached = set(shared_ids)
+            shared_items = [i for i in thread_items if i.workspace_id in reached]
+            if shared_items:
+                await name_thread_senders(shared_items, x_user_id)
 
         return WorkspaceThreadsListResponse(
             threads=thread_items,
@@ -178,13 +221,72 @@ async def list_threads(
 
 
 @router.get("/{thread_id}")
-async def get_thread(thread_id: str, x_user_id: CurrentUserId):
+async def get_thread(thread_id: str, x_user_id: ReadUserId):
     """Get thread metadata. Used by frontend to resolve workspaceId from threadId."""
-    await auth_api.require_thread_owner(thread_id, x_user_id)
-    thread = await get_thread_by_id(thread_id)
+    access = await thread_access(thread_id, x_user_id)
+    if access.is_shared:
+        thread = await get_thread_for_viewer(thread_id, x_user_id)
+    else:
+        thread = await get_thread_by_id(thread_id)
     if not thread:
         raise HTTPException(status_code=404, detail="Thread not found")
-    return _thread_list_item(thread)
+    item = _thread_list_item(thread)
+    if access.is_shared:
+        await name_thread_senders([item], x_user_id)
+    return item
+
+
+@router.put("/{thread_id}/visibility")
+async def set_thread_visibility(
+    thread_id: str, request: ThreadVisibilityRequest, x_user_id: WorkspaceWriteUserId
+):
+    """Share a shared workspace's thread with everyone in it, or make it its
+    starter's alone again. Only its starter may; making it private is
+    refused (409 ``others_sent``) once anyone else has sent a turn in it.
+    Answers the thread as ``GET /{thread_id}`` reads it after the change,
+    with ``link_turned_off`` true when making it private turned its link off."""
+    link_off = await thread_visibility.set_shared(
+        thread_id, x_user_id, request.shared_with_workspace
+    )
+    item = await get_thread(thread_id, x_user_id)
+    return {**jsonable_encoder(item), "link_turned_off": link_off}
+
+
+class ThreadOutputResponse(BaseModel):
+    thread_id: str
+    workspace_id: Optional[str]
+    status: str
+    text: str
+
+
+@router.get("/{thread_id}/output", response_model=ThreadOutputResponse)
+async def get_thread_output(
+    thread_id: str,
+    x_user_id: ReadUserId,
+    turns: int = Query(
+        1,
+        ge=0,
+        description="How many of the latest turns to include; 0 for the recent history",
+    ),
+):
+    """The text each of the thread's latest turns committed, as the Chief of
+    Staff reads an analyst's output with ``la threads output``: one labeled
+    block per run, times in the user's zone. While a turn runs, only that
+    turn's text so far, and ``status`` says it is still running."""
+    await thread_access(thread_id, x_user_id)
+    from src.server.services.wakeups.message import user_timezone
+    from src.server.services.thread_output import extract_text_from_thread
+
+    output = await extract_text_from_thread(
+        thread_id, turns=turns, timezone=await user_timezone(x_user_id)
+    )
+    if output is None:
+        # Deleted after the access check.
+        raise HTTPException(status_code=404, detail="Thread not found")
+    # The read is by id alone, and a deleted thread's id can be taken again,
+    # so it is the caller's only if the thread still is.
+    await thread_access(thread_id, x_user_id)
+    return ThreadOutputResponse(thread_id=thread_id, **output._asdict())
 
 
 class ThreadSeenRequest(BaseModel):
@@ -210,10 +312,14 @@ async def mark_thread_seen(
     then stamps ``GREATEST(last_seen_run_seq, run.run_seq)`` — a delayed
     POST can never sweep a settlement the user hasn't seen. Returns the
     authoritative cursors so the client can reconcile its store and cached
-    list rows.
+    list rows. In a shared workspace each member has a cursor of their own,
+    so one member reading a thread leaves it unread for the others.
     """
-    await auth_api.require_thread_owner(thread_id, x_user_id)
-    result = await stamp_thread_seen(thread_id, request.run_id)
+    access = await thread_access(thread_id, x_user_id)
+    if access.is_shared:
+        result = await stamp_member_seen(thread_id, x_user_id, request.run_id)
+    else:
+        result = await stamp_thread_seen(thread_id, request.run_id)
     if result is None:
         raise HTTPException(
             status_code=409,
@@ -276,9 +382,10 @@ def _target_out(row: dict, now: datetime) -> MarketWatchTarget:
 
 
 @router.get("/{thread_id}/market-watch", response_model=MarketWatchResponse)
-async def get_market_watch(thread_id: str, x_user_id: CurrentUserId):
-    """Current market-watch symbols and price targets for a thread."""
-    await auth_api.require_thread_owner(thread_id, x_user_id)
+async def get_market_watch(thread_id: str, x_user_id: ReadUserId):
+    """Current market-watch symbols and price targets for a thread: its
+    owner's, or a shared workspace's, which every member watches."""
+    await thread_access(thread_id, x_user_id)
     if not await user_feature_enabled(x_user_id, "market_watch"):
         return MarketWatchResponse(thread_id=thread_id, symbols=[])
     symbols = await get_watchlist(thread_id)
@@ -305,9 +412,10 @@ async def cancel_market_watch_target(
     """Cancel one armed target; ``cancelled`` is False when it was not armed.
 
     Not gated on the feature: turning market watch off must never leave an
-    owner unable to stop a target armed before.
+    owner unable to stop a target armed before. Any member of a shared
+    workspace may cancel one, as any member may stop a turn there.
     """
-    await auth_api.require_thread_owner(thread_id, x_user_id)
+    await thread_access(thread_id, x_user_id)
     rows = await cancel_targets(thread_id, target_id=str(target_id))
     if rows:
         await targets_changed(thread_id)
@@ -315,7 +423,9 @@ async def cancel_market_watch_target(
 
 
 @router.delete("/{thread_id}", response_model=ThreadDeleteResponse)
-async def delete_thread_endpoint(thread_id: str, x_user_id: CurrentUserId):
+async def delete_thread_endpoint(
+    thread_id: str, principal: WorkspaceDeletePrincipal, request: Request
+):
     """
     Delete a thread and all its queries/responses.
 
@@ -327,14 +437,23 @@ async def delete_thread_endpoint(thread_id: str, x_user_id: CurrentUserId):
         MutationUnavailable,
     )
 
+    x_user_id = principal.user_id
     try:
-        await auth_api.require_thread_owner(thread_id, x_user_id)
+        access = await thread_access(thread_id, x_user_id)
+        if access.is_shared and not access.may_manage:
+            # Its starter or a manager deletes a shared thread.
+            if await thread_creator(thread_id) != x_user_id:
+                await thread_access(thread_id, x_user_id, manage=True)
         # Read the row pre-delete: the thread_deleted feed event needs the
         # workspace_id and the row is gone afterwards.
         try:
             thread_row = await get_thread_by_id(thread_id)
         except Exception:
             thread_row = None
+        await cli_approval.thread_delete(request, principal, thread_id, thread_row)
+        # A private thread's delete is told to its starter alone, named
+        # while the row is there to say who.
+        private_to = await thread_reach.private_to(thread_id) if access.is_shared else None
         # Guarded delete (v4 2.4): exclusive T(thread) refuses while a fenced
         # run or tail writer is live on ANY worker; the ledger gate refuses on
         # an in_progress row (cancel the run first). The delete statement runs
@@ -377,6 +496,8 @@ async def delete_thread_endpoint(thread_id: str, x_user_id: CurrentUserId):
             workspace_id=(
                 str(thread_row["workspace_id"]) if thread_row else None
             ),
+            shared_org=access.org_id,
+            private_to=private_to,
         )
 
         logger.info(f"Successfully deleted thread thread_id={thread_id}")
@@ -420,7 +541,7 @@ def _thread_list_item(row: dict) -> WorkspaceThreadListItem:
 
 @router.patch("/{thread_id}", response_model=WorkspaceThreadListItem)
 async def update_thread_endpoint(
-    thread_id: str, request: ThreadUpdateRequest, x_user_id: CurrentUserId
+    thread_id: str, request: ThreadUpdateRequest, x_user_id: WorkspaceWriteUserId
 ):
     """Update user-editable thread fields: title, pin, archive, model,
     subagent switch, effort, fast mode.
@@ -429,15 +550,31 @@ async def update_thread_endpoint(
     (``model_fields_set``) — a pin toggle can't clear the title.
     """
     try:
-        await auth_api.require_thread_owner(thread_id, x_user_id)
+        access = await thread_access(thread_id, x_user_id)
         provided = request.model_fields_set
+        if access.is_shared and provided - {"title", "is_pinned", "archived"}:
+            # A shared thread's model and tuning would be set for every
+            # member's next turn; each member names those on their own send.
+            raise HTTPException(
+                status_code=403,
+                detail={
+                    "type": "shared_thread_setting",
+                    "message": "In a shared workspace a thread's model and "
+                    "settings are chosen with each message.",
+                },
+            )
         updates: dict = {}
         if "title" in provided:
             # An explicit null clears the title (list rows fall back to the
             # first-query preview) — only absence from the body skips it.
             updates["title"] = request.title
+        member_pin: Optional[bool] = None
         if "is_pinned" in provided and request.is_pinned is not None:
-            updates["is_pinned"] = request.is_pinned
+            if access.is_shared:
+                # Each member pins a shared thread for themselves.
+                member_pin = request.is_pinned
+            else:
+                updates["is_pinned"] = request.is_pinned
         if "archived" in provided and request.archived is not None:
             updates["archived"] = request.archived
         switched_from: str | None = None
@@ -463,11 +600,15 @@ async def update_thread_endpoint(
             updates["reasoning_effort"] = request.reasoning_effort
         if "fast_mode" in provided:
             updates["fast_mode"] = request.fast_mode
-        if not updates:
+        if not updates and member_pin is None:
             raise HTTPException(
                 status_code=400, detail="No updatable fields provided"
             )
-        updated_thread = await update_thread_fields(thread_id, **updates)
+        if member_pin is not None:
+            await set_member_pin(thread_id, x_user_id, member_pin)
+        updated_thread = await update_thread_fields(thread_id, **updates) if updates else None
+        if access.is_shared and (updated_thread or not updates):
+            updated_thread = await get_thread_for_viewer(thread_id, x_user_id)
         if not updated_thread:
             raise HTTPException(
                 status_code=404, detail=f"Thread not found: {thread_id}"
@@ -479,8 +620,10 @@ async def update_thread_endpoint(
                 workspace_id=str(updated_thread["workspace_id"]),
                 title=updated_thread.get("title") or "",
                 updated_at=updated_thread.get("updated_at"),
+                shared_org=access.org_id,
             )
-        if "is_pinned" in updates:
+        if "is_pinned" in updates or member_pin is not None:
+            # A pin is its setter's alone, a member's too: their other tabs.
             await publish_thread_pinned(
                 user_id=x_user_id,
                 thread_id=thread_id,
@@ -515,6 +658,7 @@ async def update_thread_endpoint(
                 user_id=x_user_id,
                 thread_id=thread_id,
                 workspace_id=str(updated_thread["workspace_id"]),
+                shared_org=access.org_id,
             )
             if updates["archived"]:
                 # Archiving ends the thread's scratchpad.
@@ -525,11 +669,27 @@ async def update_thread_endpoint(
                 await request_running_stops(thread_id=thread_id, by="archive")
         item = _thread_list_item(updated_thread)
         if "llm_model" in updates and updates["llm_model"] != switched_from:
+            from src.server.handlers.handoff_brief import brief_on_switch
             from src.server.handlers.thread_maintenance import hand_off_on_switch
+            from src.server.services.llm.thread_model import next_turn_runs_claude_code
 
-            item.summary_handoff = await hand_off_on_switch(
-                thread_id, x_user_id, switched_from
-            )
+            # Claude Code reads none of the thread's messages, so a brief of
+            # all of them takes the place of any summary written out for it.
+            # The switch is committed: a failed read leaves the hand-off to
+            # the next turn rather than report the PATCH failed.
+            try:
+                to_claude_code = await next_turn_runs_claude_code(
+                    x_user_id, str(updated_thread["workspace_id"]), updates["llm_model"]
+                )
+            except Exception:
+                logger.warning(f"[handoff] thread {thread_id}: switch routing not read", exc_info=True)
+                return item
+            if to_claude_code:
+                item.brief_handoff = await brief_on_switch(thread_id, x_user_id, updates["llm_model"])
+            else:
+                item.summary_handoff = await hand_off_on_switch(
+                    thread_id, x_user_id, switched_from
+                )
         return item
 
     except HTTPException:

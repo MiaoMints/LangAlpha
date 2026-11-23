@@ -48,15 +48,21 @@ export const mocks = {
 export const CHART: ReadyAttachment = {
   file: new File(['abcd'], 'chart.png', { type: 'image/png' }),
   type: 'image/png',
-  dataUrl: 'data:image/png;base64,AAAA',
-  preview: null,
+  attachmentId: 'att-chart',
 };
 
 /** What the composer sends beside the text, and the files handed back to it. */
-export const composerSend: { attachments: ReadyAttachment[]; options: ModelOptions; givenBack: ReadyAttachment[] } = {
+export const composerSend: {
+  attachments: ReadyAttachment[];
+  options: ModelOptions;
+  givenBack: ReadyAttachment[];
+  /** Files still uploading, or failed, hold the send. */
+  holding: boolean;
+} = {
   attachments: [],
   options: { model: null, reasoningEffort: null, fastMode: false },
   givenBack: [],
+  holding: false,
 };
 
 export const mutateAsync = vi.fn(async (_patch: unknown) => ({}));
@@ -87,6 +93,7 @@ export function resetWelcomeMocks() {
   composerSend.attachments = [];
   composerSend.options = { model: null, reasoningEffort: null, fastMode: false };
   composerSend.givenBack = [];
+  composerSend.holding = false;
   warmWorkspace.mockClear();
   toast.mockClear();
   localStorage.clear();
@@ -105,15 +112,15 @@ export async function framerMock(importOriginal: () => Promise<typeof import('@/
  *  it can be handed back. */
 export function composerMock() {
   const StubComposer = forwardRef<
-    Pick<ChatInputHandle, 'giveBack' | 'setValue' | 'send' | 'getModelOptions'>,
-    Pick<ChatInputProps, 'onSend' | 'disabled' | 'placeholder'>
-  >(function StubComposer({ onSend, disabled, placeholder }, ref) {
+    Pick<ChatInputHandle, 'giveBack' | 'setValue' | 'send' | 'holdsSend' | 'focus' | 'getModelOptions'>,
+    Pick<ChatInputProps, 'onSend' | 'disabled' | 'placeholder' | 'inHome'>
+  >(function StubComposer({ onSend, disabled, placeholder, inHome }, ref) {
     const [value, setValue] = useState('');
     // As the real one does, the box empties on a send, and sends nothing
-    // while it is shut or holds nothing.
+    // while it is shut, holds nothing, or its files hold it.
     const send = () => {
-      if (disabled || (!value.trim() && composerSend.attachments.length === 0)) return false;
-      onSend(value, composerSend.attachments, [], composerSend.options);
+      if (disabled || composerSend.holding || (!value.trim() && composerSend.attachments.length === 0)) return false;
+      onSend({ text: value, files: composerSend.attachments, mentions: [], commands: [], message: value, modelOptions: composerSend.options });
       setValue('');
       return true;
     };
@@ -124,12 +131,15 @@ export function composerMock() {
         composerSend.givenBack.push(...files);
       },
       send,
+      holdsSend: () => composerSend.holding,
+      focus: () => {},
       getModelOptions: () => composerSend.options,
     }));
     return (
       <div>
         <textarea
           data-testid="composer"
+          data-in-home={inHome ? '' : undefined}
           aria-label="Message"
           value={value}
           disabled={disabled}
@@ -175,7 +185,7 @@ export const screenshotDropMock = () => ({
   ScreenshotDrop: ({ onChange }: { onChange: (shots: unknown[]) => void }) => (
     <button
       type="button"
-      onClick={() => onChange([{ id: 's1', name: 'positions.png', dataUrl: 'data:image/jpeg;base64,AAAA', bytes: 4 }])}
+      onClick={() => onChange([{ id: 's1', file: new File(['abc'], 'positions.png', { type: 'image/jpeg' }), attachmentId: 'att-s1' }])}
     >
       stand-in add screenshot
     </button>
@@ -310,12 +320,13 @@ export function flowRenderer(Flow: Flow) {
 
 /** Mounts the route at `url`, with the preferences cache filled when given. */
 export function routeRenderer(Welcome: ComponentType) {
-  return function renderRoute(url: string, { cached }: { cached?: unknown } = {}) {
+  return function renderRoute(url: string, { cached, state }: { cached?: unknown; state?: unknown } = {}) {
+    const [pathname, search = ''] = url.split('?');
     const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
     if (cached !== undefined) client.setQueryData(queryKeys.user.preferences(), cached);
     render(
       <QueryClientProvider client={client}>
-        <MemoryRouter initialEntries={[url]}>
+        <MemoryRouter initialEntries={[{ pathname, search: search && `?${search}`, state }]}>
           <Routes>
             <Route path="/welcome" element={<Welcome />} />
             <Route path="*" element={null} />

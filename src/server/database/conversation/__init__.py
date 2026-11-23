@@ -33,13 +33,12 @@ from src.server.database.conversation.threads_read import (
     ThreadPrefixes,
     fenced_workspace_thread_prefixes,
     get_workspace_thread_prefixes,
-    _like_escape,
     lookup_thread_by_external_id,
 )
 from src.server.database.conversation.threads_write import (
-    calculate_next_thread_index,
     create_thread,
     delete_thread,
+    delete_unused_thread,
     ensure_thread_exists,
     _EXISTS_TTL,
     stamp_thread_seen,
@@ -57,6 +56,7 @@ from src.server.database.conversation.queries import (
     create_query,
     get_latest_turn_index,
     get_queries_for_thread,
+    recent_turn_models,
 )
 from src.server.database.conversation.responses import (
     get_recent_responses_for_thread,
@@ -78,12 +78,12 @@ from src.server.database.conversation.replay_rows import (
 # Legacy façade: symbols extracted into submodules stay importable from the
 # package root. New code should import the owning submodule directly.
 __all__ = [
-    "calculate_next_thread_index",
     "create_query",
     "create_thread",
     "create_usage_record",
     "delete_feedback",
     "delete_thread",
+    "delete_unused_thread",
     "ensure_thread_exists",
     "_EXISTS_TTL",
     "EXTERNAL_ID_CONFLICT_ERROR_TYPE",
@@ -94,6 +94,7 @@ __all__ = [
     "get_feedback_for_thread",
     "get_latest_turn_index",
     "get_queries_for_thread",
+    "recent_turn_models",
     "get_recent_responses_for_thread",
     "get_replay_responses",
     "get_replay_thread_data",
@@ -110,7 +111,6 @@ __all__ = [
     "fenced_workspace_thread_prefixes",
     "get_workspace_thread_prefixes",
     "get_thread_lifecycle_rows",
-    "_like_escape",
     "lookup_thread_by_external_id",
     "QueryConflictError",
     "_SETTLED_ATTEMPTS",

@@ -9,8 +9,8 @@ import time
 from typing import Any, Dict, List, Literal, Optional, Tuple, Union
 
 import httpx
-from langchain_core.tools import tool
 
+from src.tools.turn_tool import turn_tool
 from src.tools.utils.validation_utils import validate_iso_8601
 from src.tools.web.providers._shared import (
     SNIPPET_MAX,
@@ -53,7 +53,10 @@ _CONTENTS_ERROR_TAGS = {
     "CRAWL_NOT_FOUND": WebErrorType.NOT_FOUND,
     "CRAWL_TIMEOUT": WebErrorType.TIMEOUT,
     "CRAWL_LIVECRAWL_TIMEOUT": WebErrorType.TIMEOUT,
-    "SOURCE_NOT_AVAILABLE": WebErrorType.FORBIDDEN,
+    # Exa reports a target's own 403 as CRAWL_HTTP_403; this tag is Exa unable
+    # or unwilling to reach the source at all (reddit, facebook), which the
+    # in-house crawler often still can.
+    "SOURCE_NOT_AVAILABLE": WebErrorType.REFUSED,
     "CRAWL_UNKNOWN_ERROR": WebErrorType.PROVIDER_ERROR,
 }
 
@@ -324,6 +327,7 @@ class ExaFetchAdapter:
                         type=etype,
                         message=f"Exa contents error: {tag or 'unknown'}",
                         http_status=(status.get("error") or {}).get("httpStatusCode"),
+                        native_kind=tag.lower() or None,
                     ),
                 )
 
@@ -345,7 +349,7 @@ def build_web_search_tool(
     """
     _get_api_wrapper = lazy(ExaAPI)
 
-    @tool(response_format="content_and_artifact")
+    @turn_tool(response_format="content_and_artifact")
     async def web_search(
         query: str,
         category: Optional[

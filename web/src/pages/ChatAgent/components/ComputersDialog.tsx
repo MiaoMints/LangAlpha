@@ -12,9 +12,9 @@
  * card's Details takes the rail's place with the rest of that machine.
  *
  * The dialogs it opens (New computer, Change spec, Make primary, Remove,
- * Reinstall, Reconnect) take its place rather than piling on top: while one
- * is open this panel steps back, and the page stays dimmed exactly as much as
- * with this panel alone.
+ * Reinstall, Reconnect, a Claude Code token's) take its place rather than
+ * piling on top: while one is open this panel steps back, and the page stays
+ * dimmed exactly as much as with this panel alone.
  */
 import { Suspense, useEffect, useId, useRef, useState } from 'react';
 import { useNavigate } from 'react-router';
@@ -25,16 +25,28 @@ import { SwapCell } from '@/components/ui/crossfade';
 import { ModalShell } from '@/components/ui/ModalShell';
 import { Loader } from '@/components/ui/loader';
 import { useHomeWorkspaceId } from '@/hooks/useHomeWorkspace';
+import { CLAUDE_CODE_CONNECTION } from '@/lib/claudeCode';
 import { lazyWithMotion } from '@/lib/lazyWithMotion';
 import { DURATION } from '@/lib/motion';
 import type { Computer, ComputerCreate, ComputerReinstall } from '@/types/api';
+import type { HomePlacement } from '../utils/api';
 
 import { useComputerProviders, useComputers } from '../hooks/useComputers';
+import { useHomePlacement } from '../hooks/useHomePlacement';
 import { useReleaseRefusedRemoteControl, useThisMac, useThisMacAvailability } from '../hooks/useRemoteControl';
-import { openComputerSpec, type ComputersPanelView } from '../hooks/computerPanelStore';
-import { deletedBeforeRefusal, useComputerActions, type ReconnectComputerVariables } from '../hooks/useComputerActions';
+import { openComputerSpec, type ComputersPanelView, type ComputersReturn } from '../hooks/computerPanelStore';
+import {
+  deletedBeforeRefusal,
+  primaryName,
+  removalEndedMessage,
+  removeRefusalMessage,
+  useComputerActions,
+  type ReconnectComputerVariables,
+  type RemoveComputerVariables,
+} from '../hooks/useComputerActions';
 import { useTierQuota } from '../hooks/useTierQuota';
-import { isMoveActive, useWorkspaceMove } from '../hooks/useWorkspaceMove';
+import { isMoveActive, useShowMove, useWorkspaceMove } from '../hooks/useWorkspaceMove';
+import { createRefusalMessage } from './addComputer';
 import ComputerCard from './ComputerCard';
 import ComputerDetails from './ComputerDetails';
 import { ComputerRail, type RailStart } from './computerRail';
@@ -43,21 +55,26 @@ import './computerCards.css';
 import FilesBackupOffDialog from './FilesBackupOffDialog';
 import RemoveComputerDialog from './RemoveComputerDialog';
 import ReinstallDialog from './ReinstallDialog';
-import MakePrimaryDialog from './MakePrimaryDialog';
+import MakePrimaryDialog, { type MakePrimaryChoice } from './MakePrimaryDialog';
+import { ClaudeCodeTokenModal, RemoveClaudeCodeTokenDialog } from '@/components/modelAccess/ClaudeCodeToken';
+import { computerTokenTarget, type SheetAction } from '@/components/modelAccess/tokenTarget';
 import { PlanUpgradeHint } from './planUpgradeHint';
 import {
-  computerCapReached,
   isProviderLocked,
+  newComputerNote,
   providerHoldsOurKey,
+  providerIsOwnMachine,
   providerKeepsFilesOnRemove,
   rowsShowProvider,
   THIS_MAC_OPTION,
 } from './providerUi';
+import { useProviderGate } from '../hooks/useProviderGate';
 import { apiErrorObject, apiErrorReason, apiErrorStatus } from '../utils/api';
 import { denialMessage } from '../utils/denialMessage';
-import { entitlementErrorMessage } from '../utils/entitlementErrors';
-import { folderMarkedOwner, sshLimitMessage } from '../utils/sshLimit';
+import { folderMarkedOwner } from '../utils/sshLimit';
 import { computerNameTakenMessage } from '../utils/computerName';
+import { liveComputers, tunnelDown } from '../utils/computerStatus';
+import { pairedElsewhere } from './startFailure';
 
 type Translate = ReturnType<typeof useTranslation>['t'];
 
@@ -78,6 +95,8 @@ interface ComputersDialogProps {
   covered?: boolean;
   /** The workspace the page behind is showing, left for the gallery if a removal deletes it. */
   currentWorkspaceId?: string | null;
+  /** Opened over a sheet that steps back for it, which already dims the page. */
+  stacked?: boolean;
 }
 
 /**
@@ -95,6 +114,9 @@ function ComputersDialog({ panel, opening = 0, ...rest }: ComputersDialogProps) 
  */
 type CreateForm = 'closed' | 'fromRail' | 'awaitingRoom' | 'destination';
 
+/** A machine's Claude Code token dialog: the sheet, for what it does, or the removal. */
+type ClaudeCodeDialog = { computerId: string; action: SheetAction | 'remove' };
+
 /** True while `mutation` is running for the machine `computerId`. */
 function pendingFor(mutation: { isPending: boolean; variables?: { computerId: string } }, computerId: string): boolean {
   return mutation.isPending && mutation.variables?.computerId === computerId;
@@ -105,12 +127,17 @@ function ComputersPanel({
   onClose,
   covered = false,
   currentWorkspaceId = null,
+  stacked = false,
 }: Omit<ComputersDialogProps, 'panel' | 'opening'> & { opened: ComputersPanelView }) {
   const { t } = useTranslation();
   const navigate = useNavigate();
   const titleId = useId();
   const capNoteId = useId();
   const [createForm, setCreateForm] = useState<CreateForm>(opened.view === 'create' ? 'awaitingRoom' : 'closed');
+  // Opened from a place that lists the machines (Settings, Claude Code's
+  // view), which stands in for the rail: the rail never shows, and leaving the
+  // details or the form closes the panel onto that place.
+  const returnTo = opened.returnTo ?? null;
   // The machine whose details have taken the rail's place.
   const [detailId, setDetailId] = useState<string | null>(opened.view === 'details' ? opened.computerId : null);
   // The details take the rail's height, so the dialog keeps its size both ways.
@@ -132,20 +159,48 @@ function ComputersPanel({
   const [backupOffTargetId, setBackupOffTargetId] = useState<string | null>(null);
   const [reinstallTargetId, setReinstallTargetId] = useState<string | null>(null);
   const [reconnectTargetId, setReconnectTargetId] = useState<string | null>(null);
+  const [reconnectAfterStopId, setReconnectAfterStopId] = useState<string | null>(null);
+  // The machine whose Claude Code token a sheet adds or replaces, or a
+  // confirmation removes.
+  const [claudeCodeDialog, setClaudeCodeDialog] = useState<ClaudeCodeDialog | null>(null);
   // The source the Add dialog opens on when a reconnect sends the user there.
   const [createPick, setCreatePick] = useState<string | null>(null);
 
-  const { data, isLoading } = useComputers();
+  const { data, isLoading, refetch: refetchComputers } = useComputers();
   const computers = data?.computers ?? [];
   // Read off the live list, so a row that leaves it (removed elsewhere, or by
   // this dialog) closes its confirmation rather than leaving a stale copy.
   const find = (id: string | null) => (id ? computers.find((c) => c.computer_id === id) ?? null : null);
   const detail = find(detailId);
+  // The machine whose details a list page opened is not on the list. The page
+  // can be ahead of it (Claude Code's view polls its own rows), so the list is
+  // read once more; still missing (removed here or elsewhere), there is no
+  // rail to fall back to, so the panel goes.
+  const detailMissing = !!returnTo && detailId !== null && !detail && !isLoading;
+  useEffect(() => {
+    if (!detailMissing) return;
+    let current = true;
+    void refetchComputers().then((result) => {
+      if (current && !result.data?.computers.some((c) => c.computer_id === detailId)) onClose();
+    });
+    return () => {
+      current = false;
+    };
+  }, [detailMissing, detailId, refetchComputers, onClose]);
   const removeTarget = find(removeTargetId);
   const primaryTarget = find(primaryTargetId);
   const backupOffTarget = find(backupOffTargetId);
   const reinstallTarget = find(reinstallTargetId);
   const reconnectTarget = find(reconnectTargetId);
+  // A stop another caller already holds answers stopping. Reconnect opens
+  // once the row reads stopped, and gives up on any other status.
+  const stoppingForReconnect = find(reconnectAfterStopId);
+  if (reconnectAfterStopId && stoppingForReconnect?.status !== 'stopping') {
+    if (stoppingForReconnect?.status === 'stopped') setReconnectTargetId(reconnectAfterStopId);
+    setReconnectAfterStopId(null);
+  }
+  const claudeCodeComputer = find(claudeCodeDialog?.computerId ?? null);
+  const claudeCodeTarget = claudeCodeComputer && computerTokenTarget(claudeCodeComputer);
   const { data: providerData, isLoading: providersLoading } = useComputerProviders({ enabled: true });
   const showProvider = rowsShowProvider(providerData?.providers, computers);
   const { data: quota, isLoading: quotaLoading } = useTierQuota({ enabled: true });
@@ -153,8 +208,8 @@ function ComputersPanel({
   // added. With none of those open there is nothing for the form to offer,
   // so the button holds and says why rather than opening onto a dead end.
   // Waits for the providers: until then which ones are open is unknown.
-  const atCap = computerCapReached(quota);
-  const createHeld = atCap && !!providerData && !providerData.providers.some((p) => !isProviderLocked(p, true));
+  const gate = useProviderGate(quota);
+  const createHeld = gate.atCap && !!providerData && !providerData.providers.some((p) => !isProviderLocked(p, gate));
   // The form lays its cards out by the providers, the plan and whether this
   // Mac is one, so it opens once all three are known: opened before the
   // desktop app answers, it would enter on three cards and reflow to four.
@@ -164,8 +219,7 @@ function ComputersPanel({
   // imports it again, as the next opening does.
   const [formLoaded, setFormLoaded] = useState(false);
   useEffect(() => {
-    const done = () => setFormLoaded(true);
-    void CreateComputerDialog.preload().then(done, done);
+    void CreateComputerDialog.preload().then(() => setFormLoaded(true));
   }, []);
   const createReady = formLoaded && !providersLoading && !quotaLoading && thisMacKnown;
   // Either way in, the form waits until it can show and is known not to be
@@ -177,8 +231,17 @@ function ComputersPanel({
   }
   const createOpen = (createForm === 'fromRail' && createReady) || createForm === 'destination';
 
-  const { power, renameComputerTo, turnOffAlwaysOn, setFilesBackup, create, remove, makePrimary, reinstall, reconnect } =
-    useComputerActions();
+  const {
+    power,
+    renameComputerTo,
+    turnOffAlwaysOn,
+    setFilesBackup,
+    create,
+    remove,
+    makePrimary,
+    reinstall,
+    reconnect,
+  } = useComputerActions();
   // In the desktop app, the row whose host key is this Mac's helper is this Mac.
   const thisMac = useThisMac({ enabled: true });
   useReleaseRefusedRemoteControl(thisMac.status);
@@ -187,14 +250,37 @@ function ComputersPanel({
   const homeId = useHomeWorkspaceId() ?? makePrimary.data?.move?.workspace_id;
   const { data: homeMove } = useWorkspaceMove(homeId, { enabled: true });
   const homeMoving = isMoveActive(homeMove) ? homeMove : null;
+  // Where Home stands, for what making a computer primary does to it.
+  const { data: placement } = useHomePlacement();
   // A refused start relays the quota service's own sentence (denialMessage).
   const error = power.error ? denialMessage(power.error, t) : null;
   // A taken name is said under the name field; anything else under the form.
   const createNameError = create.error ? computerNameTakenMessage(create.error, t) : null;
   const createError = create.error && !createNameError
-    ? (sshLimitMessage(create.error, t) ?? entitlementErrorMessage(create.error, t, create.variables?.resource_tier))
+    ? createRefusalMessage(create.error, t, create.variables?.resource_tier)
     : null;
-  const removeError = remove.error ? removeErrorMessage(remove.error, t) : null;
+  // A removal of the primary waits on Home's move off it, which the server
+  // keeps on the row: one this panel sent, or one still waiting from before
+  // it opened. How one ended is told while that move is Home's latest.
+  const removal = removeTarget?.removal && removeTarget.removal.move_id === homeMove?.move_id ? removeTarget.removal : null;
+  const followingHome = remove.isPending && !!remove.variables?.homeTo;
+  const homeLeaving = followingHome || (removal?.state === 'waiting_for_home' && !!homeMoving);
+  useShowMove(followingHome ? homeId : null);
+  const removeError = remove.error
+    ? removeErrorMessage(remove.error, t, placement)
+    : removal && removeTarget ? removalEndedMessage(removal, { name: removeTarget.name, home: primaryName(computers) }, t) : null;
+  const removeOnlyComputer = apiErrorStatus(remove.error) === 409 && apiErrorObject(remove.error)?.code === 'only_computer';
+  // A primary the user brought takes Home with it: these are where Home can
+  // go instead. The rest of a hosted primary's removal is never offered.
+  const homeTargets = removeTarget?.is_primary && providerIsOwnMachine(removeTarget.kind)
+    ? liveComputers(computers).filter((c) => c.computer_id !== removeTarget.computer_id)
+    : null;
+  // A machine that can't be reached can't hand its files over, so Home comes
+  // from its last backup. Home's placement says so as of its last read; the
+  // row's tunnel flag is only as fresh as the list.
+  const homeFromBackup = !!removeTarget && (
+    placement?.computer_id === removeTarget.computer_id ? placement.unreachable : tunnelDown(removeTarget)
+  );
 
   const actionsFor = (computer: Computer): MachineActions => {
     const computerId = computer.computer_id;
@@ -224,7 +310,20 @@ function ComputersPanel({
       },
       reconnect: () => {
         reconnect.reset();
-        setReconnectTargetId(computerId);
+        // A computer whose machine paired with another account runs on
+        // nothing. The reconnect takes only a stopped one, so the dialog
+        // opens once it stopped, and a stop that failed says so here.
+        if (computer.status !== 'running' || !pairedElsewhere(computer)) {
+          setReconnectTargetId(computerId);
+          return;
+        }
+        power.mutate(
+          { computerId, action: 'stop' },
+          {
+            onSuccess: (res) =>
+              res.status === 'stopped' ? setReconnectTargetId(computerId) : setReconnectAfterStopId(computerId),
+          },
+        );
       },
       movingHome: homeMoving?.target_computer_id === computerId,
       // One move at a time per user, and Home's is the one this button starts.
@@ -233,6 +332,8 @@ function ComputersPanel({
         makePrimary.reset();
         setPrimaryTargetId(computerId);
       },
+      claudeCodeToken: (action) => setClaudeCodeDialog({ computerId, action }),
+      removeClaudeCodeToken: () => setClaudeCodeDialog({ computerId, action: 'remove' }),
     };
   };
 
@@ -252,38 +353,46 @@ function ComputersPanel({
   const submitCreate = (body: ComputerCreate) => {
     create.mutate(body, {
       onSuccess: (row) => {
+        // The place it returns to shows the new machine, preparing, as its own row.
+        if (returnTo) {
+          onClose();
+          return;
+        }
         setCreateForm('closed');
         setArrivingId(row.computer_id);
       },
     });
   };
 
-  const confirmRemove = (removeKey: boolean, workspaceIds: string[], deleteFiles: boolean) => {
+  // On a primary, `homeTo` names where Home goes first; the server removes
+  // the computer once Home is there, and the removal follows that here.
+  const confirmRemove = (removeKey: boolean, workspaceIds: string[], deleteFiles: boolean, homeTo: string | null) => {
     if (!removeTarget || remove.isPending) return;
+    const vars: RemoveComputerVariables = {
+      computerId: removeTarget.computer_id,
+      name: removeTarget.name,
+      removeKey,
+      workspaceIds,
+      deleteFiles,
+      folder: removeTarget.root_dir,
+      fingerprint: removeTarget.ssh?.fingerprint,
+      homeTo: homeTo ?? undefined,
+    };
     // Out of its details as it goes, the rail comes back with the card after
     // it in the middle.
     const index = computers.indexOf(removeTarget);
     setRailStart((last) => ({ id: null, index, focus: true, visit: last.visit + 1 }));
-    remove.mutate(
-      {
-        computerId: removeTarget.computer_id,
-        name: removeTarget.name,
-        removeKey,
-        workspaceIds,
-        deleteFiles,
-        folder: removeTarget.root_dir,
-        fingerprint: removeTarget.ssh?.fingerprint,
+    remove.mutate(vars, {
+      onSuccess: ({ workspaces_deleted: deleted, kept }) => {
+        // Kept, the row's removal says why, here.
+        if (kept) return;
+        setRemoveTargetId(null);
+        if (currentWorkspaceId && deleted.includes(currentWorkspaceId)) navigate('/chat');
       },
-      {
-        onSuccess: ({ workspaces_deleted: deleted }) => {
-          setRemoveTargetId(null);
-          if (currentWorkspaceId && deleted.includes(currentWorkspaceId)) navigate('/chat');
-        },
-        onError: (err) => {
-          if (currentWorkspaceId && deletedBeforeRefusal(err).includes(currentWorkspaceId)) navigate('/chat');
-        },
+      onError: (err) => {
+        if (currentWorkspaceId && deletedBeforeRefusal(err).includes(currentWorkspaceId)) navigate('/chat');
       },
-    );
+    });
   };
 
   // Each closes once its request is accepted: the row then says 'starting',
@@ -315,12 +424,11 @@ function ComputersPanel({
     setBackupOffTargetId(null);
   };
 
-  const confirmMakePrimary = () => {
+  // Backup goes on first where it was off, in the same request.
+  const confirmMakePrimary = ({ turnOnBackup, fromBackup }: MakePrimaryChoice) => {
     if (!primaryTarget || makePrimary.isPending) return;
-    makePrimary.mutate(
-      { computerId: primaryTarget.computer_id, name: primaryTarget.name },
-      { onSuccess: () => setPrimaryTargetId(null) },
-    );
+    const { computer_id: computerId, name } = primaryTarget;
+    makePrimary.mutate({ computerId, name, fromBackup, turnOnBackup }, { onSuccess: () => setPrimaryTargetId(null) });
   };
 
   return (
@@ -332,6 +440,7 @@ function ComputersPanel({
         onClose={onClose}
         width="wide"
         density="form"
+        stacked={stacked}
         covered={
           covered ||
           createForm !== 'closed' ||
@@ -339,7 +448,8 @@ function ComputersPanel({
           !!primaryTarget ||
           !!backupOffTarget ||
           !!reinstallTarget ||
-          !!reconnectTarget
+          !!reconnectTarget ||
+          !!claudeCodeComputer
         }
       >
         {isLoading ? (
@@ -355,12 +465,13 @@ function ComputersPanel({
                 index={computers.indexOf(detail) + 1}
                 total={computers.length}
                 height={viewHeight}
-                onBack={() => setDetailId(null)}
+                onBack={returnTo ? onClose : () => setDetailId(null)}
+                backLabel={returnTo ? returnLabel(t, returnTo) : undefined}
                 thisMac={thisMac.of(detail)}
                 showProvider={showProvider}
                 actions={actionsFor(detail)}
               />
-            ) : (
+            ) : returnTo ? null : (
               <div ref={railViewRef}>
                 <ComputerRail
                   computers={computers}
@@ -377,7 +488,7 @@ function ComputersPanel({
                     />
                   )}
                   onCreate={openCreate}
-                  ownMachines={!!providerData?.providers.some((p) => p.kind === 'ssh')}
+                  newNote={newComputerNote(t, providerData?.providers)}
                   held={createHeld}
                   heldNoteId={capNoteId}
                 />
@@ -441,10 +552,23 @@ function ComputersPanel({
             // A helper keeps our key in its own folder, never in authorized_keys.
             holdsOurKey={providerHoldsOurKey(removeTarget.kind) && !removeTarget.ssh?.helper}
             turnsOffRemoteControl={thisMac.of(removeTarget) !== null}
-            onClose={() => { if (!remove.isPending) setRemoveTargetId(null); }}
+            homeTargets={homeTargets}
+            homeFromBackup={homeFromBackup}
+            homeFilesLeft={
+              placement?.left_on_stand_in?.computer_id === removeTarget.computer_id
+                ? { ...placement.left_on_stand_in, homeComputer: placement.computer_name }
+                : null
+            }
+            movingHome={homeLeaving}
+            onAddComputer={() => {
+              setRemoveTargetId(null);
+              openCreate();
+            }}
+            onClose={() => { if (!remove.isPending && !homeLeaving) setRemoveTargetId(null); }}
             onConfirm={confirmRemove}
-            busy={remove.isPending}
+            busy={remove.isPending || homeLeaving}
             error={removeError}
+            onlyComputer={removeOnlyComputer}
           />
         )}
       </AnimatePresence>
@@ -489,10 +613,17 @@ function ComputersPanel({
         )}
       </AnimatePresence>
       <AnimatePresence propagate>
+        {claudeCodeTarget && claudeCodeDialog && (claudeCodeDialog.action === 'remove' ? (
+          <RemoveClaudeCodeTokenDialog target={claudeCodeTarget} stacked onClose={() => setClaudeCodeDialog(null)} />
+        ) : (
+          <ClaudeCodeTokenModal target={claudeCodeTarget} action={claudeCodeDialog.action} onClose={() => setClaudeCodeDialog(null)} />
+        ))}
+      </AnimatePresence>
+      <AnimatePresence propagate>
         {primaryTarget && (
           <MakePrimaryDialog
-            computerId={primaryTarget.computer_id}
-            name={primaryTarget.name}
+            computer={primaryTarget}
+            placement={placement}
             onClose={() => { if (!makePrimary.isPending) setPrimaryTargetId(null); }}
             onConfirm={confirmMakePrimary}
             busy={makePrimary.isPending}
@@ -504,23 +635,15 @@ function ComputersPanel({
   );
 }
 
-/**
- * A refused remove, in this app's words for the refusals the route names,
- * else the server's own sentence, else a plain line.
- */
-function removeErrorMessage(err: unknown, t: Translate): string {
-  if (apiErrorStatus(err) === 409) {
-    switch (apiErrorObject(err)?.code) {
-      case 'primary':
-        return t('computer.removeRefused.primary', "Your primary computer can't be removed.");
-      case 'has_workspaces':
-        // Only a workspace the confirmation did not name keeps it now.
-        return t('computer.removeRefused.hasWorkspaces', 'A workspace not listed here is on it now. Check the list and try again.');
-      case 'busy':
-        return t('computer.removeRefused.busy', 'This computer is busy. Try again in a moment.');
-    }
-  }
-  return apiErrorReason(err) || t('computer.removeFailed', "Couldn't remove this computer. Try again.");
+/** The way back's name, for the place the panel closes onto. */
+function returnLabel(t: Translate, place: ComputersReturn): string {
+  return place === 'settings' ? t('sidebar.settings', 'Settings') : CLAUDE_CODE_CONNECTION.display_name;
+}
+
+/** A refused remove request: a 409 the route names, in this app's words, else the server's sentence. */
+function removeErrorMessage(err: unknown, t: Translate, placement: HomePlacement | undefined): string {
+  const code = apiErrorStatus(err) === 409 ? apiErrorObject(err)?.code : undefined;
+  return removeRefusalMessage(typeof code === 'string' ? code : undefined, apiErrorReason(err), t, placement?.computer_name);
 }
 
 export default ComputersDialog;

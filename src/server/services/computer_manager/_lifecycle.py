@@ -32,6 +32,7 @@ from src.observability import (
 )
 
 from src.server.database.computer import (
+    fence_running_computer,
     get_computer,
     stamp_running_computer,
     try_bind_computer_provider_ref,
@@ -49,8 +50,11 @@ from src.server.database.workspace import (
     update_workspace_status,
 )
 from src.server.models.computer import CLAIMABLE_FOR_START, ComputerStatus
+from src.server.services.computer_manager._attach_only import attaching_only, refuse_start
 from src.server.services.computer_manager._providers import host_outage_of
+from src.server.services.account import refuse_machine_use
 from src.server.services.computer_manager._types import ComputerBinding
+from src.server.services.computer_usage.events import note_stop_phases
 from src.server.services.computer_start_failure import record_start_failure
 from src.server.services.path_lock_coordination import (
     STOP_HEARTBEAT_UNAVAILABLE_RECOVERY_S,
@@ -152,7 +156,9 @@ class SessionLifecycleMixin:
 
         Observe reconnect state for archived-restore SSE without an extra SDK probe.
         A changed skills_signature bypasses cooldown so warm sandboxes converge;
-        None skips only that comparison, while transitions still sync."""
+        None skips only that comparison, while transitions still sync.
+        ``user_id`` is the caller, which nothing here reads for the machine:
+        it only rides into a retry."""
         _t0 = time.time()
         _session_phases: dict[str, float] = {}
 
@@ -163,6 +169,9 @@ class SessionLifecycleMixin:
             _t0 = now
 
         binding = await self.resolve_binding(workspace_id)
+        # Ahead of the warm path: a session opened before the policy is no
+        # way around it.
+        await refuse_machine_use(binding.kind, binding.user_id)
         computer_id = binding.computer_id
         machine = self._machine(computer_id)
         _was_cached = machine.session is not None
@@ -172,7 +181,10 @@ class SessionLifecycleMixin:
         needs_deferred_sync = False
         pending_start_wait = False
         pending_stop_wait = False
-        workspace_user_id = user_id
+        # Everything the computer is given (vault, connectors, skills) is its
+        # owner's, never the caller's: on a computer more than one person's
+        # turns reach, the caller is only whoever acquired it this time.
+        workspace_user_id = binding.user_id
         # Versions piggyback the slow-path row read; early warm returns leave None.
         ws_mcp_version: int | None = None
         ws_platform_secret_version: int | None = None
@@ -182,6 +194,16 @@ class SessionLifecycleMixin:
         ):
             session = await self._take_valid_cached_session(binding, _mark)
             if session is not None:
+                # A session this worker holds does not change when the machine
+                # goes away, so it passes every check above and each call on it
+                # then fails "not connected", after the turn has paid for its
+                # model calls. A cold acquire dials and gets the gateway's own
+                # answer, which this matches.
+                from src.server.services.ssh_computers import refuse_if_tunnel_down
+
+                await refuse_if_tunnel_down(
+                    binding.computer_id, binding.kind, binding.provider_config
+                )
                 if not session.sandbox.is_ready():
                     if session.sandbox.has_failed():
                         init_err = session.sandbox.init_error
@@ -253,7 +275,6 @@ class SessionLifecycleMixin:
 
             status = workspace["status"]
             sandbox_id_from_db = workspace.get("sandbox_id")
-            workspace_user_id = workspace.get("user_id") or user_id
             ws_mcp_version = (
                 int(workspace.get("mcp_config_version") or 0)
                 if workspace.get("mcp_config_version") is not None
@@ -381,22 +402,38 @@ class SessionLifecycleMixin:
         if _session_phases:
             total = sum(_session_phases.values())
             phases = " ".join(f"{k}={v:.0f}ms" for k, v in _session_phases.items())
-            logger.info(
-                f"[SESSION_TIMING] workspace_id={workspace_id} total={total:.0f}ms ({phases})"
-            )
             if needs_deferred_sync:
                 session_path = "cold_resume"
             elif _was_cached:
                 session_path = "warm_sync"
             else:
                 session_path = "cold_create"
-            safe_add(session_path_counter, 1, {"path": session_path})
-            safe_record(session_acquire_total_ms, total, {"session_path": session_path})
+            # The default log format drops `extra`, so the path, provider and
+            # ids ride in the message for latency analysis.
+            logger.info(
+                f"[SESSION_TIMING] path={session_path} kind={binding.kind} "
+                f"computer={computer_id[:8]} workspace={workspace_id[:8]} "
+                f"total={total:.0f}ms ({phases})"
+            )
+            safe_add(
+                session_path_counter,
+                1,
+                {"path": session_path, "provider": binding.kind},
+            )
+            safe_record(
+                session_acquire_total_ms,
+                total,
+                {"session_path": session_path, "provider": binding.kind},
+            )
             for _phase, _ms in _session_phases.items():
                 safe_record(
                     session_acquire_phase_duration_ms,
                     _ms,
-                    {"phase": _phase, "session_path": session_path},
+                    {
+                        "phase": _phase,
+                        "session_path": session_path,
+                        "provider": binding.kind,
+                    },
                 )
 
         return session
@@ -415,6 +452,7 @@ class SessionLifecycleMixin:
         Runs with no lock held, so the retry is a plain re-entry into
         acquisition instead of the hand-built session the in-lock version had
         to assemble for a corrected row."""
+        refuse_start(binding.computer_id)
         workspace_id = binding.workspace_id
         logger.info(f"Workspace {workspace_id} is stopping, waiting for it to finish")
         settled = False
@@ -613,6 +651,7 @@ class SessionLifecycleMixin:
         attempt: int,
     ) -> Session:
         """Wait outside the machine lock so archived restores cannot block other ops."""
+        refuse_start(binding.computer_id)
         workspace_id = binding.workspace_id
         ws_done = await self._wait_for_start_completion(workspace_id)
         wait_status = ws_done["status"]
@@ -786,17 +825,28 @@ class SessionLifecycleMixin:
                     )
                     mark("mcp_resolve")
 
+                # The signature is stamped by the sync that delivered its
+                # skills, and only one that ran to its end: a failed one
+                # leaves it for the next acquire to try again instead of
+                # trusting the cooldown. The link pass is not asked: a
+                # workspace it cannot finish for would sync on every acquire.
+                skills_changed = (
+                    skills_signature is not None
+                    and session.skills_signature != skills_signature
+                )
                 if needs_deferred_sync:
                     logger.debug(
                         f"Completing deferred sync for lazy-init workspace {workspace_id}"
                     )
-                    await self._sync_restore_and_reconcile(
+                    delivered = await self._sync_restore_and_reconcile(
                         binding,
                         workspace_user_id,
                         session,
                         source="lazy_phase2",
                         mark=mark,
                     )
+                    if delivered and skills_signature is not None:
+                        session.skills_signature = skills_signature
                     # Defer interval writes until ready to avoid racing archived startup.
                     # An auto-stop hiccup must not revert an otherwise healthy start.
                     # Re-read the machine rather than the binding frozen at turn
@@ -817,23 +867,17 @@ class SessionLifecycleMixin:
                         self._queue_reconnect_syncs_soon(
                             computer_id, session.sandbox, opened=workspace_id
                         )
-                elif mcp_changed or (
-                    skills_signature is not None
-                    and session.skills_signature != skills_signature
-                ):
+                elif mcp_changed or skills_changed:
                     # Warm sessions still need changed MCP wrappers or skills uploaded; manifest
                     # diffs bound that work without repeating restore or promotion.
-                    await self._sync_sandbox_assets(
+                    synced = await self._sync_sandbox_assets(
                         binding,
                         workspace_user_id,
                         session.sandbox,
                         reusing_sandbox=True,
                     )
                     mark("mcp_asset_sync")
-                    if (
-                        skills_signature is not None
-                        and session.skills_signature != skills_signature
-                    ):
+                    if skills_changed:
                         # The upload only fills the shared directory; this
                         # workspace reaches a shared skill through a link the
                         # reconciler lays. Without it, a skill added or switched
@@ -845,10 +889,8 @@ class SessionLifecycleMixin:
                             source="warm_skills_changed",
                         )
                         mark("skill_reconcile")
-
-                # Stamp only after successful sync so failures retain the retry signal.
-                if skills_signature is not None:
-                    session.skills_signature = skills_signature
+                        if synced is not None:
+                            session.skills_signature = skills_signature
 
                 # Keep up-to-30s discovery off the turn and lock; completion syncs new wrappers.
                 if resolved_mcp is not None:
@@ -898,7 +940,6 @@ class SessionLifecycleMixin:
                                 computer_id,
                                 claimed_sandbox_id,
                                 failure=recovery_error,
-                                kind=binding.kind,
                             )
                         )
                         try:
@@ -996,7 +1037,7 @@ class SessionLifecycleMixin:
         machine.pending_lazy_sync = False
         workspace_id = binding.workspace_id
         if failure is not None:
-            await record_start_failure(binding.computer_id, failure, kind=binding.kind)
+            await record_start_failure(binding.computer_id, failure)
         try:
             reverted = await update_workspace_status(
                 workspace_id=workspace_id, status="stopped"
@@ -1010,7 +1051,7 @@ class SessionLifecycleMixin:
             return
         if reverted is not None:
             # The sync wrote a token beside it into a sandbox left running.
-            await self._revoke_data_token(binding.computer_id)
+            await self._revoke_computer_tokens(binding.computer_id)
 
     async def _release_lost_lazy_start(
         self,
@@ -1018,7 +1059,6 @@ class SessionLifecycleMixin:
         sandbox_id: str | None,
         *,
         failure: BaseException | None = None,
-        kind: str = "",
     ) -> None:
         """Only while the row is still this start's. A recovery on another
         worker may have bound its own sandbox meanwhile, and that start's
@@ -1026,7 +1066,7 @@ class SessionLifecycleMixin:
         client reading the row on the stopped frame finds the reason; a
         recovery that won clears it as it reaches running."""
         if failure is not None and not isinstance(failure, asyncio.CancelledError):
-            await record_start_failure(computer_id, failure, kind=kind)
+            await record_start_failure(computer_id, failure)
         try:
             released = await update_computer_status(
                 computer_id,
@@ -1044,7 +1084,7 @@ class SessionLifecycleMixin:
             )
             return
         if released is not None:
-            await self._revoke_data_token(computer_id)
+            await self._revoke_computer_tokens(computer_id)
 
     async def _publish_workspace_running_with_current_always_on(
         self,
@@ -1199,7 +1239,8 @@ class SessionLifecycleMixin:
             # ahead. That makes the stamp the fence, so a write that fails
             # fails the attach before anything is built rather than letting it
             # reconnect unfenced.
-            if not await stamp_running_computer(computer_id):
+            stamp = fence_running_computer if attaching_only() else stamp_running_computer
+            if not await stamp(computer_id):
                 raise _MachineLeftRunning(computer_id)
             try:
                 await session.initialize(
@@ -1336,6 +1377,7 @@ class SessionLifecycleMixin:
         from_status: str,
     ) -> Optional[Session]:
         """Revert failed start claims so waiters need not exhaust the 300s timeout."""
+        refuse_start(binding.computer_id)
         workspace_id = binding.workspace_id
         claimed = await self._claim_machine_for_start(binding, from_status=from_status)
         if claimed is None:
@@ -1376,9 +1418,7 @@ class SessionLifecycleMixin:
             # it, and both under one shield, so a cancel cannot skip the revert.
             async def _settle(error: BaseException) -> None:
                 if not isinstance(error, asyncio.CancelledError):
-                    await record_start_failure(
-                        claimed_computer_id, error, kind=binding.kind
-                    )
+                    await record_start_failure(claimed_computer_id, error)
                 await update_workspace_status(
                     workspace_id=workspace_id, status="stopped"
                 )
@@ -1607,6 +1647,10 @@ class SessionLifecycleMixin:
             safe_record(
                 workspace_cold_start_duration_ms,
                 (time.monotonic() - _cold_start_t0) * 1000.0,
+                {
+                    "provider": binding.kind,
+                    "path": "lazy" if lazy_init else "blocking",
+                },
             )
             return session
 
@@ -1623,6 +1667,7 @@ class SessionLifecycleMixin:
         workspace_id: str | None = None,
         unchanged_since: datetime | None = None,
         reason: str | None = None,
+        back_up: bool = True,
     ) -> Dict[str, Any]:
         """Stop the machine, which takes every project on it down with it.
 
@@ -1631,7 +1676,9 @@ class SessionLifecycleMixin:
         only names the project that asked, for the mirror and the logs.
         unchanged_since is the idle sweep's read of the row: a machine opened
         after that read has been stamped, and is no longer the idle one the
-        sweep judged. reason is why, for the usage run the stop ends."""
+        sweep judged. reason is why, for the usage run the stop ends.
+        back_up=False skips the owner's file backup, for a stop that has to
+        finish quickly and leaves the files where they already are."""
         async with self._observed_lock(computer_id, "computer.stop"):
             # Stopping one project removes every sibling's sandbox; gate across
             # the machine.
@@ -1664,6 +1711,7 @@ class SessionLifecycleMixin:
                     binding,
                     workspace_id=workspace_id,
                     durable_sandbox_id=durable_sandbox_id,
+                    back_up=back_up,
                 )
 
     async def _finish_claimed_stop(
@@ -1672,6 +1720,7 @@ class SessionLifecycleMixin:
         *,
         workspace_id: str | None,
         durable_sandbox_id: str | None,
+        back_up: bool = True,
     ) -> Dict[str, Any]:
         computer_id = binding.computer_id
         try:
@@ -1686,7 +1735,8 @@ class SessionLifecycleMixin:
                 return await self._stop_result(computer_id, workspace_id)
 
             # A machine its owner chose not to back up keeps its last backup.
-            if binding.files_backup:
+            backup_ms = None
+            if binding.files_backup and back_up:
                 backup_started = time.monotonic()
                 folder_count = await self._backup_machine_files_to_db(
                     computer_id,
@@ -1694,11 +1744,12 @@ class SessionLifecycleMixin:
                     expected_sandbox_id=durable_sandbox_id,
                     routine=True,
                 )
+                backup_ms = round((time.monotonic() - backup_started) * 1000)
                 logger.info(
-                    "Computer %s stop backup mirrored %d folder(s) in %.0fms",
+                    "Computer %s stop backup mirrored %d folder(s) in %dms",
                     computer_id,
                     int(folder_count or 0),
-                    (time.monotonic() - backup_started) * 1000,
+                    backup_ms,
                 )
 
             # The last chance to read the disk before it is unreachable, so the
@@ -1738,14 +1789,27 @@ class SessionLifecycleMixin:
                 )
                 return await self._stop_result(computer_id, workspace_id)
 
-            if session is not None:
-                await session.stop()
-                self._drop_session(computer_id)
-            elif durable_sandbox_id:
-                await self._detached_sandbox_teardown(
-                    durable_sandbox_id,
-                    delete=False,
-                    binding=binding,
+            provider_started = time.monotonic()
+            try:
+                if session is not None:
+                    try:
+                        await session.stop()
+                    finally:
+                        # Torn down even when the provider refused the stop.
+                        self._drop_session(computer_id)
+                elif durable_sandbox_id:
+                    await self._detached_sandbox_teardown(
+                        durable_sandbox_id,
+                        delete=False,
+                        binding=binding,
+                    )
+            finally:
+                # A refused stop is timed too: the slow and failing stops are
+                # the ones worth measuring.
+                note_stop_phases(
+                    computer_id,
+                    backup_ms=backup_ms,
+                    provider_ms=round((time.monotonic() - provider_started) * 1000),
                 )
 
             machine = self._machine_if_known(computer_id)

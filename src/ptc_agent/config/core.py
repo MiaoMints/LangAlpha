@@ -13,6 +13,7 @@ import logging
 import os
 import re
 from collections.abc import Mapping
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, ClassVar, Literal, Self
 
@@ -171,12 +172,16 @@ class DaytonaConfig(CredentialedSandboxConfig):
     TIER_CEILING: ClassVar[ResourceTier | None] = DAYTONA_TIER_CEILING
 
     base_url: str = "https://app.daytona.io/api"
-    auto_stop_interval: int = 3600  # 1 hour
+    auto_stop_interval: int = 1800  # Daytona stops it; the idle sweep runs 10 min ahead
     auto_archive_interval: int = 604800  # 7 days, keep stopped (fast restart) before cold storage
     auto_delete_interval: int = 7776000  # 90 days, total dormant lifetime
     # How long a computer's starts may be refused by a recovering host before
     # it is rebuilt from its backup instead; the old sandbox is kept. 0 waits.
     host_unavailable_rebuild_after_minutes: int = Field(default=60, ge=0)
+    # How long a create may take before it is given up on. Daytona answers a
+    # create only once the sandbox runs, and a slow one still comes up after
+    # the caller stops waiting, so a short wait turns slowness into a leak.
+    create_timeout_seconds: int = Field(default=180, ge=10)
     python_version: str = "3.12"
 
     # Snapshot configuration for faster sandbox initialization
@@ -225,7 +230,7 @@ class E2BConfig(CredentialedSandboxConfig):
     sandbox_url: str = ""
     # Seconds without activity before a sandbox pauses. E2B keeps a paused
     # sandbox (memory included) indefinitely and bills nothing for it.
-    auto_stop_interval: int = Field(default=3600, ge=60)
+    auto_stop_interval: int = Field(default=1500, ge=60)
     # The plan's longest continuous run (3600 on Hobby, 86400 on Pro). It caps
     # every timeout we ask for.
     max_timeout: int = Field(default=3600, ge=300, le=86400)
@@ -304,6 +309,10 @@ class VaultBlueprint(BaseModel):
         return v
 
 
+#: What a built-in http server authenticates with (see ``MCPServerConfig.auth``).
+ServerAuth = Literal["data_token", "firecrawl_account"]
+
+
 class MCPServerConfig(BaseModel):
     """Configuration for a single MCP server."""
 
@@ -320,34 +329,57 @@ class MCPServerConfig(BaseModel):
     tool_exposure_mode: Literal["summary", "detailed"] | None = None  # Per-server override
     vault_blueprints: list[VaultBlueprint] = Field(default_factory=list)
     # 'builtin' = from agent_config.yaml; 'user' = user-level server inherited
-    # by every workspace of the user unless that workspace switched it off.
-    # User servers are untrusted: vault-only secret resolution, neutral prompt
+    # by every workspace of the user unless that workspace switched it off;
+    # 'org' = a connector the user's organization sets up. User and org
+    # servers are untrusted: vault-only secret resolution, neutral prompt
     # framing, sanitized discovery.
-    source: Literal["builtin", "user"] = "builtin"
+    source: Literal["builtin", "user", "org"] = "builtin"
     discovery_uses_secrets: bool = False  # user servers: resolve vault secrets during discovery (default off = secret-less probe)
     # Set at resolve time when the user has a non-revoked OAuth connection for
     # this server — the server is then bound through the egress relay and its
     # sandbox config carries a grant reference instead of the vendor URL.
     oauth_connection_id: str | None = None
-    # The credential the sandbox client presents to a built-in http server.
-    # ``data_token`` is the computer's own data token, read from the token file
-    # the server keeps current, so the server holds no key of its own. The
-    # client resends such a server's requests on a refused token, a rate limit
-    # or a gateway error, so it must be one whose tools only read.
-    auth: Literal["data_token"] | None = None
+    # An organization connector's id and revision (``source='org'`` only). Its
+    # url is dialled by the relay alone and it carries no headers: the sandbox
+    # entry is relay-bound whatever the connector authenticates with.
+    org_connector_id: str | None = None
+    org_revision: str | None = None
+    # The credential a built-in http server is reached with. ``data_token`` is
+    # the computer's own data token, read from the token file the server keeps
+    # current, so the server holds no key of its own; the client resends such a
+    # server's requests on a refused token, a rate limit or a gateway error, so
+    # it must be one whose tools only read. Any other value names a key the
+    # host holds for the user (``firecrawl_account``: the Firecrawl account
+    # provisioned for them), which the egress relay attaches, so the sandbox
+    # dials the relay and no key reaches it.
+    auth: ServerAuth | None = None
+    # The tools this server exposes, when it lists more than the agent should
+    # see. None exposes every tool the server lists.
+    tools: list[str] | None = None
+
+    @property
+    def relay_bound(self) -> bool:
+        """Whether the sandbox reaches this server only through the egress relay.
+
+        An organization connector is relay-bound whether or not the member
+        holds a connection: its credential is resolved per call host-side.
+        """
+        return (
+            self.oauth_connection_id is not None
+            or self.source == "org"
+            or self.auth not in (None, "data_token")
+        )
 
     @model_validator(mode="after")
     def _auth_is_builtin_http_only(self) -> Self:
-        # The token authorizes the whole computer's data access, so only a
-        # server the operator configured may receive it, and only over the
-        # one transport whose requests the client stamps.
+        # Either credential reaches the vendor on the user's behalf, so only a
+        # server the operator configured may name one, and only over the one
+        # transport whose requests the client stamps and the relay dials.
         if self.auth is None:
             return self
-        if self.source != "builtin":
-            raise ValueError(f"MCP server {self.name!r}: auth is for built-in servers only")
-        if self.transport != "http":
+        if self.source != "builtin" or self.transport != "http" or not self.url:
             raise ValueError(
-                f"MCP server {self.name!r}: auth {self.auth!r} requires transport 'http'"
+                f"MCP server {self.name!r}: auth {self.auth!r} needs a built-in http server with a url"
             )
         return self
 
@@ -496,10 +528,11 @@ class SSHConfig(ResourceTieredConfig):
     # only the server sets, from the probe. Nothing connects by it: it tells
     # the agent a Mac's command line tools are not GNU's.
     os: str = ""
-    # The machine never stops on idle, so the server's idle reaper stops a
-    # quiet one by this interval. Stopping only ends this computer's own
-    # processes there; the machine keeps running.
-    auto_stop_interval: int = Field(default=3600, ge=60)
+    # How long a quiet computer keeps each worker's session for it. The
+    # server never stops the computer for being quiet: the machine is its
+    # owner's, costs the deployment nothing running, and a stop would end the
+    # owner's own work there. Only the server's own state for it goes.
+    auto_stop_interval: int = Field(default=7200, ge=60)
     # The server dials each machine itself, so by default it connects only to
     # public addresses: a user's machine is never a way into the network the
     # server sits on. A deployment whose users' machines are on its own LAN or
@@ -585,6 +618,24 @@ class SSHConfig(ResourceTieredConfig):
         return cls(**(data or {}))
 
 
+class LocalConfig(ResourceTieredConfig):
+    """The machine the server itself runs on, as the desktop app bundles it.
+
+    Only a build that turns it on offers it (``providers.local``). The machine's
+    size is its own, so the kind has one tier and the tier is never shown.
+    """
+
+    # How long a quiet computer keeps each worker's session for it. As on any
+    # machine of its owner's, the server never stops it for being quiet: only
+    # the server's own state for it goes.
+    auto_stop_interval: int = Field(default=3600, ge=60)
+    # The first start installs the Python runtime on the owner's own network.
+    bootstrap_timeout: int = Field(default=1800, ge=60)
+    resource_tiers: dict[str, ResourceTier] = Field(
+        default_factory=_single_tier, validate_default=True
+    )
+
+
 class PlatformSecretDefinition(BaseModel):
     """One backend-owned platform credential, declared in agent_config.yaml.
 
@@ -645,30 +696,42 @@ class PlatformSecretDefinition(BaseModel):
 class SandboxConfig(BaseModel):
     """Provider-agnostic sandbox configuration wrapper."""
 
-    provider: Literal["daytona", "docker", "e2b", "memory"] = "daytona"
+    provider: Literal["daytona", "docker", "e2b", "local", "memory"] = "daytona"
     # Kinds a new computer may be created on besides ``provider``, which stays
     # the default. Only this list offers a kind: holding its credentials does
-    # not, since one environment often carries keys for several providers.
-    # ``ssh`` is only ever offered: a computer on it needs a machine its owner
-    # names, so it cannot be the default.
-    offered_providers: tuple[Literal["daytona", "docker", "e2b", "ssh"], ...] = ()
+    # not, since one environment often carries keys for several providers. A
+    # self-hosted owner who chose where code runs in the app has said which
+    # keys are meant, so there the list also holds what can run now
+    # (``KindsInReach``, applied by ``create_sandbox_config``). ``ssh`` is only
+    # ever offered: a computer on it needs a machine its owner names, so it
+    # cannot be the default.
+    offered_providers: tuple[Literal["daytona", "docker", "e2b", "local", "ssh"], ...] = ()
     daytona: DaytonaConfig = Field(default_factory=DaytonaConfig)
     e2b: E2BConfig = Field(default_factory=E2BConfig)
     docker: DockerConfig = Field(default_factory=DockerConfig)
     ssh: SSHConfig = Field(default_factory=SSHConfig)
+    local: LocalConfig = Field(default_factory=LocalConfig)
     platform_secrets: tuple[PlatformSecretDefinition, ...] = ()
 
     def creatable_providers(self) -> tuple[str, ...]:
         """The kinds a new computer may be created on, the default first.
 
         Deduplicated because ``SANDBOX_PROVIDER`` can move the deployment onto
-        a kind the config also offers.
+        a kind the config also offers. A kind the build does not offer is left
+        out whatever the config says: ``local`` runs agent code as the server's
+        own user, and a build that turned Docker off knows its containers could
+        not reach this server.
         """
-        return tuple(dict.fromkeys((self.provider, *self.offered_providers)))
+        refused = kind_refusals()
+        return tuple(
+            kind
+            for kind in dict.fromkeys((self.provider, *self.offered_providers))
+            if refused.get(kind) != KIND_NOT_OFFERED
+        )
 
     def settings_for(
         self, kind: str
-    ) -> DaytonaConfig | DockerConfig | E2BConfig | SSHConfig:
+    ) -> DaytonaConfig | DockerConfig | E2BConfig | SSHConfig | LocalConfig:
         """The settings computers of ``kind`` are built from.
 
         Each kind's settings sit under a field of the kind's own name, so a
@@ -702,17 +765,118 @@ class SandboxConfig(BaseModel):
         return self
 
 
-def detect_provider_kind(daytona_api_key: str = "") -> str:
+def detect_provider_kind(
+    daytona_api_key: str = "", environ: Mapping[str, str] | None = None
+) -> str:
     """The provider a deployment that names none runs on, read from its keys.
 
     Daytona wins when both keys are set, and a deployment with neither runs
-    sandboxes on the local Docker daemon.
+    sandboxes on the local Docker daemon. That holds where the build turned
+    Docker off too: it is then the fallback a self-hosted owner is asked to
+    replace, and ``creatable_providers`` never creates a computer on it.
     """
-    if daytona_api_key or os.getenv("DAYTONA_API_KEY"):
+    environ = os.environ if environ is None else environ
+    if daytona_api_key or environ.get("DAYTONA_API_KEY"):
         return "daytona"
-    if os.getenv("E2B_API_KEY"):
+    if environ.get("E2B_API_KEY"):
         return "e2b"
     return "docker"
+
+
+#: Why a kind cannot run a computer now, as ``kind_availability`` answers.
+KIND_NOT_OFFERED = "not_offered"
+KIND_NO_KEY = "no_key"
+KIND_DAEMON_UNREACHABLE = "daemon_unreachable"
+
+#: The kinds reached with an API key, by the variable that holds it.
+KEYED_KINDS: dict[str, str] = {
+    "daytona": DaytonaConfig.ENV_FIELDS["api_key"],
+    "e2b": E2BConfig.ENV_FIELDS["api_key"],
+}
+
+
+def kind_refusals(environ: Mapping[str, str] | None = None) -> dict[str, str | None]:
+    """What stands in a kind's way however long one waits: the build's gates
+    and the API keys. None where nothing does.
+
+    ``kind_availability`` adds the one fact that changes by the moment, whether
+    the Docker daemon answers; callers that cannot wait on it read this alone.
+    A kind not listed (``ssh``) has nothing to refuse it here.
+    """
+    from ptc_agent.core.sandbox.providers.local import local_computer_allowed
+
+    environ = os.environ if environ is None else environ
+    # A build sets LANGALPHA_DOCKER_COMPUTERS=0 where it knows a container
+    # could not reach this server: one listening on loopback, on a system where
+    # containers have only the bridge.
+    refusals: dict[str, str | None] = {
+        "local": None if local_computer_allowed() else KIND_NOT_OFFERED,
+        "docker": (
+            KIND_NOT_OFFERED if environ.get("LANGALPHA_DOCKER_COMPUTERS") == "0" else None
+        ),
+    }
+    for kind, key in KEYED_KINDS.items():
+        refusals[kind] = None if environ.get(key) else KIND_NO_KEY
+    return refusals
+
+
+async def docker_reachable(timeout: float = 1.5) -> bool:
+    """A real ping of the daemon, the same socket lookup the provider uses."""
+    import asyncio
+
+    try:
+        import aiodocker
+    except ImportError:
+        return False
+    client = None
+    try:
+        async with asyncio.timeout(timeout):
+            client = aiodocker.Docker()
+            await client.version()
+        return True
+    except Exception as exc:  # noqa: BLE001 - every failure means the same thing here
+        logger.debug("Docker daemon not reachable: %s", type(exc).__name__)
+        return False
+    finally:
+        if client is not None:
+            try:
+                await client.close()
+            except Exception:  # noqa: BLE001
+                pass
+
+
+async def kind_availability(
+    environ: Mapping[str, str] | None = None,
+) -> dict[str, str | None]:
+    """Whether each kind could run a computer now: None, or why not.
+
+    The daemon is asked once, and only where the build offers Docker.
+    """
+    availability = kind_refusals(environ)
+    if availability["docker"] is None and not await docker_reachable():
+        availability["docker"] = KIND_DAEMON_UNREACHABLE
+    return availability
+
+
+@dataclass(frozen=True)
+class KindsInReach:
+    """Where a self-hosted owner said code runs, in the app, and what each
+    kind could do at that moment. Its presence means the owner chose."""
+
+    chosen: str
+    availability: Mapping[str, str | None]
+
+    def offered(self) -> tuple[str, ...]:
+        """The choice beside every other kind that would work now. ``local`` only
+        as the choice: it runs the agent with no isolation, and choosing it in
+        the app is where that is said."""
+        kinds = (self.chosen, *KEYED_KINDS, "docker")
+        return tuple(
+            kind
+            for kind in dict.fromkeys(kinds)
+            if self.availability.get(kind, KIND_NOT_OFFERED) is None
+            and (kind != "local" or kind == self.chosen)
+        )
 
 
 def validate_sandbox_api_keys(sandbox: SandboxConfig) -> None:

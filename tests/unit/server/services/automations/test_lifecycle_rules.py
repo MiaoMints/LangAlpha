@@ -3,7 +3,7 @@ pause or resume needs, and the field each refusal names for the file and REST.""
 
 import uuid
 from datetime import datetime, timezone
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from pydantic import ValidationError
@@ -144,12 +144,45 @@ class TestModelOnCreate:
 
     @pytest.mark.asyncio
     @patch(f"{_LIFECYCLE}.auto_db")
+    async def test_a_claude_code_model_is_created_in_home_as_in_a_workspace(self, mock_auto_db, models):
+        """Chief of Staff, which runs Home's automations, runs on one too, so
+        only where its CLI would run can refuse it (``check_claude_code_hosted``)."""
+        models.return_value = ("system", {"model_id": "claude-haiku-5-5"})
+        mock_auto_db.create_automation = AsyncMock(return_value=_row(llm_model="claude-haiku-5-5-code"))
+        await create_automation(OWNER, _create_data(llm_model="claude-haiku-5-5-code"))
+
+        workspace = str(uuid.uuid4())
+        with patch(f"{_LIFECYCLE}._placement", AsyncMock(return_value=workspace)):
+            await create_automation(OWNER, _create_data(llm_model="claude-haiku-5-5-code", workspace_id=workspace))
+        assert mock_auto_db.create_automation.await_count == 2
+
+    @pytest.mark.asyncio
+    @patch(f"{_LIFECYCLE}.auto_db")
     async def test_no_model_skips_the_check(self, mock_auto_db, models):
         mock_auto_db.create_automation = AsyncMock(return_value=_row())
 
         await create_automation(OWNER, _create_data())
 
         models.assert_not_awaited()
+
+
+class TestClaudeCodeCheckOnTheCallersConnection:
+    """A file save holds the user's locks on its connection, so the placement
+    read of the Claude Code check borrows no second one."""
+
+    @pytest.mark.asyncio
+    async def test_where_the_cli_runs_is_read_on_the_callers_conn(self):
+        from src.server.services.claude_code.hosted import OnOwn
+
+        conn = object()
+        placement = AsyncMock(return_value=OnOwn({"computer_id": "c-1", "name": "Studio", "kind": "ssh"}))
+        with (
+            patch("src.server.services.claude_code.hosted.checks_automations", return_value=True),
+            patch("src.server.services.claude_code.hosted.cli_placement", placement),
+        ):
+            await lifecycle.check_claude_code_hosted(OWNER, "claude-haiku-5-5-code", "ws-1", conn)
+
+        placement.assert_awaited_once_with(OWNER, "ws-1", conn=conn)
 
 
 class TestModelOnUpdate:
@@ -163,6 +196,22 @@ class TestModelOnUpdate:
 
         assert exc.value.field == "llm_model"
         mock_auto_db.update_automation.assert_not_called()
+
+    @pytest.mark.asyncio
+    @patch(f"{_LIFECYCLE}.auto_db")
+    async def test_moving_a_claude_code_automation_into_home_is_judged_as_in_any_workspace(self, mock_auto_db, models):
+        """The Chief of Staff runs Claude Code where its CLI has somewhere to run."""
+        workspace = str(uuid.uuid4())
+        mock_auto_db.get_automation = AsyncMock(
+            return_value=_row(workspace_id=workspace, llm_model="claude-haiku-5-5-code")
+        )
+        mock_auto_db.update_automation = AsyncMock(
+            return_value=_row(workspace_id=HOME, llm_model="claude-haiku-5-5-code")
+        )
+
+        await update_automation(AUTOMATION_ID, OWNER, {"workspace_id": HOME})
+
+        mock_auto_db.update_automation.assert_awaited_once()
 
     @pytest.mark.asyncio
     @patch(f"{_LIFECYCLE}.auto_db")
@@ -301,3 +350,22 @@ def test_no_warning_with_a_webhook_or_without_delivery(monkeypatch, webhook, met
     monkeypatch.setattr(lifecycle.settings, "AUTOMATION_WEBHOOK_URL", webhook)
 
     assert lifecycle.delivery_warning(methods) is None
+
+
+@pytest.mark.asyncio
+@patch(f"{_LIFECYCLE}.exec_db")
+@patch(f"{_LIFECYCLE}.auto_db")
+async def test_a_run_now_keeps_the_computer_it_was_checked_on_with_its_firing(
+    mock_auto_db, mock_exec_db
+):
+    """On the row, where every start of the firing reads it: one handed to
+    the next process, or parked for its computer, is held to it as well."""
+    mock_auto_db.get_automation = AsyncMock(return_value=_row(status="active"))
+    mock_exec_db.create_execution = AsyncMock(return_value="exec-1")
+    scheduler = MagicMock(server_id="server-1")
+    with patch(f"{_LIFECYCLE}.AutomationScheduler.get_instance", return_value=scheduler):
+        await lifecycle.trigger_automation(AUTOMATION_ID, OWNER, checked_computer_id="computer-1")
+
+    assert mock_exec_db.create_execution.await_args.kwargs["checked_computer_id"] == "computer-1"
+    scheduler.dispatch.assert_called_once()
+    assert "checked_computer_id" not in scheduler.dispatch.call_args.kwargs

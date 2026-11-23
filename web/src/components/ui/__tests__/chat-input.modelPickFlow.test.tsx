@@ -61,21 +61,22 @@ vi.mock('../use-toast', () => ({
 // The menu's own rendering is not under test; the buttons reach the same
 // onSelectModel the dropdown items call.
 vi.mock('../chat-input.modelMenu', () => ({
-  ChatInputModelMenu: ({ onSelectModel, disabled, selectedModel }: {
+  ChatInputModelMenu: ({ onSelectModel, disabled, selectedModel, metadata, tuning }: {
     onSelectModel: (m: string) => void;
     disabled?: boolean;
     selectedModel: string | null;
+    metadata?: Record<string, { reasoning_efforts?: string[] }>;
+    tuning?: { reasoningEffort: string | null };
   }) => (
     <>
       <span>{disabled ? 'menu-disabled' : 'menu-enabled'}</span>
+      <span>{`efforts:${selectedModel ? metadata?.[selectedModel]?.reasoning_efforts?.join(',') : ''}`}</span>
+      <span>{`effort:${tuning?.reasoningEffort}`}</span>
       <span>{`pill:${selectedModel}`}</span>
       <button type="button" onClick={() => onSelectModel('model-beta')}>pick-beta</button>
       <button type="button" onClick={() => onSelectModel('model-gamma')}>pick-gamma</button>
       <button type="button" onClick={() => onSelectModel('model-default')}>pick-default</button>
     </>
-  ),
-  ChatInputEffortMenu: ({ reasoningEfforts }: { reasoningEfforts: string[] }) => (
-    <span>{`efforts:${reasoningEfforts.join(',')}`}</span>
   ),
   ModelTriggerMeasure: () => null,
 }));
@@ -87,10 +88,12 @@ interface TreeProps {
   onPickModel?: (model: string) => void;
   /** Set for a thread host; left out, the composer holds its own model. */
   model?: string | null;
+  /** Set where the host's thread sends another model than the pill shows. */
+  sendModel?: string | null;
   ref?: Ref<ChatInputHandle>;
 }
 
-function tree({ onSend = vi.fn(), onPickModel, model, ref }: TreeProps = {}) {
+function tree({ onSend = vi.fn(), onPickModel, model, sendModel, ref }: TreeProps = {}) {
   if (!queryClient.getQueryData(queryKeys.user.preferences())) {
     queryClient.setQueryData(queryKeys.user.preferences(), mocks.preferences);
   }
@@ -102,6 +105,7 @@ function tree({ onSend = vi.fn(), onPickModel, model, ref }: TreeProps = {}) {
           onSend={onSend}
           onPickModel={onPickModel}
           model={model}
+          sendModel={sendModel}
         />
       </MemoryRouter>
     </QueryClientProvider>
@@ -175,12 +179,24 @@ describe('ChatInput: the thread owns the model', () => {
     const { rerender } = render(tree({ onSend, ref, model: 'model-thread', onPickModel }));
 
     send('hello');
-    expect(onSend.mock.calls[0][3]).toMatchObject({ model: 'model-thread' });
+    expect(onSend.mock.calls[0][0].modelOptions).toMatchObject({ model: 'model-thread' });
 
     rerender(tree({ onSend, ref, model: 'model-beta', onPickModel }));
     expect(ref.current?.getModelOptions()).toMatchObject({ model: 'model-beta' });
     send('again');
-    expect(onSend.mock.calls[1][3]).toMatchObject({ model: 'model-beta' });
+    expect(onSend.mock.calls[1][0].modelOptions).toMatchObject({ model: 'model-beta' });
+  });
+
+  // A thread in Home with no model of its own shows the Default it would
+  // start on, but its send names none, so the server resolves it.
+  it('sends the model the host names for a send over the one the pill shows, from a send and from getModelOptions', () => {
+    const onSend = vi.fn();
+    const ref = createRef<ChatInputHandle>();
+    render(tree({ onSend, ref, model: 'model-thread', sendModel: null, onPickModel: vi.fn() }));
+    expect(screen.getByText('pill:model-thread')).toBeInTheDocument();
+    send('hello');
+    expect(onSend.mock.calls[0][0].modelOptions).toMatchObject({ model: null });
+    expect(ref.current?.getModelOptions()).toMatchObject({ model: null });
   });
 
   it('opens on the account default with no host, and follows it when it changes', () => {
@@ -199,6 +215,7 @@ describe('ChatInput: the thread owns the model', () => {
     expect(screen.getByText('pill:model-default')).toBeInTheDocument();
     // The controls are the named model's, so its ladder is offered.
     expect(screen.getByText('efforts:low,high')).toBeInTheDocument();
+    expect(screen.getByText('effort:high')).toBeInTheDocument();
     expect(ref.current?.getModelOptions()).toMatchObject({ model: 'model-default' });
   });
 
@@ -209,7 +226,7 @@ describe('ChatInput: the thread owns the model', () => {
     fireEvent.click(screen.getByText('pick-beta'));
     expect(screen.getByText('pill:model-beta')).toBeInTheDocument();
     send('start a thread');
-    expect(onSend.mock.calls[0][3]).toMatchObject({ model: 'model-beta' });
+    expect(onSend.mock.calls[0][0].modelOptions).toMatchObject({ model: 'model-beta' });
     expectNoModelPreferenceWrite();
   });
 

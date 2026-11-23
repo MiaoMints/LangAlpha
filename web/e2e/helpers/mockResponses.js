@@ -90,6 +90,10 @@ export const defaultResponses = {
     },
   },
   'GET /skills': { skills: [] },
+  // Every flag off, as a failed read reads them. Unmocked, the read 404s and is
+  // retried once a second later, and the composer's model list waits on it, so
+  // each page with a composer drew its pills a second or more late.
+  'GET /features': { features: [] },
   'GET /market-data/snapshots/indexes': { snapshots: [] },
   'GET /market-data/intraday/indexes/*': { data: [] },
   'GET /news': { results: [], count: 0, next_cursor: null },
@@ -279,24 +283,6 @@ export const sseEvents = {
       timestamp: new Date().toISOString(),
       status: 'completed',
       payload,
-    },
-  }),
-
-  todoUpdate: (todos) => ({
-    event: 'artifact',
-    data: {
-      artifact_type: 'todo_update',
-      artifact_id: `todo-${Date.now()}`,
-      agent: 'ptc',
-      timestamp: new Date().toISOString(),
-      status: 'completed',
-      payload: {
-        todos,
-        total: todos.length,
-        completed: todos.filter((t) => t.status === 'completed').length,
-        in_progress: todos.filter((t) => t.status === 'in_progress').length,
-        pending: todos.filter((t) => t.status === 'pending').length,
-      },
     },
   }),
 

@@ -18,14 +18,26 @@ import logging
 import posixpath
 import re
 from dataclasses import asdict, dataclass, field
-from typing import Any, AsyncIterator, Dict, Iterable, Iterator, List, Optional
+from typing import (
+    Any,
+    AsyncIterator,
+    Dict,
+    Iterable,
+    Iterator,
+    List,
+    Literal,
+    Mapping,
+    Optional,
+)
 
 from ptc_agent.config.core import SSHConfig
 from ptc_agent.core.sandbox.providers import ssh as ssh_provider
 from ptc_agent.core.sandbox.providers._ssh_authorized_key import authorized_key_line
+from ptc_agent.core.sandbox.providers._ssh_connect import not_connected_error
 from ptc_agent.core.sandbox.providers.ssh_errors import SSHConnectError, SSHFolderMarked
 from src.server.database.computer import (
     count_live_computers_of_kind,
+    get_computer_for_workspace,
     get_computers_for_user,
 )
 from src.server.database.encryption import encryption_configured
@@ -34,11 +46,18 @@ from src.server.database.ssh_keys import (
     get_user_ssh_public_key,
     insert_user_ssh_key,
 )
-from src.server.database.ssh_tunnels import get_tunnels, get_user_tunnel, renew_tunnel
+from src.server.database.ssh_tunnels import (
+    computer_tunnel_down,
+    gateway_settled,
+    get_tunnels,
+    get_user_tunnel,
+    renew_tunnel,
+)
 from src.server.models.computer import (
     ComputerSSHInfo,
     ComputerSSHProbeResponse,
     ComputerSSHSpec,
+    ROOT_DIR_MAX,
 )
 from src.server.services.ssh_dial_budget import spend_dials
 from src.server.services.ssh_tunnels import tunnels_enabled
@@ -618,6 +637,13 @@ async def plan_create(
             )
         await _unshared_root_dir(user_id, spec, root_dir)
         found = await dial(root_dir)
+        # As the disk spells it, which the commit checks for a sibling again.
+        root_dir = found.root_dir
+        if len(root_dir) > ROOT_DIR_MAX:
+            raise SSHConnectError(
+                "root_dir",
+                f"Choose a folder whose path is at most {ROOT_DIR_MAX} characters.",
+            )
     if not found.supported:
         raise SSHConnectError(
             "unsupported",
@@ -729,6 +755,23 @@ async def _refuse_taking_over_own(user_id: str, take_over: Optional[str]) -> Non
         raise _folder_taken(mine)
 
 
+def is_own_computer(computer: Optional[Mapping[str, Any]]) -> bool:
+    """Whether *computer* is a machine of the user's own (the SSH provider's,
+    a Mac reached through Remote control included), which runs Claude Code
+    itself."""
+    return bool(computer) and computer.get("kind") == SSH_KIND
+
+
+def is_mac_under_remote_control(computer: Optional[Mapping[str, Any]]) -> bool:
+    """Whether *computer* is a Mac reached through LangAlpha's helper, which
+    runs in the person's desktop session, so what it opens can show on their
+    screen. A login over the Mac's own SSH runs outside that session."""
+    if computer is None or not is_own_computer(computer):
+        return False
+    machine = computer.get("provider_config") or {}
+    return machine.get("helper") is True and machine.get("os") == "Darwin"
+
+
 def tunnel_of(computer: Dict[str, Any]) -> str:
     """The id of the tunnel an ssh computer's machine connects out through, or ""."""
     if computer.get("kind") != SSH_KIND:
@@ -736,23 +779,113 @@ def tunnel_of(computer: Dict[str, Any]) -> str:
     return (computer.get("provider_config") or {}).get("tunnel") or ""
 
 
+async def _tunnel_down(
+    computer_id: Any, kind: Any, provider_config: Any, *, conn=None
+) -> bool:
+    if not computer_id or kind != SSH_KIND or not (provider_config or {}).get("tunnel"):
+        return False
+    return await computer_tunnel_down(str(computer_id), conn=conn)
+
+
+async def computer_unreachable(computer: Optional[Mapping[str, Any]], *, conn=None) -> bool:
+    """Whether *computer* is a machine the user brings that connects out
+    through a tunnel, and that tunnel is not up.
+
+    A machine the server dials directly has no tunnel record and is never
+    judged unreachable here, nor is a cloud computer. A tunnel row that is
+    gone is one the machine cannot connect through. Judged in Postgres by the
+    predicate every worker's statements use (``computer_tunnel_down``), where
+    the gateway records each tunnel's liveness, so every worker agrees; a
+    computer that predicate could never find down costs no query.
+    """
+    if not computer or computer.get("status") == "deleted":
+        return False
+    return await _tunnel_down(
+        computer.get("computer_id"),
+        computer.get("kind"),
+        computer.get("provider_config"),
+        conn=conn,
+    )
+
+
+async def refuse_if_tunnel_down(
+    computer_id: Optional[str], kind: Optional[str], provider_config: Any
+) -> None:
+    """Raise what a dial through the gateway would for a machine whose tunnel
+    is down, known without the dial, naming the computer for its
+    ``computer_unreachable`` frame. One Postgres read, and none for a
+    computer without a tunnel.
+    """
+    if await _tunnel_down(computer_id, kind, provider_config):
+        raise not_connected_error("The machine", computer_id=str(computer_id))
+
+
+async def computer_away(workspace_id: str, *, conn=None) -> Optional[Dict[str, Any]]:
+    """The computer *workspace_id* runs on, while it cannot be reached; None
+    when a turn there could reach it now.
+
+    For work nobody is watching (an automation's firing, a wake, a
+    report-back), which waits for the machine rather than fail at its
+    connect. Home's work waits only where its turn would not run in the
+    stand-in instead (``home_placement.home_turn_computer``). A read:
+    nothing is started or placed.
+    """
+    from src.server.database.home_workspace import is_home_id
+
+    computer = await get_computer_for_workspace(workspace_id, conn=conn)
+    if not await computer_unreachable(computer, conn=conn):
+        return None
+    user_id = str(computer.get("user_id") or "")
+    if is_home_id(user_id, workspace_id):
+        from src.server.services.home_placement import home_turn_computer
+
+        _, stand_in = await home_turn_computer(user_id, conn=conn)
+        if stand_in:
+            return None
+    return dict(computer)
+
+
+#: A tunnel row's ``state``, as ``ssh_tunnels`` selects it: not judged while
+#: the gateway is not settled, since its dials then fail as its own outage.
+TunnelState = Literal["live", "paired_elsewhere", "unsettled", "down"]
+
+
 async def tunnels_for(
-    user_id: str, computers: Iterable[Dict[str, Any]]
+    user_id: str, computers: Iterable[Dict[str, Any]], *, conn=None
 ) -> Optional[Dict[str, Dict[str, Any]]]:
     """The tunnels *computers* name, by id, for :func:`ssh_info` to tell which are up.
 
-    None when none of *computers* has a tunnel, so a listing without one costs
-    no query, and when they cannot be read: whether a tunnel is up is not worth
-    failing a listing over.
+    A tunnel no longer there is one the machine cannot connect through, and
+    stands in as a row whose ``state`` is down, or unsettled while the
+    gateway is. None when none of *computers* has a tunnel, so a listing
+    without one costs no query, and when they cannot be read: whether a
+    tunnel is up is not worth failing a listing over. Read on ``conn`` where
+    a caller holding locks on it passes one, inside a savepoint, so a read
+    that fails leaves the caller's transaction as it was.
     """
     tunnel_ids = {tunnel_of(computer) for computer in computers} - {""}
     if not tunnel_ids:
         return None
     try:
-        return await get_tunnels(tunnel_ids)
+        if conn is None:
+            return await _tunnels_with_gone(tunnel_ids)
+        async with conn.transaction():
+            return await _tunnels_with_gone(tunnel_ids, conn=conn)
     except Exception:  # noqa: BLE001 - shown as not known instead
         logger.warning("Could not read the tunnels of user %s", user_id, exc_info=True)
         return None
+
+
+async def _tunnels_with_gone(
+    tunnel_ids: set[str], *, conn=None
+) -> Dict[str, Dict[str, Any]]:
+    tunnels = await get_tunnels(tunnel_ids, conn=conn)
+    gone = tunnel_ids - tunnels.keys()
+    if gone:
+        settled = await gateway_settled(conn=conn)
+        state: TunnelState = "down" if settled else "unsettled"
+        tunnels.update({tunnel_id: {"state": state} for tunnel_id in gone})
+    return tunnels
 
 
 def host_key_fingerprint(host_key: str) -> Optional[str]:
@@ -794,9 +927,17 @@ def ssh_info(
     machine = shown.get("machine") if isinstance(shown.get("machine"), dict) else {}
     tunnel_id = tunnel_of(computer)
     connected = None
+    paired_elsewhere = False
     if tunnel_id and tunnels is not None:
-        # A tunnel no longer there is one the machine cannot connect through.
-        connected = bool((tunnels.get(tunnel_id) or {}).get("live"))
+        row = tunnels.get(tunnel_id) or {}
+        state: TunnelState = row.get("state", "down")
+        # A machine last seen connected shows so; one not seen is not known
+        # while the gateway is not settled, as it is not down then.
+        if state == "live" or row.get("live"):
+            connected = True
+        elif state != "unsettled":
+            connected = False
+        paired_elsewhere = state == "paired_elsewhere"
     return ComputerSSHInfo(
         host=config.get("host") or "",
         port=int(config.get("port") or 22),
@@ -804,6 +945,7 @@ def ssh_info(
         fingerprint=fingerprint,
         tunnel=bool(tunnel_id),
         tunnel_connected=connected,
+        paired_elsewhere=paired_elsewhere,
         helper=bool(config.get("helper")),
         os=config.get("os") or None,
         model=shown.get("model") or None,

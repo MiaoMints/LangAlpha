@@ -19,7 +19,6 @@ import { ZERO_USAGE } from '../../utils/tokenUsage';
 import { REPORT_BACK_IDLE_MAX_REARMS } from '../../hooks/useReportBackWatch';
 import { createAssistantMessage, appendMessage, updateMessage } from '../../hooks/utils/messageHelpers';
 import { turnOf } from '../../components/messageList/turnProjection';
-import { finalizeTodoListProcessesInMessages } from '../../hooks/utils/messageFinalizers';
 import { stripHistoryInterruptCards } from '../interrupts/buckets';
 import { checkForNewBuild } from '@/lib/staleBuild';
 import { isOnline, waitForOnline } from '@/lib/network';
@@ -74,6 +73,9 @@ export interface ReconnectOptions {
   /** Set by the same loop: the bubbles its earlier attempts wrote to, which
    *  this one settles with its own when it ends the turn. */
   owned?: ReadonlySet<string>;
+  /** A stream that ends with nothing heard goes to `onDrop` as gone, not as the
+   *  run's end: the loop has someone to ask what became of it. */
+  unheardEndIsDrop?: boolean;
 }
 
 /** A retry loop's reconnect that dropped, or failed, before its run ended. */
@@ -100,6 +102,10 @@ export interface RetryOptions {
   owned?: Iterable<string>;
   /** Whether the dropped stream rendered anything. */
   rendered?: boolean;
+  /** The run is over and the loop heard nothing of it, so it may never have
+   *  begun. The caller says what became of the reply: it goes again, or it
+   *  failed where it stands, which a reload would erase. */
+  ifNothingHeard?: (bubbleId: string) => 'resending' | 'failed';
 }
 
 export interface RecoveryDeps {
@@ -111,7 +117,6 @@ export interface RecoveryDeps {
     wasInterruptedRef: { current: boolean },
   ) => StreamEventProcessor;
   buildStreamRefs: (o?: {
-    isNewConversation?: boolean;
     isReconnect?: boolean;
     withUnresolvedInterrupt?: boolean;
   }) => StreamProcessorRefs;
@@ -122,7 +127,6 @@ export interface RecoveryDeps {
   /** `keepQueued` leaves out steers still queued in a run that may go on. */
   markTranscriptPersisted: (opts?: { keepQueued?: boolean }) => void;
   clearModelStatus: () => void;
-  finalizePendingTodos: (() => void) | null;
   /** Re-read the machine rows after a turn. */
   refreshComputerAfterTurn: () => void;
   /** Re-read the workspace row for its folder; null with no workspace. */
@@ -162,14 +166,14 @@ export const releaseStreamOwnership = (rt: RecoveryRuntime) => {
 export const reconnectToStream = async (
   rt: RecoveryRuntime,
   deps: RecoveryDeps,
-  { activeTasks = [], runId, resetCursor = false, idleAbortMs, snapshotAtMs, resetSubagentProjection = true, onDrop, owned }: ReconnectOptions = {},
+  { activeTasks = [], runId, resetCursor = false, idleAbortMs, snapshotAtMs, resetSubagentProjection = true, onDrop, owned, unheardEndIsDrop = false }: ReconnectOptions = {},
 ) => {
-  // Reconnect targets the LATCHED thread, not the threadId prop. A brand-new
+  if (runId) rt.pause.attach(runId);
+  // Reconnect targets the LATCHED thread, not the threadId prop: a brand-new
   // chat keeps the prop at '__default__' until the first SSE event updates the
-  // route, but Content-Location already latched the real id into threadIdRef.
-  // Keying off the prop would bail this whole first-answer window (the most
-  // common "ask, background the tab, come back" moment). Snapshot once so the
-  // id stays stable across this single reconnect attempt.
+  // route, though Content-Location already latched the real id. Keying off the
+  // prop would bail the whole first-answer window (the most common "ask,
+  // background the tab, come back" moment). Snapshot once for this attempt.
   const tid = rt.threadIdRef.current;
   if (!tid || tid === '__default__') return;
 
@@ -185,7 +189,13 @@ export const reconnectToStream = async (
   // A held send's `released` frame rides only the stream that sent it, so a
   // send that dropped before it would keep the line up through the answer.
   // The reconnect's own status stands in for it from here.
-  rt.setTurnHeld(null);
+  rt.setTurnStatus({ turnHeld: null });
+  // A CLI wait's line stays up through a resume: the run's stream sends the
+  // wait's end, so a resume from the cursor always hears its `admitted` or
+  // `cleared` frame or reaches the stream's end, which clears it. One that
+  // attaches afresh replays the run from its start, which draws the line
+  // again while the wait goes on.
+  if (resetCursor) rt.setTurnStatus({ cliQueue: null });
 
   console.log('[Reconnect] Starting reconnection for thread:', tid);
 
@@ -528,20 +538,26 @@ export const reconnectToStream = async (
     }
     if (result?.disconnected) {
       // The retry loop takes a drop of its own stream as it took the first:
-      // the turn runs on, left for the attempt that continues it.
+      // the turn runs on, left for the attempt that continues it. One the page
+      // came back to find quiet says nothing against the link, so it is charged
+      // as a resume; one that went quiet in view is failing, and spends attempts.
       if (onDrop) {
-        handOff(false);
+        handOff(false, null, !!result.silentOnReturn);
         return;
       }
       // A load's or a report-back's attach that drops is the same mid-run
       // drop, and goes to the loop once this reader lets go, with the idle
       // watchdog it had. Not one another stream has taken over from.
       if (rt.mainStreamAbortRef.current === abortController) {
-        handOff(false);
+        handOff(false, null, !!result.silentOnReturn);
         retryDrop = true;
         return;
       }
       throw new Error('Reconnection stream disconnected');
+    }
+    if (unheardEndIsDrop && !receivedEvent) {
+      handOff(true);
+      return;
     }
 
     // Mark this reader's bubbles complete. A steer's continuation is the
@@ -689,7 +705,7 @@ export const reconnectToStream = async (
       !rt.wasStoppedRef.current &&
       (!abortController.signal.aborted || idleClosed)
     ) {
-      cleanupAfterStreamEnd(rt, deps, ownBubbles());
+      cleanupAfterStreamEnd(rt, deps);
     } else if (stillActive && !dropped && wasInterruptedRef.current) {
       // A stream that ends on a question or an approval card skips the
       // cleanup, and the server sends no wake for an interrupted summary. The
@@ -741,7 +757,7 @@ export const attemptReconnectAfterDisconnect = async (
   rt: RecoveryRuntime,
   deps: RecoveryDeps,
   assistantMessageId: string,
-  { idleAbortMs, owned: droppedOwned = [], rendered: droppedRendered = true }: RetryOptions = {},
+  { idleAbortMs, owned: droppedOwned = [], rendered: droppedRendered = true, ifNothingHeard }: RetryOptions = {},
 ) => {
   // Long, because the cost of waiting is a spinner while the cost of giving up
   // is a truncated answer for a turn that is still running server-side.
@@ -896,6 +912,7 @@ export const attemptReconnectAfterDisconnect = async (
     try {
       const snapshotAtMs = Date.now();
       const status = await getWorkflowStatus(tid);
+      if (rt.threadIdRef.current === tid) rt.setNextSummary(status.next_summary ?? null);
       if (!status.can_reconnect) {
         console.log('[Reconnect] Workflow no longer reconnectable, cleaning up');
         runOver = true;
@@ -934,7 +951,7 @@ export const attemptReconnectAfterDisconnect = async (
       const dropped: { current: ReconnectDrop | null } = { current: null };
       await reconnectToStream(rt, deps, {
         activeTasks: status.active_tasks || [], snapshotAtMs, resetSubagentProjection: false, idleAbortMs,
-        onDrop: (drop) => { dropped.current = drop; }, owned,
+        onDrop: (drop) => { dropped.current = drop; }, owned, unheardEndIsDrop: !!ifNothingHeard,
       });
       const drop = dropped.current;
       if (drop) {
@@ -981,10 +998,12 @@ export const attemptReconnectAfterDisconnect = async (
   // a reconnect, where a stop or a newer turn can land unseen.
   if (abandoned()) return;
   rt.setIsReconnecting(false);
+  const unheard = runOver && !rendered ? ifNothingHeard?.(rt.currentMessageRef.current ?? assistantMessageId) : undefined;
+  if (unheard === 'resending') return;
 
   // Settle the bubble we gave up on, and the ones the reconnects that dropped
   // too were writing. Nothing else does: cleanupAfterStreamEnd resets the
-  // *session* (isLoading, subagents, todos) but never touches the
+  // *session* (isLoading, subagents) but never touches the
   // message, and the other stream-end paths each clear isStreaming themselves
   // on their way out. Left set, the bubble keeps its loading animation forever
   // while the composer has already flipped back to send — visibly alive, inert,
@@ -999,7 +1018,8 @@ export const attemptReconnectAfterDisconnect = async (
   // showed, so a later wake for it can still attach.
   if (!rendered && rt.currentRunIdRef.current === latchedRunId) rt.currentRunIdRef.current = null;
 
-  cleanupAfterStreamEnd(rt, deps, owned);
+  cleanupAfterStreamEnd(rt, deps);
+  if (unheard === 'failed') return;
   // The reload rebuilds the turn from the server, from its checkpoint once the
   // run is over and from the run's stream while it is not, so the bubbles on
   // screen would be a second copy. The replay clears only bubbles marked as
@@ -1013,17 +1033,12 @@ export const attemptReconnectAfterDisconnect = async (
 
 /**
  * Shared cleanup logic for all stream-end paths (send, reconnect, HITL resume).
- * Resets loading/streaming state, finalizes subagents, and auto-completes todos
- * on the bubbles the stream wrote to: a reconnect writes to several.
+ * Resets the session's loading and streaming state and finalizes subagents;
+ * it never touches the messages.
  */
-export const cleanupAfterStreamEnd = (
-  rt: RecoveryRuntime,
-  deps: RecoveryDeps,
-  bubbles: string | Iterable<string>,
-) => {
+export const cleanupAfterStreamEnd = (rt: RecoveryRuntime, deps: RecoveryDeps) => {
   rt.setIsLoading(false);
-  rt.setWorkspaceStarting(false);
-  rt.setTurnHeld(null);
+  rt.clearTurnStatus();
   rt.setIsCompacting(false);
   deps.clearModelStatus();
   // A settled turn is the cheapest moment to learn the edge has moved on: the
@@ -1033,6 +1048,24 @@ export const cleanupAfterStreamEnd = (
   rt.currentMessageRef.current = null;
   releaseStreamOwnership(rt);
 
+  // A run's closing frame says what the next send summarizes first, unless
+  // its read failed or it never came: the status says it then, once, for
+  // the thread on screen with no turn or stream since.
+  if (rt.nextSummaryOwedRef.current) {
+    rt.nextSummaryOwedRef.current = false;
+    const tid = rt.threadIdRef.current;
+    const epoch = rt.sessionEpochRef.current;
+    if (tid && tid !== '__default__') {
+      void getWorkflowStatus(tid).then(
+        (status) => {
+          if (rt.threadIdRef.current !== tid || rt.sessionEpochRef.current !== epoch || rt.isStreamingRef.current) return;
+          rt.setNextSummary(status.next_summary ?? null);
+        },
+        () => {},
+      );
+    }
+  }
+
   // Deliberately no status sweep here: card/chip status moves only on
   // positive evidence (ledger stamp at load, per-task chan_close live).
   // Absence of an open mux channel is NOT terminality — during the
@@ -1040,11 +1073,6 @@ export const cleanupAfterStreamEnd = (
   // permanently paint still-running tail tasks as completed.
   const hasOpenStreams = deps.muxOpenTaskIds().size > 0;
   rt.setHasActiveSubagents(hasOpenStreams);
-
-  // Finalize pending todos as stale
-  if (deps.finalizePendingTodos) deps.finalizePendingTodos();
-  const ids = typeof bubbles === 'string' ? [bubbles] : [...bubbles];
-  rt.setMessages((prev) => ids.reduce((next, id) => finalizeTodoListProcessesInMessages(next, id), prev));
 
   // The server measures the machine's disk when a turn ends, onto the
   // computer row; nothing else re-reads that row while the page is open.

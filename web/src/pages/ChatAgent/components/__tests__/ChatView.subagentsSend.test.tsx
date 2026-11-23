@@ -60,12 +60,13 @@ vi.mock('../../utils/api', async (importOriginal) => ({
 
 import { THREAD_ID, WORKSPACE_ID, chatInput, chatState, mountChatView, resetChatState, type ChatState } from './chatViewHarness';
 import ChatView from '../ChatView';
+import type { ComposerSend } from '@/components/ui/chat-input.types';
 
-type OnSend = (message: string, attachments?: unknown[], slashCommands?: unknown[], options?: Record<string, unknown>) => void;
+type OnSend = (send: ComposerSend) => void;
 
 /** The composer's send, as a press of Enter makes it. */
 function send(options: Record<string, unknown> = {}) {
-  act(() => { (chatInput.props!.onSend as OnSend)('hello', [], [], options); });
+  act(() => { (chatInput.props!.onSend as OnSend)({ text: 'hello', files: [], mentions: [], commands: [], message: 'hello', modelOptions: options as unknown as ComposerSend['modelOptions'] }); });
   const calls = chatState.handleSendMessage.mock.calls;
   return calls[calls.length - 1][3] as Record<string, unknown>;
 }
@@ -282,7 +283,7 @@ describe("ChatView: a draft from Subagents' Create with the agent", () => {
     await waitFor(() => expect(state?.draftMessage).toBeUndefined());
     expect(state?.workspaceId).toBe(WORKSPACE_ID);
     expect(mocks.setValue).toHaveBeenCalledTimes(1);
-    expect(mocks.setValue).toHaveBeenCalledWith('Set up a subagent that ');
+    expect(mocks.setValue).toHaveBeenCalledWith('Set up a subagent that ', undefined);
     expect(chatState.handleSendMessage).not.toHaveBeenCalled();
   });
 
@@ -313,11 +314,11 @@ describe("ChatView: a draft from Subagents' Create with the agent", () => {
     const { open, state } = mountDraftView(true);
 
     open('What moved in my watchlist today, and why?');
-    await waitFor(() => expect(mocks.setValue).toHaveBeenCalledWith('What moved in my watchlist today, and why?'));
+    await waitFor(() => expect(mocks.setValue).toHaveBeenCalledWith('What moved in my watchlist today, and why?', undefined));
     await waitFor(() => expect(state()?.draftMessage).toBeUndefined());
     open('Set up a workspace to track semiconductor breadth');
 
-    await waitFor(() => expect(mocks.setValue).toHaveBeenLastCalledWith('Set up a workspace to track semiconductor breadth'));
+    await waitFor(() => expect(mocks.setValue).toHaveBeenLastCalledWith('Set up a workspace to track semiconductor breadth', undefined));
     expect(mocks.setValue).toHaveBeenCalledTimes(2);
   });
 

@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
-import shlex
+import logging
 import time
 import uuid
 from collections.abc import AsyncIterator
@@ -17,13 +17,22 @@ from contextlib import asynccontextmanager
 from typing import Any
 
 import httpx
+from fastapi import HTTPException
 
+from ptc_agent.core.paths import WorkspaceLayout
+from ptc_agent.core.sandbox.execution import app_command
 from ptc_agent.core.sandbox.preview_probe import head_preview
-from ptc_agent.core.sandbox.runtime import PreviewInfo
+from ptc_agent.core.sandbox.runtime import PreviewInfo, PreviewPortInUse
 from src.server.database.workspace import get_preview_command
-from src.server.services.preview_capabilities import publish
+from src.server.services.preview_capabilities import (
+    PreviewProxyNotConfigured,
+    PreviewProxyUnavailable,
+    publish,
+)
 from src.server.services.preview_upstreams import probe_target
 from src.utils.cache.redis_cache import get_cache_client
+
+logger = logging.getLogger(__name__)
 
 _SIGNED_URL_TTL = 3000  # 50 min (signed URLs expire in 1h)
 # What a provider signs a preview URL for when the caller names no lifetime.
@@ -34,9 +43,11 @@ _PREVIEW_LAUNCH_LEASE_TTL_MS = 60_000
 _PREVIEW_LAUNCH_WAIT_S = 45.0
 
 
-def _preview_cache_key(sandbox_id: str, port: int) -> str:
-    """Redis key for cached signed preview URL."""
-    return f"preview:signed_url:{sandbox_id}:{port}"
+def _preview_cache_key(sandbox_id: str, port: int, viewer_id: str | None = None) -> str:
+    """Redis key for cached signed preview URL. A shared workspace's member
+    has their own, since the URL is minted for them."""
+    key = f"preview:signed_url:{sandbox_id}:{port}"
+    return key if viewer_id is None else f"{key}:{viewer_id}"
 
 
 def _preview_owner_key(sandbox_id: str, port: int) -> str:
@@ -100,10 +111,12 @@ async def delete_preview_owner(sandbox_id: str, port: int) -> None:
     await get_cache_client().delete(_preview_owner_key(sandbox_id, port))
 
 
-async def _get_cached_signed_url(sandbox_id: str, port: int) -> str | None:
+async def _get_cached_signed_url(
+    sandbox_id: str, port: int, viewer_id: str | None = None
+) -> str | None:
     """Get cached signed URL from Redis."""
     cache = get_cache_client()
-    return await cache.get(_preview_cache_key(sandbox_id, port))
+    return await cache.get(_preview_cache_key(sandbox_id, port, viewer_id))
 
 
 async def _set_cached_signed_url(
@@ -114,6 +127,7 @@ async def _set_cached_signed_url(
     expires_in: int | None = None,
     owner_workspace_id: str | None = None,
     url_expires_at: int | None = None,
+    viewer_id: str | None = None,
 ) -> None:
     """Cache a signed URL in Redis with TTL, and record when the URL itself lapses.
 
@@ -131,7 +145,7 @@ async def _set_cached_signed_url(
     now = int(time.time())
     url_expires_at = url_expires_at or now + SIGNED_URL_LIFETIME
     cache = get_cache_client()
-    await cache.set(_preview_cache_key(sandbox_id, port), url, ttl=ttl)
+    await cache.set(_preview_cache_key(sandbox_id, port, viewer_id), url, ttl=ttl)
     await cache.set(
         _preview_expiry_key(url), url_expires_at, ttl=max(url_expires_at - now, 1)
     )
@@ -149,6 +163,7 @@ async def _publish_and_cache(
     url_expires_at: int,
     cache_for: int | None = None,
     claim_owner: bool = True,
+    viewer_id: str | None = None,
 ) -> str:
     """Publish *info* and cache what a browser will be handed.
 
@@ -162,6 +177,7 @@ async def _publish_and_cache(
         port=port,
         workspace_id=workspace_id,
         expires_in=expires_in,
+        viewer_id=viewer_id,
     )
     await _set_cached_signed_url(
         sandbox_id,
@@ -170,6 +186,7 @@ async def _publish_and_cache(
         expires_in=cache_for,
         owner_workspace_id=workspace_id if claim_owner else None,
         url_expires_at=url_expires_at,
+        viewer_id=viewer_id,
     )
     return url
 
@@ -207,10 +224,12 @@ async def cache_tool_preview(
     )
 
 
-async def delete_cached_signed_url(sandbox_id: str, port: int) -> None:
+async def delete_cached_signed_url(
+    sandbox_id: str, port: int, viewer_id: str | None = None
+) -> None:
     """Delete a cached signed URL from Redis."""
     cache = get_cache_client()
-    await cache.delete(_preview_cache_key(sandbox_id, port))
+    await cache.delete(_preview_cache_key(sandbox_id, port, viewer_id))
 
 
 async def _is_preview_live_confirmed(sandbox_id: str, port: int) -> bool:
@@ -255,9 +274,10 @@ async def resolve_preview(
     command: str | None | object = UNSET,
     force: bool = False,
     expires_in: int = SIGNED_URL_LIFETIME,
-    work_dir: str,
+    folder: WorkspaceLayout,
+    viewer_id: str | None = None,
 ) -> str:
-    """Core preview URL resolution, behind ``owner_preview_url``.
+    """Core preview URL resolution, behind ``owner_preview``.
 
     When a *command* is available (supplied by the caller or read from the
     workspace ``artifacts`` column), ``start_and_get_preview_url`` is called.
@@ -270,6 +290,10 @@ async def resolve_preview(
     Pass ``command=None`` to indicate "already looked up, no command stored"
     (skips the DB lookup).  Omit the argument (or pass ``UNSET``) to have
     this function look it up from the database.
+
+    ``viewer_id`` names the member of a shared workspace the URL is for: it
+    is cached for them alone and its capability serves only while they may
+    use the workspace.
     """
     # Resolve command: explicit arg → DB lookup (only when caller didn't provide)
     cmd = command
@@ -288,17 +312,14 @@ async def resolve_preview(
             # Short-lived cache (60s) when a command is stored — covers burst
             # asset requests (CSS/JS/images) without risking long-lived stale URLs.
             if not force:
-                cached_url = await _get_cached_signed_url(sandbox.sandbox_id, port)
+                cached_url = await _get_cached_signed_url(sandbox.sandbox_id, port, viewer_id)
                 if cached_url:
                     healthy = (
                         await _is_preview_live_confirmed(sandbox.sandbox_id, port)
                         or await _check_signed_url_healthy(cached_url)
                     )
                     if healthy and owner not in (None, workspace_id):
-                        raise RuntimeError(
-                            f"Port {port} is already in use on this computer. "
-                            "Choose another port."
-                        )
+                        raise PreviewPortInUse(port)
                     if healthy:
                         await _set_preview_live_confirmed(
                             sandbox.sandbox_id, port, ttl=10
@@ -321,19 +342,17 @@ async def resolve_preview(
                     expires_in=expires_in,
                     url_expires_at=url_expires_at,
                     cache_for=60,
+                    viewer_id=viewer_id,
                 )
             if owner not in (None, workspace_id):
                 if await sandbox._is_preview_reachable(port):
-                    raise RuntimeError(
-                        f"Port {port} is already in use on this computer. "
-                        "Choose another port."
-                    )
+                    raise PreviewPortInUse(port)
                 await delete_preview_owner(sandbox.sandbox_id, port)
 
             await set_preview_owner(sandbox.sandbox_id, port, workspace_id)
             try:
                 preview_info = await sandbox.start_and_get_preview_url(
-                    f"cd {shlex.quote(work_dir)} && {cmd}",
+                    app_command(folder, cmd),
                     port,
                     expires_in=expires_in,
                     owner=workspace_id,
@@ -346,7 +365,20 @@ async def resolve_preview(
                     expires_in=expires_in,
                     url_expires_at=url_expires_at,
                     cache_for=60,
+                    viewer_id=viewer_id,
                 )
+            except PreviewPortInUse as e:
+                # `owner` is the claim read before this try made its own.
+                if owner == workspace_id:
+                    # This workspace's own claim: what holds the port is most
+                    # likely its own app, still starting or listening only on
+                    # loopback, which a worker that did not start it cannot
+                    # tell from another program's. It stays a failure, not
+                    # a port another program holds, and the claim stays, so
+                    # the next try reads the port the same way.
+                    raise RuntimeError(str(e)) from e
+                await delete_preview_owner(sandbox.sandbox_id, port)
+                raise
             except BaseException:
                 await delete_preview_owner(sandbox.sandbox_id, port)
                 raise
@@ -358,15 +390,12 @@ async def resolve_preview(
         owner = await get_preview_owner(sandbox.sandbox_id, port)
         if owner not in (None, workspace_id):
             if await sandbox._is_preview_reachable(port):
-                raise RuntimeError(
-                    f"Port {port} is already in use on this computer. "
-                    "Choose another port."
-                )
+                raise PreviewPortInUse(port)
             await delete_preview_owner(sandbox.sandbox_id, port)
 
         # No command known — try signed-URL cache, then generate fresh.
         if not force:
-            cached_url = await _get_cached_signed_url(sandbox.sandbox_id, port)
+            cached_url = await _get_cached_signed_url(sandbox.sandbox_id, port, viewer_id)
             if cached_url:
                 healthy = (
                     await _is_preview_live_confirmed(sandbox.sandbox_id, port)
@@ -378,7 +407,7 @@ async def resolve_preview(
                     )
                     return cached_url
 
-        await delete_cached_signed_url(sandbox.sandbox_id, port)
+        await delete_cached_signed_url(sandbox.sandbox_id, port, viewer_id)
         preview_info = await sandbox.get_preview_url(port, expires_in=expires_in)
         return await _publish_and_cache(
             sandbox.sandbox_id,
@@ -389,4 +418,23 @@ async def resolve_preview(
             url_expires_at=url_expires_at,
             cache_for=expires_in,
             claim_owner=False,
+            viewer_id=viewer_id,
         )
+
+
+def proxy_failure(
+    e: PreviewProxyNotConfigured | PreviewProxyUnavailable,
+    workspace_id: str,
+    port: int | None = None,
+) -> HTTPException:
+    """The answer for a preview that needs the proxy this deployment cannot give."""
+    if isinstance(e, PreviewProxyNotConfigured):
+        return HTTPException(
+            status_code=501,
+            detail=(
+                "Previews on this computer need the preview proxy, which this "
+                "deployment has not configured."
+            ),
+        )
+    logger.warning("Preview proxy unavailable for workspace %s port %s", workspace_id, port)
+    return HTTPException(status_code=503, detail="Previews are unavailable. Try again shortly.")

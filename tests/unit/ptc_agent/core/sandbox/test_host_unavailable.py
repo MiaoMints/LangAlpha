@@ -27,6 +27,7 @@ from ptc_agent.config.core import (
     SecurityConfig,
 )
 from ptc_agent.core.sandbox.providers.daytona import DaytonaProvider
+from ptc_agent.core.sandbox.providers.ssh_runtime import SSHRuntime
 from ptc_agent.core.sandbox.ptc_sandbox import PTCSandbox
 from ptc_agent.core.sandbox.retry import RetryPolicy
 from ptc_agent.core.sandbox.runtime import (
@@ -35,6 +36,7 @@ from ptc_agent.core.sandbox.runtime import (
     SandboxGoneError,
     SandboxHostLostError,
     SandboxHostUnavailableError,
+    SandboxRuntime,
     SandboxTransientError,
 )
 
@@ -100,6 +102,11 @@ class _Runtime:
         self.delete = AsyncMock()
         self.stop = AsyncMock()
         self.fetch_working_dir = AsyncMock(return_value="/home/workspace")
+
+    says_config_home = False
+
+    async def login_config_home(self):
+        return ""
 
     async def get_state(self):
         return RuntimeState.STOPPED
@@ -175,7 +182,7 @@ async def test_until_the_policy_says_rebuild_the_outage_is_transient(policy):
     assert str(raised.value) == str(failure)
     assert raised.value.__cause__ is failure
     if policy is not None:
-        policy.rebuild_now.assert_awaited_once_with(SANDBOX)
+        policy.rebuild_now.assert_awaited_once_with(SANDBOX, None)
         policy.reconnected.assert_not_awaited()
     await sandbox.cleanup()
     runtime.delete.assert_not_awaited()
@@ -378,6 +385,22 @@ async def test_a_sandbox_serving_again_after_its_outage_is_deleted_with_it():
     await sandbox.cleanup()
 
     runtime.delete.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_a_read_that_never_reaches_the_machine_is_no_sign_of_it_serving_again():
+    """Only an SSH machine keeps a config home; elsewhere the read answers
+    without a call, so a command's guard reading it keeps the sandbox."""
+    failure = await _sdk_start_error(HOST_RECOVERING)
+    sandbox, runtime = _sandbox(failure)
+    with pytest.raises(SandboxHostUnavailableError):
+        await sandbox.reconnect(SANDBOX)
+
+    assert await sandbox.login_config_home() == ""
+    await sandbox.cleanup()
+
+    runtime.delete.assert_not_awaited()
+    assert SSHRuntime.says_config_home and not SandboxRuntime.says_config_home
 
 
 @pytest.mark.asyncio

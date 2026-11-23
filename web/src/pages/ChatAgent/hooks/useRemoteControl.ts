@@ -77,9 +77,10 @@ export function isThisMac(computer: Pick<Computer, 'ssh'>, fingerprint: string |
 
 /**
  * The helper's status, and which row it makes this Mac: `of` answers null for
- * every other computer, and for every row outside the desktop app.
+ * every other computer, and for every row outside the desktop app. Options as
+ * for `useRemoteControl`.
  */
-export function useThisMac(options: { enabled: boolean }) {
+export function useThisMac(options: RemoteControlReader) {
   const { data: status } = useRemoteControl(options);
   const fingerprint = status?.fingerprint;
   const paused = status?.service === 'off';
@@ -117,11 +118,13 @@ export function serverTakesRemoteControl(providers: ComputerProvidersResponse | 
 export function useThisMacAvailability(options: RemoteControlReader) {
   const remoteControl = useRemoteControl(options);
   const { data: status, isLoading: statusLoading } = remoteControl;
-  const { data: providers, isLoading: providersLoading } = useComputerProviders({
+  const providersRead = useComputerProviders({
     enabled: options.enabled && !!status?.supported,
   });
+  const { data: providers, isLoading: providersLoading } = providersRead;
   const offered = options.enabled && remoteControlOffered(status, providers);
-  const { data: list, isLoading: listLoading } = useComputers({ enabled: offered });
+  const listRead = useComputers({ enabled: offered });
+  const { data: list, isLoading: listLoading } = listRead;
   const added = !offered ? false : list?.computers.some((c) => isThisMac(c, status?.fingerprint));
   // A read that failed has answered too, or one refused list would hold the
   // surface shut; `added` then stays undefined, and the card stays out.
@@ -130,7 +133,17 @@ export function useThisMacAvailability(options: RemoteControlReader) {
   // answer would close with each one.
   const statusRetrying = status === null && remoteControl.isFetching && !remoteControl.isFetchedAfterMount;
   const settled = !statusLoading && !statusRetrying && !providersLoading && !listLoading;
-  return { offered, added, status, settled };
+  // Whether `offered` is an answer: a read that failed leaves it false too.
+  const known = !!status && (!status.supported || !!providers);
+  // The server's reads failed on a Mac that could pair: unlike the shell's
+  // own channel, which no retry here would mend, worth asking again.
+  const serverFailed = !!status?.supported && (providersRead.isError || (offered && listRead.isError));
+  const retryServer = () => {
+    void providersRead.refetch();
+    if (offered) void listRead.refetch();
+  };
+  const retrying = providersRead.isFetching || listRead.isFetching;
+  return { offered, added, status, settled, known, serverFailed, retryServer, retrying };
 }
 
 /**

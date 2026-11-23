@@ -1,4 +1,4 @@
-import { use, useCallback, useEffect, useRef, useState } from 'react';
+import { lazy, Suspense, use, useCallback, useEffect, useRef, useState, type ReactNode } from 'react';
 import { isImeComposing } from '@/lib/ime';
 import { useTranslation } from 'react-i18next';
 import { useQueryClient } from '@tanstack/react-query';
@@ -27,8 +27,12 @@ import type { DashboardPrefs, WidgetInstance } from './widgets/types';
 import type { PresetId } from './widgets/presets';
 import './widgets/index';
 import { useIsMobile } from '@/hooks/useIsMobile';
+import { useSavedDashboards } from '@/lib/dashboards';
+import { Loader } from '@/components/ui/loader';
+import { DashboardSwitcher } from './components/DashboardSwitcher';
 import { usePreferences } from '@/hooks/usePreferences';
 import { queryKeys } from '@/lib/queryKeys';
+import { isMinorUnitListingInMajor } from './utils/portfolioSummary';
 import { useOnboarding, snoozePersonalization } from './hooks/useOnboarding';
 import { WelcomeBanner } from '../Onboarding/welcome/WelcomeBanner';
 import { getPreferences } from './utils/api';
@@ -36,7 +40,16 @@ import { useScrollMemory } from '@/lib/scrollMemory';
 import { scrollMotion } from '@/lib/reducedMotion';
 import './Dashboard.css';
 
-function DashboardPage() {
+const CustomDashboard = lazy(() => import('./CustomDashboard'));
+
+interface DashboardPageProps {
+  /** The dashboard switcher, in the header beside Edit. */
+  switcher: ReactNode;
+  /** Why the dashboard the user chose is not shown here instead. */
+  notice?: ReactNode;
+}
+
+function DashboardPage({ switcher, notice }: DashboardPageProps) {
   const { t } = useTranslation();
   const isMobile = useIsMobile();
   const { showPersonalizationBanner, setShowPersonalizationBanner } = useOnboarding();
@@ -59,8 +72,8 @@ function DashboardPage() {
     setResetConfirmOpen(false);
     setSettingsFor(null);
   }
-  const mainRef = useRef<HTMLElement>(null);
-  useScrollMemory(mainRef, 'page:dashboard');
+  const pageRef = useRef<HTMLDivElement>(null);
+  useScrollMemory(pageRef, 'page:dashboard');
 
   const ctx = useDashboardContext();
   const {
@@ -70,7 +83,7 @@ function DashboardPage() {
   } = ctx;
 
   const handleScrollToTop = useCallback(() => {
-    mainRef.current?.scrollTo({ top: 0, behavior: scrollMotion() });
+    pageRef.current?.scrollTo({ top: 0, behavior: scrollMotion() });
   }, []);
 
   useEffect(() => {
@@ -138,7 +151,7 @@ function DashboardPage() {
   const hasAgentWidget = prefs.widgets.some((w) => w.type === 'agent.conversation');
   const showFloatingChat = !hasAgentWidget && !editMode;
 
-  // Reserve a bottom gutter inside <main>'s scroll area when a floating overlay
+  // Reserve a bottom gutter inside the page's scroll area when a floating overlay
   // is visible (edit-mode toolbar or floating chat card). Sitting inside the
   // scroll area means widgets end above the overlay without exposing a seam of
   // outer-container bg at the viewport bottom.
@@ -149,16 +162,20 @@ function DashboardPage() {
 
   return (
     <div className="dashboard-container min-h-full">
-      <main
-        ref={mainRef}
+      {/* A scroller, not a landmark: the app shell's <main> holds every route. */}
+      <div
+        ref={pageRef}
         className="flex-1 flex flex-col min-h-0 overflow-y-auto overflow-x-hidden"
         style={{ paddingBottom: bottomGutter }}
       >
+        <h1 className="sr-only">{t('sidebar.dashboard')}</h1>
         <DashboardHeader
           onScrollToTop={handleScrollToTop}
           edit={canEdit ? { editMode, onEditModeChange: setEditMode } : undefined}
+          actions={switcher}
         />
         <div className="mx-auto max-w-[1920px] w-full p-3 sm:p-6 pb-6">
+          {notice}
           {/* The welcome flow, offered until an investing profile is saved */}
           {showPersonalizationBanner && (
             <WelcomeBanner
@@ -182,7 +199,7 @@ function DashboardPage() {
         </div>
 
         {showFloatingChat && <ChatInputCard />}
-      </main>
+      </div>
 
       {/* Floating edit-mode toolbar */}
       {editMode && (
@@ -358,12 +375,20 @@ function DashboardPage() {
                 />
               </label>
               <label className="block">
-                <span className="term-label dash-form-label">{t('dashboard.widgets.shell.averageCostLabel')}</span>
+                <span className="term-label dash-form-label">
+                  {portfolio.editRow?.costCurrency
+                    ? t('dashboard.widgets.shell.averageCostIn', { currency: portfolio.editRow.costCurrency })
+                    : t('dashboard.widgets.shell.averageCostLabel')}
+                </span>
                 <Input
                   type="number"
                   min="0"
                   step="any"
-                  placeholder={t('dashboard.widgets.shell.averageCostPlaceholder')}
+                  placeholder={
+                    isMinorUnitListingInMajor(portfolio.editRow?.symbol, portfolio.editRow?.costCurrency)
+                      ? t('dashboard.widgets.shell.averageCostPlaceholderMinorUnit')
+                      : t('dashboard.widgets.shell.averageCostPlaceholder')
+                  }
                   value={portfolio.editForm.averageCost ?? ''}
                   onChange={(e) => portfolio.setEditForm?.({ ...portfolio.editForm, averageCost: e.target.value })}
                   className="dash-form-input dash-form-figure border"
@@ -433,10 +458,15 @@ function settledOf(read: Promise<unknown>): Promise<void> {
  * The dashboard: the user's widget layout, or the default one when they have
  * saved none. Until the preferences are read the page suspends, so the route's
  * loader stays up rather than a guessed layout that the saved one replaces.
+ * A dashboard the user's agent built and they chose replaces the layout on
+ * every screen size: they had it built for the page they open first. While it
+ * cannot be shown, the layout stands in with a note saying why
+ * (`CustomDashboard`).
  */
 export default function Dashboard() {
   const { isLoading } = usePreferences();
   const queryClient = useQueryClient();
+  const dashboards = useSavedDashboards();
   // Not after a failed read: an observer still shows a failed read as loading,
   // so waiting again would start another read, fail, and wait again for good.
   // The page renders instead, and its own read retries once as it mounts.
@@ -450,11 +480,30 @@ export default function Dashboard() {
     const read = queryClient.getQueryCache().find({ queryKey: key })?.promise;
     if (read) use(settledOf(read));
   }
-  return (
+  const builtIn = (slots: DashboardPageProps) => (
     <DashboardDataProvider>
       <MarketDataWSProvider>
-        <DashboardPage />
+        <DashboardPage {...slots} />
       </MarketDataWSProvider>
     </DashboardDataProvider>
+  );
+  const chosen = dashboards.current;
+  if (!chosen) return builtIn({ switcher: <DashboardSwitcher dashboards={dashboards} /> });
+  return (
+    <Suspense fallback={<CustomDashboardLoading switcher={<DashboardSwitcher dashboards={dashboards} />} />}>
+      <CustomDashboard key={chosen.code} dashboard={chosen} dashboards={dashboards} builtIn={builtIn} />
+    </Suspense>
+  );
+}
+
+/** While the chosen dashboard's code loads: the header stays, so nothing jumps. */
+function CustomDashboardLoading({ switcher }: { switcher: ReactNode }) {
+  return (
+    <div className="flex h-full min-h-0 flex-col" style={{ backgroundColor: 'var(--color-bg-page)' }}>
+      <DashboardHeader actions={switcher} />
+      <div className="flex flex-1 items-center justify-center">
+        <Loader size={20} style={{ color: 'var(--color-accent-primary)' }} />
+      </div>
+    </div>
   );
 }

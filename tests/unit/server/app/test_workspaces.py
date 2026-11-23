@@ -33,7 +33,7 @@ COMPUTER_ID = "11111111-1111-4111-8111-111111111111"
 @pytest.fixture(autouse=True)
 def workspace_quota_gate_off():
     with patch(
-        "src.server.dependencies.usage_limits.platform_gating_active",
+        "src.server.services.platform_client.platform_gating_active",
         return_value=False,
     ):
         yield
@@ -84,17 +84,17 @@ async def client():
 def test_home_is_told_by_is_home_and_reads_its_real_status():
     """Bound to a computer, Home's row carries the computer's status like any
     workspace on it, so clients tell Home by ``is_home``, never by status."""
-    from src.server.app.workspaces import _workspace_to_response
+    from src.server.app.workspaces import workspace_response
     from src.server.database.home_workspace import get_home_workspace_id
 
     home_id = get_home_workspace_id("test-user-123")
-    bound = _workspace_to_response(_ws(workspace_id=home_id, name="Home"))
+    bound = workspace_response(_ws(workspace_id=home_id, name="Home"))
     assert (bound.status, bound.is_home) == ("running", True)
-    unbound = _workspace_to_response(
+    unbound = workspace_response(
         _ws(workspace_id=home_id, name="Home", status="unbound", computer_id=None)
     )
     assert (unbound.status, unbound.is_home) == ("unbound", True)
-    assert _workspace_to_response(_ws()).is_home is False
+    assert workspace_response(_ws()).is_home is False
 
 
 # ---------------------------------------------------------------------------
@@ -211,6 +211,49 @@ async def test_create_without_a_computer_asks_for_none(client):
 
     assert resp.status_code == 201
     assert mock_manager.create_workspace.call_args.kwargs["computer_id"] is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "refusal",
+    ["no_computer", "backup_off"],
+)
+async def test_a_user_with_no_computer_for_home_is_answered_once_by_the_app(refusal):
+    """The route lets the refusal through its catch-all, and the app's one
+    handler answers 409 with the body the client reads."""
+    from src.server.app.setup import _needs_computer_handler
+    from src.server.app.workspaces import router
+    from src.server.services.computer_errors import NeedsComputer
+
+    mac = {"computer_id": COMPUTER_ID, "name": "MacBook Pro"}
+    exc = (
+        NeedsComputer.no_computer()
+        if refusal == "no_computer"
+        else NeedsComputer.backup_off(mac)
+    )
+    app = create_test_app(router)
+    app.add_exception_handler(NeedsComputer, _needs_computer_handler)
+    with patch("src.server.app.workspaces.WorkspaceManager") as MockWM:
+        mock_manager = AsyncMock()
+        mock_manager.create_workspace = AsyncMock(side_effect=exc)
+        MockWM.get_instance.return_value = mock_manager
+        async with AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://test"
+        ) as c:
+            resp = await c.post("/api/v1/workspaces", json={"name": "W"})
+
+    assert resp.status_code == 409
+    detail = resp.json()["detail"]
+    if refusal == "no_computer":
+        assert detail == {"code": "needs_computer", "message": str(exc)}
+    else:
+        assert detail == {
+            "code": "needs_backup",
+            "message": str(exc),
+            "computer_id": COMPUTER_ID,
+            "computer_name": "MacBook Pro",
+        }
+        assert "MacBook Pro" in detail["message"]
 
 
 @pytest.mark.asyncio
@@ -335,54 +378,6 @@ async def test_create_workspace_validation_empty_name(client):
 
 
 # ---------------------------------------------------------------------------
-# POST /api/v1/workspaces/home
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.asyncio
-async def test_get_home_workspace(client):
-    ws = _ws(name="Home", status="unbound", computer_id=None)
-    with patch(
-        "src.server.app.workspaces.get_or_create_home_workspace",
-        new_callable=AsyncMock,
-        return_value=ws,
-    ):
-        resp = await client.post("/api/v1/workspaces/home")
-
-    assert resp.status_code == 200
-    assert resp.json()["workspace_id"] == ws["workspace_id"]
-    assert resp.json()["is_home"] is True
-
-
-@pytest.mark.asyncio
-async def test_get_home_workspace_error(client):
-    with patch(
-        "src.server.app.workspaces.get_or_create_home_workspace",
-        new_callable=AsyncMock,
-        side_effect=RuntimeError("db down"),
-    ):
-        resp = await client.post("/api/v1/workspaces/home")
-
-    assert resp.status_code == 500
-
-
-@pytest.mark.asyncio
-async def test_a_home_id_another_account_holds_is_forbidden(client):
-    """An account merge carries the merged account's Home onto the account it
-    joins. Every app load asks for it, and no retry makes it the caller's."""
-    from src.server.database.workspace import HomeWorkspaceTaken
-
-    with patch(
-        "src.server.app.workspaces.get_or_create_home_workspace",
-        new_callable=AsyncMock,
-        side_effect=HomeWorkspaceTaken("home-ws", "test-user-123"),
-    ):
-        resp = await client.post("/api/v1/workspaces/home")
-
-    assert resp.status_code == 403
-
-
-# ---------------------------------------------------------------------------
 # POST /api/v1/workspaces/reorder
 # ---------------------------------------------------------------------------
 
@@ -476,7 +471,7 @@ def _quota_platform(scopes, capacity):
     counts = AsyncMock(side_effect=lambda _uid, quota: capacity[quota])
     return (
         patch(
-            "src.server.dependencies.usage_limits.platform_gating_active",
+            "src.server.services.platform_client.platform_gating_active",
             return_value=True,
         ),
         patch(
@@ -544,10 +539,35 @@ async def test_get_workspace_quota_unknown_scopes_fail_open(client):
 
 
 @pytest.mark.asyncio
+async def test_get_workspace_quota_back_from_the_plan_page_reads_the_plan_again(client):
+    """A plan changed seconds after the last read shows what it opens on the read that says so,
+    where any other read answers from the list cached just before it."""
+    import time
+
+    from src.server.dependencies.usage_limits import _scope_cache
+
+    counts = AsyncMock(side_effect=lambda _uid, quota: _CAPACITY[quota])
+    for query, limit in (("", 0), ("?plan_changed=true", 3)):
+        _scope_cache["test-user-123"] = ([], time.time() + 300 - 5)
+        with (
+            patch("src.server.services.platform_client.platform_gating_active", return_value=True),
+            patch(
+                "src.server.services.platform_client.call_validate",
+                new=AsyncMock(return_value={"scopes": ["workspace:spec:performance"]}),
+            ),
+            patch("src.server.dependencies.usage_limits.get_capacity_status", new=counts),
+            patch("src.server.app.workspaces.get_capacity_status", new=counts),
+        ):
+            resp = await client.get(f"/api/v1/workspaces/quota{query}")
+        assert resp.json()["performance"]["limit"] == limit
+    _scope_cache.pop("test-user-123", None)
+
+
+@pytest.mark.asyncio
 async def test_get_workspace_quota_oss_all_null(client):
     """OSS mode: every capability is None, so the response fields are null."""
     with patch(
-        "src.server.dependencies.usage_limits.platform_gating_active",
+        "src.server.services.platform_client.platform_gating_active",
         return_value=False,
     ):
         resp = await client.get("/api/v1/workspaces/quota")
@@ -937,6 +957,43 @@ async def test_start_workspace_forbidden(client):
         )
 
     assert resp.status_code == 403
+
+
+@pytest.fixture(autouse=True)
+def _computer_answers():
+    """Every start here is on a computer that answers, unless a test says otherwise."""
+    with patch(
+        "src.server.app.workspaces.computer_away", AsyncMock(return_value=None)
+    ) as away:
+        yield away
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", ["stopped", "running"])
+async def test_a_warm_leaves_a_computer_that_is_away_alone(
+    client, _computer_answers, status
+):
+    """Opening a workspace on a sleeping machine starts nothing: the start
+    could only fail and leave a failed start on the computer."""
+    ws = _ws(status=status)
+    _computer_answers.return_value = {"computer_id": COMPUTER_ID}
+    with (
+        patch(
+            "src.server.app.workspaces.db_get_workspace",
+            new_callable=AsyncMock,
+            return_value=ws,
+        ),
+        patch("src.server.app.workspaces.WorkspaceManager") as MockWM,
+        patch("src.server.app.workspaces._schedule_warm_restart") as mock_schedule,
+    ):
+        MockWM.get_instance.return_value = AsyncMock()
+        resp = await client.post(
+            f"/api/v1/workspaces/{ws['workspace_id']}/start?lazy=true"
+        )
+
+    assert resp.status_code == 200
+    assert resp.json()["status"] == status
+    mock_schedule.assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -1879,6 +1936,29 @@ async def test_deleting_home_is_refused(client, bound):
         resp = await client.delete(
             f"/api/v1/workspaces/{ws['workspace_id']}"
         )
+
+    assert resp.status_code == 400
+    assert resp.json()["detail"] == "Cannot delete Home"
+
+
+@pytest.mark.asyncio
+async def test_deleting_homes_stand_in_is_refused_before_the_user_is_asked(client):
+    """The stand-in is Home to the user and the agent, and an agent's `la`
+    reaches this route, so it is refused before any approval card."""
+    from src.server.database.home_workspace import HOME_STAND_IN_KEY, get_home_stand_in_id
+
+    ws = _ws(
+        workspace_id=get_home_stand_in_id("test-user-123"),
+        name="Home",
+        config={HOME_STAND_IN_KEY: True},
+    )
+    ask = AsyncMock(side_effect=AssertionError("the user must not be asked"))
+    with patch(
+        "src.server.app.workspaces.db_get_workspace",
+        new_callable=AsyncMock,
+        return_value=ws,
+    ), patch("src.server.app.workspaces.cli_approval.workspace_delete", ask):
+        resp = await client.delete(f"/api/v1/workspaces/{ws['workspace_id']}")
 
     assert resp.status_code == 400
     assert resp.json()["detail"] == "Cannot delete Home"

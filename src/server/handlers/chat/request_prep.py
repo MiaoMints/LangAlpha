@@ -21,23 +21,33 @@ from typing import TYPE_CHECKING, Any, NamedTuple, Optional
 
 from ptc_agent.agent.limits import UNBOUNDED_RECURSION_LIMIT
 from ptc_agent.agent.middleware.provenance.command_trace import REPORT_COMMAND_KEY
-from ptc_agent.agent.middleware.runtime_context import TurnContext, parse_surface
+from ptc_agent.agent.middleware.runtime_context import HomeAway, TurnContext, parse_surface
+from ptc_agent.agent.tools.command_handoff import JOB_ENV_KEY
 from src.config.settings import (
     get_langsmith_metadata,
     get_langsmith_tags,
     get_locale_config,
 )
 from src.observability.langsmith_tracer import with_run_tracer
+from src.server.contracts.run_times import run_settled_at
 from src.server.contracts.turn_kinds import (
     ANNOUNCED_KEYS,
     NOTIFICATION_QUERY_TYPES,
     WAKE_QUERY_TYPE,
+    posted_by_server,
 )
 from src.server.database import conversation as qr_db
 from src.server.database.conversation.threads_write import remember_thread_llm_model
+from src.server.services.forks.model import ForkLineage
 from src.server.services.llm.thread_model import NamedModel
+from src.server.services.runs.pending_input import (
+    PENDING_INPUT_KEY,
+    cache_clock_attempt,
+)
 from src.server.database.runs import lifecycle as tl_db
+from src.server.database.runs.hook_jobs import SURFACE_META
 from src.server.models.chat import CommandReport, summarize_hitl_response_map
+from src.server.utils.chart_view_context import chart_views_env
 from src.server.utils.skill_context import (
     detect_slash_commands,
     parse_skill_contexts,
@@ -393,13 +403,30 @@ class PriorThread(NamedTuple):
     """
 
     last_turn_at: Optional[datetime] = None
-    # The surface the thread is bound to (the one it was created on, or a
-    # channel identity stamped onto it later). Stands in for the turn's own
-    # surface on a notification, which arrives without one (``turn_surface``).
-    platform: Optional[str] = None
     # The surface the latest attempt recorded it ran on (``surface_stamp``).
-    # Stands in for a resume's, which continues that attempt.
+    # Stands in for a resume's, which continues that attempt, and for a
+    # notification's, which reports where the user last was: for one, the
+    # latest attempt that stated its rules into the history the notification
+    # inherits (``_VOICELESS_ATTEMPT_KEYS``).
     attempt_platform: Optional[str] = None
+    # When the thread's newest attempt settled, by the run ledger, passing over
+    # one whose input never reached the graph (``cache_clock_attempt``). A
+    # cancelled or failed call still refreshed the provider's prompt cache but
+    # stamped nothing in the checkpoint, so compaction's cold-cache estimate
+    # reads this as well.
+    last_run_settled_at: Optional[datetime] = None
+    # Where a fork came from, for its first turn's carry (``forks.carry``).
+    fork: Optional[ForkLineage] = None
+    # The thread's title, which a fork's first message replaces while it is
+    # still the one the fork was made with.
+    title: Optional[str] = None
+
+
+#: Attempts a notification's surface passes over. An automation's run states
+#: no surface and records none, and an attempt whose input never reached the
+#: graph stated nothing at all, so the rules a notification inherits are those
+#: of the attempt before either, and its surface has to agree with them.
+_VOICELESS_ATTEMPT_KEYS = ("automation_execution_id", PENDING_INPUT_KEY)
 
 
 def _fork_predecessor_turn(request: ChatRequest) -> Optional[int]:
@@ -410,10 +437,9 @@ def _fork_predecessor_turn(request: ChatRequest) -> Optional[int]:
 
 
 async def _read_prior_thread(
-    thread_id: str, *, before_turn: Optional[int] = None
+    thread_id: str, *, before_turn: Optional[int] = None, notification: bool = False
 ) -> PriorThread:
-    """The prior-turn time, the surface the thread is bound to, and the
-    surface its latest attempt ran on.
+    """The prior-turn time and the surface the thread's latest attempt ran on.
 
     The time is the latest attempt row's, never the thread's ``updated_at``: a
     rename or a share bumps the thread stamp between turns, a concurrent POST
@@ -425,12 +451,29 @@ async def _read_prior_thread(
     An edit or a regenerate forks from an earlier turn, and the history the
     model reads ends there, so its prior turn is the attempt before the fork
     rather than the newest attempt on the thread.
+
+    A ``notification`` takes its surface from the latest attempt that stated
+    the rules it inherits (``_VOICELESS_ATTEMPT_KEYS``).
     """
+    reads = [
+        qr_db.get_thread_by_id(thread_id),
+        tl_db.get_latest_attempt(thread_id, before_turn=before_turn),
+    ]
+    # A fork's prior turn is an earlier attempt, but the newest one is what
+    # last refreshed the provider's cache over the history they share.
+    if before_turn is not None:
+        reads.append(tl_db.get_latest_attempt(thread_id))
     try:
-        row, attempt = await asyncio.gather(
-            qr_db.get_thread_by_id(thread_id),
-            tl_db.get_latest_attempt(thread_id, before_turn=before_turn),
-        )
+        row, attempt, *newest = await asyncio.gather(*reads)
+        clock = await cache_clock_attempt(thread_id, newest[0] if newest else attempt)
+        voiced = attempt
+        if notification and any(
+            key in ((attempt or {}).get("metadata") or {})
+            for key in _VOICELESS_ATTEMPT_KEYS
+        ):
+            voiced = await tl_db.get_latest_attempt(
+                thread_id, before_turn=before_turn, without_key=_VOICELESS_ATTEMPT_KEYS
+            )
     except Exception:
         logger.debug("thread runtime-context read failed", exc_info=True)
         return PriorThread()
@@ -443,17 +486,18 @@ async def _read_prior_thread(
         # A naive stamp would raise against the envelope's aware clock.
         last_turn_at = stamp if stamp.tzinfo else stamp.replace(tzinfo=UTC)
 
-    platform = row.get("platform")
-    ran_on = ((attempt or {}).get("metadata") or {}).get(SURFACE_KEY)
+    ran_on = ((voiced or {}).get("metadata") or {}).get(SURFACE_META)
     attempt_platform = ran_on.get("platform") if isinstance(ran_on, dict) else None
     return PriorThread(
         last_turn_at=last_turn_at,
-        platform=platform if isinstance(platform, str) and platform else None,
         attempt_platform=(
             attempt_platform
             if isinstance(attempt_platform, str) and attempt_platform
             else None
         ),
+        last_run_settled_at=run_settled_at(clock),
+        fork=ForkLineage.of(row.get("metadata")),
+        title=row.get("title"),
     )
 
 
@@ -463,17 +507,68 @@ async def ensure_thread(
     workspace_id: str,
     user_id: str,
     initial_query: str = "",
+    row_ensured: bool = False,
 ) -> PriorThread:
     """Ensure a thread record exists in the database, optionally with external linkage.
 
     Returns the prior turn as it stood on entry, read here so the ordering
     against the ensure below (which stamps the thread row) stays off the
     callers.
+
+    ``row_ensured``: ``make_thread`` already found or made the row, which is
+    then the only call that applies creation-time fields, so this one has the
+    status to resume and nothing to create or title.
     """
     prior = await _read_prior_thread(
-        thread_id, before_turn=_fork_predecessor_turn(request)
+        thread_id,
+        before_turn=_fork_predecessor_turn(request),
+        notification=is_notification_turn(request),
+    )
+    if row_ensured:
+        await qr_db.update_thread_status(thread_id, "in_progress")
+        return prior
+    created = await _ensure_thread_row(
+        request, thread_id, workspace_id, user_id, initial_query=initial_query
     )
 
+    # Threads born here (automations, channel gateways, legacy clients) never
+    # pass through POST /threads, so this is their only shot at an LLM title.
+    # Web create-first threads pre-exist → created=False → no double generation.
+    if created and initial_query:
+        from src.server.services.thread_title import schedule_title_generation
+        from src.server.utils.thread_stamp import stamped_title
+
+        schedule_title_generation(
+            thread_id=thread_id,
+            user_id=user_id,
+            first_query=initial_query,
+            expected_title=stamped_title(initial_query),
+            timezone=request.timezone,
+        )
+
+    return prior
+
+
+async def make_thread(
+    request: ChatRequest, thread_id: str, workspace_id: str, user_id: str
+) -> bool:
+    """Make the thread a send needs before its admission, untitled. Whether
+    this call made it; a thread it finds keeps its status, since the send
+    may yet be refused. A thread this call made has no prior turn."""
+    return await _ensure_thread_row(
+        request, thread_id, workspace_id, user_id, initial_query="", resume=False
+    )
+
+
+async def _ensure_thread_row(
+    request: ChatRequest,
+    thread_id: str,
+    workspace_id: str,
+    user_id: str,
+    *,
+    initial_query: str,
+    resume: bool = True,
+) -> bool:
     ensure_kwargs = dict(
         workspace_id=workspace_id,
         conversation_thread_id=thread_id,
@@ -481,6 +576,8 @@ async def ensure_thread(
         initial_query=initial_query,
         initial_status="in_progress",
     )
+    if not resume:
+        ensure_kwargs["resume"] = False
     if request.platform:
         ensure_kwargs["platform"] = request.platform
     if request.external_thread_id:
@@ -492,32 +589,17 @@ async def ensure_thread(
     # Applied only if this send creates the thread; PATCH owns it after.
     if request.subagents_allowed is not None:
         ensure_kwargs["subagents_allowed"] = request.subagents_allowed
-    created = await qr_db.ensure_thread_exists(**ensure_kwargs)
-
-    # Threads born here (automations, channel gateways, legacy clients) never
-    # pass through POST /threads, so this is their only shot at an LLM title.
-    # Web create-first threads pre-exist → created=False → no double generation.
-    if created and initial_query:
-        from src.server.services.thread_title import schedule_title_generation
-
-        schedule_title_generation(
-            thread_id=thread_id,
-            user_id=user_id,
-            first_query=initial_query,
-            expected_title=initial_query[:255],
-            timezone=request.timezone,
-        )
-
-    return prior
+    return await qr_db.ensure_thread_exists(**ensure_kwargs)
 
 
 async def keep_named_model(thread_id: str, named_model: NamedModel | None) -> None:
     """Keep the model a client named on its thread, once the turn is admitted.
 
     Called after START commits and the run is attached, so a send refused
-    before admission, or a steer that never ran on the model it carried,
-    leaves the thread as it was, and the committed run always has an owner
-    when this waits on the database.
+    before admission leaves the thread as it was, and the committed run
+    always has an owner when this waits on the database. A hand-off steered
+    into a running turn calls it too: it steers only a turn on the model it
+    named (``wait_or_steer``'s ``on_model``).
     """
     if named_model:
         await remember_thread_llm_model(
@@ -533,6 +615,10 @@ def build_turn_context(
     disk_free_mb: int | None = None,
     disk_known: bool = False,
     inherits_rules: bool = False,
+    sent_at: float | None = None,
+    carried_unwatched: bool | None = None,
+    home_away: HomeAway | None = None,
+    home_back: dict[str, Any] | None = None,
 ) -> TurnContext:
     """What this turn knows about itself: the request's surface plus the prior row.
 
@@ -543,7 +629,13 @@ def build_turn_context(
     automation stamps the origin on every request it sends, so nothing is lost.
     ``disk_free_mb`` and ``disk_known`` come from :func:`read_disk_notice`.
     ``inherits_rules`` is set for a retry whose attempt ran under the last
-    rules stated (:func:`retried_on_its_surface`).
+    rules stated (:func:`retried_on_its_surface`). ``unwatched`` is a turn
+    nobody is there to see run (:func:`is_unwatched_turn`), or as recorded on
+    the turn a restart stopped that this one resumes (``carried_unwatched``,
+    from ``carry.carried_unwatched``). ``sent_at`` is when the server
+    received the request, ahead of admission and the workspace's start.
+    ``home_away`` and ``home_back`` say where a Home turn runs
+    (``home_placement``).
 
     The zone is the profile's before the request's: a channel or an
     automation's own request names none, and the request alone would put
@@ -554,13 +646,21 @@ def build_turn_context(
     zone = _first_zone((user_profile or {}).get("timezone"), request.timezone)
     return TurnContext(
         last_turn_at=prior.last_turn_at,
+        previous_run_settled_at=prior.last_run_settled_at,
+        keep_full_context=request.keep_full_context,
+        sent_at=sent_at,
         platform=request.platform,
         origin=request.origin.type if request.origin else None,
         origin_agent=request.origin.agent if request.origin else None,
         surface_rules=request.surface_rules,
         inherits_rules=inherits_rules or is_notification_turn(request),
+        unwatched=(
+            is_unwatched_turn(request) if carried_unwatched is None else carried_unwatched
+        ),
         disk_free_mb=disk_free_mb,
         disk_known=disk_known,
+        home_away=home_away,
+        home_back=home_back,
         timezone=zone,
         tool_timezone=zone
         or get_locale_config(request.locale or "en-US", "en").get("timezone", "UTC"),
@@ -568,16 +668,27 @@ def build_turn_context(
 
 
 def is_notification_turn(request: ChatRequest) -> bool:
-    """Whether this server posted the turn itself, to report finished background
-    work, a market target's notice or a wakeup that fired.
+    """Whether this server posted the turn itself (``posted_by_server``)."""
+    return posted_by_server(request.query_type, request.platform)
 
-    A report-back arrives as a system query with no surface of its own, and a
-    wake as a ``market_target`` or ``wakeup`` query. Nobody sent any of them,
-    so it speaks where the thread's last turn did rather than naming a surface.
-    ``query_type`` is stripped from every request that is not the server's own
-    (``threads/messaging.py``), so a client cannot claim one.
+
+def is_unwatched_turn(request: ChatRequest) -> bool:
+    """Whether nobody is there to see the turn run, so nobody can wake a
+    machine of theirs that stops answering during it.
+
+    A turn this server posts (a report-back, a wake), whatever surface it
+    reports to, an automation's run, and work another agent sends (a Chief of
+    Staff hand-off, a computer's agent through the ``la`` CLI). ``query_type``
+    and the announced keys are stripped from a client's body
+    (``threads/messaging.py``), and only a session or the server states an
+    origin (``principal.stamp_origin``). A restart's resume takes it from
+    the turn it carries on instead (``carry.carried_unwatched``).
     """
-    return request.query_type in NOTIFICATION_QUERY_TYPES and not request.platform
+    return (
+        request.query_type in NOTIFICATION_QUERY_TYPES
+        or bool(request.wakeup or request.market_target)
+        or (request.origin is not None and request.origin.type in ("automation", "agent"))
+    )
 
 
 def turn_surface(request: ChatRequest, prior: PriorThread) -> Optional[str]:
@@ -587,9 +698,14 @@ def turn_surface(request: ChatRequest, prior: PriorThread) -> Optional[str]:
     arrive without one, and continues the attempt it answers, so it runs where
     that attempt ran, as a retry does: the thread's bound surface would make
     the answer to a web turn's question on a channel's thread the channel's.
-    A notification arrives without one too and continues work the thread
-    already had in hand, so it takes the surface the thread is bound to. Any
-    other turn without a surface is a plain web-app turn, which has none.
+    A notification arrives without one too and reports to the user where they
+    last were, so it takes the latest attempt's surface as well. Each
+    notification records the surface it took, so a chain of them keeps the
+    surface of the last turn a person sent, rather than the one the thread
+    was born on: the rules it runs under are the last ones stated, and the two
+    have to agree, so it passes over an automation's run and an attempt that
+    never reached the graph, neither of which stated a surface's rules. Any other turn without a surface is a plain web-app turn,
+    which has none.
     """
     return parse_surface(_turn_platform(request, prior)).name
 
@@ -598,15 +714,9 @@ def _turn_platform(request: ChatRequest, prior: PriorThread) -> Optional[str]:
     """The surface :func:`turn_surface` names, as the request spells it."""
     if request.platform:
         return request.platform
-    if request.hitl_response:
+    if request.hitl_response or is_notification_turn(request):
         return prior.attempt_platform
-    if is_notification_turn(request):
-        return prior.platform
     return None
-
-
-#: The run-row key under which an attempt records where it ran, for its retry.
-SURFACE_KEY = "surface"
 
 
 def surface_stamp(
@@ -629,7 +739,7 @@ def surface_stamp(
         stamp["rules"] = request.surface_rules
     if inherits_rules:
         stamp["inherits_rules"] = True
-    return {SURFACE_KEY: stamp} if stamp else {}
+    return {SURFACE_META: stamp} if stamp else {}
 
 
 async def retried_on_its_surface(request: ChatRequest) -> tuple[ChatRequest, bool]:
@@ -643,7 +753,7 @@ async def retried_on_its_surface(request: ChatRequest) -> tuple[ChatRequest, boo
     if not request.retry_of_run_id or request.platform:
         return request, False
     run = await tl_db.get_run(request.retry_of_run_id)
-    stamp = ((run or {}).get("metadata") or {}).get(SURFACE_KEY)
+    stamp = ((run or {}).get("metadata") or {}).get(SURFACE_META)
     if not isinstance(stamp, dict):
         return request, False
     platform, rules = stamp.get("platform"), stamp.get("rules")
@@ -749,6 +859,7 @@ def turn_skill_names(config) -> set[str] | None:
             user_skills=getattr(config, "user_skills", None) or (),
             user_skill_dir=getattr(config, "user_skill_dir", None),
             workspace_skill_dir=getattr(config, "workspace_skill_dir", None),
+            withheld=getattr(config, "withheld_skills", None) or (),
         )
     )
 
@@ -905,6 +1016,11 @@ def build_graph_config(
     report = request.report_source
     if isinstance(report, CommandReport):
         configurable[REPORT_COMMAND_KEY] = report.command_id
+    # The user's chart views reach the turn's sandbox jobs from here, never
+    # the prompt; a turn with no user message of its own has none.
+    job_env = chart_views_env(request.chart_views)
+    if job_env:
+        configurable[JOB_ENV_KEY] = job_env
     if extra_configurable:
         configurable.update(extra_configurable)
     if skill_contexts:

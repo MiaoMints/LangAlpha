@@ -1,6 +1,6 @@
 export type WakeupKind = 'at' | 'cron' | 'price' | 'order';
 export type WakeupState =
-  | 'armed' | 'held' | 'held_usage' | 'fired' | 'finished' | 'lapsed' | 'expired' | 'cancelled';
+  | 'armed' | 'held' | 'held_usage' | 'held_plan' | 'fired' | 'finished' | 'lapsed' | 'expired' | 'cancelled';
 export type OrderOutcome =
   | 'filled'
   | 'partial'
@@ -20,6 +20,9 @@ export interface WakeupPrice {
   pct_from: 'previous_close' | 'now' | null;
   armed_price: number | null;
   fired_price: number | null;
+  /** While armed, the price the monitor last read and the level it fires at. */
+  last?: number | null;
+  level?: number | null;
   expires_at?: string | null;
 }
 
@@ -52,6 +55,8 @@ export interface Wakeup {
   ends_at: string | null;
   expires_at: string | null;
   fired_at: string | null;
+  /** When the Claude plan resets that a `held_plan` wakeup waits for. */
+  plan_reset_at?: string | null;
   price: WakeupPrice | null;
   order: WakeupOrder | null;
   cancellable: boolean;

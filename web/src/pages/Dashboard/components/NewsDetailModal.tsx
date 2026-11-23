@@ -9,6 +9,7 @@ import { DashWindowDialog } from './DashWindowDialog';
 import { useIsMobile } from '@/hooks/useIsMobile';
 import { MobileBottomSheet } from '@/components/ui/mobile-bottom-sheet';
 import { Loader } from '@/components/ui/loader';
+import { TickerLabel } from '@/components/TickerLogo';
 import { useToast } from '@/components/ui/use-toast';
 import { ContextBus } from '@/lib/contextBus';
 import { createDateFormatter } from '@/lib/format';
@@ -16,17 +17,12 @@ import { TermCard, TermStatus, TermTag, type TermTone } from '@/pages/ChatAgent/
 import { TermPanelContext } from '@/pages/ChatAgent/components/charts/termContext';
 import '@/pages/ChatAgent/components/charts/termPanel.css';
 import { buildNewsWidgetSnapshot, normalizeArticle } from '../utils/newsArticleFetch';
+import { tickerImpactRows, type NewsSentiment } from '../utils/tickerImpact';
 import './dashWindow.css';
 
 interface ArticleSource {
   name: string;
   favicon_url?: string;
-}
-
-interface ArticleSentiment {
-  ticker: string;
-  sentiment: string;
-  reasoning?: string;
 }
 
 interface Article {
@@ -39,7 +35,7 @@ interface Article {
   published_at?: string;
   keywords?: string[];
   tickers?: string[];
-  sentiments?: ArticleSentiment[];
+  sentiments?: NewsSentiment[];
   source?: ArticleSource;
   [key: string]: unknown;
 }
@@ -57,7 +53,7 @@ interface NewsFallback {
   description?: string | null;
   content?: string | null;
   keywords?: string[];
-  sentiments?: ArticleSentiment[] | null;
+  sentiments?: NewsSentiment[] | null;
   imageUrl?: string | null;
   favicon?: string | null;
 }
@@ -190,11 +186,7 @@ function NewsBody({
     );
   }
 
-  const sentiments = article.sentiments ?? [];
-  // A story whose feed scored nothing still names what it is about.
-  const impact = sentiments.length > 0
-    ? sentiments.map((s) => ({ ticker: s.ticker, sentiment: s.sentiment || 'neutral', note: s.reasoning }))
-    : (article.tickers ?? []).map((ticker) => ({ ticker, sentiment: null, note: undefined }));
+  const { rows: impact, scored: aiScored } = tickerImpactRows(article.sentiments, article.tickers);
   const keywords = article.keywords ?? [];
   const image = safeHttpUrl(article.image_url);
   const hasSide = !!image || keywords.length > 0;
@@ -257,17 +249,25 @@ function NewsBody({
             </TermCard>
           )}
           {impact.length > 0 && (
-            <TermCard title={t('dashboard.newsDetail.tickerImpact')} meta={impact.length}>
+            <TermCard
+              title={t('dashboard.newsDetail.tickerImpact')}
+              meta={aiScored ? t('dashboard.newsDetail.tickerImpactMeta') : impact.length}
+              metaTitle={aiScored ? t('dashboard.newsDetail.tickerImpactNote') : undefined}
+            >
               <table className="term-table dash-window-impact">
                 <tbody>
                   {impact.map((row, i) => (
                     <tr key={`${row.ticker}-${i}`}>
-                      <td className="term-code term-strong">{row.ticker}</td>
+                      <td className="term-code term-strong">
+                        <TickerLabel symbol={row.ticker} />
+                      </td>
                       <td>
-                        {row.sentiment && (
+                        {row.sentiment ? (
                           <TermStatus tone={sentimentTone(row.sentiment)}>
                             {t(`dashboard.newsDetail.sentiment.${sentimentTone(row.sentiment)}`)}
                           </TermStatus>
+                        ) : (
+                          <span className="term-t3">{t('dashboard.newsDetail.unscored')}</span>
                         )}
                       </td>
                       <td className="term-fill term-prose">{row.note}</td>

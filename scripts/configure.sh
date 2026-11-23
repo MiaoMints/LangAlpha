@@ -31,14 +31,42 @@ set_env() {
     fi
 }
 
-# Toggle MCP server enabled flag by name
+# Set a server's enabled flag. The shipped servers are declared in plugins/, so
+# most have no entry in agent_config.yaml: one is added under mcp.servers, the
+# same two-line override the file documents. An entry already there gets the
+# flag right under its name, in place of any it had.
 toggle_mcp() {
     local name="$1" enabled="$2"
-    awk -v n="$name" -v e="$enabled" '
-        /^[[:space:]]*- name:/ && index($0, "\"" n "\"") { hit=1 }
-        hit && /^[[:space:]]*enabled:/ { sub(/enabled: *(true|false)/, "enabled: " e); hit=0 }
-        { print }
-    ' "$CONFIG" > "$CONFIG.tmp" && mv "$CONFIG.tmp" "$CONFIG"
+    if grep -Eq "^[[:space:]]*- name: *[\"']?${name}[\"']?[[:space:]]*(#.*)?$" "$CONFIG"; then
+        awk -v n="$name" -v e="$enabled" '
+            /^[[:space:]]*- name:/ {
+                inside = 0
+                line = $0
+                sub(/[[:space:]]*#.*$/, "", line)
+                gsub(/["\047[:space:]]/, "", line)
+                if (line == "-name:" n) {
+                    print
+                    print "      enabled: " e
+                    inside = 1
+                    next
+                }
+            }
+            inside && /^[[:space:]]*enabled:/ { next }
+            inside && /^ {0,4}[^ #]/ { inside = 0 }
+            { print }
+        ' "$CONFIG" > "$CONFIG.tmp" && mv "$CONFIG.tmp" "$CONFIG"
+    else
+        awk -v n="$name" -v e="$enabled" '
+            /^  servers:/ && !done {
+                print "  servers:"
+                print "    - name: \"" n "\""
+                print "      enabled: " e
+                done = 1
+                next
+            }
+            { print }
+        ' "$CONFIG" > "$CONFIG.tmp" && mv "$CONFIG.tmp" "$CONFIG"
+    fi
 }
 
 # Set a field under the top-level llm: block
@@ -176,7 +204,9 @@ if mode == 'providers':
 elif mode == 'models':
     p = sys.argv[3]
     fam = {p} | {k for k, c in pc.items() if c.get('parent_provider') == p}
-    for m in sorted(n for n, v in md.items() if v.get('provider') in fam and 'embedding' not in n):
+    # A Claude Code row runs only for a user who opted in, so it is never a deployment default.
+    for m in sorted(n for n, v in md.items() if v.get('provider') in fam and 'embedding' not in n
+                    and pc[v['provider']].get('sdk') != 'claude-code'):
         print(m)
 PYEOF
 }
@@ -310,7 +340,7 @@ printf "  ${BOLD}1${NC}) Yahoo Finance — free, no API key needed\n"
 printf "  ${BOLD}2${NC}) FMP (Financial Modeling Prep) — high-quality data (free tier available)\n"
 printf "  ${BOLD}3${NC}) Both — FMP + Yahoo Finance MCP servers\n"
 printf "\n"
-info "See README > Data Provider Fallback Chain for details."
+info "See README > Get started > Optional keys for details."
 printf "\n"
 data=$(prompt_choice "Choice" "1")
 

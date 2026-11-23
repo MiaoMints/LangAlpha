@@ -17,6 +17,7 @@ import { baseURL } from '@/pages/ChatAgent/utils/api/transport';
 
 import iconOpenai from '@/assets/providers/openai.svg';
 import iconAnthropic from '@/assets/providers/anthropic.svg';
+import iconClaude from '@/assets/providers/claude.svg';
 import iconGemini from '@/assets/providers/gemini.svg';
 import iconOpenrouter from '@/assets/providers/openrouter.svg';
 import iconZai from '@/assets/providers/z-ai.svg';
@@ -45,8 +46,8 @@ export type BrandArt = {
    *  rounded box would only cut off whatever reaches its corners. */
   bare?: boolean;
   /** The word a model's name opens with that the mark says already, dropped
-   *  where room is short (`nameBesideMark`): "GPT-6.1 Sol" beside the OpenAI
-   *  mark reads "6.1 Sol". A host whose models come from many makers
+   *  where room is short (`nameBesideMark`): "GPT-6.2 Sol" beside the OpenAI
+   *  mark reads "6.2 Sol". A host whose models come from many makers
    *  (OpenRouter, a local server) has none. */
   brand?: string;
 };
@@ -78,6 +79,7 @@ const LLM_PROVIDER_ART: Record<string, BrandArt> = {
   'codex-oauth': OPENAI,
   anthropic: ANTHROPIC,
   'claude-oauth': ANTHROPIC,
+  'claude-code': mark(iconClaude, false, 'Claude'),
   gemini: mark(iconGemini, false, 'Gemini'),
   xai: XAI,
   'grok-oauth': XAI,

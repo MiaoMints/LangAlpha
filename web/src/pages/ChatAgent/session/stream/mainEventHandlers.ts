@@ -7,9 +7,12 @@
 import { isToolResultFailure, toolNameOf } from '../subagents/subagentStatus';
 import { ownerOfToolCall } from '../toolCallOwner';
 import { deriveTaskSegment, applyTaskSegment, applyLaunchReply } from '../subagents/taskSegmentBuilder';
-import type { MessageRecord, SetMessages, ToolCallRecord, ToolCallResultRecord, TodoPayload, HtmlWidgetData } from '../../hooks/utils/types';
+import type { MessageRecord, SetMessages, ToolCallRecord, ToolCallResultRecord, HtmlWidgetData } from '../../hooks/utils/types';
 import type { ProvenanceEvent } from '@/types/sse';
-import type { ContentSegment, PendingToolCallChunk, ProvenanceRecord, SubagentTaskRecord, TextSegment } from '@/types/chat';
+import type { AssistantMessage, ContentSegment, PendingToolCallChunk, ProvenanceRecord, SubagentTaskRecord, TurnStop, TextSegment } from '@/types/chat';
+import { readPlanBilled } from '@/lib/claudeCodePlan';
+import { readCliQueue, type CliQueueFrame, type CliQueueSignal } from '@/lib/claudeCodeQueue';
+import { appendNotificationSegmentOnce } from '../../hooks/utils/messageFinalizers';
 import { provenanceEventToRecord, provenanceRecordKey } from './provenance';
 import { appendTextChunk } from './textChunks';
 import { addToolCallChunk, hasPreparing, removeLandedToolCall, withoutPending } from './toolCallChunks';
@@ -165,10 +168,12 @@ export function handleReasoningContent({ assistantMessageId, content, refs, setM
  * @param {Function} params.setMessages - State setter for messages
  * @returns {boolean} True if event was handled
  */
-export function handleTextContent({ assistantMessageId, content, finishReason, refs, setMessages, eventId, phase }: {
+export function handleTextContent({ assistantMessageId, content, finishReason, stop = true, refs, setMessages, eventId, phase }: {
   assistantMessageId: string;
   content: string;
   finishReason: string | undefined;
+  /** How a stopped turn was stopped. */
+  stop?: TurnStop;
   refs: StreamRefs;
   setMessages: SetMessages;
   eventId?: number | null;
@@ -197,7 +202,7 @@ export function handleTextContent({ assistantMessageId, content, finishReason, r
       setMessages((prev: MessageRecord[]) =>
         prev.map((msg: MessageRecord) =>
           msg.id === assistantMessageId
-            ? { ...withoutPending(msg), isStreaming: false, ...(isStopped ? { stopped: true } : {}) }
+            ? { ...withoutPending(msg), isStreaming: false, ...(isStopped ? { stopped: stop } : {}) }
             : msg
         )
       );
@@ -455,10 +460,8 @@ export function handleProvenance({ assistantMessageId, event, setMessages }: {
     prev.map((msg: MessageRecord) => {
       if (msg.id !== assistantMessageId) return msg;
 
-      const provenanceRecords = {
-        ...((msg.provenanceRecords as Record<string, ProvenanceRecord>) || {}),
-        [key]: record,
-      };
+      const records = (msg.provenanceRecords as Record<string, ProvenanceRecord>) || {};
+      const provenanceRecords = { ...records, [key]: withPriorCost(records[key], record) };
 
       return { ...msg, provenanceRecords };
     })
@@ -468,98 +471,71 @@ export function handleProvenance({ assistantMessageId, event, setMessages }: {
 }
 
 /**
- * Handles artifact events with artifact_type: "todo_update" during streaming
- * @param {Object} params - Handler parameters
- * @param {string} params.assistantMessageId - ID of the assistant message being updated
- * @param {string} params.artifactType - Type of artifact ("todo_update")
- * @param {string} params.artifactId - ID of the artifact
- * @param {Object} params.payload - Payload containing todos array and status counts
- * @param {Object} params.refs - Refs object with contentOrderCounterRef
- * @param {Function} params.setMessages - State setter for messages
- * @returns {boolean} True if event was handled
+ * `record` over the one already listed under its key, carrying the costs of
+ * both: one code run can make the same paid call twice, each charged, and the
+ * list shows them as one access. A redelivered event is not another call.
  */
-export function handleTodoUpdate({ assistantMessageId, artifactType, artifactId, payload, refs, setMessages, eventId }: {
+function withPriorCost(prior: ProvenanceRecord | undefined, record: ProvenanceRecord): ProvenanceRecord {
+  if (!prior) return { ...record, cost_record_ids: [record.record_id] };
+  const counted = prior.cost_record_ids ?? [prior.record_id];
+  if (counted.includes(record.record_id)) {
+    return { ...record, cost_credits: prior.cost_credits, cost_record_ids: counted };
+  }
+  const cost = record.cost_credits == null
+    ? prior.cost_credits
+    : (prior.cost_credits ?? 0) + record.cost_credits;
+  return { ...record, cost_credits: cost, cost_record_ids: [...counted, record.record_id] };
+}
+
+/**
+ * Handles a `claude_code_plan` event on both the live-stream and
+ * history-replay paths: a reply whose last request was billed to usage
+ * credits gets its notice under it, once on a reply however often the event
+ * is delivered. Callers keep it to the main agent's reply.
+ */
+export function handlePlanBilled({ assistantMessageId, event, order, setMessages }: {
   assistantMessageId: string;
-  artifactType: string;
-  artifactId: string;
-  payload: TodoPayload | null;
-  refs: StreamRefs;
+  event: Record<string, unknown>;
+  order: number;
   setMessages: SetMessages;
-  eventId?: number | null;
 }): boolean {
-  const { contentOrderCounterRef, updateTodoListCard, isNewConversation } = refs;
-
-  // Only handle todo_update artifacts
-  if (artifactType !== 'todo_update' || !payload) {
-    return false;
-  }
-
-  const { total, completed, in_progress, pending } = payload;
-  const todos = Array.isArray(payload.todos) ? payload.todos : [];
-
-  // Update floating card with todo list data (only during live streaming, not history)
-  // Do this before setMessages to ensure we have the latest data
-  // Always update the card if updateTodoListCard is available, even if todos array is empty
-  // This ensures the card persists and shows the latest state
-  if (updateTodoListCard) {
-    updateTodoListCard(
-      {
-        todos,
-        total: total || 0,
-        completed: completed || 0,
-        in_progress: in_progress || 0,
-        pending: pending || 0,
-      },
-      isNewConversation || false
+  const planBilled = readPlanBilled(event);
+  if (!planBilled) return false;
+  setMessages((prev: MessageRecord[]) => prev.map((msg: MessageRecord) => {
+    if (msg.id !== assistantMessageId || msg.role !== 'assistant') return msg;
+    return appendNotificationSegmentOnce(
+      msg as AssistantMessage, { type: 'notification', notice: { kind: 'planBilled', ...planBilled }, order },
+      (s) => s.notice?.kind === 'planBilled',
     );
-  }
-
-  // Use artifactId as the base todoListId to track updates to the same logical todo list
-  // But create a unique segmentId for each event to preserve chronological order
-  const baseTodoListId = artifactId || `todo-list-base-${Date.now()}`;
-  // Create a unique segment ID that includes timestamp to ensure chronological ordering
-  const segmentId = `${baseTodoListId}-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
-  // Always create a new segment for each todo_update event to preserve chronological order
-  const currentOrder = eventId != null ? eventId : ++contentOrderCounterRef.current;
-
-  setMessages((prev: MessageRecord[]) => {
-    const updated = prev.map((msg: MessageRecord) => {
-      if (msg.id !== assistantMessageId) return msg;
-
-      const todoListProcesses = { ...((msg.todoListProcesses as Record<string, unknown>) || {}) };
-      const contentSegments = [...((msg.contentSegments as Record<string, unknown>[]) || [])];
-
-      // Add new segment at the current chronological position
-      contentSegments.push({
-        type: 'todo_list',
-        todoListId: segmentId, // Use unique segmentId for this specific event
-        order: currentOrder,
-      });
-
-      // Store the todo list data with the segmentId
-      // If this is an update to an existing logical todo list (same artifactId),
-      // we still create a new segment but can reference the base ID for data updates
-      todoListProcesses[segmentId] = {
-        todos,
-        total: total || 0,
-        completed: completed || 0,
-        in_progress: in_progress || 0,
-        pending: pending || 0,
-        order: currentOrder,
-        baseTodoListId: baseTodoListId, // Keep reference to base ID for potential future use
-      };
-
-      const updatedMsg: MessageRecord = {
-        ...msg,
-        contentSegments,
-        todoListProcesses,
-      };
-      return updatedMsg;
-    });
-    return updated;
-  });
-
+  }));
   return true;
+}
+
+/**
+ * Handles a `claude_code_queue` frame on both the live-stream and
+ * history-replay paths: a wait long enough to note (`admitted`) gets its
+ * notice where in the reply it happened, once on a reply however often the
+ * frame is delivered. Returns the frame read, null for one this client
+ * cannot read, so the live path can show or clear the wait's line. Callers
+ * keep it to the main agent's reply.
+ */
+export function handleCliQueue({ assistantMessageId, event, order, setMessages }: {
+  assistantMessageId: string;
+  event: CliQueueFrame;
+  order: number;
+  setMessages: SetMessages;
+}): CliQueueSignal | null {
+  const queue = readCliQueue(event);
+  if (queue?.signal !== 'admitted') return queue;
+  const { wait } = queue;
+  setMessages((prev: MessageRecord[]) => prev.map((msg: MessageRecord) => {
+    if (msg.id !== assistantMessageId || msg.role !== 'assistant') return msg;
+    return appendNotificationSegmentOnce(
+      msg as AssistantMessage, { type: 'notification', notice: { kind: 'cliWait', ...wait }, order },
+      (s) => s.notice?.kind === 'cliWait' && s.notice.waitId === wait.waitId,
+    );
+  }));
+  return queue;
 }
 
 /**

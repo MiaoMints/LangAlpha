@@ -1,8 +1,18 @@
 from __future__ import annotations
 
 import pytest
+from langchain_core.messages import HumanMessage, ToolMessage
 
-from ptc_agent.agent.claude_code.session import Arrivals, CheckpointSessionStore, SessionDrift, session_records_reducer
+from ptc_agent.agent.claude_code.session import (
+    ENDED,
+    Arrivals,
+    CheckpointSessionStore,
+    SessionDrift,
+    answered_in,
+    pending_deferral,
+    resume_from,
+    session_records_reducer,
+)
 
 
 def write(sid: str, *uuids: str | None) -> dict:
@@ -26,6 +36,13 @@ def test_a_write_naming_another_session_starts_it_over():
     state = session_records_reducer(session_records_reducer(None, [write("s1", "a")]), [write("s2", "x")])
     assert state["session_id"] == "s2"
     assert [e["uuid"] for e in state["entries"]] == ["x"]
+
+
+def test_an_ended_session_leaves_nothing_to_resume():
+    held = session_records_reducer(None, [{**write("s1", "a"), "pinned": {"system_prompt": "p", "tools": []}, "baseline": "b1"}])
+    ended = session_records_reducer(held, [ENDED])
+    assert not ended.get("session_id") and not ended["entries"]
+    assert ended.get("pinned") is None and ended.get("baseline") is None
 
 
 @pytest.mark.asyncio
@@ -63,3 +80,34 @@ async def test_a_wait_returns_once_every_key_has_arrived():
         await arrivals.wait(["t1", "t2"], timeout=0.01)
     await arrivals.add({"t2": "u1"})
     assert await arrivals.wait(["t1", "t2"], timeout=0.1) == ["u1", "u1"]
+
+
+def _deferred(tool_use_id: str) -> dict:
+    return {"type": "attachment", "uuid": "d-" + tool_use_id, "attachment": {"type": "hook_deferred_tool", "toolUseID": tool_use_id}}
+
+
+def _result(tool_use_id: str) -> dict:
+    return {"type": "user", "uuid": "r-" + tool_use_id,
+            "message": {"content": [{"type": "tool_result", "tool_use_id": tool_use_id, "content": "ok"}]}}
+
+
+def test_the_call_a_session_holds_deferred_is_its_last_deferral_no_result_followed():
+    text = {"type": "user", "uuid": "u", "message": {"content": "plain text"}}
+    assert pending_deferral({"entries": [_deferred("a"), text]}) == "a"
+    assert pending_deferral({"entries": [_deferred("a"), _result("a")]}) is None
+    assert pending_deferral({"entries": [_deferred("a"), _result("a"), _deferred("b")]}) == "b"
+    assert pending_deferral(None) is None
+
+
+def test_a_cli_resumes_on_the_answer_to_the_call_it_deferred_or_on_a_session_that_never_deferred_it():
+    records = {"entries": [_result("x"), _deferred("b"), _deferred("a")]}
+    answer = ToolMessage("User answered: apple", tool_call_id="a")
+    assert resume_from(records, [answer]) == (records["entries"], answer)
+    assert resume_from(records, [ToolMessage("other", tool_call_id="x")]) == ([_result("x"), _deferred("b")], None)
+    assert resume_from({"entries": [_result("x")]}, []) == ([_result("x")], None)
+
+
+def test_a_cli_resumed_on_a_message_after_the_answer_holds_the_answer_in_place_of_the_deferral():
+    records = {"entries": [_result("x"), _deferred("a")]}
+    answer = ToolMessage("User answered: apple", tool_call_id="a")
+    assert resume_from(records, [answer, HumanMessage("actually, banana")]) == (answered_in(records["entries"], answer), None)

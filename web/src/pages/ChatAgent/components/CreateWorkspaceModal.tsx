@@ -3,12 +3,16 @@ import type { TFunction } from 'i18next';
 import { useTranslation } from 'react-i18next';
 import { X, Upload, FileText, CheckCircle2, Circle, AlertCircle } from 'lucide-react';
 import { Loader } from '@/components/ui/loader';
+import { buttonSlot } from '@/components/ui/button-class';
 import { Input } from '../../../components/ui/input';
 import { Select } from '@/components/ui/select';
 import { useLocale } from '@/hooks/useLocale';
 import { formatBytes } from '@/lib/format';
 import type { Computer, Workspace } from '@/types/api';
 import { startWorkspace, uploadWorkspaceFile } from '../utils/api';
+import { isNeedsComputer, needsBackupOf } from '../utils/needsComputer';
+import { useOpenComputers } from '../hooks/useOpenComputers';
+import { ComputerRefusal, type ComputerRefusalKind } from './ComputerRefusal';
 import { createWorkspaceDenialMessage, denialMessage } from '../utils/denialMessage';
 import { clampWorkspaceName } from '../utils/workspaceName';
 import type { NewWorkspace } from '../hooks/useCreateWorkspace';
@@ -28,6 +32,9 @@ interface CreateWorkspaceModalProps {
 type Phase = 'form' | 'progress';
 type CreationStep = 'uploading' | 'done' | 'error';
 type FileUploadStatus = 'pending' | 'uploading' | 'done' | 'failed';
+
+/** Why the form can't go on: in words, or for want of a computer Home can live on. */
+type FormRefusal = { kind: 'message'; message: string } | Exclude<ComputerRefusalKind, { kind: 'onlyComputer' }>;
 
 /**
  * CreateWorkspaceModal.
@@ -55,7 +62,11 @@ function CreateWorkspaceModal({ isOpen, onClose, onCreate, onComplete }: CreateW
   const [name, setName] = useState('');
   const [description, setDescription] = useState('');
   const [queuedFiles, setQueuedFiles] = useState<File[]>([]);
-  const [error, setError] = useState<string | null>(null);
+  // Why the form can't go on: in words, or for want of a computer (none is
+  // built for this user, or the one they have can't hold Home with its
+  // backup off), whose way out leads to the Computers dialog.
+  const [refusal, setRefusal] = useState<FormRefusal | null>(null);
+  const openComputers = useOpenComputers();
   const [pickedComputerId, setPickedComputerId] = useState<string | null>(null);
   const computerFieldId = useId();
 
@@ -95,7 +106,7 @@ function CreateWorkspaceModal({ isOpen, onClose, onCreate, onComplete }: CreateW
 
   const addFiles = useCallback((fileList: FileList) => {
     const incoming = Array.from(fileList);
-    setError(null);
+    setRefusal(null);
 
     setQueuedFiles((prev) => {
       const existingNames = new Set(prev.map((f) => f.name));
@@ -151,7 +162,7 @@ function CreateWorkspaceModal({ isOpen, onClose, onCreate, onComplete }: CreateW
     // The blocking start also attaches a new folder on an already-running
     // computer. Retry must repeat it if the previous start failed.
     try {
-      await startWorkspace(workspace.workspace_id);
+      await startWorkspace(workspace.workspace_id, { reason: 'create' });
     } catch (err: unknown) {
       setProgressError(denialMessage(err, t));
       setCreationStep('error');
@@ -191,12 +202,12 @@ function CreateWorkspaceModal({ isOpen, onClose, onCreate, onComplete }: CreateW
   const handleSubmit = async (e: React.FormEvent | Event) => {
     e.preventDefault();
     if (!name.trim() || submitting || preparingTarget) {
-      if (!name.trim()) setError(t('workspace.workspaceNameRequired'));
+      if (!name.trim()) setRefusal({ kind: 'message', message: t('workspace.workspaceNameRequired') });
       return;
     }
 
     setSubmitting(true);
-    setError(null);
+    setRefusal(null);
 
     let workspace: Workspace;
     try {
@@ -209,7 +220,10 @@ function CreateWorkspaceModal({ isOpen, onClose, onCreate, onComplete }: CreateW
       // A refusal keeps the user on the form with their input intact. On a 429
       // the sentence is the quota service's, relayed as it arrived.
       setSubmitting(false);
-      setError(createWorkspaceDenialMessage(err, t));
+      const backupOff = needsBackupOf(err);
+      if (isNeedsComputer(err)) setRefusal({ kind: 'needsComputer' });
+      else if (backupOff) setRefusal({ kind: 'needsBackup', ...backupOff });
+      else setRefusal({ kind: 'message', message: createWorkspaceDenialMessage(err, t) });
       return;
     }
 
@@ -240,7 +254,7 @@ function CreateWorkspaceModal({ isOpen, onClose, onCreate, onComplete }: CreateW
     setName('');
     setDescription('');
     setQueuedFiles([]);
-    setError(null);
+    setRefusal(null);
     setPickedComputerId(null);
     setPhase('form');
     setCreationStep('uploading');
@@ -276,7 +290,7 @@ function CreateWorkspaceModal({ isOpen, onClose, onCreate, onComplete }: CreateW
         <div className="cwm-modal" onClick={(e) => e.stopPropagation()}>
           {/* Header */}
           <div className="cwm-header">
-            <h2 className="cwm-title">
+            <h2 data-bracket="title" className="cwm-title">
               {creationStep === 'done' ? t('workspace.workspaceReady') : t('workspace.uploadingFiles')}
             </h2>
             {canClose && (
@@ -347,14 +361,14 @@ function CreateWorkspaceModal({ isOpen, onClose, onCreate, onComplete }: CreateW
             {/* Action buttons */}
             <div className="cwm-actions">
               {creationStep === 'done' && (
-                <button className="cwm-btn-create" onClick={handleOpenWorkspace}>
+                <button {...buttonSlot()} className="cwm-btn-create" onClick={handleOpenWorkspace}>
                   {t('workspace.openWorkspace')}
                 </button>
               )}
               {creationStep === 'error' && (
                 <>
-                  <button className="cwm-btn-cancel" disabled={submitting} onClick={resetAndClose}>{t('common.cancel')}</button>
-                  <button className="cwm-btn-create" onClick={handleRetry}>{t('common.retry')}</button>
+                  <button {...buttonSlot('outline')} className="cwm-btn-cancel" disabled={submitting} onClick={resetAndClose}>{t('common.cancel')}</button>
+                  <button {...buttonSlot()} className="cwm-btn-create" onClick={handleRetry}>{t('common.retry')}</button>
                 </>
               )}
             </div>
@@ -370,7 +384,7 @@ function CreateWorkspaceModal({ isOpen, onClose, onCreate, onComplete }: CreateW
       <div className="cwm-modal" onClick={(e) => e.stopPropagation()}>
         {/* Header */}
         <div className="cwm-header">
-          <h2 className="cwm-title">{t('workspace.createNewWorkspace')}</h2>
+          <h2 data-bracket="title" className="cwm-title">{t('workspace.createNewWorkspace')}</h2>
           <button className="cwm-close-btn" disabled={!canClose} onClick={resetAndClose}>
             <X className="h-5 w-5" />
           </button>
@@ -390,8 +404,8 @@ function CreateWorkspaceModal({ isOpen, onClose, onCreate, onComplete }: CreateW
               placeholder={t('workspace.enterWorkspaceName')}
               className="w-full"
               style={{
-                backgroundColor: 'var(--color-bg-card)',
-                border: '1px solid var(--color-border-muted)',
+                backgroundColor: 'var(--color-shell-fill, var(--color-bg-card))',
+                border: '1px solid var(--color-shell-edge, var(--color-border-muted))',
                 color: 'var(--color-text-primary)',
               }}
               autoFocus
@@ -407,6 +421,7 @@ function CreateWorkspaceModal({ isOpen, onClose, onCreate, onComplete }: CreateW
               onChange={(e) => setDescription(e.target.value)}
               placeholder={t('workspace.enterWorkspaceDesc')}
               rows={3}
+              data-slot="input"
               className="cwm-textarea"
             />
           </div>
@@ -502,15 +517,33 @@ function CreateWorkspaceModal({ isOpen, onClose, onCreate, onComplete }: CreateW
           </div>
 
           {/* Error */}
-          {error && <div className="cwm-error">{error}</div>}
+          {refusal?.kind === 'message' && <div className="cwm-error">{refusal.message}</div>}
+          {refusal && refusal.kind !== 'message' && (
+            <ComputerRefusal
+              refusal={refusal}
+              message={refusal.kind === 'needsComputer'
+                ? t(
+                  'computer.needsComputer.body',
+                  "Workspaces live on a computer, and you don't have one yet. Add a computer, then create the workspace.",
+                )
+                : t('homePlacement.needsBackup', { name: refusal.name })}
+              onOpen={(panel) => {
+                resetAndClose();
+                openComputers(panel);
+              }}
+              alert
+              className="mb-2"
+            />
+          )}
 
           {/* Actions */}
           <div className="cwm-actions">
-            <button type="button" className="cwm-btn-cancel" disabled={submitting} onClick={resetAndClose}>
+            <button type="button" {...buttonSlot('outline')} className="cwm-btn-cancel" disabled={submitting} onClick={resetAndClose}>
               {t('common.cancel')}
             </button>
             <button
               type="submit"
+              {...buttonSlot()}
               className="cwm-btn-create"
               disabled={!name.trim() || submitting || !!preparingTarget}
               aria-busy={submitting}

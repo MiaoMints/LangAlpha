@@ -15,7 +15,7 @@ import '@testing-library/jest-dom';
 import { renderWithProviders } from '@/test/utils';
 import MessageList from '../MessageList';
 import { MessageActionsProvider, type MessageActions } from '../messageList/MessageActionsContext';
-import { computeTurnTails, newestTurn, projectTurns } from '../messageList/turnProjection';
+import { computeReplyEnds, computeTurnTails, newestTurn, projectTurns } from '../messageList/turnProjection';
 import { visibleProjection } from '../messageList/contentProjection';
 import type { MessageRecord } from '../messageList/types';
 
@@ -160,6 +160,18 @@ describe('turnProjection — raw turn semantics', () => {
     const visible = visibleProjection(projectTurns(messages as MessageRecord[]));
     // [u0, a0, a0-cont, u1, a1] → a0 is mid-turn, a0-cont and a1 are tails.
     expect(computeTurnTails(visible)).toEqual([false, false, true, false, true]);
+  });
+
+  it('closes a reply at a steer the user sent, not at a report-back row', () => {
+    const ends = (between: Msg) => {
+      const visible = visibleProjection(projectTurns([
+        userMsg('u0'), assistant('a0'), between, assistant('a0-cont', { isSteering: true }),
+      ] as MessageRecord[]));
+      return computeReplyEnds(visible, computeTurnTails(visible));
+    };
+    expect(ends(userMsg('s0', { steeringDelivered: true }))).toEqual([false, true, false, true]);
+    expect(ends(userMsg('r0', { steeringDelivered: true, provenance: { kind: 'task_report' } })))
+      .toEqual([false, false, false, true]);
   });
 });
 
@@ -335,6 +347,113 @@ describe('MessageList — regenerate lands on the last visible bubble', () => {
 
     expect(bubble(container, 'u0')?.querySelector('[title="chat.actions.editMessage"]')).not.toBeNull();
     expect(bubble(container, 'u1-steering')?.querySelector('[title="chat.actions.editMessage"]')).toBeNull();
+  });
+});
+
+describe('MessageList — copying a turn into a new chat', () => {
+  const forkBtn = (container: HTMLElement, id: string) =>
+    bubble(container, id)?.querySelector('[title="chat.actions.forkFromHere"]') ?? null;
+  const newChatBtn = (container: HTMLElement, id: string) =>
+    bubble(container, id)?.querySelector('[title="chat.actions.editInNewChat"]') ?? null;
+
+  it('forks through the turn from its last visible reply only', async () => {
+    const onForkFromTurn = vi.fn().mockResolvedValue(undefined);
+    const messages: Msg[] = [
+      userMsg('u0'),
+      assistant('a0'),
+      userMsg('u1'),
+      assistant('a1'),
+      userMsg('u2-steering', { steeringDelivered: true }),
+      assistant('a1-cont', { isSteering: true }),
+    ];
+    const { container } = renderList(messages, { onForkFromTurn });
+
+    expect(forkBtn(container, 'a1')).toBeNull();
+    expect(forkBtn(container, 'a1-cont')).not.toBeNull();
+    await act(async () => { fireEvent.click(forkBtn(container, 'a0') as HTMLElement); });
+    expect(onForkFromTurn).toHaveBeenCalledWith(0, 'through_turn');
+    await act(async () => { fireEvent.click(forkBtn(container, 'a1-cont') as HTMLElement); });
+    expect(onForkFromTurn).toHaveBeenLastCalledWith(1, 'through_turn');
+  });
+
+  it('opens a sent message in a new chat before its turn, and not a steer', async () => {
+    const onForkFromTurn = vi.fn().mockResolvedValue(undefined);
+    const messages: Msg[] = [
+      userMsg('u0'),
+      assistant('a0'),
+      userMsg('u1'),
+      assistant('a1'),
+      userMsg('u2-steering', { steeringDelivered: true }),
+    ];
+    const { container } = renderList(messages, { onForkFromTurn });
+
+    expect(newChatBtn(container, 'u2-steering')).toBeNull();
+    await act(async () => { fireEvent.click(newChatBtn(container, 'u1') as HTMLElement); });
+    expect(onForkFromTurn).toHaveBeenCalledWith(1, 'before_turn');
+  });
+
+  it('holds the button while the copy is under way', async () => {
+    let settle: () => void = () => {};
+    const onForkFromTurn = vi.fn(() => new Promise<void>((resolve) => { settle = resolve; }));
+    const { container } = renderList([userMsg('u0'), assistant('a0')], { onForkFromTurn });
+
+    await act(async () => { fireEvent.click(forkBtn(container, 'a0') as HTMLElement); });
+    expect(forkBtn(container, 'a0')).toBeDisabled();
+    await act(async () => { settle(); });
+    expect(forkBtn(container, 'a0')).not.toBeDisabled();
+  });
+
+  it('forks from a finished reply while a later turn runs, but not from the running one', () => {
+    const onForkFromTurn = vi.fn().mockResolvedValue(undefined);
+    const onRegenerate = vi.fn();
+    const messages: Msg[] = [
+      userMsg('u0'),
+      assistant('a0'),
+      userMsg('u1'),
+      assistant('a1', { isStreaming: true }),
+    ];
+    const { container } = renderWithProviders(
+      <MessageActionsProvider actions={{ onForkFromTurn, onRegenerate }}>
+        <MessageList messages={messages as MessageRecord[]} isLoading />
+      </MessageActionsProvider>,
+    );
+
+    expect(forkBtn(container, 'a0')).not.toBeNull();
+    expect(regenerateBtn(container, 'a0')).toBeNull();
+    expect(forkBtn(container, 'a1')).toBeNull();
+    // The running turn's own message still forks before itself.
+    expect(newChatBtn(container, 'u1')).not.toBeNull();
+  });
+
+  it('draws no row on a finished reply that ends no turn while a later one runs', () => {
+    const onForkFromTurn = vi.fn().mockResolvedValue(undefined);
+    const messages: Msg[] = [
+      userMsg('u0'),
+      assistant('a0'),
+      userMsg('u0-steering', { steeringDelivered: true }),
+      assistant('a0-cont', { isSteering: true }),
+      userMsg('u1'),
+      assistant('a1', { isStreaming: true }),
+    ];
+    const { container } = renderWithProviders(
+      <MessageActionsProvider actions={{ onForkFromTurn, onRegenerate: vi.fn() }}>
+        <MessageList messages={messages as MessageRecord[]} isLoading />
+      </MessageActionsProvider>,
+    );
+    const row = (id: string) => bubble(container, id)?.querySelector('[aria-hidden="true"][inert]') ?? null;
+
+    // Mid-turn, nothing on a0 applies while a1 runs: no button, so no row.
+    expect(bubble(container, 'a0')?.querySelector('button[title]')).toBeNull();
+    expect(row('a0')).not.toBeNull();
+    // Its turn's tail forks, so that row shows.
+    expect(forkBtn(container, 'a0-cont')).not.toBeNull();
+    expect(row('a0-cont')).toBeNull();
+  });
+
+  it('offers neither without the handler', () => {
+    const { container } = renderList([userMsg('u0'), assistant('a0')], { onEditMessage: vi.fn() });
+    expect(forkBtn(container, 'a0')).toBeNull();
+    expect(newChatBtn(container, 'u0')).toBeNull();
   });
 });
 

@@ -3,7 +3,6 @@ fence and generation, and the sweep writes each computer from one worker."""
 
 from __future__ import annotations
 
-import asyncio
 import json
 import subprocess
 import sys
@@ -231,6 +230,25 @@ class TestSweepClaim:
             assert await sweeper._write_locked(COMPUTER_ID, _row()) is False
 
         push.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_an_own_machine_whose_tunnel_is_down_is_not_dialed(self):
+        sweeper = DataTokenSweeper()
+        manager = MagicMock(_detached_runtime=MagicMock(side_effect=AssertionError("dialed")))
+        row = {**_row(), "kind": "ssh", "provider_config": {"tunnel": "tun-1"}}
+
+        with (
+            patch.object(db, "load", AsyncMock(return_value=db.DataTokenRow())),
+            patch(
+                "src.server.services.computer_manager.ComputerManager.get_instance",
+                return_value=manager,
+            ),
+            patch(
+                "src.server.services.ssh_computers.computer_tunnel_down",
+                AsyncMock(return_value=True),
+            ),
+        ):
+            assert await sweeper._write_locked(COMPUTER_ID, row) is False
 
     @pytest.mark.asyncio
     async def test_a_sandbox_paused_during_the_mint_is_not_written(self):
@@ -509,7 +527,7 @@ class TestRewriteAfterRevocation:
 
         with (
             patch.object(db, "load_in_service", AsyncMock(return_value=row)),
-            patch.object(sweeper, "_keeps_running", keeps),
+            patch("src.server.services.data_token_sweep.keeps_running", keeps),
             patch.object(sweeper, "_write_locked", locked),
             _session_lock([True]),
         ):
@@ -526,7 +544,7 @@ class TestRewriteAfterRevocation:
 
         with (
             patch.object(db, "load_in_service", AsyncMock(return_value=row)),
-            patch.object(sweeper, "_keeps_running", AsyncMock(return_value=False)),
+            patch("src.server.services.data_token_sweep.keeps_running", AsyncMock(return_value=False)),
             patch.object(sweeper, "_write_locked", locked),
         ):
             assert await sweeper.rewrite(COMPUTER_ID) is False
@@ -544,7 +562,7 @@ class TestRewriteAfterRevocation:
         with (
             patch.object(data_token_sweep, "_LOCK_POLL_S", 0.0),
             patch.object(db, "load_in_service", AsyncMock(return_value=row)),
-            patch.object(sweeper, "_keeps_running", AsyncMock(return_value=True)),
+            patch("src.server.services.data_token_sweep.keeps_running", AsyncMock(return_value=True)),
             patch.object(sweeper, "_write_locked", locked),
             _session_lock([False, False, True]),
         ):
@@ -621,13 +639,24 @@ class TestMintPatience:
 
     @pytest.mark.asyncio
     async def test_patience_is_bounded(self):
-        loop = asyncio.get_running_loop()
-        began = loop.time()
+        # Time passes only when the mint sleeps, so the bound is on the
+        # schedule it chose, not on how promptly a busy runner woke it.
+        clock = SimpleNamespace(now=0.0)
 
-        with self._tries(always=DOWN) as (once, _):
+        async def sleep(delay: float) -> None:
+            clock.now += delay
+
+        fake_asyncio = SimpleNamespace(
+            get_running_loop=lambda: SimpleNamespace(time=lambda: clock.now),
+            sleep=sleep,
+        )
+        with (
+            self._tries(always=DOWN) as (once, _),
+            patch.object(data_tokens, "asyncio", fake_asyncio),
+        ):
             assert await data_tokens._mint(USER_ID, COMPUTER_ID, patient=True) is None
 
-        assert loop.time() - began < 0.3
+        assert clock.now < 0.3
         assert once.await_count > 2
         assert all(c.args[2] <= data_tokens._TIMEOUT_S for c in once.await_args_list)
 
@@ -660,10 +689,10 @@ class TestMintPatience:
 
         with (
             patch(
-                "src.server.dependencies.usage_limits.get_http_client",
+                "src.server.services.platform_client.get_http_client",
                 AsyncMock(return_value=client),
             ),
-            patch("src.server.dependencies.usage_limits.service_headers", return_value={}),
+            patch("src.server.services.platform_client.service_headers", return_value={}),
         ):
             minted, _, again = await data_tokens._mint_once(USER_ID, COMPUTER_ID, 5.0)
 
@@ -676,10 +705,10 @@ class TestMintPatience:
 
         with (
             patch(
-                "src.server.dependencies.usage_limits.get_http_client",
+                "src.server.services.platform_client.get_http_client",
                 AsyncMock(return_value=client),
             ),
-            patch("src.server.dependencies.usage_limits.service_headers", return_value={}),
+            patch("src.server.services.platform_client.service_headers", return_value={}),
         ):
             minted, _, again = await data_tokens._mint_once(USER_ID, COMPUTER_ID, 5.0)
 
@@ -709,10 +738,10 @@ class TestRevokeUpstream:
 
         with (
             patch(
-                "src.server.dependencies.usage_limits.get_http_client",
+                "src.server.services.platform_client.get_http_client",
                 AsyncMock(return_value=client),
             ),
-            patch("src.server.dependencies.usage_limits.service_headers", return_value={}),
+            patch("src.server.services.platform_client.service_headers", return_value={}),
             patch.object(data_tokens.asyncio, "sleep", AsyncMock()),
         ):
             assert await data_tokens._revoke_upstream(USER_ID, COMPUTER_ID) == answer
@@ -725,10 +754,10 @@ class TestKeepIsPatientOnlyWithoutALiveToken:
     @pytest.mark.parametrize(
         ("row", "patient"),
         [
-            (db.DataTokenRow(), True),
-            (db.DataTokenRow(datetime.now(UTC) + timedelta(minutes=50), "other", 3), True),
-            (db.DataTokenRow(datetime.now(UTC) - timedelta(minutes=1), SANDBOX_ID, 3), True),
-            (db.DataTokenRow(datetime.now(UTC) + timedelta(minutes=10), SANDBOX_ID, 3), False),
+            (lambda: db.DataTokenRow(), True),
+            (lambda: db.DataTokenRow(datetime.now(UTC) + timedelta(minutes=50), "other", 3), True),
+            (lambda: db.DataTokenRow(datetime.now(UTC) - timedelta(minutes=1), SANDBOX_ID, 3), True),
+            (lambda: db.DataTokenRow(datetime.now(UTC) + timedelta(minutes=10), SANDBOX_ID, 3), False),
         ],
         ids=["none", "another-sandbox", "run-out", "refresh"],
     )
@@ -737,7 +766,7 @@ class TestKeepIsPatientOnlyWithoutALiveToken:
 
         with (
             patch.object(data_tokens, "configured", return_value=True),
-            patch.object(db, "load", AsyncMock(return_value=row)),
+            patch.object(db, "load", AsyncMock(return_value=row())),
             patch.object(data_tokens, "push", push),
         ):
             await data_tokens.keep(COMPUTER_ID, USER_ID, SANDBOX_ID, AsyncMock())
@@ -779,10 +808,20 @@ class TestSweepSparesIdleComputers:
     async def test_recent_use_is_judged_by_the_providers_idle_limit(
         self, idle_s, kept
     ):
-        sweeper = DataTokenSweeper()
-
         with self._manager(), self._executor(False):
-            assert await sweeper._keeps_running(self._idle_row(idle_s)) is kept
+            assert await data_token_sweep.keeps_running(self._idle_row(idle_s)) is kept
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(("own_machine", "kept"), [(True, True), (False, False)])
+    async def test_an_own_machine_keeps_its_token_fresh_however_long_it_is_quiet(
+        self, own_machine, kept
+    ):
+        """No sweep stops a machine of the user's own, so a server or an app
+        the agent left running there may call the data servers hours after
+        the last turn stamped it, with no command of the agent's in flight."""
+        row = {**self._idle_row(4 * 3600), "kind": "ssh" if own_machine else "daytona"}
+        with self._manager(), self._executor(False):
+            assert await data_token_sweep.keeps_running(row) is kept
 
     @pytest.mark.asyncio
     async def test_an_idle_computer_with_nothing_running_is_not_written(self):
@@ -826,11 +865,13 @@ class TestTheAcquireKeepsTheToken:
             yield
 
         session = SimpleNamespace(sandbox=SimpleNamespace(runtime=object()))
-        binding = SimpleNamespace(computer_id=COMPUTER_ID, root_dir="/home/workspace", dir_name=None)
+        binding = SimpleNamespace(
+            computer_id=COMPUTER_ID, root_dir="/home/workspace", dir_name=None, user_id=USER_ID
+        )
         manager = SimpleNamespace(
             _acquire_session=AsyncMock(return_value=session),
             resolve_binding=AsyncMock(return_value=binding),
-            _keep_data_token=AsyncMock(),
+            _keep_computer_tokens=AsyncMock(),
             _settle_folders=AsyncMock(),
             _ensure_project_attached=AsyncMock(),
         )
@@ -841,4 +882,4 @@ class TestTheAcquireKeepsTheToken:
             )
 
         assert got is session
-        manager._keep_data_token.assert_awaited_once_with(COMPUTER_ID, USER_ID, session.sandbox)
+        manager._keep_computer_tokens.assert_awaited_once_with(COMPUTER_ID, USER_ID, session.sandbox)

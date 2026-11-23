@@ -8,6 +8,7 @@ from psycopg.rows import dict_row
 from psycopg.types.json import Json
 
 from src.server.database import pool
+from src.server.database.shared_workspaces import refuse_holder
 from src.server.utils.pg_sanitize import normalize_uuid
 
 logger = logging.getLogger(__name__)
@@ -43,7 +44,15 @@ async def create_usage_record(
 
     Raises:
         psycopg.Error: On database errors
+        HolderNotAPerson: When ``user_id`` names a shared workspace's holder
+
+    ``user_id`` is the account the run is recorded as
+    (``TurnIdentity.recorded_as``). Who sent it is the ``user_id`` of the
+    ``conversation_responses`` row ``conversation_response_id`` names, for a
+    turn's row and a subagent's. A model call between turns (a compact, a
+    hand-off brief) is written under an id of its own that names no run row.
     """
+    refuse_holder(usage_data["user_id"], "usage record")
 
     async def _create(cur):
         await cur.execute(
@@ -112,7 +121,8 @@ async def create_usage_record(
 async def get_thread_token_totals(
     conversation_thread_id: str, live_run_id: Optional[str] = None
 ) -> Optional[Dict[str, int]]:
-    """Input and output tokens over every usage row of a thread.
+    """Input and output tokens over every usage row of a thread, and how
+    many of the input the providers read from cache.
 
     Every model call the thread made counts: the main agent's and its
     subagents', on every attempt, including turns an edit or regenerate later
@@ -133,7 +143,9 @@ async def get_thread_token_totals(
                         COALESCE(SUM((m.value->>'input_tokens')::bigint), 0)
                             AS input_tokens,
                         COALESCE(SUM((m.value->>'output_tokens')::bigint), 0)
-                            AS output_tokens
+                            AS output_tokens,
+                        COALESCE(SUM((m.value->>'cached_tokens')::bigint), 0)
+                            AS cached_tokens
                     FROM conversation_usages u,
                          jsonb_each(u.token_usage->'by_model') AS m
                     WHERE u.conversation_thread_id = %(thread_id)s
@@ -153,6 +165,7 @@ async def get_thread_token_totals(
                 return {
                     "input_tokens": int(row["input_tokens"]),
                     "output_tokens": int(row["output_tokens"]),
+                    "cached_tokens": int(row["cached_tokens"]),
                 }
     except Exception as e:
         logger.error(f"Error reading thread token totals: {e}")

@@ -4,8 +4,9 @@
  */
 import { queryOptions } from '@tanstack/react-query';
 import { queryKeys } from '@/lib/queryKeys';
+import { isLastingRefusal } from '@/api/errors';
 import type { ThreadsResponse } from '@/types/api';
-import { getThread, getThreadShareStatus, getWorkspaceThreads } from './api';
+import { getRecentThreads, getThread, getThreadShareStatus, getWorkspaceThreads } from './api';
 
 /**
  * One thread, read to learn its workspace on a direct link. No retry: the chat
@@ -29,6 +30,15 @@ export function workspaceThreadsQuery(workspaceId: string, limit: number) {
   });
 }
 
+/** The user's newest `limit` threads across every workspace. */
+export function recentThreadsQuery(limit: number) {
+  return queryOptions({
+    queryKey: queryKeys.threads.recent(limit),
+    queryFn: () => getRecentThreads(limit, 0) as Promise<ThreadsResponse>,
+    staleTime: 30_000,
+  });
+}
+
 /**
  * A thread's public-link status. Fresh for 30s, so each view's header reads it
  * once; a share panel reads it again as it opens.
@@ -38,5 +48,7 @@ export function threadShareQuery(threadId: string) {
     queryKey: queryKeys.threads.share(threadId),
     queryFn: () => getThreadShareStatus(threadId),
     staleTime: 30_000,
+    // A refusal stands: asking again only doubles the request.
+    retry: (count, error) => count < 1 && !isLastingRefusal(error),
   });
 }

@@ -38,7 +38,19 @@ from ptc_agent.agent.middleware.background_subagent.context import (
     current_steer_resume,
 )
 from ptc_agent.agent.middleware.background_subagent.utils import config_own_run_id
-from ptc_agent.agent.transcript.steer_text import STEERS_AT, sender_runs, steer_text
+from ptc_agent.agent.transcript.sender import (
+    HARNESS_NAMED_KEY,
+    MEMBER_SENDER_KEY,
+    MemberSender,
+    escape_unrecorded,
+)
+from ptc_agent.agent.transcript.steer_text import (
+    STEERS_AT,
+    SteerSender,
+    sender_runs,
+    sent_by,
+    steer_text,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -70,7 +82,8 @@ class SteeredReport:
     (``ReportInbox.render_group``): a wakeup's ``content`` is its one line,
     and the notices share one ``<wakeup>`` block. ``shown`` is the reader's
     view of a report, the one key its ``steering_delivered`` entry carries
-    (``report_source``, ``market_alert`` or ``wakeup``)."""
+    (``report_source``, ``market_alert`` or ``wakeup``), and of a steer
+    carrying file comments (``artifact_comments``), beside its text."""
 
     job_id: str
     content: str                    # what the model reads
@@ -83,6 +96,9 @@ class SteeredReport:
     timestamp: float | None = None
     created_at: Any = None
     user_id: str | None = None
+    #: In a shared workspace, the member who wrote a steer, as of sending,
+    #: tagged as their messages are (``transcript/sender.py``); None elsewhere.
+    member: MemberSender | None = None
 
 
 @dataclass(frozen=True)
@@ -100,7 +116,7 @@ class TaskResume:
         """What the resumed run reads: each sender's messages in the blocks a
         running task reads them in, so who sent each one is not lost."""
         return steer_text(
-            sender_runs((e.get("sender") or "user", e.get("content") or "") for e in self.entries)
+            sender_runs(sent_by(self.entries))
         )
 
     @property
@@ -126,7 +142,14 @@ class ReportInbox(Protocol):
     ) -> list[str]: ...
     async def confirm_resumes(self, run_id: str, job_ids: list[str]) -> None: ...
     async def release_resumes(
-        self, thread_id: str, run_id: str, task_id: str, job_ids: list[str]
+        self,
+        thread_id: str,
+        run_id: str,
+        task_id: str,
+        job_ids: list[str],
+        *,
+        counted: bool = True,
+        final: bool = False,
     ) -> None: ...
 
 
@@ -219,15 +242,19 @@ class SteeringMiddleware(AgentMiddleware):
             return None
         run_id = config_own_run_id(config)
 
-        for delivered in _opened_with(
+        for delivered in opened_with(
             state, configurable.get("steer_input_message_id"), run_id
         ):
-            _announce(runtime, thread_id, delivered)
+            announce(runtime.stream_writer, thread_id, delivered)
         taken = await self._take(thread_id, run_id)
         resumes = await self._take_resumes(thread_id, run_id)
         if not taken and not resumes:
             return None
-        update = self._inject(runtime, thread_id, run_id, taken)
+        update: dict[str, Any] = {"messages": []}
+        if taken:
+            message, delivered = self._message(thread_id, run_id, taken)
+            announce(runtime.stream_writer, thread_id, delivered)
+            update["messages"].append(message)
         if resumes:
             update["messages"].append(_resume_call(resumes, run_id))
             update["jump_to"] = "tools"
@@ -237,15 +264,28 @@ class SteeringMiddleware(AgentMiddleware):
             )
         return update
 
-    def _inject(
-        self,
-        runtime: Runtime,
-        thread_id: str,
-        run_id: str | None,
-        taken: list[SteeredReport],
-    ) -> dict[str, Any]:
-        if not taken:
-            return {"messages": []}
+    async def take_message(
+        self, thread_id: str, run_id: str | None
+    ) -> HumanMessage | None:
+        """What waits for this run, held for it, as the one message it is
+        read in; None when nothing waits. For a runtime that reads it in its
+        own place rather than before a model call; resumes are not taken."""
+        taken = await self._take(thread_id, run_id)
+        return self._message(thread_id, run_id, taken)[0] if taken else None
+
+    async def resume_call(
+        self, thread_id: str, run_id: str | None
+    ) -> AIMessage | None:
+        """The call that resumes each task whose run ended with messages it
+        never read, holding them for this run, as the model call it is made
+        before would take it; None when none waits. For a runtime that makes
+        it in its own place."""
+        resumes = await self._take_resumes(thread_id, run_id)
+        return _resume_call(resumes, run_id) if resumes else None
+
+    def _message(
+        self, thread_id: str, run_id: str | None, taken: list[SteeredReport]
+    ) -> tuple[HumanMessage, dict[str, Any]]:
         message, delivered = _steering_message(
             taken, run_id, time.time(), self.report_inbox.render_group
         )
@@ -254,15 +294,14 @@ class SteeringMiddleware(AgentMiddleware):
             f"steer(s) and {sum(t.kind != 'steer' for t in taken)} report(s) "
             f"for thread_id={thread_id}"
         )
-        _announce(runtime, thread_id, delivered)
-        return {"messages": [message]}
+        return message, delivered
 
     async def awrap_model_call(
         self,
         request: ModelRequest,
         handler: Callable[[ModelRequest], Awaitable[ModelResponse]],
     ) -> ModelResponse:
-        await self._confirm(request.state)
+        await self.confirm_read((request.state or {}).get("messages") or [])
         return await handler(request)
 
     async def awrap_tool_call(
@@ -306,13 +345,28 @@ class SteeringMiddleware(AgentMiddleware):
         finally:
             current_steer_resume.reset(token)
             if "held_jobs" not in resume:
-                await self._settle_resume(held, result)
+                await self._settle_resume(
+                    held,
+                    result,
+                    counted=not resume.get("busy"),
+                    final=bool(resume.get("final")),
+                )
         return result
 
-    async def _settle_resume(self, held: dict[str, Any], result: Any) -> None:
+    async def _settle_resume(
+        self,
+        held: dict[str, Any],
+        result: Any,
+        *,
+        counted: bool = True,
+        final: bool = False,
+    ) -> None:
         """Give the rows back on a refused resume (one that raised too: the
-        run did not start). A resume that started without handing them to a
-        run of its own (no run ledger) confirms them here instead."""
+        run did not start), counting the refusal unless it lifts by itself
+        (``counted``: the computer was busy), or settle them when it lasts
+        as long as the task (``final``). A resume that started without
+        handing them to a run of its own (no run ledger) confirms them here
+        instead."""
         artifact = (
             (getattr(result, "additional_kwargs", None) or {}).get("task_artifact")
             if isinstance(result, ToolMessage)
@@ -334,6 +388,8 @@ class SteeringMiddleware(AgentMiddleware):
                     held["run_id"],
                     held["task_id"],
                     list(held["job_ids"]),
+                    counted=counted,
+                    final=final,
                 )
         except Exception as e:
             logger.warning(f"[Steering] Settling resume of {held['task_id']} failed: {e}")
@@ -352,7 +408,7 @@ class SteeringMiddleware(AgentMiddleware):
             logger.warning(f"[Steering] Taking task resumes failed: {e}")
             return []
 
-    async def _confirm(self, state: Any) -> None:
+    async def confirm_read(self, messages: Sequence[Any]) -> None:
         """Close the rows injected since the last model response.
 
         The step that injected them is checkpointed before this one starts,
@@ -361,7 +417,7 @@ class SteeringMiddleware(AgentMiddleware):
         if self.report_inbox is None:
             return
         # A resume call in the window holds no rows of its own.
-        for message in since_model_response((state or {}).get("messages") or []):
+        for message in since_model_response(messages):
             kwargs = getattr(message, "additional_kwargs", None) or {}
             held: _HeldJobs | None = kwargs.get(_HELD_JOBS) or kwargs.get(_LEGACY_HELD)
             if held and held.get("run_id") and held.get("job_ids"):
@@ -447,7 +503,7 @@ def _held_resume(request: ToolCallRequest) -> dict[str, Any] | None:
     return None
 
 
-def _opened_with(
+def opened_with(
     state: Any, input_id: str | None, run_id: str | None
 ) -> list[dict[str, Any]]:
     """The ``steering_delivered`` payloads of the steers this run's turn
@@ -472,11 +528,12 @@ def _opened_with(
     return opened
 
 
-def _announce(runtime: Runtime, thread_id: str, delivered: dict[str, Any]) -> None:
+def announce(
+    writer: Callable[[Any], None], thread_id: str, delivered: dict[str, Any]
+) -> None:
+    """Tell the stream a steering message was delivered."""
     try:
-        runtime.stream_writer(
-            {"type": "steering_delivered", "thread_id": thread_id, **delivered}
-        )
+        writer({"type": "steering_delivered", "thread_id": thread_id, **delivered})
     except Exception:
         logger.debug("[Steering] stream_writer unavailable, skipping SSE event")
 
@@ -509,11 +566,14 @@ def _steer_entry(steer: SteeredReport) -> dict[str, Any]:
         "content": steer.content,
         "user_id": steer.user_id,
         "timestamp": steer.timestamp,
+        **steer.shown,
     }
     if steer.platform:
         entry["platform"] = steer.platform
     if steer.sender and steer.sender != "user":
         entry["sender"] = steer.sender
+    if steer.member is not None:
+        entry[MEMBER_SENDER_KEY] = steer.member.to_record()
     if steer.request_key:
         entry["request_key"] = steer.request_key
     origin = _delivered_origin(steer.origin)
@@ -544,15 +604,28 @@ def _steering_message(
         if t.kind not in ("report", "steer"):
             groups.setdefault(t.kind, []).append(t)
     steers = [t for t in taken if t.kind == "steer"]
-    said = "\n\n".join(report.content for report in reports)
+    # A member's steer names them with the harness's tag, so the message is
+    # passed over by the naming step's escape (``HARNESS_NAMED_KEY``): all
+    # else in it, which no member is recorded as writing, is escaped here.
+    named = any(s.member is not None for s in steers)
+    plain = escape_unrecorded if named else (lambda text: text)
+    said = plain("\n\n".join(report.content for report in reports))
     if groups and render_group is None:
         raise ValueError(f"no block to read {', '.join(groups)} reports in")
     blocks = [
-        render_group(kind, [g.content for g in group])
+        plain(render_group(kind, [g.content for g in group]))
         for kind, group in groups.items()
     ]
     sent = (
-        steer_text(sender_runs((s.sender or "user", s.content) for s in steers))
+        steer_text(
+            sender_runs(
+                (
+                    SteerSender(s.sender or "user", s.member),
+                    s.content if s.member is not None else plain(s.content),
+                )
+                for s in steers
+            )
+        )
         if steers
         else ""
     )
@@ -576,6 +649,9 @@ def _steering_message(
         STEERS_AT: len(content) - len(sent),
         _HELD_JOBS: _HeldJobs(run_id=run_id, job_ids=[t.job_id for t in taken]),
     }
+    if named:
+        # Its tags are the harness's, each member's words escaped under them.
+        additional_kwargs[HARNESS_NAMED_KEY] = True
     # A fresh id per injection: the reducer replaces a message whose id it
     # already holds.
     message = HumanMessage(

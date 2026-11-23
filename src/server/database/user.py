@@ -6,31 +6,42 @@ user preferences in PostgreSQL.
 """
 
 import logging
+from collections.abc import Collection
 from datetime import datetime
 from typing import Any, Dict, Optional
 from uuid import uuid4
 
-from psycopg.rows import dict_row
+from psycopg.rows import dict_row, tuple_row
 from psycopg.types.json import Json
 
 from src.llms.preferences import MOVED_MODEL_KEYS, TuningError
+from src.server.database.oauth_tokens import CLAUDE_CODE_PROVIDER
 from src.server.database.pool import get_db_connection
+from src.server.database.shared_workspaces import HOLDER_PREFIX
 from src.server.database.user_lock import lock_user_profile
+from src.server.models.onboarding import ACCOUNT_SETUP_KEY
 from src.server.models.profile_vocabulary import structured_preferences
 from src.server.utils.db import UpdateQueryBuilder
 
 logger = logging.getLogger(__name__)
+
+def _has_oauth(alias: str = "users") -> str:
+    return (
+        f"EXISTS (SELECT 1 FROM user_oauth_tokens WHERE user_oauth_tokens.user_id = {alias}.user_id"
+        f" AND user_oauth_tokens.provider <> '{CLAUDE_CODE_PROVIDER}') AS has_oauth_token"
+    )
+
 
 # Computed columns appended to user SELECT queries for gate logic.
 def _gate_cols(alias: str = "users") -> str:
     """Return the has_api_key + has_oauth_token EXISTS subqueries for a given table alias."""
     return (
         f"EXISTS (SELECT 1 FROM user_api_keys WHERE user_api_keys.user_id = {alias}.user_id) AS has_api_key,\n"
-        f"                    EXISTS (SELECT 1 FROM user_oauth_tokens WHERE user_oauth_tokens.user_id = {alias}.user_id) AS has_oauth_token"
+        f"                    {_has_oauth(alias)}"
     )
 
 _HAS_API_KEY = "EXISTS (SELECT 1 FROM user_api_keys WHERE user_api_keys.user_id = users.user_id) AS has_api_key"
-_HAS_OAUTH = "EXISTS (SELECT 1 FROM user_oauth_tokens WHERE user_oauth_tokens.user_id = users.user_id) AS has_oauth_token"
+_HAS_OAUTH = _has_oauth()
 
 
 # ==================== User Operations ====================
@@ -224,7 +235,7 @@ async def get_user(user_id: str) -> Optional[Dict[str, Any]]:
                     user_id, email, name, avatar_url, timezone, locale,
                     onboarding_completed,
                     COALESCE(personalization_completed, FALSE) AS personalization_completed,
-                    auth_provider,
+                    auth_provider, computer_choice,
                     created_at, updated_at, last_login_at,
                     """ + _HAS_API_KEY + """,
                     """ + _HAS_OAUTH + """
@@ -247,6 +258,7 @@ async def update_user(
     personalization_completed: Optional[bool] = None,
     last_login_at: Optional[datetime] = None,
     auth_provider: Optional[str] = None,
+    computer_choice: Optional[str] = None,
 ) -> Optional[Dict[str, Any]]:
     """
     Update user profile fields.
@@ -264,6 +276,7 @@ async def update_user(
         personalization_completed: New personalization status
         last_login_at: New last login timestamp
         auth_provider: Authentication provider (e.g. google, github, email)
+        computer_choice: Where the user works, ``own_machine`` or ``cloud``
 
     Returns:
         Updated user dict or None if user not found
@@ -278,6 +291,7 @@ async def update_user(
     builder.add_field("personalization_completed", personalization_completed)
     builder.add_field("last_login_at", last_login_at)
     builder.add_field("auth_provider", auth_provider)
+    builder.add_field("computer_choice", computer_choice)
 
     if not builder.has_updates():
         return await get_user(user_id)
@@ -286,7 +300,7 @@ async def update_user(
         "user_id", "email", "name", "avatar_url", "timezone", "locale",
         "onboarding_completed",
         "COALESCE(personalization_completed, FALSE) AS personalization_completed",
-        "auth_provider",
+        "auth_provider", "computer_choice",
         "created_at", "updated_at", "last_login_at",
         _HAS_API_KEY,
         _HAS_OAUTH,
@@ -370,16 +384,17 @@ async def upsert_user(
 _USER_PREFS_TTL = 86400  # 24h — freshness via explicit invalidation
 
 # Cached-shape version, as for the profile below. A migration that rewrites
-# these rows in raw SQL, as 072 renamed the Background slot's keys, passes no
-# application write path, so it bumps this to retire every row cached before.
-_USER_PREFS_SHAPE = 2
+# these rows in raw SQL, as 072 renamed the Background slot's keys and 121
+# granted the Claude sign-in, passes no application write path, so it bumps
+# this to retire every row cached before.
+_USER_PREFS_SHAPE = 3
 
 
 def _user_prefs_cache_key(user_id: str) -> str:
     return f"user_prefs:v{_USER_PREFS_SHAPE}:{user_id}"
 
 
-async def get_user_preferences(user_id: str) -> Optional[Dict[str, Any]]:
+async def get_user_preferences(user_id: str, *, cached: bool = True) -> Optional[Dict[str, Any]]:
     """
     Get user preferences (cached in Redis).
 
@@ -389,6 +404,9 @@ async def get_user_preferences(user_id: str) -> Optional[Dict[str, Any]]:
 
     Args:
         user_id: User ID
+        cached: False reads the row itself and leaves the cache alone, for a
+            read that must see the latest write: a read that misses the cache
+            as a write commits can put the old value back for the TTL.
 
     Returns:
         Preferences dict or None if not found
@@ -398,11 +416,12 @@ async def get_user_preferences(user_id: str) -> Optional[Dict[str, Any]]:
 
     cache_key = _user_prefs_cache_key(user_id)
     cache = get_cache_client()
-    if cache.enabled and cache.client:
+    use_cache = cached and cache.enabled and cache.client
+    if use_cache:
         try:
-            cached = await cache.client.get(cache_key)
-            if cached is not None:
-                return _json.loads(cached) if cached != b"null" else None
+            hit = await cache.client.get(cache_key)
+            if hit is not None:
+                return _json.loads(hit) if hit != b"null" else None
         except Exception:
             pass  # Redis down — fall through to DB
 
@@ -421,7 +440,7 @@ async def get_user_preferences(user_id: str) -> Optional[Dict[str, Any]]:
             row = await cur.fetchone()
             result = dict(row) if row else None
 
-    if cache.enabled and cache.client:
+    if use_cache:
         try:
             await cache.client.set(
                 cache_key,
@@ -548,6 +567,31 @@ _PREF_RETURNING = (
 )
 
 
+class PreferenceChanged(Exception):
+    """A write expected keys of ``other_preference`` to hold values they no
+    longer hold, so nothing was written."""
+
+    def __init__(self, keys: list[str]):
+        super().__init__(f"other_preference changed: {', '.join(keys)}")
+        self.keys = keys
+
+
+def _expectation_sql(expected: Dict[str, Any]) -> tuple[str, list[Any]]:
+    """The update's guard: each named key still holds what the caller read.
+
+    A stored JSON ``null`` reads as absent, as the merge never keeps one, so
+    an expectation of ``None`` matches a missing key either way.
+    """
+    clauses = [
+        "NULLIF(user_preferences.other_preference -> %s::text, 'null'::jsonb) IS NOT DISTINCT FROM %s::jsonb"
+        for _ in expected
+    ]
+    params: list[Any] = []
+    for key, value in expected.items():
+        params.extend([key, None if value is None else Json(value)])
+    return " AND ".join(clauses), params
+
+
 async def upsert_user_preferences(
     user_id: str,
     risk_preference: Optional[Dict[str, Any]] = None,
@@ -557,6 +601,7 @@ async def upsert_user_preferences(
     model_preference: Optional[Dict[str, Any]] = None,
     replace: bool = False,
     conn=None,
+    expect_other_preference: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Create or update a user's preferences, merging each column that is passed.
 
@@ -564,6 +609,12 @@ async def upsert_user_preferences(
     any depth, so ``{"profiles": {"m1": None}}`` drops one model's overrides and
     leaves its siblings, and clearing a key 034 moved clears its pre-move copy
     too. ``replace=True`` overwrites each provided column whole.
+
+    ``expect_other_preference`` names keys with the value each held when the
+    caller read it (``None`` = absent). The write lands only if all still do,
+    checked by the statement that writes, else ``PreferenceChanged``: a key
+    written whole from a stale read would otherwise drop another device's
+    change, a revoked grant coming back among them.
     """
     _validate_model_shape(model_preference)
     other_preference = _mirror_moved_deletes(model_preference, other_preference)
@@ -593,25 +644,43 @@ async def upsert_user_preferences(
             updates, deletes = _split_updates_and_deletes(patch)
             set_params.extend([deletes, Json(updates) if updates else None])
 
+    row_params = [str(uuid4()), user_id, *insert_params]
+    if expect_other_preference:
+        # With no row every key is absent, so a fresh row is made only when
+        # every expectation is None; an existing row goes to the update's guard.
+        guard, guard_params = _expectation_sql(expect_other_preference)
+        source = (
+            f"SELECT %s::uuid, %s, {_PREF_INSERT_VALUES}, NOW(), NOW()\n"
+            "        WHERE %s OR EXISTS (SELECT 1 FROM user_preferences WHERE user_id = %s)"
+        )
+        row_params += [
+            all(v is None for v in expect_other_preference.values()),
+            user_id,
+        ]
+        where = f"\n        WHERE {guard}"
+    else:
+        source = f"VALUES (%s, %s, {_PREF_INSERT_VALUES}, NOW(), NOW())"
+        guard_params, where = [], ""
+
     sql = f"""
         INSERT INTO user_preferences (
             user_preference_id, user_id, {_PREF_COLUMN_LIST}, created_at, updated_at
         )
-        VALUES (%s, %s, {_PREF_INSERT_VALUES}, NOW(), NOW())
+        {source}
         ON CONFLICT (user_id) DO UPDATE
         SET
                         {_PREF_REPLACE_SET if replace else _PREF_MERGE_SET},
-                        updated_at = NOW()
+                        updated_at = NOW(){where}
         RETURNING {_PREF_RETURNING}
     """
 
     async with get_db_connection(conn) as conn, conn.transaction():
         async with conn.cursor(row_factory=dict_row) as cur:
             await lock_user_profile(cur, user_id)
-            await cur.execute(
-                sql, [str(uuid4()), user_id, *insert_params, *set_params]
-            )
+            await cur.execute(sql, [*row_params, *set_params, *guard_params])
             result = await cur.fetchone()
+            if result is None:
+                raise PreferenceChanged(sorted(expect_other_preference or {}))
             logger.info(f"[user_db] upsert_user_preferences user_id={user_id} replace={replace}")
             return dict(result)
 
@@ -632,24 +701,37 @@ async def lock_user_preferences(user_id: str, *, conn) -> Optional[Dict[str, Any
         return dict(row) if row else None
 
 
-async def delete_user_preferences(user_id: str) -> bool:
+async def delete_user_preferences(user_id: str, *, keep_overrides: Collection[str] = ()) -> bool:
     """
-    Delete all preferences for a user.
-
-    Args:
-        user_id: User ID
+    Delete all preferences for a user, except the ``feature_overrides`` named
+    in ``keep_overrides`` and the account setup stamp (``ACCOUNT_SETUP_KEY``),
+    which only the server writes: a reset clears what the user chose, not a
+    record of what their account has done.
 
     Returns:
         True if a row was deleted, False if no preferences existed
     """
     async with get_db_connection() as conn, conn.transaction():
-        async with conn.cursor() as cur:
+        async with conn.cursor(row_factory=dict_row) as cur:
             await lock_user_profile(cur, user_id)
             await cur.execute(
-                "DELETE FROM user_preferences WHERE user_id = %s",
+                "DELETE FROM user_preferences WHERE user_id = %s RETURNING other_preference",
                 (user_id,),
             )
             deleted = cur.rowcount > 0
+            row = await cur.fetchone() if deleted else None
+            other = (row or {}).get("other_preference")
+            other = other if isinstance(other, dict) else {}
+            overrides = other.get("feature_overrides")
+            kept = {k: v for k, v in overrides.items() if k in keep_overrides} if isinstance(overrides, dict) else {}
+            saved: dict[str, Any] = {"feature_overrides": kept} if kept else {}
+            if other.get(ACCOUNT_SETUP_KEY) is not None:
+                saved[ACCOUNT_SETUP_KEY] = other[ACCOUNT_SETUP_KEY]
+            if saved:
+                await cur.execute(
+                    "INSERT INTO user_preferences (user_id, other_preference) VALUES (%s, %s)",
+                    (user_id, Json(saved)),
+                )
             logger.info(f"[user_db] delete_user_preferences user_id={user_id} deleted={deleted}")
             return deleted
 
@@ -671,7 +753,7 @@ async def get_user_with_preferences(user_id: str) -> Optional[Dict[str, Any]]:
                     u.user_id, u.email, u.name, u.avatar_url, u.timezone, u.locale,
                     u.onboarding_completed,
                     COALESCE(u.personalization_completed, FALSE) AS personalization_completed,
-                    u.auth_provider,
+                    u.auth_provider, u.computer_choice,
                     u.created_at, u.updated_at, u.last_login_at,
                     """ + _gate_cols("u") + """,
                     p.user_preference_id, p.risk_preference, p.investment_preference,
@@ -699,6 +781,7 @@ async def get_user_with_preferences(user_id: str) -> Optional[Dict[str, Any]]:
                 'has_api_key': result['has_api_key'],
                 'has_oauth_token': result['has_oauth_token'],
                 'auth_provider': result['auth_provider'],
+                'computer_choice': result['computer_choice'],
                 'created_at': result['created_at'],
                 'updated_at': result['updated_at'],
                 'last_login_at': result['last_login_at'],
@@ -806,3 +889,39 @@ async def invalidate_user_profile_cache(user_id: str) -> None:
             await cache.client.delete(_user_profile_cache_key(user_id))
     except Exception:
         pass
+
+
+async def names_of(user_ids: list[str]) -> dict[str, Optional[str]]:
+    """Display names by id, for people named as senders or starters."""
+    if not user_ids:
+        return {}
+    async with get_db_connection() as conn, conn.cursor(row_factory=tuple_row) as cur:
+        await cur.execute(
+            "SELECT user_id, name FROM users WHERE user_id = ANY(%s)", (list(user_ids),)
+        )
+        return {r[0]: r[1] for r in await cur.fetchall()}
+
+
+async def avatars_of(user_ids: list[str]) -> dict[str, Optional[str]]:
+    """Avatar URLs by id, for people another service names."""
+    if not user_ids:
+        return {}
+    async with get_db_connection() as conn, conn.cursor(row_factory=tuple_row) as cur:
+        await cur.execute(
+            "SELECT user_id, avatar_url FROM users WHERE user_id = ANY(%s)", (list(user_ids),)
+        )
+        return {r[0]: r[1] for r in await cur.fetchall()}
+
+
+async def user_by_email(email: str) -> Optional[dict[str, Any]]:
+    """The one person an address names; a shared workspace's holder is not
+    one."""
+    async with get_db_connection() as conn, conn.cursor(row_factory=dict_row) as cur:
+        await cur.execute(
+            "SELECT user_id, name, email FROM users WHERE lower(email) = lower(%s) "
+            f"AND user_id NOT LIKE '{HOLDER_PREFIX}%%' ORDER BY created_at LIMIT 2",
+            (email.strip(),),
+        )
+        rows = await cur.fetchall()
+    # Two accounts under one address cannot be told apart by it.
+    return dict(rows[0]) if len(rows) == 1 else None

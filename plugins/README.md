@@ -76,12 +76,42 @@ instead of bending `mcp.json`:
   printable ASCII characters with no `$`. The portable `mcp.json` stays free of
   credentials either way; the reference is written only into the installed
   server.
+- **`skills`** describes skills the bundle carries, keyed by directory name.
+  `"needs_own_data": true` marks one whose work is the user's own data (their
+  profile, portfolio, dashboard or vault), which a turn in a shared workspace
+  cannot read, so those turns are not offered it. Read from a bundle only.
 - **`icon`** names the site that owns the plugin's mark, or the `https`
   address of the image itself when no site serves it as an icon. The plugin's
   servers wear it too unless one names its own, here or in the handshake. Ours
   ship their logo with the frontend instead, so a self-host with no outbound
   network still draws them. An uploaded plugin without one shows its
   homepage's mark, or the account's avatar when that homepage is on GitHub.
+
+## Writing a skill
+
+A skill is prompt surface, as a tool's docstring is (`src/tools/AGENTS.md`).
+Its `description` is read on every turn, its `SKILL.md` once the skill is
+loaded, and a file under `references/` when `SKILL.md` points the agent at it.
+
+- **Every sentence changes what the agent does**: which skill it picks, what
+  it builds, or what it does with a result. One the model would follow anyway
+  is cut whole, not trimmed.
+- **The description selects.** It says what the skill makes and names the
+  requests that mean it, one phrase per case.
+- **One home per fact.** What a reference file owns, `SKILL.md` points at
+  rather than repeats, and a fact about one tool stays in that tool's
+  description. A fact told twice is two places to change and reads as twice
+  as important as it is.
+- **Facts are stated outright; steps are for an order that matters.** What the
+  agent cannot work out by looking (a path the platform follows, a cap, what
+  happens to the output after the turn) goes in plainly, with its reason.
+- **Describe a control, never quote its label.** The label is translated, and
+  an agent that repeats the English one sends a reader in another language
+  looking for words that are not on their screen.
+- **Routing goes one way.** A skill may name the cheaper skill it gets
+  mistaken for. The cheaper one says where it stops and names no others; the
+  descriptions do that routing.
+- **A code sample runs.** Parse each one before it ships; the agent copies it.
 
 ## Adding a server to a bundle
 

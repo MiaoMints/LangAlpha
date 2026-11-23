@@ -9,8 +9,8 @@ Usage examples:
   # The Chief of Staff (the agent in Home)
   python scripts/utils/render_prompt.py --role chief_of_staff
 
-  # PTC with the TodoWrite opt-in + storage enabled
-  python scripts/utils/render_prompt.py --todo --storage
+  # PTC without the plan tool (a user who turned it off), storage enabled
+  python scripts/utils/render_prompt.py --no-plan --storage
 
   # General-purpose subagent prompt
   python scripts/utils/render_prompt.py --subagent general-purpose
@@ -117,7 +117,10 @@ def build_parser() -> argparse.ArgumentParser:
 
     # Feature flags
     p.add_argument(
-        "--todo", action="store_true", help="Render as if the user opted in to TodoWrite."
+        "--no-plan",
+        dest="plan",
+        action="store_false",
+        help="Render as if the user turned the UpdatePlan tool off (it is on by default).",
     )
     p.add_argument(
         "--crawl", action="store_true", help="Enable the site-crawl tool section (WebCrawl/WebMap)."
@@ -134,6 +137,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument(
         "--no-ask-user", action="store_true", help="Disable ask-user guidelines."
+    )
+    p.add_argument(
+        "--claude-code",
+        action="store_true",
+        help="Render as for a Claude Code turn (one question per AskUserQuestion call).",
     )
     p.add_argument(
         "--channels",
@@ -267,7 +275,6 @@ def render(args: argparse.Namespace) -> str:
     loader = init_loader(session_start_time=now)
 
     tool_summary = args.tool_summary if args.tool_summary else STUB_TOOL_SUMMARY
-    subagent_summary = format_subagent_summary(stub_subagents(args.role))
     user_profile = None if args.no_user_profile else STUB_USER_PROFILE
     guidance_vars = guidance_template_vars(resolve_guidance(args))
 
@@ -292,7 +299,6 @@ def render(args: argparse.Namespace) -> str:
                 "web_search",
                 "finance",
                 "think",
-                "todo",
             ]
         }
         compiler = SubagentCompiler(
@@ -316,17 +322,17 @@ def render(args: argparse.Namespace) -> str:
     )
 
     # PTC system prompt
-    return loader.get_system_prompt(
+    prompt = loader.get_system_prompt(
         tool_summary=tool_summary,
-        subagent_summary=subagent_summary,
         user_profile=user_profile,
-        todo_enabled=args.todo,
+        plan_enabled=args.plan,
         role=args.role,
         crawl_enabled=args.crawl,
         scratchpad_enabled=args.scratchpad,
         storage_enabled=args.storage,
         ask_user_enabled=not args.no_ask_user,
         channels_enabled=args.channels,
+        claude_code=args.claude_code,
         current_time=current_time,
         thread_id=args.thread_id,
         max_concurrent_task_units=args.max_concurrent_tasks,
@@ -335,6 +341,13 @@ def render(args: argparse.Namespace) -> str:
         **layout_vars,
         **guidance_vars,
     )
+    # The subagent roster rides the per-thread baseline, after the prompt's
+    # cache breakpoint, so a user's edit to a subagent never moves the prefix.
+    roster = loader.render(
+        "envelope/baseline_subagents.md.j2",
+        content=format_subagent_summary(stub_subagents(args.role)),
+    )
+    return f"{prompt.rstrip()}\n\n<!-- runtime-context baseline (excerpt) -->\n{roster.strip()}\n"
 
 
 def estimate_tokens(text: str) -> int:

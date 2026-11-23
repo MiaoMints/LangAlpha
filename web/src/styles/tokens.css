@@ -83,7 +83,10 @@ html {
 
   --sidebar-width: 64px;
   --sidebar-rail-width: 64px;
-  --bottom-tab-height: 78px;
+  --bottom-tab-bar: 78px;
+  /* What is fixed to the screen's bottom measures off this, which is the keyboard
+     while one is up (App.css). */
+  --bottom-tab-height: var(--bottom-tab-bar);
   /* Space above a page's first row. Every route's title or header row starts
      this far down, so the first row sits at one depth when moving between pages
      (centre of a 28px title row: --page-top + 14px). */
@@ -98,7 +101,7 @@ html {
      | token        | surface                                                |
      |--------------|--------------------------------------------------------|
      | bg-page      | the app ground: chat page, settings, auth               |
-     | bg-canvas    | ground behind filled cards (orders); = page in dark     |
+     | bg-canvas    | a recessed well: the PDF viewer; = page in dark        |
      | bg-card      | a card/panel sitting on page or canvas                  |
      | bg-card-hover| hover fill of a clickable card row (solid twin of card) |
      | bg-tool-card | agent tool/artifact cards inside the transcript         |
@@ -151,10 +154,15 @@ html {
      takes the accent. */
   --color-border-strong: rgba(230, 230, 228, 0.32);
 
+  /* Text kept marked once the real selection has moved away. The system colour
+     alone is opaque and pale, which the theme's text cannot be read on; thinned,
+     it reads as the selection the browser paints itself and keeps the OS accent. */
+  --color-quote-highlight: color-mix(in srgb, Highlight 42%, transparent);
+
   /* Data cards in the transcript (charts/termCard.css): an unfilled box held
-     by its edge, the rules inside it a step quieter. Light is cool and
-     neutral against the warm page, so a number reads as data, not as
-     chrome; the cards are the only cool surface. */
+     by its edge, the rules inside it a step quieter. Light is cool against
+     the gray page, so a number reads as data, not as chrome; the
+     cards are the only cool surface. */
   --color-term-edge: #3A3C40;
   --color-term-edge-hover: #5C5F65;
   --color-term-rule: #2E3033;
@@ -165,7 +173,7 @@ html {
   --color-text-primary: #E6E6E4;
   --color-text-secondary: #9B9FA6;
   --color-text-tertiary: rgba(230, 230, 228, 0.62);
-  --color-text-quaternary: rgba(230, 230, 228, 0.36);
+  --color-text-quaternary: rgba(230, 230, 228, 0.55);
   --color-text-muted: #B9BDC2;
   /* Ink, not white — the dark accent is a light ember, so white on it lands
      under 3:1. Anything painted on --color-accent-primary must use this. */
@@ -193,9 +201,6 @@ html {
      ring-ring and a hand-written box-shadow can never drift apart. */
   --color-focus-ring: hsl(var(--ring));
 
-  --color-slash-icon: rgb(233, 149, 74);
-  --color-slash-pill-bg: rgba(233, 149, 74, 0.1);
-  --color-slash-pill-border: rgba(233, 149, 74, 0.28);
 
   --color-profit: #3FB950;
   --color-profit-soft: rgba(63, 185, 80, 0.16);
@@ -211,8 +216,22 @@ html {
   --color-warning-soft: rgba(216, 176, 76, 0.12);
   --color-info: #6E9EF7;
   --color-info-soft: rgba(110, 158, 247, 0.12);
+  /* An extended-hours price as text: the hue of its chart line, held to 4.5:1. */
+  --color-ext-pre: #FBBF24;
+  --color-ext-post: #60A5FA;
   --color-success: #3FB950;
   --color-success-soft: rgba(63, 185, 80, 0.12);
+  /* The parts of the context window, in the composer's context panel: a hue
+     each, in the order the context is sent, so a legend row finds its stretch
+     of the bar. Identity only, never state. Neighbours are checked apart for
+     color-deficient readers on bg-elevated, each theme with its own steps. */
+  --color-context-system: #3987E5;
+  --color-context-tools: #D95926;
+  --color-context-mcp: #199E70;
+  --color-context-skills: #C98500;
+  --color-context-memory: #D55181;
+  --color-context-environment: #008300;
+  --color-context-conversation: #9085E9;
   --color-accent-light: #F2B67C;
   --color-btn-primary-bg: #ECECEA;
   --color-btn-primary-text: #1A1B1D;
@@ -337,28 +356,28 @@ html {
 
 /* ---------- Light theme overrides ---------- */
 /* Notion-paper: pure-white page, white cards separated by neutral hairline
-   borders (not tonal fills), warm-neutral grays for text. The amber darkens a
+   borders (not tonal fills), near-neutral grays for text. The amber darkens a
    step from the dark theme (#E9954A → #D07D33) so it holds on white — see
    --login-ember in Login/LoginPage.css, which owns the auth surface and must
    stay in step. */
 [data-theme="light"] {
   /* bg-page / bg-card / bg-input / bg-popover are derived from the HSL block
      below (see the role table in :root) — they need no override here. */
-  /* Warm paper ground so white cards read as raised surfaces instead of
+  /* A plain gray ground so white cards read as raised surfaces instead of
      border-only outlines on the same white. */
-  --color-bg-canvas: #F5F4F1;
+  --color-bg-canvas: #F4F4F4;
   /* Filled surfaces in the chat (task cards, the subagent bar, the chart
-     annotation chip): warm paper fill, the inverse of the canvas pairing
+     layer chip): the canvas fill, the inverse of the canvas pairing
      (on the orders page white cards sit on tinted canvas; here tinted cards
      sit on the white chat page). The data cards are unfilled frames, and the
      detail panel's chart canvases draw on a transparent ground, so neither
      reads this token. */
-  --color-bg-tool-card: #F5F4F1;
-  --color-bg-card-hover: #FAFAF8;
-  --color-bg-elevated: #F7F7F6;
-  --color-bg-tag: #EFEFED;
-  --color-bg-code: #F4F4F2;
-  --color-bg-surface: #F4F4F2;
+  --color-bg-tool-card: #F4F4F4;
+  --color-bg-card-hover: #FAFAFA;
+  --color-bg-elevated: #F6F6F6;
+  --color-bg-tag: #EEEEEE;
+  --color-bg-code: #F4F4F4;
+  --color-bg-surface: #F4F4F4;
   --color-bg-hover: rgba(0, 0, 0, 0.04);
   --color-bg-subtle: rgba(0, 0, 0, 0.02);
   --color-bg-chart-placeholder: #FFFFFF;
@@ -369,11 +388,12 @@ html {
   --color-bg-overlay-strong: rgba(0, 0, 0, 0.45);
 
   --color-border-muted: rgba(31, 31, 30, 0.08);
-  --color-border-default: #E8E8E6;
-  --color-border-elevated: #E3E3E1;
-  --color-border-subtle: #EFEFEE;
-  --color-border-input: #E3E3E1;
+  --color-border-default: #E6E6E6;
+  --color-border-elevated: #E6E6E6;
+  --color-border-subtle: #EFEFEF;
+  --color-border-input: #E6E6E6;
   --color-border-strong: rgba(31, 31, 30, 0.3);
+  --color-quote-highlight: color-mix(in srgb, Highlight 73%, transparent);
 
   --color-term-edge: #CDD2D9;
   --color-term-edge-hover: #9AA1AC;
@@ -382,11 +402,13 @@ html {
   --color-term-text-secondary: #5B6370;
   --color-term-text-tertiary: #8A919C;
 
+  /* Every step is read as text, so each holds 4.5:1 on white and all but the
+     last on the canvas too (styles/__tests__/textContrast.test.ts). */
   --color-text-primary: #1F1F1E;
-  --color-text-secondary: #73726E;
-  --color-text-tertiary: #A3A29E;
-  --color-text-quaternary: #B4B3AF;
-  --color-text-muted: #8C8B87;
+  --color-text-secondary: #5F5E5A;
+  --color-text-tertiary: #716F6B;
+  --color-text-quaternary: #767571;
+  --color-text-muted: #6B6A66;
   /* Ink, matching dark — white on the amber is under 3:1 in either theme. */
   --color-text-on-accent: #241505;
   --color-icon-muted: #8C8B87;
@@ -405,9 +427,6 @@ html {
   --color-accent-overlay: rgba(208, 125, 51, 0.65);
   --color-accent-gradient: linear-gradient(90deg, #F8F2EA 0%, #F8F2EA 100%);
 
-  --color-slash-icon: rgb(208, 125, 51);
-  --color-slash-pill-bg: rgba(208, 125, 51, 0.12);
-  --color-slash-pill-border: rgba(208, 125, 51, 0.35);
 
   --color-profit: #1A7F37;
   --color-profit-soft: rgba(26, 127, 55, 0.08);
@@ -423,8 +442,17 @@ html {
   --color-warning-soft: rgba(180, 83, 9, 0.08);
   --color-info: #4477D4;
   --color-info-soft: rgba(68, 119, 212, 0.08);
+  --color-ext-pre: #B45309;
+  --color-ext-post: #2563EB;
   --color-success: #1A7F37;
   --color-success-soft: rgba(26, 127, 55, 0.08);
+  --color-context-system: #2A78D6;
+  --color-context-tools: #EB6834;
+  --color-context-mcp: #1BAF7A;
+  --color-context-skills: #EDA100;
+  --color-context-memory: #E87BA4;
+  --color-context-environment: #008300;
+  --color-context-conversation: #6250D6;
   --color-accent-light: #E09A57;
   /* Confirm/approve buttons in chat — deliberately ink, not the accent, so
      approving a request never reads as the same affordance as a brand action. */
@@ -444,12 +472,12 @@ html {
 
   --color-dot-grid: rgba(31, 31, 30, 0.05);
 
-  --color-art-ground: #FCFCFB;
+  --color-art-ground: #FBFBFB;
   --color-art-top: #FFFFFF;
-  --color-art-s3: #F4F4F1;
-  --color-art-s2: #EDEDEA;
-  --color-art-s1: #E5E5E2;
-  --color-art-s0: #DCDCD9;
+  --color-art-s3: #F3F3F3;
+  --color-art-s2: #ECECEC;
+  --color-art-s1: #E4E4E4;
+  --color-art-s0: #DBDBDB;
   --color-art-line-hi: #26262A;
   --color-art-line-mid: #8A8A8F;
   --color-art-line-lo: #B4B4B8;
@@ -482,7 +510,7 @@ html {
   /* Solid white tile + crisp system hairline — the 75%-white wash the dark
      theme uses for glass is invisible against the white page. */
   --color-bg-card-gradient: #ffffff;
-  --color-bg-card-border: #e8e8e6;
+  --color-bg-card-border: #E6E6E6;
 
   /* Tailwind/shadcn HSL — white page, white bordered cards, burnished amber */
   --background: 0 0% 100%;
@@ -493,7 +521,7 @@ html {
   --popover-foreground: 60 2% 12%;
   --primary: 28 63% 51%;
   --primary-foreground: 28 60% 8%;
-  --secondary: 60 3% 94%;
+  --secondary: 0 0% 94%;
   --secondary-foreground: 60 2% 20%;
   --muted: 48 2% 54%;
   --muted-foreground: 60 2% 12% / 0.55;
@@ -502,10 +530,10 @@ html {
   --destructive: 356 72% 47%;
   --destructive-foreground: 0 0% 100%;
   --border: 60 2% 12% / 0.09;
-  --input: 60 4% 96.5%;
+  --input: 0 0% 96.5%;
   /* The light theme's text ink, for the same reason. */
   --ring: var(--foreground);
-  /* Kept tight rather than dropped: floating overlays (AgentEventOverlay,
+  /* Kept tight rather than dropped: floating overlays (ChartLayerOverlay,
      SelectionCommentOverlay, JumpToLatestPill) rely on this to separate from
      a now-pure-white page — the workspace cards carry their own border. */
   --shadow-card: 0 1px 2px rgba(31, 29, 26, 0.04), 0 2px 8px rgba(31, 29, 26, 0.05);
@@ -513,13 +541,13 @@ html {
   --bg-main: 0 0% 100%;
   --bg-panel: 0 0% 100% / 0.92;
   --border-light: 60 2% 12% / 0.08;
-  --border-card: 60 4% 91%;
+  --border-card: 0 0% 90%;
   --color-up: 137 66% 30%;
   --color-up-soft: 137 66% 30% / 0.08;
   --color-down: 356 72% 47%;
   --color-down-soft: 356 72% 47% / 0.08;
   --accent-fin: 28 63% 51%;
-  --sidebar-bg: 60 9% 96.5%;
+  --sidebar-bg: 0 0% 97.3%;
   --sidebar-border: 60 2% 12% / 0.07;
   --sidebar-hover: 60 2% 12% / 0.04;
   --sidebar-icon: 60 2% 12% / 0.50;
@@ -691,7 +719,9 @@ html {
    built instead of coming back to edit this selector. It must: the halo is
    a shadow, and a shadow draws on a borderless field too, as a faint
    rectangle inside a box already lit. The block below hands that box the
-   edge on its field's behalf, the way `.rings-within` hands it the ring. */
+   edge on its field's behalf, the way `.rings-within` hands it the ring; a
+   box that draws its focus otherwise says so in `--focus-edge`/`--focus-halo`
+   (the dashboard search, in ink in the open card styles). */
 :where(input, textarea, select):focus:not([type="checkbox"], [type="radio"], [type="range"], [type="file"], [type="color"], [type="submit"], [type="button"], [aria-invalid="true"], .owns-its-edge, .owns-its-edge *) {
   border-color: var(--color-accent-primary) !important;
   box-shadow: 0 0 0 1px var(--color-accent-soft) !important;
@@ -699,8 +729,8 @@ html {
 
 @supports selector(:has(*)) {
   .owns-its-edge:has(> :where(input, textarea):focus) {
-    border-color: var(--color-accent-primary) !important;
-    box-shadow: 0 0 0 1px var(--color-accent-soft) !important;
+    border-color: var(--focus-edge, var(--color-accent-primary)) !important;
+    box-shadow: var(--focus-halo, 0 0 0 1px var(--color-accent-soft)) !important;
   }
 }
 
@@ -752,6 +782,43 @@ html {
     scrollbar-width: thin;
     scrollbar-color: var(--color-border-elevated) transparent;
   }
+}
+
+/* Tailwind's scrollbar-none sets only scrollbar-width, which Safari reads from
+   18.2; before that the styled bar above still draws. This adds a second rule
+   under the same name, after the built-in one. */
+@utility scrollbar-none {
+  &::-webkit-scrollbar {
+    display: none;
+  }
+}
+
+/* What every list row that lights up wears. Two rows can be lit at once (the
+   chosen one and the one under the pointer or the keyboard, an open submenu's
+   row and its neighbour), and touching fills run together into one block. A
+   transparent 1px edge above and below, with the fill clipped inside it, keeps
+   two lit neighbours two shapes 2px apart. The edge takes a pixel of the row's
+   vertical padding, so the row keeps its height: give it the padding it had as
+   --row-py (row-inset is py-1.5's, row-inset-2 py-2's; a sheet sets the
+   property itself), and the row keeps it in rem as the app's text scale moves.
+   The clip is !important because it is the point of the class: a lit state
+   written with the `background` shorthand would otherwise reset it. A sheet
+   takes it with `@reference` to this file and `@apply row-inset`. */
+@property --row-py {
+  syntax: '*';
+  inherits: false;
+}
+@utility row-inset {
+  border-block: 1px solid transparent;
+  background-clip: padding-box !important;
+  padding-block: calc(var(--row-py, 0.375rem) - 1px);
+}
+/* Written out again: @apply row-inset here would match this rule too. */
+@utility row-inset-* {
+  --row-py: calc(var(--spacing) * --value(number));
+  border-block: 1px solid transparent;
+  background-clip: padding-box !important;
+  padding-block: calc(var(--row-py) - 1px);
 }
 
 /* Monaco's own scrollbar, inset through CodeEditor's options. Its arrows are

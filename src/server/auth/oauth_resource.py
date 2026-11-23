@@ -27,7 +27,7 @@ from src.config.env import (
     OAUTH_RESOURCE_JWKS_URL,
 )
 from src.server.auth.jwt_bearer import _SigningKeys, auth_unavailable
-from src.server.dependencies.usage_limits import get_http_client, service_headers
+from src.server.services.platform_client import get_http_client, service_headers
 from src.utils.cache.redis_cache import get_cache_client
 
 logger = logging.getLogger(__name__)
@@ -80,9 +80,13 @@ async def warm_oauth_resource_keys() -> None:
 
 
 def from_resource_issuer(token: str) -> bool:
-    """Whether ``token`` names the configured issuer, read without verifying it.
+    """Whether ``token`` names the configured issuer and one of this API's
+    audiences, read without verifying it.
 
-    Only chooses the verifier; ``verify_access_token`` checks everything.
+    Only chooses the verifier; ``verify_access_token`` checks everything. The
+    audience is asked too since the issuer may also sign the app's own
+    sessions (Supabase's OAuth server signs both), whose audience is the
+    app's, not this API's.
     """
     if not oauth_resource_enabled():
         return False
@@ -90,7 +94,13 @@ def from_resource_issuer(token: str) -> bool:
         claims = jwt.decode(token, options={"verify_signature": False})
     except jwt.InvalidTokenError:
         return False
-    return claims.get("iss") == OAUTH_RESOURCE_ISSUER
+    # Unverified, so any JSON: only the strings in it can name an audience.
+    aud = claims.get("aud")
+    entries = [aud] if isinstance(aud, str) else aud if isinstance(aud, list) else []
+    claimed = {a for a in entries if isinstance(a, str)}
+    return claims.get("iss") == OAUTH_RESOURCE_ISSUER and not claimed.isdisjoint(
+        OAUTH_RESOURCE_AUDIENCES
+    )
 
 
 def _unauthorized(message: str, **extra: str) -> HTTPException:

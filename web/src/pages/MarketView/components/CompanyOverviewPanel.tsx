@@ -12,6 +12,7 @@ import {
   CashFlowChart,
   RevenueBreakdownChart,
 } from '../../ChatAgent/components/charts/CompanyCharts';
+import { TickerLogo } from '@/components/TickerLogo';
 import { formatMoney } from '@/lib/bars';
 import { compactNumberFixed2, fixed2, signedFixed2 } from '@/lib/format';
 import { deriveOverviewQuote, type CompanyOverviewArtifact } from '@/lib/quotes/overview';
@@ -70,14 +71,16 @@ function QuoteSummary({ data, symbol }: QuoteSummaryProps) {
   const { quote } = data;
   if (!quote) return null;
 
-  const { displayPrice, displayChange, displayChangePct, currency, dualName } = deriveOverviewQuote(data, symbol);
+  const { displayPrice, displayChange, displayChangePct, currency, places, dualName } = deriveOverviewQuote(data, symbol);
   const money = (n: number): string => formatMoney(n, currency, locale);
+  const quoteMoney = (n: number | null): string => formatMoney(n, currency, locale, { upTo: places });
 
   return (
     <div style={{ marginBottom: 16 }}>
       {/* Two long names can outrun the panel, so both shrink to an ellipsis and
           the ticker, the shortest and most useful of the three, never does. */}
       <div style={{ display: 'flex', alignItems: 'baseline', gap: 8, marginBottom: 8, minWidth: 0 }}>
+        <TickerLogo symbol={symbol} className="self-center [--ticker-logo-size:22px]" />
         <span title={dualName.primary} style={{ ...NAME_CLIP, fontSize: '1.125rem', fontWeight: 700, color: 'var(--color-text-primary)' }}>
           {dualName.primary}
         </span>
@@ -88,23 +91,23 @@ function QuoteSummary({ data, symbol }: QuoteSummaryProps) {
       </div>
       <div style={{ display: 'flex', alignItems: 'baseline', gap: 8, marginBottom: 10 }}>
         <span style={{ fontSize: '1.375rem', fontWeight: 700, color: 'var(--color-text-primary)' }}>
-          {formatMoney(displayPrice, currency, locale)}
+          {quoteMoney(displayPrice)}
         </span>
         {displayChange != null && (
           <span style={{ fontSize: '0.8125rem', color: displayChange >= 0 ? GREEN : RED }}>
-            {formatMoney(displayChange, currency, locale, { signed: true })}
+            {formatMoney(displayChange, currency, locale, { signed: true, upTo: places })}
             {displayChangePct != null && ` (${signedFixed2(displayChangePct, locale)}%)`}
           </span>
         )}
       </div>
       <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '0 16px' }}>
-        {quote.open != null && <QuoteStat label={t('toolArtifact.open')} value={money(quote.open)} />}
-        {quote.previousClose != null && <QuoteStat label={t('toolArtifact.prevClose')} value={money(quote.previousClose)} />}
+        {quote.open != null && <QuoteStat label={t('toolArtifact.open')} value={quoteMoney(quote.open)} />}
+        {quote.previousClose != null && <QuoteStat label={t('toolArtifact.prevClose')} value={quoteMoney(quote.previousClose)} />}
         {quote.dayLow != null && quote.dayHigh != null && (
-          <QuoteStat label={t('toolArtifact.dayRange')} value={`${money(quote.dayLow)} - ${money(quote.dayHigh)}`} />
+          <QuoteStat label={t('toolArtifact.dayRange')} value={`${quoteMoney(quote.dayLow)} - ${quoteMoney(quote.dayHigh)}`} />
         )}
         {quote.yearLow != null && quote.yearHigh != null && (
-          <QuoteStat label={t('toolArtifact.52wRange')} value={`${money(quote.yearLow)} - ${money(quote.yearHigh)}`} />
+          <QuoteStat label={t('toolArtifact.52wRange')} value={`${quoteMoney(quote.yearLow)} - ${quoteMoney(quote.yearHigh)}`} />
         )}
         {quote.volume != null && <QuoteStat label={t('toolArtifact.volume')} value={compactNumberFixed2(quote.volume, locale)} />}
         {quote.marketCap != null && <QuoteStat label={t('toolArtifact.marketCap')} value={formatMoney(quote.marketCap, currency, locale, { compact: true })} />}

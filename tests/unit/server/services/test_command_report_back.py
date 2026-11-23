@@ -14,7 +14,7 @@ from unittest.mock import AsyncMock, patch
 import pytest
 
 from src.server.services.report_back import command as cmd
-from src.server.services.report_back.notify_turn import NotOwed
+from src.server.services.report_back.notify_turn import TURN_ROOM_WAIT_S, NotOwed
 
 _ID = "bg-3f9a1c2e7d10"
 _LOG = ".agents/threads/3f9a1c2e/commands/bg-3f9a1c2e7d10.log"
@@ -191,6 +191,35 @@ async def test_a_failed_wakeup_read_still_delivers_the_notice():
     assert verdict.wakeups == []
 
 
+_PAID = "Paid data calls in this run: firecrawl_scrape x1 = 1 Firecrawl credits (2 credits charged)."
+_CHARGES = "src.server.services.metered_charges.command_charges"
+
+
+@pytest.mark.asyncio
+async def test_a_handed_off_commands_notice_names_what_its_paid_calls_cost():
+    """Its result was a placeholder, so the line a result that returned in
+    time carries never reached the agent."""
+    charges = AsyncMock(return_value=_PAID)
+    with _verdict_env(_row(job_ref={"call_id": "c0ffee00"})), patch(_CHARGES, new=charges):
+        verdict = await cmd.command_report_verdict(_job())
+
+    charges.assert_awaited_once_with("u-1", "c0ffee00")
+    assert verdict.message(steered=True) == APPROVED_COMPLETED_STEERED.replace(
+        "\n</system>", f"\n\n{_PAID}\n</system>"
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("job_ref", [None, {"handle": "j"}, {"call_id": "c0ffee00"}])
+async def test_a_notice_with_no_paid_calls_has_no_line(job_ref):
+    charges = AsyncMock(return_value="")
+    with _verdict_env(_row(job_ref=job_ref)), patch(_CHARGES, new=charges):
+        verdict = await cmd.command_report_verdict(_job())
+
+    assert charges.await_count == (1 if job_ref and "call_id" in job_ref else 0)
+    assert verdict.message(steered=True) == APPROVED_COMPLETED_STEERED
+
+
 # --- the live-turn offer ---------------------------------------------------------
 
 
@@ -353,6 +382,25 @@ async def test_a_steered_notice_stamps_the_end_before_its_job_closes():
             stamp.assert_awaited_once_with([_ID])
             assert order[-1] == "close"
         assert close.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_no_room_for_another_claude_code_turn_asks_again_by_the_clock():
+    # Room opens as turns on other threads end, which release nothing on
+    # this one: parked for its next turn it would wait for the user.
+    post = AsyncMock(return_value=("full", None))
+    room = AsyncMock(return_value=True)
+    defer = AsyncMock(return_value="pending")
+    with _verdict_env(_row()), _idle_thread_env(post), patch(
+        "src.server.database.runs.outbox.wait_for_room", new=room
+    ), patch("src.server.database.runs.outbox.defer_claimed_job", new=defer):
+        await cmd.execute_command_report_back(_job())
+
+    assert post.await_args.kwargs["room_fails_fast"]
+    room.assert_awaited_once_with(
+        _job()["hook_outbox_id"], attempts=_job()["attempts"], wait_s=TURN_ROOM_WAIT_S
+    )
+    defer.assert_not_awaited()
 
 
 @pytest.mark.asyncio

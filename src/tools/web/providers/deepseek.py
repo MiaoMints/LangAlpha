@@ -1,144 +1,188 @@
-"""DeepSeek web search provider.
+"""DeepSeek provider: web search (/v1/tools/search) and page fetch (/v1/tools/fetch).
 
-DeepSeek publishes a standalone search endpoint (``POST /v1/tools/search``)
-billed per successful call, so it belongs at the end of a fallback chain:
-free-tier providers are tried first and DeepSeek only answers when the
-earlier links fail or run out of quota.
+API docs: https://api-docs.deepseek.com/guides/search/ — bearer auth with the
+same key as DeepSeek's models (DEEPSEEK_API_KEY). Both endpoints bill only a
+call that returns something: an empty search or a failed fetch is free.
 """
 
-from __future__ import annotations
-
+import asyncio
 import logging
 import os
-from datetime import date, timedelta
-from typing import Any, Dict, List, Literal, Optional, Tuple, Union
+import re
+import time
+from dataclasses import replace
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import httpx
-from langchain_core.tools import tool
 
+from src.tools.turn_tool import turn_tool
 from src.tools.web.providers._shared import (
+    SNIPPET_MAX,
+    empty_content_error,
+    error_from_httpx,
+    error_response,
+    is_empty_markdown,
     lazy,
+    missing_key_error,
     request_json,
     result_card,
     search_failed,
+    search_refusal,
+    time_range_to_start_date,
+)
+from src.tools.web.types import (
+    FetchRequest,
+    FetchResponse,
+    FetchResult,
+    SearchResult,
+    WebError,
+    WebErrorType,
 )
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_BASE_URL = "https://api.deepseek.com"
-SEARCH_PATH = "/v1/tools/search"
-MAX_QUERY_CHARS = 128
-MAX_COUNT = 50
-SNIPPET_CHARS = 600
+_BASE_URL = "https://api.deepseek.com/v1/tools"
+_SEARCH_TIMEOUT = 30.0
+_FETCH_TIMEOUT = 60.0
 
-_TIME_RANGE_DAYS: Dict[str, int] = {
-    "h": 0,
-    "d": 1,
-    "day": 1,
-    "w": 7,
-    "week": 7,
-    "m": 30,
-    "month": 30,
-    "y": 365,
-    "year": 365,
+# The API refuses a query or question longer than this many characters.
+_QUERY_MAX = 128
+# The API caps count here.
+_COUNT_MAX = 50
+
+_DATE_OPERATOR = re.compile(r"(?:^|\s)(?:after|before):", re.IGNORECASE)
+
+# /fetch is one URL per call, so its 4xx statuses are about that URL, not our
+# account: 400 is a URL it will not take, 404 a page it got nothing usable
+# from (dead, blocked by the site, an unsupported type), 504 the site being
+# slow. The in-house crawler may still get them, so each stays retryable, and
+# none counts against the breaker. 401/402/5xx keep the shared mapping.
+_FETCH_STATUS_OVERRIDES = {
+    400: WebErrorType.UNSUPPORTED_URL,
+    404: WebErrorType.EMPTY,
+    504: WebErrorType.TIMEOUT,
 }
 
 
-def _apply_time_range(query: str, time_range: Optional[str]) -> str:
-    """Express recency as DeepSeek's ``after:`` search syntax."""
-    if not time_range:
+def _fetch_error(e: httpx.HTTPError) -> WebError:
+    """Classify a failed /fetch call.
+
+    A fetch 429 is DeepSeek's per-domain limit as often as the account's, and
+    its body does not say which, so it never counts against the breaker: one
+    busy site must not shut DeepSeek off for every URL. The URL still falls
+    back in-house, and an account limit clears within the second.
+    """
+    error = error_from_httpx(e, status_overrides=_FETCH_STATUS_OVERRIDES)
+    if error.http_status == 429:
+        return replace(error, provider_fault=False)
+    return error
+
+
+def _with_default_date(query: str, default_time_range: Optional[str]) -> str:
+    """Add the deployment's default range as an ``after:`` operator.
+
+    The API has no date field, so the range rides in the query. A query that
+    names its own date keeps it, and one the operator would push past the
+    length cap goes unfiltered rather than refused.
+    """
+    if _DATE_OPERATOR.search(query):
         return query
-    days = _TIME_RANGE_DAYS.get(str(time_range).lower())
-    if days is None:
-        return query
-    cutoff = date.today() - timedelta(days=max(days, 1))
-    return f"{query} after:{cutoff.isoformat()}"
+    start = time_range_to_start_date(default_time_range, fmt="%Y-%m-%d", provider="DeepSeek")
+    with_date = f"{query} after:{start}" if start else query
+    return with_date if len(with_date) <= _QUERY_MAX else query
 
 
-def _truncate(text: Any, limit: int = SNIPPET_CHARS) -> str:
-    if not isinstance(text, str):
-        return ""
-    collapsed = " ".join(text.split())
-    return collapsed[:limit]
+class DeepSeekAPI:
+    """Raw-httpx DeepSeek tools client. Key is read lazily so a missing
+    DEEPSEEK_API_KEY surfaces as a per-call error, not a build crash."""
 
-
-class DeepSeekSearchAPI:
-    """Thin sync-style wrapper around DeepSeek's search endpoint."""
-
-    def __init__(self, api_key: Optional[str] = None, base_url: Optional[str] = None) -> None:
-        self._api_key = api_key or os.environ.get("DEEPSEEK_API_KEY", "")
-        if not self._api_key:
-            raise ValueError("DEEPSEEK_API_KEY not provided or found in environment")
-        self._base_url = (
-            base_url
-            or os.environ.get("DEEPSEEK_SEARCH_BASE_URL", "")
-            or DEFAULT_BASE_URL
-        ).rstrip("/")
-
-    async def fetch(
-        self,
-        query: str,
-        count: int = 10,
-        need_content: bool = False,
-    ) -> Dict[str, Any]:
-        """Call the search endpoint and return the raw JSON payload."""
-        payload = {
-            "query": query[:MAX_QUERY_CHARS],
-            "count": max(1, min(int(count), MAX_COUNT)),
-            "need_content": bool(need_content),
+    def __init__(self, api_key: Optional[str] = None):
+        self.api_key = api_key or os.getenv("DEEPSEEK_API_KEY")
+        if not self.api_key:
+            raise ValueError("DEEPSEEK_API_KEY not found in environment variables")
+        self.headers = {
+            "Authorization": f"Bearer {self.api_key}",
+            "Content-Type": "application/json",
         }
+
+    async def _post(self, path: str, payload: Dict[str, Any], timeout: float) -> Dict[str, Any]:
         return await request_json(
-            "POST",
-            f"{self._base_url}{SEARCH_PATH}",
-            provider="DeepSeek",
-            headers={
-                "Authorization": f"Bearer {self._api_key}",
-                "Content-Type": "application/json",
-            },
-            json_body=payload,
-            timeout=30.0,
+            "POST", f"{_BASE_URL}{path}", provider="DeepSeek",
+            headers=self.headers, json_body=payload, timeout=timeout,
         )
 
-    def _format(
-        self,
-        raw: Dict[str, Any],
-        query: str,
-    ) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
-        rows = raw.get("results") if isinstance(raw, dict) else None
-        if not isinstance(rows, list):
-            rows = []
+    async def search(
+        self, query: str, count: int = 10, question: Optional[str] = None
+    ) -> Tuple[List[SearchResult], Dict[str, Any]]:
+        """POST /search; each hit's model-facing ``summary`` is its content."""
+        payload: Dict[str, Any] = {"query": query, "count": max(1, min(count, _COUNT_MAX))}
+        if question:
+            payload["ori_question"] = question
 
-        detailed_results: List[Dict[str, Any]] = []
-        cards: List[Dict[str, Any]] = []
-        for row in rows:
-            if not isinstance(row, dict):
-                continue
-            url = str(row.get("url") or "")
-            title = str(row.get("title") or "")
-            snippet = _truncate(row.get("snippet") or row.get("summary") or row.get("content"))
-            if not url:
-                continue
-            detailed_results.append(
-                {
-                    "title": title,
-                    "url": url,
-                    "content": _truncate(row.get("summary") or row.get("content") or snippet),
-                    "score": row.get("rerank_score"),
-                    "site_name": row.get("site_name"),
-                    "date": row.get("date"),
-                }
+        start_time = time.time()
+        data = await self._post("/search", payload, _SEARCH_TIMEOUT)
+        response_time = time.time() - start_time
+
+        items = data.get("results") or []
+        results = [
+            SearchResult(
+                title=item.get("title") or "",
+                url=item.get("url") or "",
+                content=item.get("summary") or item.get("snippet") or "",
+                published_date=item.get("date"),
+                score=item.get("rerank_score"),
             )
-            cards.append(result_card(title=title, url=url, snippet=snippet))
+            for item in items
+        ]
 
-        metadata: Dict[str, Any] = {
+        metadata = {
             "type": "web_search",
             "query": query,
-            "search_type": "general",
             "search_engine": "deepseek",
-            "total_results": len(detailed_results),
-            "results": cards,
+            "response_time": round(response_time, 2),
+            "total_results": len(results),
+            # The cards show DeepSeek's display snippet; the model reads the summary.
+            "results": [
+                result_card(
+                    title=item.get("title") or "",
+                    url=item.get("url") or "",
+                    favicon=item.get("site_icon"),
+                    snippet=(item.get("snippet") or item.get("summary") or "")[:SNIPPET_MAX],
+                )
+                for item in items
+            ],
         }
-        return detailed_results, metadata
+        return results, metadata
+
+    async def fetch(self, url: str) -> Dict[str, Any]:
+        """POST /fetch — one page as markdown."""
+        return await self._post("/fetch", {"url": url}, _FETCH_TIMEOUT)
+
+
+class DeepSeekFetchAdapter:
+    """FetchAdapter over DeepSeek /fetch (one URL per call)."""
+
+    name = "deepseek"
+
+    async def _fetch_one(self, api: DeepSeekAPI, url: str) -> FetchResult:
+        try:
+            data = await api.fetch(url)
+        except httpx.HTTPError as e:
+            return FetchResult(url=url, error=_fetch_error(e))
+        markdown = data.get("content") or ""
+        if is_empty_markdown(markdown):
+            return FetchResult(url=url, error=empty_content_error())
+        return FetchResult(url=url, title=data.get("title") or None, markdown=markdown)
+
+    async def fetch(self, req: FetchRequest, native_params: Dict[str, Any]) -> FetchResponse:
+        try:
+            api = DeepSeekAPI()
+        except ValueError as e:
+            return error_response(req.urls, missing_key_error(str(e)), self.name)
+        results: List[FetchResult] = await asyncio.gather(
+            *(self._fetch_one(api, u) for u in req.urls)
+        )
+        return FetchResponse(results=list(results), provider=self.name)
 
 
 def build_web_search_tool(
@@ -146,41 +190,54 @@ def build_web_search_tool(
     default_time_range: Optional[str] = None,
     verbose: bool = True,
 ):
-    """Build a per-request DeepSeek web_search tool."""
-    _get_api_wrapper = lazy(DeepSeekSearchAPI)
+    """Build a per-request DeepSeek web_search tool.
 
-    @tool(response_format="content_and_artifact")
+    Fresh tool per call: settings live in closure scope so concurrent
+    requests with different settings can't race. ``verbose`` is accepted for
+    the uniform builder interface; DeepSeek results have no image variant.
+    """
+    _get_api_wrapper = lazy(DeepSeekAPI)
+
+    @turn_tool(response_format="content_and_artifact")
     async def web_search(
         query: str,
-        time_range: Optional[Literal["day", "week", "month", "year", "d", "w", "m", "y"]] = None,
-    ) -> tuple[Union[list[dict[str, Any]], str], dict[str, Any]]:
-        """Search the web with DeepSeek's built-in search service.
+        question: Optional[str] = None,
+    ) -> Tuple[Union[List[Dict[str, Any]], str], Dict[str, Any]]:
+        """Search the web with DeepSeek's search engine.
 
-        Use when you need:
-        - Current events, news, or facts beyond the knowledge cutoff
-        - Verification of a specific claim or figure
-        - Chinese-language sources (DeepSeek indexes zh content well)
+        Use when you need to:
+        - Find recent news, filings, or facts on a topic
+        - Research topics beyond your knowledge cutoff
+
+        query and question are each refused past 128 characters.
 
         Args:
-            query: Search query. Supports ``site:``, ``-term``, ``"exact phrase"``,
-                ``lang:zh,en`` and ``after:YYYY-MM-DD`` operators.
-            time_range: Optional recency filter, translated to ``after:``.
+            query: Keywords. Accepts operators, which combine: site:sec.gov
+                (several joined with OR), -site:x.com, "exact phrase", -word,
+                lang:en,zh, after:2025-01-01, before:2025-06-30
+            question: The full question the search serves; improves ranking
 
         Returns:
-            Ranked results as titles, snippets and URLs — not full page text.
+            Ranked results, each with ~700 characters of its page's best text.
         """
-        effective_query = _apply_time_range(query, time_range or default_time_range)
+        if not query.strip() or len(query) > _QUERY_MAX or len(question or "") > _QUERY_MAX:
+            # The API refuses these, and that is the agent's mistake, not a failed search.
+            return search_refusal(
+                ValueError(f"query must be 1 to {_QUERY_MAX} characters, question at most {_QUERY_MAX}"),
+                query,
+            )
+
         try:
             api = _get_api_wrapper()
-            logger.debug(
-                "Executing DeepSeek search: query=%r, count=%s", effective_query, max_results
+            effective_query = _with_default_date(query, default_time_range)
+            logger.debug(f"Executing DeepSeek search: query='{effective_query}'")
+            results, metadata = await api.search(
+                query=effective_query, count=max_results, question=question
             )
-            raw = await api.fetch(effective_query, count=max_results)
-            detailed_results, metadata = api._format(raw, query)
-            logger.debug("DeepSeek search completed: %s results", len(detailed_results))
-            return detailed_results, metadata
-        except httpx.HTTPError as e:
-            logger.error("DeepSeek search failed: %s", e, exc_info=True)
-            return search_failed(e, query)
+            return [r.as_dict() for r in results], metadata
+
+        except (httpx.HTTPError, ValueError) as e:
+            logger.error(f"DeepSeek search failed: {e}", exc_info=True)
+            return search_failed(e, query, quote_http_body=True)
 
     return web_search

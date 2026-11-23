@@ -20,6 +20,7 @@ from market_protocol import (
     to_display,
     vendor_symbol,
 )
+from market_protocol.symbology import UNKNOWN_MIC
 
 
 class _CookieCacheWithA3:
@@ -65,6 +66,30 @@ def guard_cookie_cache() -> None:
 guard_cookie_cache()
 
 
+# Minor-unit quote currencies yfinance may declare → (major ISO 4217, divisor).
+# Keyed on the spelling Yahoo reports (case-sensitive); a case-insensitive
+# fallback covers casing drift, except where lowercasing would collide with
+# the major code. e.g. LSE quotes arrive in pence ("GBp"), while "GBP" is pounds.
+_MINOR_UNITS = {
+    "GBp": ("GBP", 100),
+    "GBX": ("GBP", 100),
+    "ZAc": ("ZAR", 100),
+    "ILA": ("ILS", 100),
+}
+_MINOR_UNITS_CI = {
+    code.lower(): conv
+    for code, conv in _MINOR_UNITS.items()
+    if code.lower() != conv[0].lower()
+}
+
+
+def minor_unit(code: Optional[str]) -> Optional[tuple[str, int]]:
+    """(major ISO 4217, divisor) if ``code`` is a minor-unit currency, else None."""
+    if not isinstance(code, str):
+        return None
+    return _MINOR_UNITS.get(code) or _MINOR_UNITS_CI.get(code.lower())
+
+
 def yfinance_symbol(ref: InstrumentRef) -> str:
     """Yahoo's spelling: ``^GSPC`` for a family index, ``600519.SS``, ``EURUSD=X`` for FX."""
     if is_family_index(ref):
@@ -78,11 +103,14 @@ def boundary(ticker: str) -> tuple[str, str, Optional[str]]:
     """Resolve an agent-supplied ticker at the protocol boundary.
 
     Returns ``(display_symbol, yfinance_symbol, price_currency)``. Falls back to
-    the upper-cased raw ticker when the symbol cannot be canonicalized.
+    the upper-cased raw ticker when the symbol cannot be canonicalized. A venue
+    the protocol does not know resolves to the US default home, so its listing
+    has no currency here rather than USD.
     """
     try:
         ref = to_canonical(ticker)
-        return to_display(ref), yfinance_symbol(ref), ref.price_currency
+        currency = None if ref.mic == UNKNOWN_MIC else ref.price_currency
+        return to_display(ref), yfinance_symbol(ref), currency
     except Exception:  # noqa: BLE001
         cleaned = (ticker or "").strip().upper()
         return cleaned, cleaned, None

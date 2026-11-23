@@ -7,7 +7,10 @@
  *  2. items fold from the TAIL of the declared priority order;
  *  3. the ⋯ trigger pays for itself out of the budget;
  *  4. the loop breaks on the first miss — a narrow low-priority item never
- *     jumps ahead of a wide high-priority one.
+ *     jumps ahead of a wide high-priority one;
+ *  5. the model pill gives way only once every item has folded, and its
+ *     level goes before its name shrinks;
+ *  6. past the name's floor, the name itself gives way to the logo.
  */
 import { describe, it, expect } from 'vitest';
 import { computeFold, TOOLBAR_GAP, ICON_BUTTON_W } from '../chat-input.useToolbarFold';
@@ -127,5 +130,53 @@ describe('computeFold', () => {
       rightReserve: 0,
     });
     expect(r.folded).toEqual([]);
+  });
+});
+
+describe('computeFold: the model pill', () => {
+  // Left: one 40px toggle. Right: the model pill, 130 with its level, 60
+  // with no level and the name at its floor.
+  const items = [{ id: 'toggle', visible: true }];
+  const widths = { toggle: 40 };
+  const toggle = 40 + TOOLBAR_GAP;
+  const trigger = TOOLBAR_GAP + ICON_BUTTON_W;
+  const fit = (containerWidth: number, status = 0) => computeFold({
+    containerWidth, widths, items, fixedLeft: 0, rightReserve: 130, rightFloor: 60, status,
+  });
+
+  it('keeps the level while the row holds the whole pill beside the items', () => {
+    expect(fit(130 + toggle)).toMatchObject({ folded: [], levelHidden: false, nameHidden: false });
+  });
+
+  it('folds the items before the level goes', () => {
+    const r = fit(130 + toggle - 1);
+    expect(r.folded).toEqual(['toggle']);
+    expect(r.levelHidden).toBe(false);
+  });
+
+  it('drops the level before the name shrinks', () => {
+    // Everything folded, a pixel short of the whole pill: the name keeps its
+    // room and the level goes.
+    expect(fit(130 + trigger - 1)).toMatchObject({ folded: ['toggle'], levelHidden: true, nameHidden: false });
+  });
+
+  it('lets a host status take the level, not an item', () => {
+    // The row holds the toggle beside the pill at its floor, so the 30px
+    // status costs the level its room rather than the toggle its slot.
+    expect(fit(130 + toggle, 30)).toMatchObject({ folded: [], levelHidden: true });
+  });
+
+  it('hides the model name only once the folded row cannot hold it at its floor', () => {
+    expect(fit(60 + trigger)).toMatchObject({ folded: ['toggle'], levelHidden: true, nameHidden: false });
+    expect(fit(60 + trigger - 1).nameHidden).toBe(true);
+  });
+
+  it('charges no ⋯ trigger when there are no items', () => {
+    const fold = (containerWidth: number) => computeFold({
+      containerWidth, widths: { model: 130 }, items: [], fixedLeft: 0, rightReserve: 130, rightFloor: 60,
+    });
+    expect(fold(130)).toMatchObject({ levelHidden: false, nameHidden: false });
+    expect(fold(129)).toMatchObject({ levelHidden: true, nameHidden: false });
+    expect(fold(59).nameHidden).toBe(true);
   });
 });

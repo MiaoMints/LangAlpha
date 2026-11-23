@@ -46,19 +46,21 @@ from deepagents.backends.protocol import (
 )
 
 from ptc_agent.agent.backends.results import EditTextResult
-from ptc_agent.core.paths import on_file_mount, resolve_agent_path
+from ptc_agent.core.paths import langalpha_config_dir, on_file_mount, resolve_agent_path
 from ptc_agent.core.sandbox import PTCSandbox
+from ptc_agent.core.sandbox.execution import app_command
 from ptc_agent.core.sandbox.grep_render import GrepLine
 from ptc_agent.core.sandbox.jobs import (
     Ended,
     Failed,
+    JobContext,
     JobOutcome,
     JobRef,
     JobSpec,
     Running,
     StoppedJob,
 )
-from ptc_agent.core.sandbox.livefs_mount import MountHandle, TranscriptReach
+from ptc_agent.core.sandbox.livefs_mount import HistoryFiles, MountHandle, TranscriptReach
 from ptc_agent.core.sandbox.runtime import PreviewInfo
 
 logger = structlog.get_logger(__name__)
@@ -82,6 +84,7 @@ class SandboxBackend(SandboxBackendProtocol):
         virtual_mode: bool = True,
         operation_callback: OperationCallback | None = None,
         preview_owner: str | None = None,
+        history: HistoryFiles | None = None,
     ) -> None:
         """Create a new SandboxBackend.
 
@@ -96,6 +99,10 @@ class SandboxBackend(SandboxBackendProtocol):
                                 Receives a dict with operation details for persistence/logging.
             preview_owner: Workspace allowed to reuse preview ports started by
                            this backend on a shared computer.
+            history: The thread's own transcript, which the host serves this
+                     agent in process where what serves the computer's past
+                     threads leaves it out; it is then where this agent's
+                     transcripts reach its tools.
         """
         self.sandbox = sandbox
         self._pinned_root = root_dir.rstrip("/") if root_dir else None
@@ -103,6 +110,7 @@ class SandboxBackend(SandboxBackendProtocol):
         self.virtual_mode = virtual_mode
         self.operation_callback = operation_callback
         self.preview_owner = preview_owner
+        self._history = history
         logger.debug("Initialized SandboxBackend", root_dir=self.root_dir, virtual_mode=self.virtual_mode)
 
     @property
@@ -119,6 +127,8 @@ class SandboxBackend(SandboxBackendProtocol):
     def transcripts(self) -> TranscriptReach | None:
         """Where this agent's transcripts reach its tools, or None while
         nothing serves them."""
+        if self._history is not None:
+            return TranscriptReach(self._history, shell=False)
         return self.sandbox.transcripts
 
     async def settled_livefs(
@@ -131,6 +141,15 @@ class SandboxBackend(SandboxBackendProtocol):
         if mount is None or not await mount.ready(workspace_id):
             return None
         return self.sandbox.livefs
+
+    async def config_folder(self) -> str | None:
+        """LangAlpha's config folder on the machine when the login's config
+        home is a custom one, which no fixed spelling names; None otherwise,
+        where ``LANGALPHA_CONFIG_SPELLINGS`` names it as ``.config/langalpha``.
+        Raises where the machine cannot say, so a command is never let past
+        the guard unread."""
+        config_home = await self.sandbox.login_config_home()
+        return langalpha_config_dir("", config_home) if config_home.startswith("/") else None
 
     @property
     def workspace_dir(self) -> str:
@@ -670,18 +689,14 @@ class SandboxBackend(SandboxBackendProtocol):
         *,
         working_dir: str | None = None,
         wait_s: float | None,
-        thread_id: str | None = None,
-        call_id: str | None = None,
-        allowed_servers: frozenset[str] | None = None,
+        context: JobContext = JobContext(),
     ) -> JobOutcome:
         """Start a bash command as a job; wait up to ``wait_s`` (None: until it ends)."""
         return await self.sandbox.start_bash_job(
             command,
             working_dir=working_dir,
             wait_s=wait_s,
-            thread_id=thread_id,
-            call_id=call_id,
-            allowed_servers=allowed_servers,
+            context=context,
         )
 
     async def run_foreground(self, spec: JobSpec, timeout: int) -> Ended | Failed:
@@ -693,17 +708,13 @@ class SandboxBackend(SandboxBackendProtocol):
         code: str,
         *,
         wait_s: float | None,
-        thread_id: str | None = None,
-        call_id: str | None = None,
-        allowed_servers: frozenset[str] | None = None,
+        context: JobContext = JobContext(),
     ) -> JobOutcome:
         """Start Python code as a job; wait up to ``wait_s`` (None: until it ends)."""
         return await self.sandbox.start_code_job(
             code,
             wait_s=wait_s,
-            thread_id=thread_id,
-            call_id=call_id,
-            allowed_servers=allowed_servers,
+            context=context,
         )
 
     async def continue_job(self, outcome: Running, wait_s: float | None) -> JobOutcome:
@@ -747,7 +758,7 @@ class SandboxBackend(SandboxBackendProtocol):
         if self.preview_owner is not None:
             kwargs["owner"] = self.preview_owner
         return await self.sandbox.start_and_get_preview_url(
-            f"cd {shlex.quote(self.workspace_dir)} && {command}",
+            app_command(self.sandbox.workspace(), command),
             port,
             **kwargs,
         )

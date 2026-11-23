@@ -84,11 +84,14 @@ EXPECTED_ABSOLUTE = {
     "internal": "/home/workspace/_internal",
     "internal_src": "/home/workspace/_internal/src",
     "packs": "/home/workspace/_internal/packs",
+    "claude_code": "/home/workspace/_internal/claude-code",
     "wsfiles": "/home/workspace/_internal/.wsfiles",
     "manifest": "/home/workspace/_internal/.sandbox_manifest.json",
     "mcp_tokens": "/home/workspace/_internal/.mcp_tokens.json",
     "egress_relay": "/home/workspace/_internal/.egress_relay.json",
     "vault_secrets": "/home/workspace/_internal/.vault_secrets.json",
+    "cli_token": "/home/workspace/_internal/.cli_token.json",
+    "cli_bin": "/home/workspace/_internal/src/la/bin",
 }
 
 # Every relative name SandboxLayout spells, not only the emitted subset.
@@ -125,8 +128,11 @@ EXPECTED_RELATIVE = {
     "MCP_TOKENS_FILE": "_internal/.mcp_tokens.json",
     "EGRESS_RELAY_FILE": "_internal/.egress_relay.json",
     "VAULT_SECRETS_FILE": "_internal/.vault_secrets.json",
+    "CLI_TOKEN_FILE": "_internal/.cli_token.json",
+    "CLI_BIN_DIR": "_internal/src/la/bin",
     "MCP_CHECK_PREFIX": "_internal/.mcp_check_",
     "LEFTOVERS_DIR": "_internal/leftovers",
+    "CLAUDE_CODE_DIR": "_internal/claude-code",
 }
 
 # The workspace tier, relative to the workspace folder rather than the root.
@@ -144,6 +150,7 @@ EXPECTED_WORKSPACE_RELATIVE = {
     "SCRATCHPAD_DIR": ".agents/scratchpad",
     "SCRATCHPAD_NOTE_DIR": "note",
     "TRANSCRIPTS_DIR": ".agents/transcripts",
+    "MEMBERS_DIR": ".agents/members",
     "AGENT_MD_FILE": "agent.md",
     "DATA_DIR": "data",
 }
@@ -744,7 +751,7 @@ class TestTraversalContainment:
         [
             "/home/workspace/beta-c3d4/work/x.md",
             "/home/workspace/beta-c3d4/.agents/memory/n.md",
-            "/home/workspace/beta-c3d4/.agents/user/memory/stray.md",
+            "/home/workspace/beta-c3d4/.agents/tmp/n.md",
             "/home/workspace/.agents/user/memory/n.md",
             "/home/workspace/alpha-a1b2/work/x.md",
             "/home/workspace/_internal/.manifest",
@@ -762,6 +769,31 @@ class TestTraversalContainment:
         sandbox, project = self._sandbox(), self._project()
         virtual = _paths.virtualize_path(sandbox, real, project)
         assert _paths.normalize_path(sandbox, virtual, project) == real
+
+    @pytest.mark.parametrize(
+        "spelling",
+        [
+            "/home/workspace/beta-c3d4/.agents/user/profile/portfolio.json",
+            "/home/workspace/alpha-a1b2/.agents/user/profile/portfolio.json",
+            "/.agents/user/profile/portfolio.json",
+            ".agents/user/profile/portfolio.json",
+        ],
+    )
+    def test_a_folders_link_into_the_user_tier_names_the_computers(self, spelling):
+        """Every folder links ``.agents/user`` to the computer's, and the store
+        route is keyed on the root's, so each spelling has to land there."""
+        sandbox, project = self._sandbox(), self._project()
+        assert (
+            _paths.normalize_path(sandbox, spelling, project)
+            == f"{self.ROOT}/.agents/user/profile/portfolio.json"
+        )
+
+    def test_a_folder_the_turn_does_not_know_keeps_its_user_path(self):
+        sandbox, project = self._sandbox(), self._project()
+        real = f"{self.ROOT}/gamma-e5f6/.agents/user/profile/portfolio.json"
+        assert _paths.normalize_path(sandbox, real, project) != (
+            f"{self.ROOT}/.agents/user/profile/portfolio.json"
+        )
 
     def test_a_sibling_keeps_its_absolute_path_and_the_folder_owns_the_slash(self):
         sandbox, project = self._sandbox(), self._project()

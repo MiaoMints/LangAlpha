@@ -44,6 +44,7 @@ import { sendChatMessageStream, cancelWorkflow, getWorkflowStatus, reconnectToWo
 import { useChatMessages } from '../useChatMessages';
 import type { AssistantMessage } from '@/types/chat';
 import { settleMountEffect } from './chatHookHarness';
+import { queryKeys } from '@/lib/queryKeys';
 
 const mockSendStream = sendChatMessageStream as Mock;
 const mockCancel = cancelWorkflow as Mock;
@@ -159,6 +160,43 @@ describe('useChatMessages — stopWorkflow (hard stop)', () => {
     expect(result.current.messageError).toBeNull();
   });
 
+  it('while the computer starts, cancels first and drops the reader once the server has it', async () => {
+    // A send that drops during setup ends as a dropped send, not a stop, so
+    // the turn would never read as stopped for anyone else watching it.
+    const { result } = await mountSettled();
+    const hang = deferred<{ disconnected: boolean; aborted: boolean }>();
+    let signal: AbortSignal | undefined;
+    mockSendStream.mockImplementation(async (...args: unknown[]) => {
+      const { onEvent, signal: s } = args[3] as { onEvent: OnEvent; signal: AbortSignal };
+      signal = s;
+      onEvent({ event: 'metadata', thread_id: 'th-stop', run_id: 'run-1' });
+      onEvent({ event: 'workspace_status', status: 'starting' });
+      return hang.promise;
+    });
+    const cancel = deferred<{ cancelled: boolean }>();
+    mockCancel.mockReturnValue(cancel.promise);
+
+    let send: Promise<unknown> = Promise.resolve();
+    act(() => { send = result.current.handleSendMessage('analyze AAPL'); });
+    await waitFor(() => expect(result.current.turnStatus.workspaceStarting).toBe('starting'));
+
+    let stopped: Promise<unknown> = Promise.resolve();
+    act(() => { stopped = result.current.stopWorkflow(); });
+    expect(mockCancel).toHaveBeenCalledTimes(1);
+    expect(mockCancel).toHaveBeenCalledWith('th-stop', 'run-1');
+    expect(signal?.aborted).toBe(false);
+    expect(result.current.isLoading).toBe(false);
+
+    await act(async () => {
+      cancel.resolve({ cancelled: true });
+      await stopped;
+    });
+    expect(signal?.aborted).toBe(true);
+    expect(mockCancel).toHaveBeenCalledTimes(1);
+    hang.resolve({ disconnected: false, aborted: true });
+    await act(async () => { await send.catch(() => undefined); });
+  });
+
   it('clears the in-flight tool-call "generating" row on stop (no lingering shimmer)', async () => {
     const { result } = await mountSettled();
 
@@ -243,6 +281,20 @@ describe('useChatMessages — stopWorkflow (hard stop)', () => {
     expect(afterProc?.isInProgress).toBe(false);
     expect(afterProc?.isComplete).toBe(true);
 
+    hang.resolve({ disconnected: false, aborted: true });
+    await act(async () => { await send.catch(() => undefined); });
+  });
+
+  it('rereads the Claude plan once the cancel settles, since the aborted reader hears no run_end', async () => {
+    const { result, queryClient } = await mountSettled();
+    const { hang, send } = await startHangingSendWithReasoning(result);
+    const invalidate = vi.spyOn(queryClient, 'invalidateQueries');
+    await act(async () => {
+      await result.current.stopWorkflow();
+    });
+    const keys = invalidate.mock.calls.map(([filters]) => JSON.stringify(filters?.queryKey));
+    expect(keys).toContain(JSON.stringify(queryKeys.features.claudeCodeStatus()));
+    expect(keys).toContain(JSON.stringify(queryKeys.features.claudeCodeComputers()));
     hang.resolve({ disconnected: false, aborted: true });
     await act(async () => { await send.catch(() => undefined); });
   });
@@ -584,6 +636,32 @@ describe('useChatMessages — stopWorkflow gives the user\'s steers back', () =>
     const resend = mockSendStream.mock.calls[0][3] as SendOpts;
     expect(resend.steerOnly).toBeFalsy();
     expect(resend.requestKey).not.toBe(keys[0]);
+  });
+
+  it('gives back the note of a returned steer carrying comments, and says the comments wait again', async () => {
+    const { result, keys } = await runningTurnWithSteers(['steer one']);
+    const heard: unknown[] = [];
+    const stop = result.current.watchCommentSends((_comments: unknown, outcome: unknown) => { heard.push(outcome); });
+    mockCancel.mockResolvedValue({
+      cancelled: true,
+      message: 'ok',
+      returned_steers: [{
+        content: 'my note',
+        request_key: keys[0],
+        artifact_comments: {
+          note: 'my note',
+          reading: 'chat',
+          comments: [{ comment_id: 'c1', artifact_id: 'a1', workspace_id: 'ws', number: 3, path: 'r.html', anchor_label: 'x', excerpt: 'y' }],
+        },
+      }],
+    });
+    await act(async () => {
+      await result.current.stopWorkflow();
+    });
+    stop();
+
+    expect(result.current.returnedSteering).toBe('my note');
+    expect(heard).toContain('returned');
   });
 
   it('leaves the composer alone when the stop returns no steers', async () => {

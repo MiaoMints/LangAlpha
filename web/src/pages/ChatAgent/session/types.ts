@@ -12,26 +12,14 @@ import type { SubagentTokenUsage } from '../utils/tokenUsage';
 import type { DecisionTarget } from './interrupts/toolApprovalCard';
 import type { StreamRefs, UpdateSubagentCard } from './streamRefs';
 import type { RetryNotice } from './stream/autoRetry';
-import type { ThreadTokenTotals } from '../utils/api/messages';
+import type { NextSummary, ThreadTokenTotals } from '../utils/api/messages';
+import type { TokenUsage } from './tokenUsage';
+import type { CliQueueWait } from '@/lib/claudeCodeQueue';
 
 // --- Internal types for useChatMessages ---
 
 /** React state setter for messages array. */
 type SetMessages = React.Dispatch<React.SetStateAction<ChatMessage[]>>;
-
-/** Token usage state for context window progress ring. The totals are the
- *  thread's: the server's count when it loaded, plus live calls since. The
- *  rest is the newest call's. */
-interface TokenUsage {
-  totalInput: number;
-  totalOutput: number;
-  /** Whether the totals started from the server's count. Without one they
-   *  sum the calls the view has loaded, the closest it can come. */
-  fromServer: boolean;
-  lastOutput: number;
-  total: number;
-  threshold: number;
-}
 
 /** Pending HITL interrupt state. */
 interface PendingInterrupt {
@@ -41,6 +29,9 @@ interface PendingInterrupt {
   questionId?: string;
   proposalId?: string;
   toolCallId?: string;
+  /** The run that raised it: a reattach to another run of the thread is how
+   *  the view learns it was answered elsewhere. Null when not known. */
+  runId?: string | null;
 }
 
 /** Loosely-typed SSE event — all event shapes merged. */
@@ -80,6 +71,10 @@ interface SSEEvent {
   output_tokens?: number;
   total_tokens?: number;
   threshold?: number;
+  /** Cache-read input tokens of a `token_usage` call, held in `input_tokens`. */
+  cached_tokens?: number;
+  /** The model's context window, on a `token_usage` call. */
+  context_limit?: number;
   original_message_count?: number;
   /** About how many tokens a summary being written has written so far. */
   summary_tokens?: number;
@@ -105,6 +100,11 @@ interface SSEEvent {
   elapsed_ms?: number;
   /** What the thread has used, on a `run_end` frame. */
   token_totals?: ThreadTokenTotals | null;
+  /** What the thread's next send summarizes first, on a `run_end` frame. */
+  next_summary?: NextSummary | null;
+  /** Where each sandbox image the run's reply named was captured, by the path
+   *  as written, on a `run_end` frame. */
+  images?: Record<string, string>;
   [key: string]: unknown;
 }
 
@@ -117,6 +117,24 @@ interface SSEEvent {
 export type ModelStatus =
   | { kind: 'retrying'; model: string; attempt: number; maxRetries: number }
   | { kind: 'fallback'; fromModel: string; toModel: string; paidBy?: string; provider?: string };
+
+/**
+ * What a turn waits on before its answer can go on, each drawn as a line
+ * under the transcript (`TranscriptStatus`) and gone when the wait ends or
+ * the stream does: the workspace starting, `false` when it is not or
+ * `'archived'` on the slow restore from cold storage (widen the union when
+ * the backend adds a `sandbox_state`); a send held on a thread mutation (the
+ * `turn_held` reason: 'compact', 'offload', 'handoff', or another or empty),
+ * null when it is not held; a Claude Code turn waiting for one of its
+ * computer's CLIs, null when it waits for none.
+ */
+export interface TurnStatus {
+  workspaceStarting: false | 'starting' | 'archived';
+  turnHeld: string | null;
+  cliQueue: CliQueueWait | null;
+}
+
+export const NO_TURN_STATUS: TurnStatus = { workspaceStarting: false, turnHeld: null, cliQueue: null };
 
 /**
  * Suggestion surfaced as a pill above the chat input after a turn was
@@ -161,6 +179,15 @@ interface ModelOptions {
    */
   reasoningEffortOverride?: string;
   fastModeOverride?: boolean;
+  /** In a shared workspace, the thread this send creates is shared with
+   *  everyone there from its first message; absent, its starter's alone. */
+  sharedWithWorkspace?: boolean;
+  /**
+   * The file comments this send carries, as its bubble shows them. Their ids
+   * go out as `artifact_comment_ids` with its `reading`, and the message is
+   * the note typed with them, which may be empty.
+   */
+  artifactComments?: import('@/types/api').ArtifactCommentsShown;
 }
 
 /** What a fresh send takes beyond the model options an edit or regenerate does. */
@@ -174,6 +201,19 @@ interface SendOptions extends ModelOptions {
   /** The title of the thread this send creates, in place of one generated
    *  from its message. A send on a live thread leaves the title alone. */
   threadTitle?: string;
+  /**
+   * What the composer held when it sent this. Should the server not keep the
+   * send while the host has the transcript out of view (`returnsUnsent`), it
+   * goes back to the composer as this, and the message leaves the transcript,
+   * where a failed reply's Retry would wait unseen.
+   */
+  draft?: import('@/components/ui/chat-input.types').ComposerDraft;
+  /** This turn starts without the summary a cold thread would get first. An
+   *  edit, regenerate or Retry takes it as an argument of its own. */
+  keepFullContext?: boolean;
+  /** What the charts beside the composer show, sent as `chart_views` so the
+   *  agent's snapshot paints the same view. */
+  chartViews?: import('@/pages/MarketView/types/chartView').ChartView[];
 }
 
 /** Offload batch ref state. */

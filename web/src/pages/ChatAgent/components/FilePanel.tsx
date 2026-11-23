@@ -1,5 +1,5 @@
 import React, { useCallback, useEffect, useEffectEvent, useId, useMemo, useRef, useState, Suspense } from 'react';
-import { CandlestickChart, FolderTree, LayoutDashboard, TextSelect, Upload } from 'lucide-react';
+import { Activity, BookMarked, CandlestickChart, FolderTree, Globe, LayoutDashboard, ScrollText, Upload } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
 import {
   memoMimeForName,
@@ -15,7 +15,7 @@ import { useIsMobile } from '@/hooks/useIsMobile';
 import { useNarrowContainer } from '@/hooks/useNarrowContainer';
 import {
   readWorkspaceFile, readWorkspaceFileFull, writeWorkspaceFile, downloadWorkspaceFileAsArrayBuffer,
-  openWorkspaceFileRanged, triggerFileDownload, resolveWorkspaceFile,
+  openWorkspaceFileRanged, triggerFileDownload, resolveWorkspaceFile, LIVE, type FullRead,
 } from '../utils/api';
 import { folderLinkTarget, linkCandidates } from '../utils/fileRefResolver';
 import { useWorkspaceFolders } from '../contexts/WorkspaceContext';
@@ -31,12 +31,15 @@ import './FilePanel.css';
 
 const ExportPreviewModal = React.lazy(() => import('./ExportPreviewModal'));
 
-import type { ApiAdapter, ChartTabSpec, ContextPayload, PanelTarget } from './filePanel/types';
+import type { ContextPayload } from '@/components/ui/chat-input.types';
+import type { ApiAdapter, ChartTabSpec, PanelAccess, PanelTarget } from './filePanel/types';
 import { EDITABLE_EXTENSIONS, getFileExtension, viewerFor } from './filePanel/fileMeta';
 import { useFileUpload } from './filePanel/useFileUpload';
 import { useFileEdit } from './filePanel/useFileEdit';
 import { usePanelConfirm } from './filePanel/usePanelConfirm';
-import { useSelectionContext } from './filePanel/useSelectionContext';
+import { selectionSourceName, useSelectionContext } from './filePanel/useSelectionContext';
+import { ImageReply } from './selectionQuote/ImageReply';
+import { SelectionQuote } from './selectionQuote/SelectionQuote';
 import { useFileSelection } from './filePanel/useFileSelection';
 import { useFileBackup } from './filePanel/useFileBackup';
 import { useFileFocus } from './filePanel/useFileFocus';
@@ -47,6 +50,7 @@ import { useTreeInteraction, useTreeOpen } from './filePanel/useTreeInteraction'
 import { useFileRefOpen } from './filePanel/useFileRefOpen';
 import { PanelNotices } from './filePanel/PanelNotices';
 import { RestoreOffer } from './RestoreOffer';
+import { useSharedEntry, useWorkspaceCapabilities } from '@/hooks/useSharedWorkspaces';
 import { FileContextMenu, type FileMenuAction } from './filePanel/FileContextMenu';
 import { useFileDownloads } from './filePanel/useFileDownloads';
 import { useFileBodyCache, useFileBody } from './filePanel/useFileBody';
@@ -56,16 +60,24 @@ import { TabStrip } from './filePanel/TabStrip';
 import { AnimatePresence } from '@/lib/framer';
 import { TreeColumn } from './filePanel/TreeColumn';
 import { FileCrumbs } from './filePanel/FileCrumbs';
+import { BrowserCrumbs } from './filePanel/BrowserCrumbs';
 import { PreviewCrumbs } from './filePanel/PreviewCrumbs';
 import { SiblingCrumbs } from './filePanel/SiblingCrumbs';
 import { PreviewPanes } from './filePanel/PreviewPanes';
+import { commentViewer, useFileComments } from './filePanel/useFileComments';
+import { useBrowserView } from './filePanel/useBrowserView';
+import { useBrowserGone, useBrowserHere } from '../hooks/useBrowserHere';
+import type { BrowserViewSession } from './filePanel/browserStream';
+import { useComputer } from '../hooks/useComputers';
 import { usePreviews } from './filePanel/usePreviews';
 import { usePanelTarget } from './filePanel/usePanelTarget';
+import { useCommentUi } from './viewers/html/comments/useCommentUi';
 import { ActiveTabBody } from './filePanel/ActiveTabBody';
-import type { NewTabMenu } from './filePanel/panelLaunchers';
+import type { NewTabMenu, PanelLauncher } from './filePanel/panelLaunchers';
 import { useWatchTab } from './filePanel/useWatchTab';
-import type { MarketWatchState } from '../session/marketWatchEvents';
-import { useThreadWakeups } from '../hooks/useWakeups';
+import { useThreadStatus } from './chatView/threadStatus';
+import type { FilesAway } from '../hooks/useWorkspaceFiles';
+import { useComputerAway } from './filePanel/useComputerAway';
 import { RouteLeaveGuardContext, type RouteLeaveGuard } from '../contexts/RouteLeaveGuardContext';
 import type { SubagentInfo } from './ToolCallDetailView';
 import type { TranscriptReader } from './filePanel/useTranscript';
@@ -95,8 +107,6 @@ interface FilePanelProps {
   onTargetHandled?: (seq?: number) => void;
   onTargetMemoryHandled?: (seq?: number) => void;
   onTargetMemoHandled?: (seq?: number) => void;
-  /** The live market watch, which the Status tab follows. */
-  marketWatch?: MarketWatchState | null;
   /** Leaves the panel for the full MarketView page on this symbol. */
   onOpenInMarketView?: ((spec: ChartTabSpec) => void) | null;
   /** Leaves for a subagent's own transcript, from a tool tab showing its task. */
@@ -112,6 +122,10 @@ interface FilePanelProps {
   files?: string[];
   filesLoading?: boolean;
   filesError?: string | null;
+  /** The workspace's computer did not answer: the files are its backup, or
+   *  there is none and the listing failed. Nothing can change until it is
+   *  back. Null while it answers. */
+  filesAway?: FilesAway | null;
   onRefreshFiles?: () => void;
   readOnly?: boolean;
   /** Whether this viewer may save a file's bytes. A copy-link share grants
@@ -120,15 +134,21 @@ interface FilePanelProps {
   canDownload?: boolean;
   /** Lock to one file: no tree. */
   singleFileMode?: boolean;
-  /** False keeps the strip in memory only: a panel browsing beside a gallery
-   *  must not write over the strip the workspace's conversations seed from. */
+  /** False keeps the strip in memory only, for the life of this mount: a panel
+   *  browsing beside a gallery is not a conversation's strip. */
   persistTabs?: boolean;
+  /** The chat this panel belongs to, stable for that chat's life. Before its
+   *  first message the strip is held under it, so closing the panel or a
+   *  layout change that remounts it does not lose what the chat opened. */
+  chatKey?: string;
   /** False for a panel mounted off screen (a recently visited thread the chat
    *  keeps warm): it holds its strip but does not save it, since the saved
    *  strip is the one the reader is looking at. */
   isActive?: boolean;
   apiAdapter?: ApiAdapter | null;
   onAddContext?: ((ctx: ContextPayload) => void) | null;
+  /** Who a quote from this panel goes to: the placeholder names them. */
+  agentName?: string;
   showSystemFiles?: boolean;
   onToggleSystemFiles?: (() => void) | null;
   /** The guard the panel's own close runs, for whoever else can unmount the
@@ -139,14 +159,15 @@ interface FilePanelProps {
    *  The host that sizes the panel reads this, since a chart has a floor of
    *  its own. */
   onActiveTabKindChange?: ((kind: FileTab['kind'] | null) => void) | null;
-  /** Offer the open file's share dialog in its header: the owner's own panel only. */
-  canShare?: boolean;
   /** Set while a Home or analyst panel shows a sibling's files in place of
    *  its own: the panel names that workspace and offers the way back, asking
    *  first about unsaved edits as its own close does. */
   onReturnHome?: (() => void) | null;
   /** What the way back is labelled with; Home when unset. */
   returnLabel?: string | null;
+  /** The browser view of the workspace shown, held by the host so it follows the
+   *  workspace rather than the mount. None offers no Browser tab. */
+  browserView?: BrowserViewSession | null;
 }
 
 function FilePanel({
@@ -160,7 +181,6 @@ function FilePanel({
   onTargetHandled,
   onTargetMemoryHandled,
   onTargetMemoHandled,
-  marketWatch = null,
   onOpenInMarketView = null,
   onOpenSubagentTask = null,
   transcript = null,
@@ -169,21 +189,24 @@ function FilePanel({
   files = [],
   filesLoading = false,
   filesError = null,
+  filesAway = null,
   onRefreshFiles,
   readOnly = false,
   canDownload = true,
   singleFileMode = false,
   persistTabs = true,
+  chatKey,
   isActive = true,
   apiAdapter = null,
   onAddContext = null,
+  agentName,
   showSystemFiles = false,
   onToggleSystemFiles = null,
   onLeaveGuardChange = null,
   onActiveTabKindChange = null,
-  canShare = false,
   onReturnHome = null,
   returnLabel = null,
+  browserView = null,
 }: FilePanelProps): React.ReactElement {
   const { t } = useTranslation();
   const isMobile = useIsMobile();
@@ -200,15 +223,21 @@ function FilePanel({
     const adapter: ApiAdapter = apiAdapter ?? {};
     const { readFile, readFileFull, downloadFileAsArrayBuffer, triggerDownload, writeFile, resolveFile } = adapter;
     return {
-      readFileFn: readFile ? (_: string, p: string) => readFile(p) : readWorkspaceFile,
-      readFileFullFn: readFileFull ? (_: string, p: string) => readFileFull(p) : readWorkspaceFileFull,
+      // A share serves its files as they stand, never from a backup.
+      readFileFn: readFile ? async (_: string, p: string) => ({ ...(await readFile(p)), from: LIVE }) : readWorkspaceFile,
+      readFileFullFn: readFileFull
+        ? async (_: string, p: string): Promise<FullRead> =>
+          ({ content: (await readFileFull(p)).content, version: null, rewriting: false, from: LIVE })
+        : readWorkspaceFileFull,
       downloadFileAsArrayBufferFn: downloadFileAsArrayBuffer
-        ? (_: string, p: string) => downloadFileAsArrayBuffer(p)
+        ? async (_: string, p: string) => ({ buffer: await downloadFileAsArrayBuffer(p), from: LIVE })
         : downloadWorkspaceFileAsArrayBuffer,
       // A share's route redacts each file whole, so it has no ranges to read.
       openRangedFn: apiAdapter ? undefined : openWorkspaceFileRanged,
       triggerDownloadFn: triggerDownload ? (_: string, p: string) => triggerDownload(p) : triggerFileDownload,
-      writeFileFn: writeFile ? (_: string, p: string, c: string) => writeFile(p, c) : writeWorkspaceFile,
+      writeFileFn: writeFile
+        ? async (_: string, p: string, c: string) => { await writeFile(p, c); return { version: null }; }
+        : writeWorkspaceFile,
       resolveFileFn: apiAdapter
         ? resolveFile ?? null
         : (candidates: string[], recentWrites: string[]) => resolveWorkspaceFile(workspaceId, candidates, recentWrites),
@@ -221,7 +250,9 @@ function FilePanel({
   // The reader's memory and memo stores open here as tabs. A share reads
   // through an adapter with no workspace id: it browses someone else's files
   // and has no stores to show.
+  const capabilities = useWorkspaceCapabilities(workspaceId);
   const stores = !!workspaceId;
+  const memos = stores && capabilities.memos;
   // A file the tree never got is not a file that is gone, so this flag also
   // decides what a missed reference is told.
   const filesRestoreIncomplete = wsData?.files_restore_incomplete === true;
@@ -245,7 +276,7 @@ function FilePanel({
   // this workspace's: pointing the panel at another one starts that
   // workspace's strip rather than leaving these tabs under the new id.
   const persistStrip = !singleFileMode && persistTabs;
-  const tabs = useFileTabs(workspaceId, threadId, { persist: persistStrip, active: isActive });
+  const tabs = useFileTabs(workspaceId, threadId, { persist: persistStrip, active: isActive, chat: chatKey });
   const activeTab = tabs.activeTab;
   // The tree lists the workspace's files, so it sits beside a file or the
   // empty tab and nothing else: a chart, a tool result or an app is its own
@@ -254,12 +285,43 @@ function FilePanel({
   const selectedFile = activeTab.kind === 'file' ? activeTab.path : null;
 
   const previews = usePreviews(workspaceId);
+  const { data: computer } = useComputer(wsData?.computer_id ?? null);
+  const sharedWorkspace = useSharedEntry(workspaceId) != null;
+  const browserHere = useBrowserHere(computer, sharedWorkspace);
+  useBrowserView(
+    browserView,
+    workspaceId,
+    wsData?.computer_id ?? null,
+    computer,
+    isActive && activeTab.kind === 'browser' && browserHere,
+  );
+  // A Browser tab kept from a computer that had one, or from before the reader
+  // turned the browser off, closes once it is known there is none here.
+  const browserGone = useBrowserGone();
+  const browserTabId = tabs.tabs.find((t) => t.kind === 'browser')?.id ?? null;
+  const closeBrowserTab = tabs.closeTab;
+  useEffect(() => {
+    if (browserGone && browserTabId) closeBrowserTab(browserTabId);
+  }, [browserGone, browserTabId, closeBrowserTab]);
+  // Publishing, comments, versions and a file's record are the owner's: a
+  // read-only panel, or a share's, shows a file alone. Decided here once, and
+  // what acts on it reads this rather than deciding again.
+  const servePrefix = apiAdapter?.servePrefix;
+  const access = useMemo<PanelAccess>(
+    () => (servePrefix ? { kind: 'share', servePrefix } : readOnly || !workspaceId ? { kind: 'readOnly' } : { kind: 'owner' }),
+    [servePrefix, readOnly, workspaceId],
+  );
 
   const { body, loading: fileLoading, error: readError, readAt, refetch } = useFileBody({
     cache, path: selectedFile, workspaceStatus: wsData?.status,
   });
   const fileContent = body?.content ?? null;
   const fileMime = body?.mime ?? null;
+
+  const { selectionTooltip, selectionComposing, beginReply, dismissSelection, contentWrapperRef, contextMenu, setContextMenu, handleEditorTextSelect, handleAddSelectionContext, askAboutWords } =
+    useSelectionContext({ selectedFile, fileContent, onAddContext });
+  const commentUi = useCommentUi(onAddContext ? askAboutWords : null);
+  const comments = access.kind === 'owner' ? commentUi : undefined;
 
   const { markRead, forget: forgetChanged, hasChanged } = useChangedFiles(transcript);
   useEffect(() => {
@@ -274,13 +336,17 @@ function FilePanel({
   useEffect(() => () => dropBodies(), []);
 
   const downloads = useFileDownloads({ workspaceId, triggerDownloadFn, workspaceStatus: wsData?.status });
-  const fileError = downloads.errorFor(selectedFile) ?? readError;
+  const away = useComputerAway({
+    filesAway, filesError, bodyFrom: body?.from, fileError: downloads.errorFor(selectedFile) ?? readError,
+    computerId: wsData?.computer_id ?? null, invalidate: cache.invalidate,
+  });
+  const { fileError } = away;
 
   const [exportModalOpen, setExportModalOpen] = useState(false);
   const [pageCounts, setPageCounts] = useState<Record<string, number>>({});
 
   const { uploadProgress, uploadSaving, cancelUpload, uploadError, setUploadError, fileInputRef, isDragOver, handleFileInputChange, handleDragEnter, handleDragLeave, handleDragOver, handleDrop } =
-    useFileUpload({ workspaceId, onRefreshFiles });
+    useFileUpload({ workspaceId, onRefreshFiles, away });
 
   const setFileContent = useCallback((next: React.SetStateAction<string | null>) => {
     if (!selectedFile) return;
@@ -299,6 +365,7 @@ function FilePanel({
 
   const edit = useFileEdit({
     tabId: activeTab.id, workspaceId, selectedFile, setFileContent, readFileFullFn, writeFileFn, ask, onSaveSettled,
+    invalidate: cache.invalidate, away,
   });
   // Taken apart here: the hook hands back a new object every render, so a
   // callback that closed over `edit` would be new every render too.
@@ -309,10 +376,7 @@ function FilePanel({
   useEffect(() => { reportActiveKind(activeTab.kind); }, [activeTab.kind]);
   useEffect(() => () => reportActiveKind(null), []);
 
-  const { selectionTooltip, contentWrapperRef, contextMenu, setContextMenu, handleContentMouseUp, handleEditorTextSelect, handleAddSelectionContext } =
-    useSelectionContext({ selectedFile, fileContent, onAddContext });
-
-  const viewer = selectedFile ? viewerFor(selectedFile, fileMime, edit.isEditing) : 'other';
+  const viewer = selectedFile && !edit.isEditing ? viewerFor(selectedFile, fileMime) : 'other';
   const focus = useFileFocus({
     selectedFile,
     viewer,
@@ -327,6 +391,22 @@ function FilePanel({
   // A replay restores the reader's place and leaves their choice of view be.
   const htmlView = useHtmlViewMode(focus.replayed ? null : focus.htmlAnchor, focus.seq);
   const { setSource: setHtmlSource } = htmlView;
+
+  // The file the owner reads takes comments, and an HTML one has versions,
+  // unless its viewer failed: the fallback drew no comment layer.
+  const [documentFailed, setDocumentFailed] = useState(false);
+  const fileComments = useFileComments({
+    workspaceId, tabId: activeTab.id, file: selectedFile, commentViewer: documentFailed ? null : commentViewer(viewer, !!body), source: htmlView.source,
+    active: isActive, readAt: readAt ?? null, ui: comments, threadId, dismissSelection,
+  });
+  const htmlArtifactPath = fileComments.path;
+  // The agent's edit to the HTML file in front is read at once, unlike other
+  // files: the frame swaps it in over the old one with the place kept, and a
+  // reader whose comments the agent is answering is waiting for exactly that.
+  const htmlChanged = !!htmlArtifactPath && !edit.isEditing && hasChanged(htmlArtifactPath);
+  useEffect(() => {
+    if (htmlChanged && htmlArtifactPath) cache.invalidate(htmlArtifactPath);
+  }, [htmlChanged, htmlArtifactPath, cache]);
 
   // Replay the tab's own location whenever it comes back to the front. A
   // location the tab has already been to is a replay; a new one is an ask.
@@ -367,7 +447,7 @@ function FilePanel({
     }
     tabs.forgetPaths(paths);
   }, [tabs, forgetTab, forgetChanged, cache]);
-  const selection = useFileSelection({ workspaceId, filteredSortedFiles: filter.filteredSortedFiles, targetDirectory: scopeDir, onRefreshFiles, onDeleted: forgetDeleted });
+  const selection = useFileSelection({ workspaceId, filteredSortedFiles: filter.filteredSortedFiles, targetDirectory: scopeDir, onRefreshFiles, onDeleted: forgetDeleted, away });
   // A restore offer holds the folder's backup until the reader answers it.
   const restoreOffered = !!wsData?.files_restore_offered_at;
   const backup = useFileBackup({
@@ -434,6 +514,7 @@ function FilePanel({
   usePanelTarget({
     target, tabs, previews, openFileRef, cancelPending,
     clearSearch, setTreeOpen, setScopeDir, onTargetHandled,
+    onCommentFocus: comments?.requestFocus,
   });
 
   // Opening a singleton tab drops a reference still resolving, like any other
@@ -442,7 +523,7 @@ function FilePanel({
   const openSettings = useCallback(() => { cancelPending(); tabs.openSettings(); }, [tabs, cancelPending]);
   const openMemory = useCallback(() => { cancelPending(); tabs.openMemory(); }, [tabs, cancelPending]);
   const openMemo = useCallback(() => { cancelPending(); tabs.openMemo(); }, [tabs, cancelPending]);
-  const viewInMemo = stores ? openMemo : null;
+  const viewInMemo = memos ? openMemo : null;
 
   const handleAddToMemo = useAddToMemo({ workspaceId, downloadFileAsArrayBufferFn, readFileFullFn, onSwitchToMemoTab: viewInMemo });
   const memoedMap = useWorkspaceMemoIndex(workspaceId);
@@ -453,8 +534,10 @@ function FilePanel({
   const [memoSyncing, setMemoSyncing] = useState(false);
   const [memoDiffOpen, setMemoDiffOpen] = useState(false);
 
-  const wakeups = useThreadWakeups(threadId, isActive);
-  useWatchTab(tabs, marketWatch, wakeups);
+  // The chat's status, which the Status tab follows: a market watch, or a
+  // pending wakeup, which fires server-side between turns.
+  const trayContents = useThreadStatus()?.contents;
+  useWatchTab(tabs, !!(trayContents?.watch || trayContents?.wakeups));
 
   // Stable: `retryOpen` is new with every file list and every change mark, and
   // the viewer this reaches should render only for its own file.
@@ -486,7 +569,7 @@ function FilePanel({
     setContextMenu(null);
     if (action === 'add-context' && onAddContext) {
       tabs.openFile(filePath, { pin: true });
-      onAddContext({ path: filePath });
+      onAddContext({ kind: 'file', path: filePath });
     } else if (action === 'add-to-memo') {
       handleAddToMemo(filePath);
     } else if (action === 'open') {
@@ -568,33 +651,36 @@ function FilePanel({
 
   // Reads the strip as it is when the close runs, which the discard question
   // can put off while tabs come and go underneath it.
-  const closeTabNow = useStableHandler((id: string) => {
-    const tab = tabs.tabs.find((x) => x.id === id);
-    if (!tab) return;
-    forgetTab(id);
-    if (tab.kind === 'file') {
-      // The marker is what forces a re-read on reopen; the cached bytes must
-      // not outlive it, or a rewrite lands inside the body's fresh window.
-      if (hasChanged(tab.path)) cache.invalidate(tab.path);
-      forgetChanged(tab.path);
+  const closeTabsNow = useStableHandler((ids: readonly string[]) => {
+    const closing = tabs.tabs.filter((x) => ids.includes(x.id));
+    if (!closing.length) return;
+    for (const tab of closing) {
+      forgetTab(tab.id);
+      if (tab.kind === 'file') {
+        // The marker is what forces a re-read on reopen; the cached bytes must
+        // not outlive it, or a rewrite lands inside the body's fresh window.
+        if (hasChanged(tab.path)) cache.invalidate(tab.path);
+        forgetChanged(tab.path);
+      }
     }
     // The last tab takes the panel with it, and the panel reopens on the
     // empty tab rather than on the one just closed. A file still being looked
     // up has no tab yet, so the panel stays for it to land in. Anything else
     // still pending is the closed tab's own, and is dropped.
-    if (tabs.tabs.length <= 1 && !isLookingUp()) {
+    if (closing.length >= tabs.tabs.length && !isLookingUp()) {
       cancelPending();
       tabs.closeOut();
       onClose();
       return;
     }
-    tabs.closeTab(id);
+    tabs.closeTabs(closing.map((x) => x.id));
   });
 
-  const closeTab = useCallback((id: string) => {
-    if (tabHasUnsavedChanges(id)) askDiscard(() => closeTabNow(id));
-    else closeTabNow(id);
-  }, [tabHasUnsavedChanges, askDiscard, closeTabNow]);
+  // One question for the lot, the same one a single dirty tab asks.
+  const closeTabs = useCallback((ids: readonly string[]) => {
+    if (ids.some(tabHasUnsavedChanges)) askDiscard(() => closeTabsNow(ids));
+    else closeTabsNow(ids);
+  }, [tabHasUnsavedChanges, askDiscard, closeTabsNow]);
 
   // A step replaces what the tab shows, so it asks what closing the tab would.
   // Read at the moment it runs: the question can put it off while the strip
@@ -644,6 +730,13 @@ function FilePanel({
     void openFileRef(path, { fromFile: rooted ? null : selectedFile, location, pin: opts?.pin });
   });
 
+  // A link in a framed document opens beside it, so the document cannot stay
+  // the preview tab the new one would take over. Its path starts at the workspace.
+  const handleFrameLink = useStableHandler((path: string, fragment: string) => {
+    tabs.pinTab(activeTab.id);
+    handleViewerLink(path, undefined, parseFragment(fragment) ?? undefined, { rooted: true, pin: true });
+  });
+
   const handleAnchorLink = useStableHandler((fragment: string) => {
     if (selectedFile) focus.focusAt(selectedFile, parseFragment(fragment));
   });
@@ -658,12 +751,11 @@ function FilePanel({
 
   // Editing needs a text viewer under it: the pdf, excel and html readers are
   // not editors, and an image or a parked tool result is not text. A CSV reads
-  // in the grid (`other`) but edits as the text it is; a file already in the
-  // editor keeps its verdict rather than reading the editor as `other`.
-  const selectedExt = selectedFile ? getFileExtension(selectedFile) : '';
-  const canEdit = !!(selectedFile && !readOnly && !fileError
-    && EDITABLE_EXTENSIONS.has(selectedExt)
-    && (edit.isEditing || viewer === 'code' || viewer === 'markdown' || (viewer === 'other' && selectedExt === 'csv' && fileMime !== 'image')));
+  // in the grid but edits as the text it is; a file already in the editor
+  // keeps its verdict and its draft, and its Save says why it waits.
+  const canEdit = !!(selectedFile && !readOnly && !fileError && (!away.blockedReason || edit.isEditing)
+    && EDITABLE_EXTENSIONS.has(getFileExtension(selectedFile))
+    && (edit.isEditing || viewer === 'code' || viewer === 'markdown' || viewer === 'csv'));
 
   const meta = useMemo(() => {
     if (!selectedFile || !body) return null;
@@ -682,15 +774,38 @@ function FilePanel({
     previews.ensure(port);
   }, [previews, tabs, cancelPending]);
 
-  const openChart = readOnly ? null : () => { cancelPending(); tabs.openChart({ symbol: lastChartSymbol(workspaceId, { persist: persistStrip }) }); };
+  // The live views a tab can show besides files, each only where it has a place:
+  // a chart not on a share, the browser only beside a computer that has one.
+  const liveViews: PanelLauncher[] = readOnly ? [] : [
+    {
+      key: 'chart',
+      label: t('filePanel.chartTab'),
+      icon: CandlestickChart,
+      open: () => { cancelPending(); tabs.openChart({ symbol: lastChartSymbol(workspaceId, { persist: persistStrip }) }); },
+    },
+    ...(browserView && workspaceId && browserHere ? [{ key: 'browser', label: t('filePanel.browserTab'), icon: Globe, open: () => { cancelPending(); tabs.openBrowser(); } }] : []),
+  ];
+
+  // Pinned above the tree's listing: the reader's stores, then the live views.
+  const pinned: PanelLauncher[] = [
+    ...(stores ? [{ key: 'memory', label: t('filePanel.tabs.memory'), icon: BookMarked, open: openMemory }] : []),
+    ...(viewInMemo ? [{ key: 'memo', label: t('filePanel.tabs.memo'), icon: ScrollText, open: viewInMemo }] : []),
+    ...liveViews,
+  ];
+
+  // The thread's Status is one tab, so picking it again brings that tab
+  // forward. A panel with no thread (the gallery's) has no Status to show.
+  const openStatus = threadId ? () => { cancelPending(); tabs.openStatus(); } : null;
 
   // A right click on the new tab button picks what the tab opens on: the
-  // files, as a plain click gives, a chart, or a running app's tab. Each one
-  // opens beside the tab in front, or on the tab it already has.
+  // files, as a plain click gives, a live view, the thread's Status, or a
+  // running app's tab. Each one opens beside the tab in front, or on the tab
+  // it already has.
   const newTabMenu: NewTabMenu = {
     kinds: [
       { key: 'files', label: t('filePanel.files'), icon: FolderTree, open: newTab },
-      ...(openChart ? [{ key: 'chart', label: t('filePanel.chartTab'), icon: CandlestickChart, open: openChart }] : []),
+      ...liveViews,
+      ...(openStatus ? [{ key: 'status', label: t('filePanel.tabs.status'), icon: Activity, open: openStatus }] : []),
     ],
     apps: previews.previews.map((app) => ({
       key: `app:${app.port}`, label: app.title || `:${app.port}`, icon: LayoutDashboard, open: () => openPreviewTab(app.port),
@@ -713,7 +828,7 @@ function FilePanel({
         tabs={tabs.tabs}
         activeId={tabs.activeId}
         onActivate={activateTab}
-        onClose={closeTab}
+        onClose={closeTabs}
         onPin={tabs.pinTab}
         transcript={transcript}
         onNewTab={singleFileMode || readOnly ? null : newTab}
@@ -745,22 +860,29 @@ function FilePanel({
 
       {activeTab.kind === 'preview' && (
         <PreviewCrumbs
-          entry={previews.byPort.get(activeTab.port) ?? { port: activeTab.port, url: '', loading: true, error: false, reloadToken: 0 }}
+          entry={previews.byPort.get(activeTab.port) ?? { port: activeTab.port, url: '', loading: true, reloadToken: 0 }}
           onRefresh={() => previews.refresh(activeTab.port)}
           workspaceId={workspaceId}
+          threadId={threadId}
           readOnly={readOnly}
         />
       )}
+
+      {activeTab.kind === 'browser' && browserView && <BrowserCrumbs view={browserView} computer={capabilities.machineSettings ? computer ?? null : null} />}
 
       {selectedFile && (
         <FileCrumbs
           path={selectedFile}
           onOpenDir={revealInTree}
-          meta={meta}
+          // A page in front of the owner has its version and comments to say
+          // there; its line count is the markup's, read under Source.
+          meta={fileComments.hideMeta ? null : meta}
           unsaved={edit.hasUnsavedChanges}
           chip={focus.chip && (
             <FocusChip state={focus.chip} onJump={focus.jump} onDismiss={() => { focus.dismiss(); tabs.clearLocation(activeTab.id); }} />
           )}
+          artifact={fileComments.crumbs}
+          tools={fileComments.tools}
           actions={(
             <FileHeaderActions
               selectedFile={selectedFile}
@@ -774,8 +896,9 @@ function FilePanel({
               triggerDownloadFn={triggerDownloadFn}
               canDownload={canDownload}
               readFileFullFn={readFileFullFn}
-              servePrefix={apiAdapter?.servePrefix}
-              canShare={canShare}
+              access={access}
+              openPublish={fileComments.openPublish}
+              artifactDoc={fileComments.doc}
               htmlSource={htmlView.source}
               // Only where the viewer is up to switch: not while loading, nor on an error card.
               onToggleHtmlSource={viewer === 'html' && !fileLoading && !fileError ? () => setHtmlSource((v) => !v) : null}
@@ -801,20 +924,21 @@ function FilePanel({
         // The tree shows this itself; the body takes it over while the tree is
         // folded or absent, so a listing that failed is never a silent blank.
         // A tab that is not a listing carries neither notice.
-        filesError={treeShown || !listingTab ? null : filesError}
+        filesError={treeShown || !listingTab ? null : away.filesError}
         filesRestoreIncomplete={treeShown || !listingTab ? false : filesRestoreIncomplete}
+        backupNotice={listingTab ? away.backupNotice : null}
         onRefreshFiles={onRefreshFiles}
         busy={selection.deleteLoading || backup.backingUp || uploadSaving}
         backupResult={backup.backupOff ? null : backup.backupResult}
         // Said where the files are listed, and only to the folder's owner,
         // who is the one able to answer it.
-        restoreOffer={restoreOffered && listingTab && !readOnly && workspaceId
+        restoreOffer={restoreOffered && listingTab && !readOnly && capabilities.restoreOffer && workspaceId
           ? <RestoreOffer workspaceId={workspaceId} variant="notice" />
           : null}
         onDismissBackupResult={() => setBackupResult(null)}
         editing={edit.isEditing}
       />
-      {memoEntry && selectedFile && (
+      {memos && memoEntry && selectedFile && (
         <MemoStaleBanner
           status={memoStaleStatus}
           syncing={memoSyncing}
@@ -842,46 +966,42 @@ function FilePanel({
           <div className="file-panel-viewer">
             {/* font-content only while reading a file: the tree stays on the UI font. */}
             <div className={`file-panel-content${selectedFile ? ' font-content' : ''}`} ref={contentWrapperRef}>
-              {selectionTooltip && onAddContext && (
-                <button
-                  type="button"
-                  className="file-panel-selection-tooltip"
-                  style={{ left: Math.max(8, selectionTooltip.x - 60), top: Math.max(4, selectionTooltip.y - 32) }}
-                  // Acts on mousedown: a click would land after the browser has
-                  // already collapsed the selection it is meant to capture.
-                  onMouseDown={(e: React.MouseEvent) => {
-                    e.preventDefault(); e.stopPropagation();
-                    tabs.pinTab(activeTab.id);
-                    handleAddSelectionContext();
-                  }}
-                  onKeyDown={(e: React.KeyboardEvent) => {
-                    if (e.key !== 'Enter' && e.key !== ' ') return;
-                    e.preventDefault();
-                    tabs.pinTab(activeTab.id);
-                    handleAddSelectionContext();
-                  }}
-                >
-                  <TextSelect className="h-3.5 w-3.5" style={{ color: 'var(--color-accent-primary)' }} />
-                  {selectionTooltip.lineStart != null
+              <ImageReply surfaceRef={contentWrapperRef} enabled={!!onAddContext && isActive !== false} paused={!!selectionTooltip || commentUi.modeTab === activeTab.id} agentName={agentName} onAddContext={onAddContext} />
+              {selectionTooltip && selectedFile && (
+                <SelectionQuote
+                  key={selectionTooltip.id}
+                  anchor={selectionTooltip}
+                  composing={selectionComposing}
+                  hidden={!onAddContext || isActive === false}
+                  boundsRef={contentWrapperRef}
+                  label={t('context.quote.from', { name: selectionSourceName(selectionTooltip.path ?? selectedFile, selectionTooltip) })}
+                  placeholder={agentName ? t('context.quote.reply', { name: agentName }) : t('context.quote.replyGeneric')}
+                  addLabel={selectionTooltip.lineStart != null
                     ? (selectionTooltip.lineEnd !== selectionTooltip.lineStart
                         ? t('context.addLinesToContext', { start: selectionTooltip.lineStart, end: selectionTooltip.lineEnd })
                         : t('context.addLineToContext', { line: selectionTooltip.lineStart }))
                     : t('context.addToContext')}
-                </button>
+                  onAdd={(reply) => {
+                    tabs.pinTab(activeTab.id);
+                    handleAddSelectionContext(reply);
+                  }}
+                  onReply={() => beginReply(selectionTooltip)}
+                  onDismiss={dismissSelection}
+                  asks
+                  onComment={fileComments.selectionComment(selectionTooltip)}
+                />
               )}
-              <PreviewPanes tabs={tabs.tabs} activeId={activeTab.id} previews={previews} />
+              <PreviewPanes tabs={tabs.tabs} activeId={activeTab.id} previews={previews} workspaceId={readOnly ? null : workspaceId} />
               {!treeFull && (
               <ActiveTabBody
                 activeTab={activeTab}
+                browser={browserView}
                 tabs={tabs}
                 workspaceId={workspaceId}
                 apiAdapter={apiAdapter}
                 target={target}
                 onTargetMemoryHandled={onTargetMemoryHandled}
                 onTargetMemoHandled={onTargetMemoHandled}
-                marketWatch={marketWatch}
-                threadId={threadId}
-                isActive={isActive}
                 onOpenFile={onOpenFile}
                 onOpenSubagentTask={onOpenSubagentTask}
                 transcript={transcript}
@@ -896,6 +1016,7 @@ function FilePanel({
                   onDownload: handleDownloadSelected,
                   downloadState: selectedDownloadState,
                   onDownloadInFallback: handleDownloadInFallback,
+                  onDocumentFailed: setDocumentFailed,
                   focus,
                   isEditing: edit.isEditing,
                   editContent: edit.editContent,
@@ -907,10 +1028,12 @@ function FilePanel({
                   onUndoRedoChange: edit.handleUndoRedoChange,
                   onEditorTextSelect: handleEditorTextSelect,
                   onAddContext: onAddContext ? addViewerContext : null,
-                  onContentMouseUp: handleContentMouseUp,
                   onViewerLink: handleViewerLink,
+                  onFrameLink: handleFrameLink,
                   onAnchorLink: handleAnchorLink,
                   htmlSource: htmlView.source,
+                  htmlArtifact: fileComments.view,
+                  comments: fileComments.target,
                 }}
                 onPageCount={onPageCount}
                 canUpload={!readOnly}
@@ -930,7 +1053,7 @@ function FilePanel({
               selection={selection}
               backup={backup}
               filesLoading={filesLoading}
-              filesError={filesError}
+              filesError={away.filesError}
               onRefreshFiles={onRefreshFiles}
               showSystemFiles={showSystemFiles}
               onToggleSystemFiles={onToggleSystemFiles}
@@ -953,10 +1076,8 @@ function FilePanel({
               onCancelUpload={uploadProgress !== null ? cancelUpload : null}
               previews={previews.previews}
               onOpenPreview={openPreviewTab}
-              onOpenMemory={stores ? openMemory : null}
-              onOpenMemo={viewInMemo}
-              onOpenChart={openChart}
-              onOpenSettings={!readOnly && !isHome ? openSettings : null}
+              pinned={pinned}
+              onOpenSettings={!readOnly && !isHome && capabilities.machineSettings ? openSettings : null}
               workspaceName={wsData?.name}
               filesRestoreIncomplete={filesRestoreIncomplete}
               overlay={narrow}
@@ -976,7 +1097,7 @@ function FilePanel({
           onAction={handleContextMenuAction}
           onClose={() => setContextMenu(null)}
           canAddContext={!!onAddContext}
-          memoState={memoMimeForName(contextMenu.filePath)
+          memoState={memos && memoMimeForName(contextMenu.filePath)
             ? (memoedMap.has(contextMenu.filePath) ? 'present' : 'absent')
             : null}
           canDownload={canDownload}
@@ -997,6 +1118,7 @@ function FilePanel({
           />
         </Suspense>
       )}
+      {fileComments.dialog}
       {selectedFile && memoEntry && memoStaleSandboxText !== null && (
         <MemoDiffModal
           open={memoDiffOpen}
@@ -1015,7 +1137,7 @@ function FilePanel({
 }
 
 export default FilePanel;
-export type { ContextPayload, PanelTarget } from './filePanel/types';
+export type { PanelTarget } from './filePanel/types';
 export { SYSTEM_DIR_PREFIXES } from './filePanel/fileMeta';
 // eslint-disable-next-line react-refresh/only-export-components
 export { categorizeFileError } from './filePanel/fileErrors';

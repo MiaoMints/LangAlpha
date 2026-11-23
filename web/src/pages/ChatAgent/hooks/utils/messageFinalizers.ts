@@ -5,7 +5,6 @@
  */
 
 import type { ChatMessage, AssistantMessage, ModelFallbackNotice, NotificationSegment } from '@/types/chat';
-import type { TodoItem } from '@/types/sse';
 import { INTERRUPT_CARD_BUCKETS } from '../../session/interrupts/buckets';
 import type { ToolCallAgentIndex } from '../../session/subagents/historyStore';
 
@@ -51,7 +50,7 @@ function buildModelFallbackSegment(
   // pays for the model it moved to.
   if (typeof event.to_paid_by === 'string') fallback.paidBy = event.to_paid_by;
   if (typeof event.to_provider === 'string') fallback.provider = event.to_provider;
-  const segment: NotificationSegment = { type: 'notification', fallback, order };
+  const segment: NotificationSegment = { type: 'notification', notice: { kind: 'fallback', ...fallback }, order };
   if (detail) {
     segment.detail = detail;
     segment.detailKind = 'error';
@@ -60,16 +59,18 @@ function buildModelFallbackSegment(
 }
 
 /**
- * Append a notification segment unless one with the same order already exists.
- * Redelivery guard: a reconnect or replay that re-sends a persisted event
- * (same _eventId-derived order) must not create a duplicate divider.
+ * Append a notification segment unless one it duplicates already exists: by
+ * default one with the same order. Redelivery guard: a reconnect or replay
+ * that re-sends a persisted event (same _eventId-derived order) must not
+ * create a duplicate divider.
  */
 function appendNotificationSegmentOnce(
   aMsg: AssistantMessage,
   segment: NotificationSegment,
+  duplicates: (existing: NotificationSegment) => boolean = (s) => s.order === segment.order,
 ): AssistantMessage {
   const existing = aMsg.contentSegments || [];
-  if (existing.some((s) => s.type === 'notification' && s.order === segment.order)) {
+  if (existing.some((s) => s.type === 'notification' && duplicates(s))) {
     return aMsg;
   }
   return { ...aMsg, contentSegments: [...existing, segment] };
@@ -92,47 +93,6 @@ function isWorkspaceChangingToolSuccess(resultContent: unknown): boolean {
   }
 }
 
-
-/**
- * Marks incomplete todos as 'stale' in todoListProcesses of assistant messages.
- * Used when the agent stream ends without completing all todos.
- * @param messages - Current messages array
- * @param targetMessageId - If provided, only finalize the specific message; otherwise finalize all
- */
-export function finalizeTodoListProcessesInMessages(
-  messages: ChatMessage[],
-  targetMessageId?: string
-): ChatMessage[] {
-  let anyChanged = false;
-  const updated = messages.map((m) => {
-    if (m.role !== 'assistant') return m;
-    if (targetMessageId && m.id !== targetMessageId) return m;
-    const am = m as AssistantMessage;
-    if (!am.todoListProcesses || Object.keys(am.todoListProcesses).length === 0) return m;
-    const entries = Object.entries(am.todoListProcesses);
-    const lastEntry = entries.reduce((a, b) => ((a[1].order || 0) >= (b[1].order || 0) ? a : b));
-    const [lastKey, lastVal] = lastEntry;
-    if (!Array.isArray(lastVal.todos)) return m;
-    const hasIncomplete = lastVal.todos.some(
-      (todo: TodoItem) => todo.status !== 'completed' && todo.status !== 'stale'
-    );
-    if (!hasIncomplete) return m;
-    anyChanged = true;
-    const finalizedTodos: TodoItem[] = lastVal.todos.map((todo: TodoItem) =>
-      todo.status === 'completed' || todo.status === 'stale'
-        ? todo
-        : { ...todo, status: 'stale' as const }
-    );
-    return {
-      ...am,
-      todoListProcesses: {
-        ...am.todoListProcesses,
-        [lastKey]: { ...lastVal, todos: finalizedTodos, in_progress: 0, pending: 0 },
-      },
-    };
-  });
-  return anyChanged ? updated : messages;
-}
 
 /**
  * Map a task artifact event's tool_call_id to its agentId and drain the pending queue.

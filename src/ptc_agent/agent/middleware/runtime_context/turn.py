@@ -61,6 +61,7 @@ from ptc_agent.agent.middleware.runtime_context.durable import (
 from ptc_agent.agent.middleware.runtime_context.state import STATE_BASELINE, state_get
 from ptc_agent.agent.middleware.runtime_context.surface import Surface, parse_surface
 from ptc_agent.agent.middleware.runtime_context.templates import render_template
+from ptc_agent.agent.middleware.runtime_context.turn_context import ForkNotice, HomeAway
 
 logger = logging.getLogger(__name__)
 
@@ -80,6 +81,30 @@ NOTES_DUE_ROW_KIND = "notes_due"
 #: ``update_row.md.j2`` hardcodes the same way.
 NOTES_CHECK_IN_ROW_KIND = "notes_check_in"
 
+#: Row kind of the plan check-in (``middleware/plan.py``), which
+#: ``update_row.md.j2`` hardcodes the same way.
+PLAN_CHECK_IN_ROW_KIND = "plan_check_in"
+
+#: Row kind of the ask, once per request, to show a plan for work that has
+#: run a while without one (``middleware/plan.py``), which
+#: ``update_row.md.j2`` hardcodes the same way.
+PLAN_NUDGE_ROW_KIND = "plan_nudge"
+
+#: Row kind of the ask, after a final answer, to mark the plan steps the turn
+#: finished (``middleware/plan_close_out.py``), which ``update_row.md.j2``
+#: hardcodes the same way.
+PLAN_CLOSE_OUT_ROW_KIND = "plan_close_out"
+
+#: Row kind of the ask to bring the notes up to date before a summary that
+#: keeps no turn mid-turn (``compaction/notes.py``), which
+#: ``update_row.md.j2`` hardcodes the same way.
+REBUILD_NOTES_ROW_KIND = "rebuild_notes"
+
+#: Row kind of the last step's calls and results that such a summary carries
+#: (``compaction/carry.py``), which ``update_row.md.j2`` hardcodes the same
+#: way.
+LAST_STEP_ROW_KIND = "last_step"
+
 #: Row kind of the ask to answer before the turn's time runs out, which
 #: ``update_row.md.j2`` hardcodes the same way.
 TIME_UP_ROW_KIND = "turn_time_up"
@@ -92,20 +117,28 @@ TIME_UP_WITHDRAWN_ROW_KIND = "turn_time_up_withdrawn"
 #: ``update_row.md.j2`` hardcodes the same way.
 MARKET_WATCH_ROW_KIND = "market_watch"
 
+#: The stamp ``schema_version`` from which a stamp is history. One written
+#: before went out for a single call, so no model's reasoning or measured
+#: usage holds it: the carrier leaves it out rather than put it back in front
+#: of everything written after it.
+MARKET_WATCH_KEPT_SINCE = 3
+
 #: Row kind of the user's cancel of wakeups the agent set
 #: (``middleware/wakeups.py``), which ``update_row.md.j2`` hardcodes the same
 #: way.
 WAKEUP_CANCELLED_ROW_KIND = "wakeup_cancelled"
 
 #: Rows that speak for no block, so a rebuild neither folds them in nor
-#: retires them, but a summary carries them: nobody states them again, and
-#: the user's cancel of a wakeup holds whatever the blocks say.
-NOTICE_ROW_KINDS = frozenset({WAKEUP_CANCELLED_ROW_KIND})
+#: retires them, but a summary carries them: nobody states them again, the
+#: user's cancel of a wakeup holds whatever the blocks say, and a carried step
+#: holds results the work goes on from.
+NOTICE_ROW_KINDS = frozenset({WAKEUP_CANCELLED_ROW_KIND, LAST_STEP_ROW_KIND})
 
 #: Rows that are no change under the baseline: their writers state them again
 #: once a compaction takes them from view (the notes reminder before the next
-#: summary, the check-in after the next run of tool calls, the time-up ask on
-#: the next call, the live prices on the next fetch), so a rebuild does not
+#: summary, the check-in after the next run of tool calls, the ask before a
+#: mid-turn rebuild at the next one, the time-up ask on the next call, the
+#: live prices on the next fetch), so a rebuild does not
 #: count them and a summary does not carry them. The withdrawal of a time-up ask answers only that ask, which a
 #: summary does not carry either, so it has nothing to answer once both are
 #: out of view.
@@ -115,6 +148,10 @@ NON_CHANGE_ROW_KINDS = frozenset(
         SUBAGENTS_ROW_KIND,
         NOTES_DUE_ROW_KIND,
         NOTES_CHECK_IN_ROW_KIND,
+        PLAN_CHECK_IN_ROW_KIND,
+        PLAN_NUDGE_ROW_KIND,
+        PLAN_CLOSE_OUT_ROW_KIND,
+        REBUILD_NOTES_ROW_KIND,
         TIME_UP_ROW_KIND,
         TIME_UP_WITHDRAWN_ROW_KIND,
         MARKET_WATCH_ROW_KIND,
@@ -256,6 +293,13 @@ class TurnContextMiddleware(AgentMiddleware):
             when it is low enough that the agent should work around it.
         disk_known: Whether a current reading stands behind ``disk_free_mb``
             being None, as opposed to no reading at all.
+        home_away: For a Home turn in Home's stand-in on a cloud computer,
+            where it runs and why.
+        home_back: For a Home turn on Home's own computer, what came back from
+            the stand-in; stated after a row that said Home was away, and once
+            more, naming the folder, after one that said the copy was not done.
+        forked: On a forked thread's first turn, what the fork carried;
+            stated on that turn's row.
         is_subagent: Whether this stack belongs to a subagent.
     """
 
@@ -273,6 +317,9 @@ class TurnContextMiddleware(AgentMiddleware):
         inherits_rules: bool = False,
         disk_free_mb: int | None = None,
         disk_known: bool = False,
+        home_away: HomeAway | None = None,
+        home_back: dict[str, Any] | None = None,
+        forked: ForkNotice | None = None,
         is_subagent: bool = False,
     ) -> None:
         super().__init__()
@@ -287,6 +334,9 @@ class TurnContextMiddleware(AgentMiddleware):
         self._inherits_rules = inherits_rules
         self._disk_free_mb = disk_free_mb
         self._disk_known = disk_known
+        self._home_away = home_away
+        self._home_back = home_back
+        self._forked = None if is_subagent else forked
         self._is_subagent = is_subagent
         # Set once the turn-open hook has run on this instance; see
         # ``abefore_model``.
@@ -322,9 +372,10 @@ class TurnContextMiddleware(AgentMiddleware):
                 # turn an automation's handoff waits for either.
                 key = last
             # An automation's thread can take a manual follow-up. The last
-            # rules the model can read then say nobody is waiting, and a turn
-            # with no rules of its own would leave that standing, so the
-            # handoff is stated as this turn's rule and keyed so it is said once.
+            # rules the model can read then say the user may not be watching,
+            # and a turn with no rules of its own would leave that standing, so
+            # the handoff is stated as this turn's rule and keyed so it is said
+            # once.
             # Only a turn with no origin is a person's: an agent or system
             # origin changes the key and restates the surface, without the line.
             handoff = (
@@ -332,23 +383,32 @@ class TurnContextMiddleware(AgentMiddleware):
                 and self._origin is None
                 and not self._is_subagent
             )
-            if handoff and key is None:
-                key = ATTENDED_KEY
-            # A turn with no rules of its own (the web app sends no surface
-            # for a plain turn; a channel may send its name and drop its
-            # text) after a turn that stated some would leave that paragraph
+            # A turn with no rules of its own (the mobile app sends no
+            # surface; a channel may send its name and drop its text) after a turn that stated some would leave that paragraph
             # as the last rule in view, so the return to the default shape is
             # stated as this turn's rule, keyed so that it too is said once.
-            # The handoff row already left the model on that shape, so it is
-            # not a rule to take back.
+            # Two paragraphs can stand: a surface's, and an automation's,
+            # which a person's turn takes back with the handoff instead.
+            standing = _standing_surface(state)
             reset = (
                 not _states_rules(key)
                 and key != last
-                and _states_rules(last)
-                and not handoff
+                and (standing is not None or (_is_automation_key(last) and not handoff))
             )
-            if key is None and (reset or last == DEFAULT_KEY):
-                key = DEFAULT_KEY
+            # A built-in surface's paragraph, its own line or a caller's
+            # rules for it, replaces a channel's without saying so, and the
+            # channel's told the model to reply with send_message, so the
+            # paragraph says the earlier rules no longer apply.
+            leaves_channel = (
+                standing is not None
+                and "#" in standing
+                and surface.name in BUILT_IN_SURFACES
+            )
+            if key is None:
+                if reset or last == DEFAULT_KEY:
+                    key = DEFAULT_KEY
+                elif handoff:
+                    key = ATTENDED_KEY
             rules = (
                 ""
                 if key is None or key == last
@@ -359,6 +419,7 @@ class TurnContextMiddleware(AgentMiddleware):
                     self._surface_rules,
                     handoff=handoff,
                     reset=reset,
+                    leaves_channel=leaves_channel,
                 )
             )
             provenance: dict[str, Any] = {
@@ -389,6 +450,22 @@ class TurnContextMiddleware(AgentMiddleware):
                 elif self._disk_known:
                     provenance["disk_low"] = False
                     disk_recovered = _last_disk_low(state)
+            # Where a Home turn runs is a fact of this turn, stated while it is
+            # in the stand-in and taken back once, on the first turn home again.
+            # A copy still running then is recorded as "pending", so the turn
+            # that first finds it done names the folder it filled.
+            home_back = None
+            if not self._is_subagent:
+                if self._home_away is not None:
+                    provenance["home_away"] = True
+                elif self._home_back is not None:
+                    pending = bool(self._home_back.get("pending"))
+                    provenance["home_away"] = "pending" if pending else False
+                    last = last_stated(state, TURN_ROW_KIND, "home_away", False)
+                    if last is True:
+                        home_back = self._home_back
+                    elif last == "pending" and not pending and self._home_back.get("folder"):
+                        home_back = {**self._home_back, "settled": True}
             row = DurableUpdate(
                 kind=TURN_ROW_KIND,
                 schema_version=TURN_SCHEMA_VERSION,
@@ -400,6 +477,8 @@ class TurnContextMiddleware(AgentMiddleware):
                     market,
                     _last_turn_market(state),
                     disk_recovered=disk_recovered,
+                    home_back=home_back,
+                    forked=self._forked,
                 ),
                 provenance=provenance,
                 created_at=now,
@@ -524,6 +603,8 @@ class TurnContextMiddleware(AgentMiddleware):
         last_market: LastSession | None,
         *,
         disk_recovered: bool = False,
+        home_back: dict[str, Any] | None = None,
+        forked: ForkNotice | None = None,
     ) -> str:
         from ptc_agent.agent.prompts import format_current_time
 
@@ -547,6 +628,9 @@ class TurnContextMiddleware(AgentMiddleware):
             "surface_rules": surface_rules,
             "disk_free_mb": self._disk_free_mb,
             "disk_recovered": disk_recovered,
+            "home_away": None if self._is_subagent else self._home_away,
+            "home_back": home_back,
+            "forked": forked,
         }
         return render_template("envelope/turn.md.j2", **fields)
 
@@ -686,10 +770,51 @@ def _states_rules(key: str | None) -> bool:
     """
     if key is None or key in (DEFAULT_KEY, ATTENDED_KEY):
         return False
-    if key == "subagent" or _is_automation_key(key):
-        return True
+    return key == "subagent" or _is_automation_key(key) or _surface_states(key)
+
+
+def _surface_part(key: str) -> str | None:
+    """The surface a rules key names, with its symbol or digest, or None for
+    a key that names none: an automation's alone, a handoff's, a subagent's
+    and the return to the default."""
+    if key in (DEFAULT_KEY, ATTENDED_KEY, "subagent"):
+        return None
     head = key.split("+")[0]
-    return "#" in head or head.split(":")[0] in BUILT_IN_SURFACES
+    return None if head == "automation" else head
+
+
+def _surface_states(key: str) -> bool:
+    """Whether the key's surface states a paragraph: caller text (the digest)
+    or a built-in line. A bare surface only names itself on the run line."""
+    head = _surface_part(key)
+    return head is not None and ("#" in head or head.split(":")[0] in BUILT_IN_SURFACES)
+
+
+def _standing_surface(state: Any) -> str | None:
+    """The surface whose paragraph is still the last word on the surface
+    among the rows in view (its key's surface part), or None.
+
+    The last key alone does not say: an automation's paragraph, and the
+    handoff that takes it back, say nothing about the surface, so a channel's
+    paragraph from before them stays in force behind them. That holds for an
+    automation on a bare surface too, which states no surface rules and so
+    never resets. A return to the default, or a person's bare surface, leaves
+    none standing.
+    """
+    for row in reversed(rows_in_view(state)):
+        key = row.provenance.get("rules_key") if row.kind == TURN_ROW_KIND else None
+        if not isinstance(key, str):
+            continue
+        if key == DEFAULT_KEY:
+            return None
+        head = _surface_part(key)
+        if head is None:
+            continue
+        if _surface_states(key):
+            return head
+        if not _is_automation_key(key):
+            return None
+    return None
 
 
 def render_surface_rules(
@@ -700,6 +825,7 @@ def render_surface_rules(
     *,
     handoff: bool = False,
     reset: bool = False,
+    leaves_channel: bool = False,
 ) -> str:
     return render_template(
         "envelope/surface_rules.md.j2",
@@ -710,6 +836,7 @@ def render_surface_rules(
         surface_rules=surface_rules,
         handoff=handoff,
         reset=reset,
+        leaves_channel=leaves_channel,
     )
 
 

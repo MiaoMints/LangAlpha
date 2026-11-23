@@ -197,16 +197,6 @@ class TestFinancialDataSourceContract:
         if data:
             assert isinstance(data[0], dict)
 
-    async def test_get_sector_performance(self, source):
-        data = await source.get_sector_performance()
-        assert isinstance(data, list) and len(data) > 0
-        row = data[0]
-        assert "sector" in row
-        # _format_sector_change_pct renders averageChange into changePctStr;
-        # both keys are expected on the row.
-        assert "changePctStr" in row
-        assert row["changePctStr"].endswith("%")
-
     async def test_screen_stocks(self, source):
         data = await source.screen_stocks(
             sector="Technology",
@@ -616,15 +606,15 @@ class TestAnalystDataRoute:
 class TestSecEarningsCall:
     async def test_fetch_matching_earnings_call(self):
         from src.tools.sec.earnings_call import fetch_matching_earnings_call
+        from src.tools.sec.types import FilingType
 
-        # AAPL filed a 10-Q a few days after the FY2025 Q3 earnings call
-        # (call: 2025-07-31, filing: ~2025-08-01). Either we find that call
-        # or the fetcher returns None — both are acceptable.
+        # AAPL's Q3 FY2025 10-Q covers the quarter ended 2025-06-28, so a
+        # match must be its 2025-07-31 call; None is accepted when FMP lists
+        # no call for it.
         result = await fetch_matching_earnings_call(
-            symbol=SYMBOL, filing_date=date(2025, 8, 1),
+            symbol=SYMBOL, filing_type=FilingType.FORM_10Q, period_end="2025-06-28",
         )
         if result is not None:
             content, fiscal_year, quarter, call_date = result
             assert isinstance(content, str) and len(content) > 0
-            assert isinstance(fiscal_year, int) and 2020 <= fiscal_year <= 2030
-            assert isinstance(quarter, int) and 1 <= quarter <= 4
+            assert (fiscal_year, quarter, call_date) == (2025, 3, date(2025, 7, 31))

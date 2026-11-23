@@ -2,7 +2,9 @@ import React, { Suspense, useCallback, useMemo } from 'react';
 import { ExternalLink, TextSelect } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
 import { ChartToolButton } from '@/pages/MarketView/components/ChartToolButton';
-import type { ChartTabSpec, ContextPayload } from './types';
+import { QuoteListDrawer } from '@/pages/MarketView/components/quoteList/QuoteListDrawer';
+import type { ContextPayload } from '@/components/ui/chat-input.types';
+import type { ChartTabSpec } from './types';
 import type { FileTab, FileTabsApi } from './useFileTabs';
 import './ChartTab.css';
 
@@ -27,8 +29,9 @@ interface ChartTabProps {
  * interval. A symbol switch is followed in place, the way the MarketView page
  * does it: the surface resubscribes, reloads bars and resyncs annotations off
  * the prop, so nothing here remounts it. The chart's own header carries the
- * ticker (which changes the symbol in place) and the panel's two actions, so
- * it needs no crumb row.
+ * ticker (which changes the symbol in place) and the panel's actions: the
+ * watchlist and holdings drawer, which switches it the same way, add to
+ * context and open in the market page. It needs no crumb row.
  */
 export function ChartTab({ tab, tabs, workspaceId, onAddContext, onOpenInMarketView }: ChartTabProps): React.ReactElement {
   const { t } = useTranslation();
@@ -41,9 +44,10 @@ export function ChartTab({ tab, tabs, workspaceId, onAddContext, onOpenInMarketV
   // what the user is looking at, not a copy of the data behind it.
   const addToContext = useCallback(() => {
     onAddContext?.({
+      kind: 'chip',
+      source: 'chart',
       label: `${symbol} · ${timeframe}`,
       snippet: t('filePanel.chartContextHint', { symbol, timeframe }),
-      source: 'chart',
     });
   }, [onAddContext, symbol, timeframe, t]);
 
@@ -63,6 +67,7 @@ export function ChartTab({ tab, tabs, workspaceId, onAddContext, onOpenInMarketV
 
   const headerActions = useMemo(() => (
     <>
+      <QuoteListDrawer symbol={symbol} onPick={onSwitchSymbol} />
       {onAddContext && (
         <ChartToolButton onClick={addToContext} title={t('filePanel.addChartToContext')}>
           <TextSelect size={14} />
@@ -74,7 +79,7 @@ export function ChartTab({ tab, tabs, workspaceId, onAddContext, onOpenInMarketV
         </ChartToolButton>
       )}
     </>
-  ), [onAddContext, addToContext, onOpenInMarketView, openInMarketView, t]);
+  ), [symbol, onSwitchSymbol, onAddContext, addToContext, onOpenInMarketView, openInMarketView, t]);
 
   return (
     <Suspense fallback={null}>
@@ -88,7 +93,6 @@ export function ChartTab({ tab, tabs, workspaceId, onAddContext, onOpenInMarketV
           headerActions={headerActions}
           // Picks go out with the thread's composer, so only a host with one gets the tools.
           selectionTools={onAddContext != null}
-          variant="compact"
         />
       </div>
     </Suspense>

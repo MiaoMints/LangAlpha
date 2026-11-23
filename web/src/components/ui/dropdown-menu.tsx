@@ -23,6 +23,7 @@ function DropdownMenuContent({
   return (
     <DropdownMenuPrimitive.Portal container={container ?? undefined}>
       <DropdownMenuPrimitive.Content
+        data-slot="menu"
         sideOffset={sideOffset}
         collisionPadding={collisionPadding}
         onCloseAutoFocus={closeAutoFocus(onCloseAutoFocus)}
@@ -48,7 +49,7 @@ export const ITEM_HIGHLIGHT = "data-highlighted:bg-accent/15"
 
 // Every shape of item shares this box, so a checkbox row lines up with the
 // plain rows around it.
-export const ITEM_BOX = "relative flex w-full cursor-default select-none items-center gap-2 rounded-sm px-2.5 py-1.5 text-sm transition-colors data-disabled:pointer-events-none data-disabled:opacity-50"
+export const ITEM_BOX = "relative flex w-full cursor-default select-none items-center gap-2 rounded-sm px-2.5 row-inset text-sm transition-colors data-disabled:pointer-events-none data-disabled:opacity-50"
 
 export const DESTRUCTIVE_ITEM = "text-destructive data-highlighted:bg-destructive/10 data-highlighted:text-destructive"
 
@@ -68,6 +69,7 @@ function DropdownMenuItem({
 }) {
   return (
     <DropdownMenuPrimitive.Item
+      data-slot="menu-item"
       className={cn(ITEM_BOX, itemVariants[variant], className)}
       {...props}
     />
@@ -111,6 +113,7 @@ function DropdownMenuLabel({
 }: React.ComponentProps<typeof DropdownMenuPrimitive.Label>) {
   return (
     <DropdownMenuPrimitive.Label
+      data-slot="menu-label"
       className={cn("px-2.5 py-1.5 text-sm font-medium", className)}
       {...props}
     />
@@ -123,7 +126,8 @@ function DropdownMenuSeparator({
 }: React.ComponentProps<typeof DropdownMenuPrimitive.Separator>) {
   return (
     <DropdownMenuPrimitive.Separator
-      className={cn("-mx-1 my-1 h-px bg-border", className)}
+      data-slot="menu-separator"
+      className={cn("-mx-1 my-1 h-px bg-[var(--color-shell-divider,hsl(var(--border)))]", className)}
       {...props}
     />
   )
@@ -139,7 +143,7 @@ function DropdownMenuSubTrigger({
   return (
     <DropdownMenuPrimitive.SubTrigger
       className={cn(
-        "flex cursor-default select-none items-center gap-2 rounded-sm px-2.5 py-1.5 text-sm data-[state=open]:bg-accent/15",
+        "flex cursor-default select-none items-center gap-2 rounded-sm px-2.5 row-inset text-sm data-[state=open]:bg-accent/15",
         ITEM_HIGHLIGHT,
         className
       )}

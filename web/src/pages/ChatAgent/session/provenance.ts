@@ -61,6 +61,7 @@ export function reportRowProvenance(source?: ReportSource): MessageProvenance | 
         status: source.status,
         failureReason: source.failure_reason ?? null,
         toolCallId: source.tool_call_id ?? null,
+        ...(source.chart_layers?.length ? { chartLayers: source.chart_layers } : {}),
       };
     default:
       return null;
@@ -120,7 +121,7 @@ export function withLiveReportRow(
 
 /** What each place a report is drawn sets on its row beside the caption. */
 type ReportRowFields = Pick<UserMessage, 'id' | 'timestamp'>
-  & Partial<Pick<UserMessage, 'turnIndex' | 'runId' | 'isHistory' | 'steeringDelivered'>>;
+  & Partial<Pick<UserMessage, 'turnIndex' | 'runId' | 'isHistory' | 'steeringDelivered' | 'sender'>>;
 
 /**
  * A report's row: the caption alone, whether the report opened its own turn

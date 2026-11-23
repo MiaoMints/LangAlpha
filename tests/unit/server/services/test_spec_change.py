@@ -32,6 +32,8 @@ from src.server.services.spec_change import (
     SPEC_CHANGE_FAILED,
     SPEC_CHANGE_INTERRUPTED,
     SPEC_CHANGE_NOT_ALLOWED,
+    SIZED_BY_OWNER,
+    sized_by_owner,
     spec_change_error,
     spec_change_from_row,
     spec_refusal,
@@ -112,6 +114,22 @@ def _row(stale=None, **change):
     if stale is not None:
         row["spec_change_stale"] = stale
     return row
+
+
+class TestSizedByOwner:
+    """A size the owner chose stays theirs: a later change that fails, or
+    is refused, must not hand the computer back to its plan."""
+
+    def test_an_earlier_choice_survives_a_later_failed_change(self):
+        row = {**_row(state="failed", error={"code": "unknown", "message": "m"}), "config": {SIZED_BY_OWNER: True}}
+        assert sized_by_owner(row)
+
+    def test_a_last_succeeded_change_counts_without_the_mark(self):
+        assert sized_by_owner(_row(state="succeeded"))
+
+    def test_a_failed_change_alone_is_no_choice(self):
+        assert not sized_by_owner({**_row(state="failed"), "config": {}})
+        assert not sized_by_owner({"computer_id": "c1", "config": None})
 
 
 class TestReadBack:
@@ -207,7 +225,7 @@ def run_env(manager):
         patch(f"{_SPEC}.settle_computer_spec_change", AsyncMock(side_effect=settle)),
         patch(f"{_SPEC}.publish_computer_status_change", AsyncMock()) as publish,
         patch(
-            "src.server.dependencies.usage_limits.platform_gating_active",
+            "src.server.services.platform_client.platform_gating_active",
             return_value=False,
         ),
     ):
@@ -283,7 +301,7 @@ class TestRunSettles:
 
         with (
             patch(
-                "src.server.dependencies.usage_limits.platform_gating_active",
+                "src.server.services.platform_client.platform_gating_active",
                 return_value=True,
             ),
             patch(f"{_SPEC}.computer_capacity_lock", capacity),
@@ -510,7 +528,11 @@ async def test_an_empty_machine_reads_its_metrics_before_its_session_deletes_it(
     )
     # The session's cleanup is what deletes a live sandbox.
     manager._clear_session = AsyncMock(side_effect=lambda _c: order.append("delete"))
-    manager._destroy_sandbox = AsyncMock()
+    manager._destroy_sandbox = AsyncMock(side_effect=lambda *a, **k: order.append("gone"))
+    # The confirmed delete ends the run and its disk, not the stop after it.
+    manager._end_replaced_usage_run = AsyncMock(
+        side_effect=lambda c, sb: order.append(f"ended {sb}")
+    )
 
     with (
         patch(f"{_SPEC}.get_live_workspace_ids_for_computer", AsyncMock(return_value=[])),
@@ -521,4 +543,4 @@ async def test_an_empty_machine_reads_its_metrics_before_its_session_deletes_it(
             {"computer_id": "c-1", "user_id": "u-1", "kind": "daytona"}, "sb-1"
         )
 
-    assert order == ["fold c-1", "delete"]
+    assert order == ["fold c-1", "delete", "gone", "ended sb-1"]

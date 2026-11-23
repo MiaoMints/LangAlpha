@@ -24,6 +24,7 @@ from ptc_agent.agent.middleware.runtime_context import (
 from ptc_agent.agent.middleware.runtime_context.harness_blocks import (
     harness_update_kind,
 )
+from ptc_agent.agent.middleware.runtime_context.profile import AnswerPreferences
 from ptc_agent.agent.prompts import guidance_template_vars, init_loader
 from ptc_agent.agent.prompts.loader import PromptLoader
 
@@ -81,11 +82,17 @@ ENVELOPE_CASES: dict[str, dict] = {
         "preferred_market": "US",
     },
     "envelope/baseline_files.md.j2": {},
+    "envelope/baseline_model.md.j2": {
+        "content": "Claude Opus 5.5, reasoning effort high",
+    },
     "envelope/baseline_mcp_servers.md.j2": {
         "content": "### market_data\n- get_quote: the last trade",
     },
     "envelope/baseline_skills.md.j2": {
         "content": "## Available Skills\n\n- **pdf**: read and write PDFs",
+    },
+    "envelope/baseline_subagents.md.j2": {
+        "content": "- **research**: finds things\n  Tools: web_search",
     },
     "envelope/baseline_activity.md.j2": {
         "content": "Recent threads, this one aside:\n"
@@ -93,6 +100,12 @@ ENVELOPE_CASES: dict[str, dict] = {
     },
     "envelope/baseline_scratchpad.md.j2": {
         "content": "/home/workspace/NVDA/.agents/scratchpad/a1b2c3d4/",
+    },
+    "envelope/member_context.md.j2": {
+        "name": "Ana",
+        "preferences": AnswerPreferences([("tone", "terse")], {"research_depth": "light"}),
+        "memory": "- [Code word](codeword.md)",
+        "folder": ".agents/members/1a2b3c/memory/",
     },
 }
 
@@ -107,8 +120,10 @@ BASELINE_TEMPLATES = [
     "envelope/baseline_memory.md.j2",
     "envelope/baseline_identity.md.j2",
     "envelope/baseline_files.md.j2",
+    "envelope/baseline_model.md.j2",
     "envelope/baseline_mcp_servers.md.j2",
     "envelope/baseline_skills.md.j2",
+    "envelope/baseline_subagents.md.j2",
     "envelope/baseline_activity.md.j2",
     "envelope/baseline_scratchpad.md.j2",
 ]
@@ -257,15 +272,38 @@ class TestBaselineDeterminism:
         skills = _render("envelope/baseline_skills.md.j2", "detailed")
         assert "<skills>" in skills and "</skills>" in skills
         assert "## Available Skills" in skills, "the manifest is stated verbatim"
+        subagents = _render("envelope/baseline_subagents.md.j2", "detailed")
+        assert subagents.strip() == (
+            "<subagents>\n- **research**: finds things\n  Tools: web_search\n</subagents>"
+        )
         activity = _render("envelope/baseline_activity.md.j2", "detailed")
         assert "<activity>" in activity and "</activity>" in activity
         assert "NVDA earnings" in activity
 
+    def test_the_model_block_says_who_picks_the_model_only_to_the_main_agent(self):
+        """A subagent cannot pick its model or run `la`, so it gets the fact alone."""
+        main = _render("envelope/baseline_model.md.j2", "detailed")
+        assert main.strip() == (
+            "<model>\n"
+            "You run on Claude Opus 5.5, reasoning effort high. The user picks the "
+            "model; `la models list` shows the models they can run and who each "
+            "one bills to.\n"
+            "</model>"
+        )
+        subagent = init_loader().render(
+            "envelope/baseline_model.md.j2",
+            content="GPT-6 Astra",
+            subagent=True,
+        )
+        assert subagent.strip() == "<model>\nYou run on GPT-6 Astra.\n</model>"
+
     @pytest.mark.parametrize(
         "template",
         [
+            "envelope/baseline_model.md.j2",
             "envelope/baseline_mcp_servers.md.j2",
             "envelope/baseline_skills.md.j2",
+            "envelope/baseline_subagents.md.j2",
             "envelope/baseline_activity.md.j2",
             "envelope/baseline_scratchpad.md.j2",
         ],
@@ -381,7 +419,10 @@ class TestHarnessRows:
         assert rendered.splitlines()[0] == (
             f"The {block.subject} changed after the copy in {block.label} was frozen"
         )
-        assert f"compares it with the frozen copy in {block.label}" in rendered
+        # A value block's row states the value; there is no diff to compare.
+        assert (
+            f"compares it with the frozen copy in {block.label}" in rendered
+        ) is (block.value_intro is None)
         assert "+a new server" in rendered
         # No writer to credit, and no file to send the model off to read.
         assert "last edit by" not in rendered
@@ -398,7 +439,7 @@ class TestTheRosterSplit:
     """
 
     def test_the_main_prompt_points_at_the_baseline_element(self):
-        prompt = init_loader().get_system_prompt(subagent_summary="")
+        prompt = init_loader().get_system_prompt()
         assert "`<mcp-servers>` element of the runtime-context block" in prompt
 
     def test_a_subagent_states_its_roster_inline(self):
@@ -410,12 +451,20 @@ class TestTheRosterSplit:
         assert "<mcp-servers>" not in rendered
 
 
+class TestTheSubagentRosterRidesTheBaseline:
+    """A user's edit to their own subagent must not move the cached prefix,
+    so the prompt only points at the element and the baseline holds the list."""
+
+    def test_the_prompt_points_at_the_element_and_holds_no_roster(self):
+        prompt = init_loader().get_system_prompt(subagent_summary="- **x**: leaked")
+        assert "`<subagents>` element of the runtime-context block" in prompt
+        assert "leaked" not in prompt
+
+
 class TestStaticComponentsReachTheSystemPrompt:
     @pytest.mark.parametrize("level", ["lean", "detailed"])
     def test_sections_are_included(self, level):
-        prompt = init_loader().get_system_prompt(
-            subagent_summary="", **guidance_template_vars(level)
-        )
+        prompt = init_loader().get_system_prompt(**guidance_template_vars(level))
         for tag in ("<time_rules>",):
             assert tag in prompt, f"{tag} missing from the {level} system prompt"
 
@@ -423,18 +472,14 @@ class TestStaticComponentsReachTheSystemPrompt:
     def test_the_runtime_context_framing_survives_the_lean_render(self, level):
         """Trust framing is not scaffolding: stripping it at lean would leave a
         small model reading machine state as if the user had typed it."""
-        prompt = init_loader().get_system_prompt(
-            subagent_summary="", **guidance_template_vars(level)
-        )
+        prompt = init_loader().get_system_prompt(**guidance_template_vars(level))
         assert "frozen for the turn" in prompt
         assert "on the same footing as `<agentmd>` and `<memory>`" in prompt
 
     def test_the_stamp_sentence_names_every_carrier_shape(self):
         """The prefix is cached while a mid-turn fallback can change the
         model, so the sentence has to hold for whichever shape the stamp takes."""
-        prompt = init_loader().get_system_prompt(
-            subagent_summary="", **guidance_template_vars("lean")
-        )
+        prompt = init_loader().get_system_prompt(**guidance_template_vars("lean"))
         assert "as a system or developer message just below the user's message" in prompt
         assert "`<system-reminder>` block at the end of it" in prompt
         assert prompt.count("Each turn opens with a stamp") == 1
@@ -459,7 +504,7 @@ class TestStaticComponentsReachTheSystemPrompt:
     def test_the_stamp_itself_is_not_in_the_static_prompt(self):
         """Time rules are static and cacheable; the clock is not. Putting the
         stamp back in a system template is the defect this slice removes."""
-        prompt = init_loader().get_system_prompt(subagent_summary="")
+        prompt = init_loader().get_system_prompt()
         assert "Current Date/Time" not in prompt
 
 

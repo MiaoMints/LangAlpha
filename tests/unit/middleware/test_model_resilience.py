@@ -10,6 +10,7 @@ from ptc_agent.agent.middleware.model_resilience import (
     ModelResilienceMiddleware,
     build_fallback_pairs,
 )
+from src.llms.model_identity import CATALOG_MODEL_KEY
 
 
 class _FakeModel:
@@ -174,6 +175,25 @@ class TestRetryBehavior:
         assert fallbacks[0]["status_code"] == 404
 
     @pytest.mark.asyncio
+    async def test_a_fallback_attempt_is_marked_for_the_middleware_inside(self, events):
+        """What the primary's reasoning is bound to stays put while a fallback answers."""
+        from ptc_agent.agent.middleware.model_resilience import answering_as_fallback
+
+        client = _FakeModel("primary-model")
+        mw = _make_middleware(client, fallbacks=[("fallback-a", _FakeModel("fallback-a"))])
+        seen = []
+
+        async def handler(req):
+            seen.append((req.model is client, answering_as_fallback()))
+            if req.model is client:
+                raise _status_error("Error code: 404 - model not found", status=404)
+            return ModelResponse(result=[AIMessage("ok")])
+
+        await mw.awrap_model_call(_FakeRequest(client), handler)
+        assert seen == [(True, False), (False, True)]
+        assert answering_as_fallback() is False
+
+    @pytest.mark.asyncio
     async def test_an_answer_a_fallback_wrote_names_it(self, events):
         client = _FakeModel("primary-model")
         fallback_client = _FakeModel("fallback-a")
@@ -189,8 +209,31 @@ class TestRetryBehavior:
         down = False
         by_primary = await mw.awrap_model_call(_FakeRequest(client), handler)
 
-        assert by_fallback.result[0].response_metadata == {"model_name": "x", FALLBACK_KEY: "fallback-a"}
-        assert by_primary.result[0].response_metadata == {"model_name": "x"}
+        assert by_fallback.result[0].response_metadata == {
+            "model_name": "x", FALLBACK_KEY: "fallback-a", CATALOG_MODEL_KEY: "fallback-a",
+        }
+        assert by_primary.result[0].response_metadata == {
+            "model_name": "x", CATALOG_MODEL_KEY: "primary-model",
+        }
+
+    @pytest.mark.asyncio
+    async def test_an_answer_names_the_catalog_model_of_the_client_that_wrote_it(self, events):
+        """A subagent on its own model shares the turn's middleware: its
+        answer names its own catalog row, not the turn's model, and one from
+        a client with no catalog name is left unstamped."""
+        client = _FakeModel("primary-model")
+        sub = _FakeModel("sub-model-id")
+        sub.metadata = {"manifest_model": "sub-model"}
+        mw = _make_middleware(client)
+
+        async def handler(req):
+            return ModelResponse(result=[AIMessage("ok")])
+
+        by_sub = await mw.awrap_model_call(_FakeRequest(sub), handler)
+        unknown = await mw.awrap_model_call(_FakeRequest(_FakeModel("raw-id")), handler)
+
+        assert by_sub.result[0].response_metadata[CATALOG_MODEL_KEY] == "sub-model"
+        assert CATALOG_MODEL_KEY not in unknown.result[0].response_metadata
 
 
 class TestProgrammingErrors:
@@ -462,34 +505,33 @@ class TestFallbackChain:
         assert tried == ["sub-model-id", "primary-model"]
 
     @pytest.mark.parametrize(
-        ("billing", "users_fallbacks", "expected"),
+        ("billing", "expected"),
         [
-            # On the user's own key, the deployment's list may not move it
-            # onto the platform's key, only onto another key of the user's.
-            ("byok", False, ["sub-model-id", "fallback-b"]),
-            ("oauth", False, ["sub-model-id", "fallback-b"]),
-            # A list the user saved is billed as they picked it.
-            ("byok", True, ["sub-model-id", "fallback-a", "fallback-b"]),
-            # On credits already, credits is no move at all.
-            ("platform", False, ["sub-model-id", "fallback-a", "fallback-b"]),
+            # The user's own key moves only to another of their keys.
+            ("byok", ["sub-model-id", "fallback-b"]),
+            # Our credits move only to another model on credits.
+            ("platform", ["sub-model-id", "fallback-a"]),
+            # A subscription answers for itself: its card, and the user picks
+            # the next model.
+            ("oauth", ["sub-model-id"]),
         ],
     )
     @pytest.mark.asyncio
-    async def test_a_subagent_falls_back_only_onto_a_payer_the_user_chose(
-        self, events, billing, users_fallbacks, expected
+    async def test_a_call_falls_back_only_onto_a_model_its_payer_bills(
+        self, events, billing, expected
     ):
-        # The turn's list was built for a main model on credits.
         client = _FakeModel("primary-model")
         fb_a = _FakeModel("fallback-a")
         fb_a.metadata = {"billing_type": "platform"}
         fb_b = _FakeModel("fallback-b")
         fb_b.metadata = {"billing_type": "byok"}
+        fb_c = _FakeModel("fallback-c")
+        fb_c.metadata = {"billing_type": "oauth"}
         sub = _FakeModel("sub-model-id")
         sub.metadata = {"manifest_model": "sub-model", "billing_type": billing}
         mw = _make_middleware(
             client,
-            fallbacks=[("fallback-a", fb_a), ("fallback-b", fb_b)],
-            users_fallbacks=users_fallbacks,
+            fallbacks=[("fallback-a", fb_a), ("fallback-b", fb_b), ("fallback-c", fb_c)],
         )
         tried = []
 
@@ -658,7 +700,6 @@ class TestFallbackChain:
         cfg = SimpleNamespace(
             fallback_llm_clients=[fallback],
             fallback_llm_names=["fallback-a"],
-            fallback_users_choice=False,
             llm=SimpleNamespace(fallback=None),
             compaction=SimpleNamespace(enabled=compaction_enabled),
         )
@@ -1244,6 +1285,142 @@ class TestReasoningPayloadEscalation:
             raise _status_error("nope", status=status)
 
         with pytest.raises(Exception):
+            await mw.awrap_model_call(_FakeRequest(client, self._history()), handler)
+        assert len(calls) == 1
+
+
+class TestUnfinishedReply:
+    """A reply whose stream ended before the response did is retried, never
+    returned: kept, it would name items the server never stored on every later
+    request to that provider."""
+
+    @staticmethod
+    def _reply(**metadata):
+        return ModelResponse(
+            result=[AIMessage(content=[{"type": "reasoning", "id": "rs_cut", "summary": []}], response_metadata=metadata)]
+        )
+
+    @pytest.mark.asyncio
+    async def test_is_retried_on_the_same_model(self, events):
+        client = _FakeModel("primary-model")
+        mw = _make_middleware(client)
+        finished = ModelResponse(result=[AIMessage("ok", response_metadata={"id": "resp_2", "status": "completed"})])
+        replies = [self._reply(id="resp_1"), finished]
+
+        async def handler(req):
+            return replies.pop(0)
+
+        result = await mw.awrap_model_call(_FakeRequest(client), handler)
+
+        assert result is finished
+        assert [e["type"] for e in events] == ["model_retry"]
+
+    @pytest.mark.asyncio
+    async def test_a_cut_that_repeats_gets_one_retry(self, events):
+        """A server that closes every stream at the same point is not asked a
+        third time: each attempt is billed and none can finish."""
+        from src.llms.error_classification import UnfinishedReplyError
+
+        client = _FakeModel("primary-model")
+        mw = _make_middleware(client)
+        calls = []
+
+        async def handler(req):
+            calls.append(req)
+            return self._reply(id="resp_1")
+
+        with pytest.raises(UnfinishedReplyError):
+            await mw.awrap_model_call(_FakeRequest(client), handler)
+        assert len(calls) == 2
+
+    @pytest.mark.asyncio
+    async def test_a_finished_reply_passes_untouched(self, events):
+        client = _FakeModel("primary-model")
+        mw = _make_middleware(client)
+        finished = self._reply(id="resp_1", status="incomplete")
+
+        async def handler(req):
+            return finished
+
+        assert await mw.awrap_model_call(_FakeRequest(client), handler) is finished
+        assert events == []
+
+
+class TestMissingItem:
+    """A 404 naming the request's ``input``: the server does not hold an item
+    the history sends. Only reasoning sent by id alone can be that item, so only
+    it is stripped, and the rest of the history keeps its reasoning."""
+
+    SEALED = {"type": "reasoning", "id": "rs_done", "summary": [], "encrypted_content": "opaque"}
+    BARE = {"type": "reasoning", "id": "rs_cut", "summary": []}
+
+    def _history(self):
+        from langchain_core.messages import HumanMessage
+
+        return [
+            HumanMessage("q", id="h-1"),
+            AIMessage(content=[self.SEALED, {"type": "text", "text": "a"}], id="a-1"),
+            AIMessage(content=[self.BARE], id="a-2"),
+            HumanMessage("what happened?", id="h-2"),
+        ]
+
+    @staticmethod
+    def _not_found(param="input"):
+        exc = _status_error("Item with id 'rs_cut' not found.", status=404)
+        exc.param = param
+        return exc
+
+    @pytest.mark.asyncio
+    async def test_strips_only_the_bare_item_and_remembers_it(self, events):
+        from langchain.agents.middleware.types import ExtendedModelResponse
+
+        client = _FakeModel("primary-model")
+        mw = _make_middleware(client)
+        answer = ModelResponse(result=[AIMessage("ok", id="a-3")])
+        seen = []
+
+        async def handler(req):
+            seen.append([m.id for m in req.messages])
+            if len(seen) == 1:
+                raise self._not_found()
+            return answer
+
+        result = await mw.awrap_model_call(_FakeRequest(client, self._history()), handler)
+
+        assert seen == [["h-1", "a-1", "a-2", "h-2"], ["h-1", "a-1", "h-2"]]
+        assert isinstance(result, ExtendedModelResponse)
+        assert result.command.update == {"_unsent_thinking_ids": {"a-2"}}
+
+    @pytest.mark.asyncio
+    async def test_with_nothing_bare_it_strips_all_reasoning(self, events):
+        from langchain_core.messages import HumanMessage
+
+        client = _FakeModel("primary-model")
+        mw = _make_middleware(client)
+        history = [HumanMessage("q", id="h-1"), AIMessage(content=[self.SEALED, {"type": "text", "text": "a"}], id="a-1")]
+        seen = []
+
+        async def handler(req):
+            seen.append([b["type"] for m in req.messages if isinstance(m, AIMessage) for b in m.content])
+            if len(seen) == 1:
+                raise self._not_found()
+            return ModelResponse(result=[AIMessage("ok")])
+
+        await mw.awrap_model_call(_FakeRequest(client, history), handler)
+
+        assert seen == [["reasoning", "text"], ["text"]]
+
+    @pytest.mark.asyncio
+    async def test_a_404_on_anything_else_is_not_retried(self, events):
+        client = _FakeModel("primary-model")
+        mw = _make_middleware(client)
+        calls = []
+
+        async def handler(req):
+            calls.append(req)
+            raise self._not_found(param="model")
+
+        with pytest.raises(Exception, match="not found"):
             await mw.awrap_model_call(_FakeRequest(client, self._history()), handler)
         assert len(calls) == 1
 

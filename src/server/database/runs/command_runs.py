@@ -38,6 +38,8 @@ from typing import (
 from psycopg.rows import dict_row
 
 from src.server.database import pool
+from src.server.database.shared_workspaces import former_member_sql
+from src.server.models.chart_layer import CommandOutbox
 from src.server.models.command import CommandStatus, FailureReason, StopMark
 from src.server.utils.pg_sanitize import SafeJson, normalize_uuid, strip_pg_nul_str
 
@@ -199,7 +201,8 @@ async def record_handoff(
 
     A thread archived while the call still waited had no row for the
     archive's stop to mark, so the row is written marked by it, and the
-    watcher ends the job at once."""
+    watcher ends the job at once. A command launched on the computer is a
+    read of it, so its other commands are no longer away (``away_since``)."""
     async with pool.get_db_connection() as conn:
         async with conn.cursor(row_factory=dict_row) as cur:
             await cur.execute(
@@ -236,6 +239,12 @@ async def record_handoff(
                 ),
             )
             row = await cur.fetchone()
+            if row is not None:
+                await cur.execute(
+                    "UPDATE command_runs SET away_since = NULL"
+                    " WHERE computer_id = %s AND away_since IS NOT NULL",
+                    (computer_id,),
+                )
             if row is None:
                 # A retried write finds its own row. Another thread's under
                 # the same id is a collision, never this command's row.
@@ -291,23 +300,56 @@ async def schedule_next_check(
     """Move each claimed row's next check to ``in_s`` from now, where it
     still holds the lease its claim set (``leases``: id and that
     ``next_check_at``). A row a stop marked since keeps the stop's grace, and
-    one that ended has no check."""
+    one that ended has no check. Its computer was read, so none of that
+    computer's commands is away any more (``away_since``)."""
+    await _schedule(leases, in_s, away=False)
+
+
+async def schedule_away_check(
+    leases: Sequence[Tuple[str, datetime]], in_s: float
+) -> None:
+    """``schedule_next_check`` for rows whose computer's machine is away:
+    ``away_since`` keeps when it was first found so, which the watcher reads
+    to give up on a machine that never comes back."""
+    await _schedule(leases, in_s, away=True)
+
+
+async def _schedule(
+    leases: Sequence[Tuple[str, datetime]], in_s: float, *, away: bool
+) -> None:
     if not leases:
         return
     async with pool.get_db_connection() as conn:
-        async with conn.cursor() as cur:
+        async with conn.cursor(row_factory=dict_row) as cur:
             await cur.execute(
                 """
                 UPDATE command_runs c
                 SET next_check_at = clock_timestamp() + make_interval(secs => %s),
+                    away_since = CASE WHEN %s THEN COALESCE(c.away_since, NOW()) END,
                     updated_at = NOW()
                 FROM unnest(%s::text[], %s::timestamptz[]) AS t(command_id, lease)
                 WHERE c.command_id = t.command_id
                   AND c.status = 'running'
                   AND c.next_check_at = t.lease
+                RETURNING c.computer_id
                 """,
-                (float(in_s), [c for c, _ in leases], [lease for _, lease in leases]),
+                (float(in_s), away, [c for c, _ in leases], [lease for _, lease in leases]),
             )
+            held = {row["computer_id"] for row in await cur.fetchall()}
+            if not away and held:
+                # The read answered for the whole machine: a command on it
+                # not due this pass would otherwise keep an old stamp and give
+                # the machine's next absence up as already past its limit.
+                # Only a read whose lease held speaks for now: one taken over
+                # meanwhile may be older than the away its taker found.
+                await cur.execute(
+                    """
+                    UPDATE command_runs SET away_since = NULL
+                    WHERE away_since IS NOT NULL AND status = 'running'
+                      AND computer_id = ANY(%s)
+                    """,
+                    (list(held),),
+                )
 
 
 async def finalize(
@@ -316,6 +358,7 @@ async def finalize(
     *,
     tail: Optional[str] = None,
     trace: Optional[List[Dict[str, Any]]] = None,
+    outbox: Optional[CommandOutbox] = None,
     oom_kill_on: Optional[Tuple[str, str]] = None,
 ) -> Optional[Dict[str, Any]]:
     """The one move from ``running`` to ``outcome``; None when the row is
@@ -333,12 +376,23 @@ async def finalize(
     in and never starts one of its own.
 
     ``trace`` follows what the call's earlier attempts recorded at hand-off;
-    none keeps the row's. ``oom_kill_on`` names the computer's (provider
-    kind, sandbox id) for a job that exited 137: the kill is counted against
+    none keeps the row's. ``outbox`` is the chart layers the job published:
+    their rows are stored here, inside the move, so only the finalize that
+    wins stores them, once, and a retried or losing one stores nothing (a
+    layer the user deleted meanwhile stays deleted). The row keeps their
+    read-back, which the notice carries, and their entries, which its caption
+    draws as the chat's chart-layer card; a store that fails leaves the end
+    to commit with the read-back saying so and no entries. ``oom_kill_on``
+    names the computer's (provider kind, sandbox id) for a job that exited
+    137: the kill is counted against
     that sandbox's open usage run inside the move, so a retried finalize,
     which moves nothing, never counts it twice."""
+    from src.server.database.chart_annotation import encode_layers
+
     command_id = str(judged["command_id"])
     mark = judged.get("stopped_by")
+    # Encoded before the row is locked: it can take a while.
+    layer_rows = await encode_layers(outbox.rows) if outbox is not None and outbox.rows else []
     async with pool.get_db_connection() as conn:
         async with conn.transaction():
             async with conn.cursor(row_factory=dict_row) as cur:
@@ -347,6 +401,8 @@ async def finalize(
                     UPDATE command_runs
                     SET status = %s, exit_code = %s, failure_reason = %s,
                         output_tail = COALESCE(%s, output_tail),
+                        outbox_report = COALESCE(%s, outbox_report),
+                        outbox_layers = COALESCE(%s::jsonb, outbox_layers),
                         mcp_trace = CASE
                             WHEN %s::jsonb IS NULL THEN mcp_trace
                             -- After what the call's earlier attempts called.
@@ -356,13 +412,15 @@ async def finalize(
                         next_check_at = NULL, updated_at = NOW()
                     WHERE command_id = %s AND status = 'running'
                       AND stopped_by IS NOT DISTINCT FROM %s
-                    RETURNING {_LISTED_COLUMNS}
+                    RETURNING {_LISTED_COLUMNS}, outbox_report, outbox_layers
                     """,
                     (
                         outcome.status,
                         outcome.exit_code,
                         outcome.failure_reason,
                         _tail(tail),
+                        strip_pg_nul_str(outbox.report if outbox else None),
+                        SafeJson(list(outbox.layers)) if outbox and outbox.layers else None,
                         SafeJson(trace) if trace is not None else None,
                         SafeJson(trace) if trace is not None else None,
                         outcome.stopped_by,
@@ -378,6 +436,8 @@ async def finalize(
                 )
                 return None
             row = dict(row)
+            if layer_rows:
+                await _store_layers(conn, row, outbox, layer_rows)
             if oom_kill_on is not None:
                 await _count_oom_kill(conn, oom_kill_on, command_id)
             if outcome.report != "none":
@@ -388,6 +448,36 @@ async def finalize(
         f"report={outcome.report}"
     )
     return row
+
+
+async def _store_layers(
+    conn, row: Dict[str, Any], outbox: CommandOutbox, layer_rows: List[Tuple[Any, ...]]
+) -> None:
+    """Store the job's chart layers on the finalize transaction, in a
+    savepoint of their own: a failed store never holds back the command's
+    end, which then commits with the read-back that says the layers were not
+    saved (and ``row`` is changed to match)."""
+    from src.server.database.chart_annotation import insert_layers
+
+    try:
+        async with conn.transaction():
+            await insert_layers(conn, layer_rows)
+        return
+    except Exception:
+        logger.warning(
+            f"[command_runs] storing the chart layers of {row['command_id']} failed",
+            exc_info=True,
+        )
+    row["outbox_report"] = outbox.unsaved_report
+    row["outbox_layers"] = None
+    async with conn.cursor() as cur:
+        await cur.execute(
+            """
+            UPDATE command_runs SET outbox_report = %s, outbox_layers = NULL
+            WHERE command_id = %s
+            """,
+            (strip_pg_nul_str(outbox.unsaved_report), row["command_id"]),
+        )
 
 
 async def _count_oom_kill(conn, oom_kill_on: Tuple[str, str], command_id: str) -> None:
@@ -591,7 +681,8 @@ async def get_thread_command(
         async with conn.cursor(row_factory=dict_row) as cur:
             await cur.execute(
                 f"""
-                SELECT {_prefixed("c", _LISTED_COLUMNS)}, {_REPORTED_SQL} AS reported{trace}
+                SELECT {_prefixed("c", _LISTED_COLUMNS)}, c.outbox_report, c.outbox_layers,
+                       {_REPORTED_SQL} AS reported{trace}
                 FROM command_runs c
                 WHERE c.command_id = %s AND c.conversation_thread_id = %s
                 """,
@@ -607,14 +698,16 @@ async def read_notice(command_id: str) -> Optional[Dict[str, Any]]:
 
     ``owed``: ``COMMAND_OWED_SQL``. ``no_turn``: no turn will come to its
     thread (``outbox.NO_TURN_SQL``). ``thread_workspace_id``: the workspace
-    its thread is in now, which a notice turn posts to."""
+    its thread is in now, which a notice turn posts to. ``outbox_report``:
+    what the job's outbox came to, which the notice carries, and
+    ``outbox_layers`` the layers it stored, which its caption draws."""
     from src.server.database.runs.outbox import NO_TURN_SQL
 
     async with pool.get_db_connection() as conn:
         async with conn.cursor(row_factory=dict_row) as cur:
             await cur.execute(
                 f"""
-                SELECT {_prefixed("c", _LISTED_COLUMNS)},
+                SELECT {_prefixed("c", _LISTED_COLUMNS)}, c.outbox_report, c.outbox_layers,
                        t.workspace_id AS thread_workspace_id,
                        {COMMAND_OWED_SQL} AS owed,
                        {NO_TURN_SQL} AS no_turn
@@ -653,6 +746,27 @@ async def statuses_on(computer_id: str, command_ids: Sequence[str]) -> Dict[str,
                 (computer_id, list(command_ids)),
             )
             return {str(r["command_id"]): str(r["status"]) for r in await cur.fetchall()}
+
+
+async def computer_has_running_command(computer_id: str) -> bool:
+    """Whether a command handed off on this computer is still running there,
+    whichever worker follows it."""
+    computer_id = normalize_uuid(computer_id)
+    if computer_id is None:
+        return False
+    async with pool.get_db_connection() as conn:
+        async with conn.cursor() as cur:
+            await cur.execute(
+                """
+                SELECT EXISTS (
+                    SELECT 1 FROM command_runs
+                    WHERE computer_id = %s AND status = 'running'
+                )
+                """,
+                (computer_id,),
+            )
+            row = await cur.fetchone()
+            return bool(row and row[0])
 
 
 async def list_for_thread(
@@ -703,11 +817,16 @@ async def list_for_thread(
 
 
 def _one_scope(
-    caller: str, thread_id: Optional[str], workspace_id: Optional[str]
+    caller: str,
+    thread_id: Optional[str],
+    workspace_id: Optional[str],
+    user_id: Optional[str] = None,
 ) -> Tuple[str, Optional[str]]:
     """The column and normalized id of the one scope given."""
     scopes = {"conversation_thread_id": thread_id, "workspace_id": workspace_id}
     given = [(col, normalize_uuid(v)) for col, v in scopes.items() if v is not None]
+    if user_id is not None:
+        given.append(("user_id", user_id or None))
     if len(given) != 1:
         raise ValueError(f"{caller}: give exactly one scope")
     return given[0]
@@ -717,12 +836,15 @@ async def request_stops(
     *,
     thread_id: Optional[str] = None,
     workspace_id: Optional[str] = None,
+    user_id: Optional[str] = None,
     by: StopMark,
     grace_s: float = 0.0,
     supersede: Sequence[StopMark] = (),
+    started_before: Optional[datetime] = None,
 ) -> List[str]:
-    """Mark every running command of one thread or workspace that nobody has
-    asked to stop yet as stopped by ``by``; the ids marked.
+    """Mark every running command of one thread, workspace or user that
+    nobody has asked to stop yet, started before ``started_before`` when
+    given, as stopped by ``by``; the ids marked.
 
     ``request_stop`` over each row read unmarked. With no grace, no stopper
     of its own is at work, so the watcher's next pass ends each job and
@@ -730,14 +852,38 @@ async def request_stops(
     passes ``STOP_GRACE_S``, as ``request_stop`` does. A row already marked
     keeps its stopper, unless its mark is one of ``supersede``: that stopper,
     finalizing the row as it judged it, then loses its CAS."""
-    column, value = _one_scope("request_stops", thread_id, workspace_id)
+    column, value = _one_scope("request_stops", thread_id, workspace_id, user_id)
     if value is None:
         return []
     rows = await _mark_stops(
-        f"{column} = %s AND (stopped_by IS NULL OR stopped_by = ANY(%s))",
-        (value, list(supersede)),
+        f"{column} = %s AND (stopped_by IS NULL OR stopped_by = ANY(%s))"
+        " AND (%s::timestamptz IS NULL OR started_at < %s::timestamptz)",
+        (value, list(supersede), started_before, started_before),
         by=by,
         grace_s=grace_s,
+    )
+    return [str(r["command_id"]) for r in rows]
+
+
+async def request_former_member_stops(
+    workspace_id: str, user_id: Optional[str]
+) -> List[str]:
+    """Mark as ``removed`` the running commands in a shared workspace of
+    ``user_id``, or with None of anyone not listed on it now, that nobody
+    has asked to stop yet; the ids marked. The watcher's next pass ends
+    each, as it does a suspension's."""
+    workspace_id = normalize_uuid(workspace_id)
+    if workspace_id is None:
+        return []
+    one = user_id is not None
+    who = former_member_sql(
+        "command_runs.user_id", "command_runs.workspace_id", "%s" if one else None
+    )
+    rows = await _mark_stops(
+        f"workspace_id = %s AND stopped_by IS NULL AND {who}",
+        (workspace_id, user_id) if one else (workspace_id,),
+        by="removed",
+        grace_s=0.0,
     )
     return [str(r["command_id"]) for r in rows]
 

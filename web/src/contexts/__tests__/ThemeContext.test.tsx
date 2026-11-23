@@ -25,14 +25,23 @@ function Harness() {
   );
 }
 
+function fromOtherTab(newValue: string | null) {
+  act(() => {
+    window.dispatchEvent(new StorageEvent('storage', { key: 'theme', newValue }));
+  });
+}
+
+beforeEach(() => {
+  localStorage.clear();
+  document.documentElement.removeAttribute('data-theme');
+  document.documentElement.style.colorScheme = '';
+  document.head.innerHTML = '<meta name="color-scheme" content="dark light" />';
+  mockMatchMedia(false); // system resolves to dark
+});
+
 describe('ThemeContext kept in step with color-scheme', () => {
   beforeEach(() => {
-    localStorage.clear();
     localStorage.setItem('theme', 'dark');
-    document.documentElement.removeAttribute('data-theme');
-    document.documentElement.style.colorScheme = '';
-    document.head.innerHTML = '<meta name="color-scheme" content="dark light" />';
-    mockMatchMedia(false); // system resolves to dark
   });
 
   it('stamps data-theme, style.colorScheme and the meta on mount', () => {
@@ -92,5 +101,20 @@ describe('ThemeContext kept in step with color-scheme', () => {
     expect(document.documentElement.style.colorScheme).toBe('dark');
     const meta = document.querySelector('meta[name="color-scheme"]') as HTMLMetaElement;
     expect(meta.content).toBe('dark');
+  });
+});
+
+describe('a theme picked in another tab of this browser', () => {
+  it('is shown here too, and removed there means the default', () => {
+    localStorage.setItem('theme', 'dark');
+    render(<ThemeProvider>{null}</ThemeProvider>);
+    expect(document.documentElement.dataset.theme).toBe('dark');
+
+    fromOtherTab('light');
+    expect(document.documentElement.dataset.theme).toBe('light');
+    expect(localStorage.getItem('theme')).toBe('light');
+
+    fromOtherTab(null);
+    expect(localStorage.getItem('theme')).toBe('auto');
   });
 });

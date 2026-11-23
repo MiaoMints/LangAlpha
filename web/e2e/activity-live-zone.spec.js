@@ -5,23 +5,19 @@
  * call lands while the live zone is still collapsing. The zone must end up
  * as tall as the one row it now holds, not the three it held before.
  */
-import { configureSSE, resetMockServer, mockAPI, test, expect } from './fixtures.js';
+import { configureSSE, releaseSSE, resetMockServer, mockAPI, test, expect } from './fixtures.js';
 import { sseEvents, defaultResponses } from './helpers/mockResponses.js';
 import { TH, chatViewOverrides, openThread, replayNothing, send } from './helpers/chatScenario.js';
 import { sampleFrames, stopSampling } from './helpers/frameProbe.js';
-import { ROW_FOLD, MIN_LIVE_EXPOSURE_MS } from '../src/pages/ChatAgent/components/messageList/liveZoneTiming.ts';
+import { MIN_LIVE_EXPOSURE_MS } from '../src/pages/ChatAgent/components/messageList/liveZoneTiming.ts';
 
-// A completed row stays live for MIN_LIVE_EXPOSURE_MS after its call was
-// created, then folds on ROW_FOLD, a spring with about a fifth of the height
-// left three time constants (1 / sqrt(stiffness)) in, so a call landing then
-// lands late inside the collapse. Late, because the fold can only run behind
-// its clock (a busy first frame stamps the calls late), never ahead. The clock starts
-// at the first event, and the four events before the delay each cost a gap,
-// so the delay is measured from the first event, not from the last result.
-// The tool must not be an inline-artifact tool (those skip the exposure
-// window).
-const EVENT_GAP_MS = 30;
-const LAND_MID_COLLAPSE_MS = MIN_LIVE_EXPOSURE_MS + Math.round((3 / Math.sqrt(ROW_FOLD.stiffness)) * 1000) - 4 * EVENT_GAP_MS;
+// A completed row stays live for MIN_LIVE_EXPOSURE_MS after the page saw its
+// call, then folds. The fourth call waits at a gate the test opens once the
+// page shows the fold under way, so it lands inside the collapse by the page's
+// clock. Timed from the stream's first write, it came before the fold whenever
+// the page read the first events late, since the margin was the collapse's
+// first 190ms. The tool must not be an inline-artifact tool (those skip the
+// exposure window).
 
 test.describe('activity live zone', () => {
   test.beforeEach(async () => {
@@ -40,8 +36,8 @@ test.describe('activity live zone', () => {
         sseEvents.finishToolCalls(),
         sseEvents.toolCallResult('toolu_a1', '0'),
         sseEvents.toolCallResult('toolu_a2', '1'),
-        { ...sseEvents.toolCallResult('toolu_a3', '2'), delayAfter: LAND_MID_COLLAPSE_MS },
-        sseEvents.toolCalls([{ name: 'bash', args: { command: 'echo 3' }, id: 'toolu_b' }]),
+        sseEvents.toolCallResult('toolu_a3', '2'),
+        { ...sseEvents.toolCalls([{ name: 'bash', args: { command: 'echo 3' }, id: 'toolu_b' }]), holdUntil: 'folding' },
         // Hold the fourth call in progress so it stays a live row while measured.
         { ...sseEvents.finishToolCalls(), delayAfter: 3000 },
         sseEvents.toolCallResult('toolu_b', '3'),
@@ -49,7 +45,7 @@ test.describe('activity live zone', () => {
         sseEvents.finishStop(),
         sseEvents.creditUsage(),
       ],
-      delay: EVENT_GAP_MS,
+      delay: 30,
     });
 
     await page.goto(`/chat/t/${TH}`);
@@ -66,6 +62,15 @@ test.describe('activity live zone', () => {
       return { active: document.querySelectorAll('[data-testid="activity-live-zone"] .titem.running').length };
     }, null, { timeout: 15000 }).then((h) => h.jsonValue());
     expect(atFold.active, 'the fourth call went live before the first three folded').toBe(0);
+    await releaseSSE('folding');
+    // Read on the frame the fourth call shows: rows still leaving the zone
+    // mean it landed mid-fold, the case that regressed.
+    const landed = await page.waitForFunction(() => {
+      const zone = document.querySelector('[data-testid="activity-live-zone"]');
+      if (!zone?.querySelector('.titem.running')) return null;
+      return { rows: zone.children.length };
+    }, null, { timeout: 15000, polling: 'raf' }).then((h) => h.jsonValue());
+    expect(landed.rows, 'the fourth call landed after the fold had ended').toBeGreaterThan(1);
 
     const zone = page.getByTestId('activity-live-zone');
     await expect(zone.locator('.titem.running')).toHaveCount(1, { timeout: 15000 });
@@ -467,6 +472,117 @@ test.describe('activity live zone', () => {
 
   }
 
+
+  // The count the reader opens or closes folds as one panel. Each row moving
+  // on its own opened every box at once with nothing in it and brought the
+  // content in after, a hole as tall as the list, and closing emptied the
+  // rows before anything under them moved. The step in flight is on screen
+  // open or shut: on the status line it changes rows with the toggle, and a
+  // row that faded out as another faded in left it off the screen while what
+  // was under the block went the wrong way.
+  for (const layout of ['rows', 'status']) {
+    test(`opens and closes the count as one panel, in the ${layout} layout`, async ({ page }) => {
+      await openThread(page, layout === 'status' ? { layout } : {});
+      const events = [];
+      for (let i = 0; i < 5; i++) {
+        events.push(sseEvents.toolCalls([{ name: 'Grep', args: { pattern: `term${i}`, path: 'data' }, id: `g${i}` }]));
+        events.push({ ...sseEvents.finishToolCalls(), delayAfter: 150 });
+        events.push({ ...sseEvents.toolCallResult(`g${i}`, 'data/a.csv:1'), delayAfter: 100 });
+      }
+      events.push(sseEvents.toolCalls([{ name: 'WebFetch', args: { url: 'https://one.example.com' }, id: 'w1' }]));
+      events.push(sseEvents.finishToolCalls());
+      // In flight through both toggles.
+      events.push({ ...sseEvents.toolCallResult('w1', 'Fetched'), holdUntil: 'toggled' });
+      events.push(sseEvents.messageChunk('The margin held.'), sseEvents.finishStop(), sseEvents.creditUsage());
+      await configureSSE({ method: 'POST', path: `/api/v1/threads/${TH}/messages`, events, delay: 30 });
+      await send(page, 'Check margins');
+      const zone = page.locator('[data-testid="activity-live-zone"]');
+      await expect(zone).toContainText('one.example.com', { timeout: 15000 });
+      // Every finished step has left the zone for the count.
+      await expect.poll(() => zone.locator(':scope > *').count(), { timeout: 10000 }).toBe(1);
+      await page.waitForTimeout(600);
+      await sampleFrames(page, () => {
+        const zone = document.querySelector('[data-testid="activity-live-zone"]');
+        const mark = document.querySelector('[data-testid="streaming-indicator"]');
+        // Every row drawing the step in flight, the line's or its own: the
+        // one showing most, and where its text is.
+        const [step] = [...(zone?.children ?? [])].filter((row) => row.textContent.includes('one.example.com')).map((row) => {
+          const text = [...row.querySelectorAll('*')].find((el) => el.children.length === 0 && el.textContent.includes('one.example.com'));
+          return {
+            shown: row.getBoundingClientRect().height > 12
+              ? Number(getComputedStyle(row).opacity) * Number(getComputedStyle(row.firstElementChild).opacity) : 0,
+            top: text?.getBoundingClientRect().top ?? 0,
+          };
+        }).sort((a, b) => b.shown - a.shown);
+        return {
+          phase: window.__phase ?? 'closed',
+          markTop: mark ? mark.getBoundingClientRect().top : null,
+          stepShown: step?.shown ?? 0,
+          stepAboveMark: mark && step ? mark.getBoundingClientRect().top - step.top : null,
+          // The finished steps' rows: how open each box is and how much of
+          // its content shows (the box's opacity times its content's).
+          rows: [...(zone?.children ?? [])].filter((row) => !row.textContent.includes('one.example.com')).map((row) => ({
+            h: row.getBoundingClientRect().height,
+            shown: Number(getComputedStyle(row).opacity) * Number(getComputedStyle(row.firstElementChild).opacity),
+          })),
+        };
+      });
+      const summary = page.locator('[id^="activity-summary-"]');
+      for (const phase of ['opening', 'closing', 'reopening']) {
+        await page.evaluate((name) => { window.__phase = name; }, phase);
+        await summary.click();
+        await page.waitForTimeout(1200);
+      }
+      // Shut and opened again before the close has landed: the rows the
+      // close was sending away are still in the list, and come back.
+      await page.evaluate(() => { window.__phase = 'flicked'; });
+      await summary.click();
+      await page.waitForTimeout(100);
+      await summary.click();
+      await page.waitForTimeout(1200);
+      const samples = await stopSampling(page);
+      await releaseSSE('toggled');
+
+      const flicked = samples.filter((s) => s.phase === 'flicked' && s.markTop !== null);
+      expect(Math.min(...flicked.map((s) => s.stepShown)), 'flicked: the step left the screen').toBeGreaterThan(0.99);
+      expect(flicked.at(-1).rows.filter((row) => row.h > 33 && row.shown > 0.99).length, 'flicked: the count did not end open').toBe(5);
+
+      for (const phase of ['opening', 'closing']) {
+        const frames = samples.filter((s) => s.phase === phase && s.markTop !== null);
+        const marks = frames.map((s) => s.markTop);
+        const [from, to] = [marks[0], marks.at(-1)];
+        expect(Math.abs(to - from), `${phase}: the count did not toggle`).toBeGreaterThan(120);
+        // One glide: what is under the block never goes back or past its end.
+        const back = Math.sign(from - to);
+        for (let i = 1; i < marks.length; i++) {
+          expect((marks[i] - marks[i - 1]) * back, `${phase}: what is under the block went back`).toBeLessThan(0.5);
+        }
+        // The step in flight never leaves the screen, and rides the panel's
+        // edge with what is under the block: it is never set down elsewhere.
+        expect(Math.min(...frames.map((s) => s.stepShown)), `${phase}: the step left the screen`).toBeGreaterThan(0.99);
+        const gaps = frames.map((s) => s.stepAboveMark);
+        expect(Math.max(...gaps) - Math.min(...gaps), `${phase}: the step left the edge`).toBeLessThan(6);
+        const moving = frames.filter((s) => s.rows.some((row) => row.h > 0.5 && row.h < 33));
+        // However few frames a busy runner draws of it.
+        expect(moving.length, `${phase}: frames mid-fold`).toBeGreaterThan(2);
+        for (const frame of moving) {
+          // The edge is in one row at a time: the rows over it are open and
+          // the ones under it shut.
+          const edge = frame.rows.findIndex((row) => row.h < 33);
+          expect(frame.rows.slice(edge + 1).every((row) => row.h < 0.5), `${phase}: two rows moved at once`).toBe(true);
+        }
+        // No box stands open with nothing in it. Opening, the content shows
+        // from the first frame; closing, it dims with what is left of the
+        // panel, so only the last of it is faint.
+        const open = (frame) => frame.rows.reduce((total, row) => total + row.h, 0);
+        const full = Math.max(...frames.map(open));
+        for (const frame of frames) {
+          const faint = frame.rows.filter((row) => row.shown < (phase === 'opening' ? 0.99 : 0.3)).reduce((total, row) => total + row.h, 0);
+          expect(faint, `${phase}: open rows with nothing in them`).toBeLessThan(phase === 'opening' ? 0.5 : full * 0.35);
+        }
+      }
+    });
+  }
 });
 
 // ---- tool rows and preparing calls ----

@@ -4,13 +4,16 @@ import type {
   Attachment,
   ToolCallData,
   ToolCallResultData,
-  TodoItem,
   OrderProposal,
-  ProvenanceSourceType,
+  ProvenanceEnvelopeKey,
+  ProvenanceEvent,
 } from './sse';
-import type { ErrorLinkSpec, StructuredError } from '@/utils/rateLimitError';
+import type { PageLinkSpec, StructuredError } from '@/utils/rateLimitError';
+import type { PlanBilled } from '@/api/model';
+import type { CliWait } from '@/lib/claudeCodeQueue';
 import type { DispatchingAgent, ReportOutcome } from './api';
 import type { CommandFailureReason, CommandTool } from './commands';
+import type { PublishedLayer } from '@/pages/MarketView/types/chartLayer';
 
 // --- Content Segments (discriminated union) ---
 
@@ -41,12 +44,6 @@ export interface TextSegment {
 export interface ToolCallSegment {
   type: 'tool_call';
   toolCallId: string;
-  order: number;
-}
-
-export interface TodoListSegment {
-  type: 'todo_list';
-  todoListId: string;
   order: number;
 }
 
@@ -104,17 +101,48 @@ export interface ModelFallbackNotice {
   provider?: string;
 }
 
+/** A thread moved onto a model that keeps a session of its own (Claude
+ *  Code), which opened on a brief of everything before. Manifest keys,
+ *  named when shown as a fallback's are. */
+export interface HandOffNotice {
+  /** The model the thread was on, absent when the server put the brief
+   *  together without a model. */
+  from?: string;
+  to: string;
+}
+
+/** Which expander toggle label a notification's detail takes. */
+export type NotificationDetailKind = 'summary' | 'brief' | 'error';
+
+/**
+ * What a notification draws beyond a plain labelled divider, one kind each.
+ * `NOTICES` (`components/messageList/notices.tsx`) says how each kind is
+ * drawn and whether a folded turn keeps it.
+ */
+export type SegmentNotice =
+  /** A model switch, labelled when shown. */
+  | ({ kind: 'fallback' } & ModelFallbackNotice)
+  /** A hand-off to a model that keeps a session of its own, labelled when shown. */
+  | ({ kind: 'handoff' } & HandOffNotice)
+  /** A reply whose last request was billed to usage credits at a Claude
+   *  plan's limit: a quiet notice line under it, not a divider. */
+  | ({ kind: 'planBilled' } & PlanBilled)
+  /** A Claude Code turn that waited for one of its computer's CLIs: a notice
+   *  line where in the reply the wait happened. */
+  | ({ kind: 'cliWait' } & CliWait);
+
 export interface NotificationSegment {
   type: 'notification';
-  /** The label. A model switch has none: its label is written from `fallback`. */
+  /** The label of a plain divider. A notice has none: its own is written
+   *  from it when shown. */
   content?: string;
-  fallback?: ModelFallbackNotice;
+  notice?: SegmentNotice;
   order: number;
   /** Optional longer text (e.g. the compaction summary) shown in an
    *  expandable panel beneath the notification label. */
   detail?: string;
-  /** Picks the expander toggle label — 'summary' (default) or 'error'. */
-  detailKind?: 'summary' | 'error';
+  /** Picks the expander toggle label, 'summary' by default. */
+  detailKind?: NotificationDetailKind;
 }
 
 export interface UserQuestionSegment {
@@ -176,7 +204,6 @@ export type ContentSegment =
   | ReasoningSegment
   | TextSegment
   | ToolCallSegment
-  | TodoListSegment
   | SubagentTaskSegment
   | NotificationSegment
   | UserQuestionSegment
@@ -215,27 +242,12 @@ export interface ToolCallProcess {
   _createdAt?: number;
 }
 
-export interface ProvenanceRecord {
-  record_id: string;
-  /** Originating agent: "main" or "task:{id}". */
-  agent?: string;
-  timestamp: string;
-  source_type: ProvenanceSourceType;
-  identifier: string;
-  title?: string;
-  /** Data-kind slug within this source type (e.g. "company_overview"); the
-   *  Sources panel i18n-maps it to label each access in the hover breakdown. */
-  detail?: string;
-  provider?: string;
-  tool_call_id?: string;
-  args_fingerprint?: Record<string, unknown>;
-  /** Tool-call arguments with secrets already redacted server-side. Redacted
-   *  values are the literal string "[redacted]". May be absent/empty. */
-  args?: Record<string, unknown>;
-  result_sha256?: string;
-  result_size?: number;
-  result_snippet?: string;
-}
+/** A provenance event without its stream and replay envelope. */
+export type ProvenanceRecord = Omit<ProvenanceEvent, ProvenanceEnvelopeKey> & {
+  /** The events whose costs `cost_credits` sums, when several paid calls
+   *  are listed as one access. */
+  cost_record_ids?: string[];
+};
 
 /**
  * Per-access discriminator appended to a provenance dedup key — `mcp_tool` only.
@@ -309,14 +321,17 @@ export function countDedupedSources(
   return seen.size;
 }
 
-export interface TodoListProcess {
-  todos: TodoItem[];
-  total: number;
-  completed: number;
-  in_progress: number;
-  pending: number;
+/** A step of the agent's plan (`UpdatePlan`). */
+export interface PlanStep {
+  title: string;
+  status: 'pending' | 'in_progress' | 'completed';
+}
+
+/** One plan update on its bubble. `order` is its place among the turn's
+ *  events, which a steering split cuts by. */
+export interface PlanSnapshot {
   order: number;
-  baseTodoListId: string;
+  steps: PlanStep[];
 }
 
 export interface PendingToolCallChunk {
@@ -411,6 +426,9 @@ export interface PTCAgentProposalState {
   /** The call that made the hand-off, which names it in the transcript. */
   tool_call_id?: string;
   report_back?: boolean;
+  /** The model the hand-off names for its turn; absent when it runs the
+   *  thread's own or the user's default. */
+  model?: string | null;
   /** Approved, but the dispatch failed (`utils/dispatchResult.ts`). */
   dispatch_failed?: boolean;
   /** With `dispatch_failed`: the failure left it unknown whether the run
@@ -449,7 +467,7 @@ export interface CreditPauseState {
   message?: string;
   /** Where the user resolves the denial, built by ``buildRateLimitError`` so a
    *  pause and a 429 banner offer the same destinations. */
-  links?: ErrorLinkSpec[];
+  links?: PageLinkSpec[];
   interruptId: string;
 }
 
@@ -496,7 +514,16 @@ export type MessageProvenance =
       kind: 'command_report'; tool: CommandTool; description: string | null; status: 'completed' | 'failed' | 'stopped';
       failureReason: CommandFailureReason | null;
       toolCallId: string | null;
+      /** The chart layers it published in the background, drawn under its
+       *  line as the cards an inline call's are. Absent when none. */
+      chartLayers?: PublishedLayer[];
     };
+
+/** The member who sent a turn in a shared workspace. */
+export interface MessageSender {
+  userId: string;
+  name: string | null;
+}
 
 export type UserMessage = {
   id: string;
@@ -525,12 +552,23 @@ export type UserMessage = {
    * re-renders these cards (see serialize_chart_selections_for_metadata).
    */
   chartSelections?: import('@/pages/MarketView/stores/chartSelectionStore').ChartSelectionSnapshot[];
+  /** The file comments this message sent, drawn under its note. `content`
+   *  is that note wherever the row came from: the server keeps the block the
+   *  agent read as the query, and every way a row comes in (a replay, a
+   *  delivery) puts the note in its place. */
+  artifactComments?: import('./api').ArtifactCommentsShown;
   /** Who sent it, when not the user in this view. A report-back's row has
    *  empty content and is drawn as this label alone. */
   provenance?: MessageProvenance;
+  /** In a shared workspace, the member who sent it (replay and the live
+   *  start frame both name them); absent everywhere else. */
+  sender?: MessageSender;
   /** On a report-back's row only: the run it opened. History and a live
    *  attach can both draw that row, and know it by this. */
   runId?: string;
+  /** On a Home turn that ran on the cloud stand-in while Home's own machine
+   *  could not be reached: drawn as a quiet line under the message. */
+  homeFallback?: import('./sse').HomeFallback;
   steeringDelivered?: boolean;
   steering?: boolean;
   /** The request key this view sent the message under. A delivery that
@@ -578,10 +616,14 @@ export type AssistantMessage = {
    *  was writing when it dropped (`session/stream/continuedBubbles.ts`). */
   continues?: string;
   contentSegments: ContentSegment[];
+  /** Where each sandbox image path the reply streamed was captured, from its
+   *  run's `run_end`; a replayed reply has the URLs in its text instead. */
+  capturedImages?: Record<string, string>;
   reasoningProcesses: Record<string, ReasoningProcess>;
   toolCallProcesses: Record<string, ToolCallProcess>;
   provenanceRecords?: Record<string, ProvenanceRecord>;
-  todoListProcesses?: Record<string, TodoListProcess>;
+  /** Each plan update the bubble carried, newest last. */
+  planSnapshots?: PlanSnapshot[];
   subagentTasks?: Record<string, SubagentTaskRecord>;
   pendingToolCallChunks?: Record<string, PendingToolCallChunk>;
   // HITL interrupt state
@@ -605,9 +647,11 @@ export type AssistantMessage = {
    *  the end, so it offers a Regenerate: the server refuses a Retry for a
    *  run that did not fail. */
   unloaded?: boolean;
-  // Set when the user hard-stopped this turn (live finalize or history replay
-  // of a stopped turn). Drives the per-message "⏹ Stopped" chip.
-  stopped?: boolean;
+  /** Set when the turn was stopped (live finalize or history replay of a
+   *  stopped turn): `true` when its user stopped it, which the "⏹ Stopped"
+   *  chip says, or `suspension` when the account's suspension ended it,
+   *  which its own chip says. */
+  stopped?: TurnStop;
   /** The reply to a send the server refused before admitting it (see
    *  UserMessage.unadmitted). */
   unadmitted?: boolean;
@@ -623,6 +667,8 @@ export type AssistantMessage = {
    * loss or a paused turn; replay's completedAt takes precedence. */
   completionObservedAt?: number;
 };
+
+export type TurnStop = true | 'suspension';
 
 export type NotificationVariant = 'info' | 'success' | 'warning';
 

@@ -3,7 +3,7 @@ import { useTranslation } from 'react-i18next';
 import { Plus, ArrowUpRight, ArrowDownRight, Trash2, Pencil, Eye, EyeOff, Sunrise, Sunset, MoreVertical } from 'lucide-react';
 import { motion, AnimatePresence } from '@/lib/framer';
 import { useNavigate } from 'react-router';
-import { getExtendedHoursInfo } from '@/lib/marketUtils';
+import { sessionQuote, type MarketStatusData } from '@/lib/marketUtils';
 import { useIsMobile } from '@/hooks/useIsMobile';
 import { createFormatter, grouped2, integer } from '@/lib/format';
 import { useLocale } from '@/hooks/useLocale';
@@ -18,47 +18,14 @@ import {
 
 const fmt1 = createFormatter({ minimumFractionDigits: 1, maximumFractionDigits: 1 });
 
-interface WatchlistRow {
-  watchlist_item_id?: string | number;
-  symbol: string;
-  price: number;
-  change: number;
-  changePercent: number;
-  isPositive: boolean;
-  quoteAvailable?: boolean;
-  previousClose?: number | null;
-  earlyTradingChangePercent?: number | null;
-  lateTradingChangePercent?: number | null;
-  currency?: string | null;
-  assetClass?: string | null;
-  [key: string]: unknown;
-}
-
-interface PortfolioRow {
-  user_portfolio_id?: string | number;
-  symbol: string;
-  price: number;
-  quantity?: number | null;
-  average_cost?: number | null;
-  currency: string;
-  marketValue?: number | null;
-  unrealizedPlPercent?: number | null;
-  isPositive?: boolean;
-  quoteAvailable?: boolean;
-  previousClose?: number | null;
-  earlyTradingChangePercent?: number | null;
-  lateTradingChangePercent?: number | null;
-  [key: string]: unknown;
-}
-
-// TODO: type properly once marketUtils exports this
-type MarketStatusData = Parameters<typeof getExtendedHoursInfo>[0];
+import type { WatchlistRow } from '../../../hooks/useWatchlistData';
+import type { PortfolioRow } from '../../../hooks/usePortfolioData';
 
 interface WatchlistItemProps {
   item: WatchlistRow;
   index: number;
   onDelete?: (id: string) => void;
-  marketStatus: MarketStatusData;
+  marketStatus: MarketStatusData | null;
   isMobile: boolean;
 }
 
@@ -76,8 +43,8 @@ function WatchlistItem({ item, index, onDelete, marketStatus, isMobile }: Watchl
   const code = quoteCurrency(item.currency, item.symbol, item.assetClass);
 
   // Extended hours: show when not regular session and data available
-  const { extPct, extType, extPrice: _extPrice, extChange: _extChange } = getExtendedHoursInfo(marketStatus, item, { shortLabels: true });
-  const extColor = extType === 'pre' ? '#fbbf24' : '#3b82f6';
+  const { headline, ext } = sessionQuote(marketStatus, item, { shortLabels: true });
+  const extColor = ext?.type === 'pre' ? '#fbbf24' : '#3b82f6';
 
   const rowContent = (
     <motion.div
@@ -112,7 +79,7 @@ function WatchlistItem({ item, index, onDelete, marketStatus, isMobile }: Watchl
         <div className="text-right whitespace-nowrap">
           <div className="text-sm font-medium dashboard-mono" style={{ color: 'var(--color-text-primary)' }}>
             {hasQuote
-              ? formatMoney(Number(extType && item.previousClose != null ? item.previousClose : item.price), code, locale)
+              ? formatMoney(headline.price, code, locale, { upTo: item.places })
               : 'N/A'}
           </div>
           <div
@@ -141,10 +108,10 @@ function WatchlistItem({ item, index, onDelete, marketStatus, isMobile }: Watchl
           >
             {pctStr}
           </div>
-          {hasQuote && extType && extPct != null && (
+          {hasQuote && ext && (
             <div className="text-[0.625rem] mt-0.5 text-center flex items-center justify-center gap-0.5 whitespace-nowrap" style={{ color: extColor }}>
-              {extType === 'pre' ? <Sunrise size={10} /> : <Sunset size={10} />}
-              {formatMoney(Number(item.price), code, locale)} {extPct >= 0 ? '+' : ''}{grouped2(extPct, locale)}%
+              {ext.type === 'pre' ? <Sunrise size={10} /> : <Sunset size={10} />}
+              {formatMoney(ext.price, code, locale, { upTo: item.places })} {ext.pct >= 0 ? '+' : ''}{grouped2(ext.pct, locale)}%
             </div>
           )}
         </div>
@@ -198,7 +165,7 @@ interface PortfolioItemProps {
   onEdit?: (item: PortfolioRow) => void;
   onDelete?: (id: string) => void;
   valuesHidden: boolean;
-  marketStatus: MarketStatusData;
+  marketStatus: MarketStatusData | null;
   isMobile: boolean;
 }
 
@@ -216,8 +183,8 @@ function PortfolioItem({ item, index, onEdit, onDelete, valuesHidden, marketStat
   const hasId = !!item.user_portfolio_id;
 
   // Extended hours
-  const { extPct, extType, extPrice: _extPrice2 } = getExtendedHoursInfo(marketStatus, item, { shortLabels: true });
-  const extColor = extType === 'pre' ? '#fbbf24' : '#3b82f6';
+  const { ext } = sessionQuote(marketStatus, item, { shortLabels: true });
+  const extColor = ext?.type === 'pre' ? '#fbbf24' : '#3b82f6';
   const displayMarketValue =
     hasQuote && item.marketValue != null
       ? formatPortfolioMoney(item.marketValue, currency, locale)
@@ -225,7 +192,7 @@ function PortfolioItem({ item, index, onEdit, onDelete, valuesHidden, marketStat
   const displayPrice =
     hasQuote
       ? formatPortfolioMoney(
-          Number(extType && item.previousClose != null ? item.previousClose : item.price),
+          ext ? item.session?.previousClose ?? item.price : item.price,
           currency,
           locale,
         )
@@ -290,10 +257,10 @@ function PortfolioItem({ item, index, onEdit, onDelete, valuesHidden, marketStat
           >
             {plStr}
           </div>
-          {hasQuote && extType && extPct != null && (
+          {hasQuote && ext && (
             <div className="text-[0.625rem] mt-0.5 text-center flex items-center justify-center gap-0.5 whitespace-nowrap" style={{ color: extColor }}>
-              {extType === 'pre' ? <Sunrise size={10} /> : <Sunset size={10} />}
-              {formatPortfolioMoney(item.price, currency, locale)} {extPct >= 0 ? '+' : ''}{grouped2(extPct, locale)}%
+              {ext.type === 'pre' ? <Sunrise size={10} /> : <Sunset size={10} />}
+              {formatPortfolioMoney(ext.price, currency, locale)} {ext.pct >= 0 ? '+' : ''}{grouped2(ext.pct, locale)}%
             </div>
           )}
         </div>
@@ -392,7 +359,7 @@ interface PortfolioWatchlistCardProps {
   onPortfolioAdd?: () => void;
   onPortfolioDelete?: (id: string) => void;
   onPortfolioEdit?: (item: PortfolioRow) => void;
-  marketStatus: MarketStatusData;
+  marketStatus: MarketStatusData | null;
 }
 
 function PortfolioWatchlistCard({

@@ -1,0 +1,23 @@
+{
+  "version": "2.1.321",
+  "manifest_sha256": "d073d63928081951b871b35780d7abc83c26fa9b8b97f1ace64fc90d4591d325",
+  "signed_by": "31DDDE24DDFAB679F42D7BD2BAA929FF1A7ECACE",
+  "platforms": {
+    "darwin-arm64": {
+      "sha256": "abc9feeeca8091d51b623291e044cf0528c2f6b74e0c1d6ef671d52c73f7cd3c",
+      "size": 323686048
+    },
+    "darwin-x64": {
+      "sha256": "f4e04d8726ee1343999679ad745eca2f6d263c2941f132b1fdca4283ee6d5f02",
+      "size": 338384032
+    },
+    "linux-arm64": {
+      "sha256": "6bea0633074627ba79328e00115ed0588c3acf906a8463612b25db696dbfd3f0",
+      "size": 341501368
+    },
+    "linux-x64": {
+      "sha256": "426c33815ca6645a772f722fbff10dbf2cbdb124a8aeab733c1365dbf8bbf61f",
+      "size": 341910032
+    }
+  }
+}

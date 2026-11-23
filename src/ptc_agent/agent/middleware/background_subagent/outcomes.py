@@ -8,14 +8,17 @@ aggregate. Deriving it separately per writer is how a credit stop came to read
 and each writer projects the value rather than recomputing it.
 """
 
+import asyncio
 from dataclasses import dataclass
 from typing import Any
 
 from ptc_agent.agent.middleware.background_subagent.registry import (
+    RESTART_CANCEL,
+    TIME_LIMIT_CANCEL,
     TransportLostError,
 )
 from ptc_agent.agent.middleware.credit_gate import CreditStopError
-from src.server.contracts.status import CREDIT_STOP_ERROR_TYPE
+from src.server.contracts.status import CREDIT_STOP_ERROR_TYPE, RESTART_STOP_ERROR_TYPE
 
 # Declared spellings for the two terminals something downstream matches on: the
 # retention contract greps "transport_lost", and the credit resume query and the
@@ -36,6 +39,12 @@ class SubagentTimeLimitError(Exception):
     is the backstop for a run that kept going anyway, as the turn's own stop is
     for the main agent.
     """
+
+
+def is_time_limit_cancel(cancel: asyncio.CancelledError) -> bool:
+    """A cancel from the stop for running past every clock
+    (``time_out_writers_where``), which ends a run as its own clock would."""
+    return cancel.args == (TIME_LIMIT_CANCEL,)
 
 
 @dataclass(frozen=True)
@@ -60,6 +69,29 @@ class Outcome:
             local_status=(
                 "timeout" if isinstance(e, SubagentTimeLimitError) else None
             ),
+        )
+
+    @classmethod
+    def from_cancel(cls, cancel: asyncio.CancelledError) -> "Outcome | None":
+        """How a run one of our own stops cancelled ended: a graceful
+        restart's (``stop_writers_for_restart``) or the time limit's. None
+        for any other cancel, which the caller lets through."""
+        if cancel.args == (RESTART_CANCEL,):
+            return cls.restart_stop()
+        if is_time_limit_cancel(cancel):
+            return cls.from_exception(
+                SubagentTimeLimitError("Timed out: still running past its time limit")
+            )
+        return None
+
+    @classmethod
+    def restart_stop(cls) -> "Outcome":
+        """A run a graceful restart stopped: neutral like a cancel, and kept
+        apart from one by its error type, which offers it back for resume."""
+        return cls(
+            status="cancelled",
+            error="paused by a routine deployment",
+            error_type=RESTART_STOP_ERROR_TYPE,
         )
 
     @classmethod
@@ -117,6 +149,14 @@ def is_credit_stop(result: Any) -> bool:
     """
     return (
         isinstance(result, dict) and result.get("error_type") == CREDIT_STOP_ERROR_TYPE
+    )
+
+
+def is_restart_stop(result: Any) -> bool:
+    """Whether a settled task was stopped by a graceful restart, with its
+    checkpoint intact for a resume."""
+    return (
+        isinstance(result, dict) and result.get("error_type") == RESTART_STOP_ERROR_TYPE
     )
 
 

@@ -6,38 +6,32 @@ from __future__ import annotations
 
 import asyncio
 import codecs
+import hashlib
 import logging
 import re
-from collections.abc import Iterator, Mapping, Sequence
+from collections.abc import Iterable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
+from functools import cached_property
 from typing import Any
 
 from charset_normalizer import from_bytes
-from fastapi import HTTPException
+from fastapi import HTTPException, Request
+from fastapi.responses import Response
 
 
 from ptc_agent.agent.backends.db_json_route import DbJsonRoute
 from ptc_agent.agent.filesystem_routes import USER_DATA_ROUTES, route_for
 from ptc_agent.core.paths import (
-    AGENT_SYSTEM_DIRS,
     USER_DATA_DIRS,
-    ALWAYS_HIDDEN_BASENAMES as _SHARED_BASENAMES,
-    ALWAYS_HIDDEN_DIR_NAMES,
-    ALWAYS_HIDDEN_PATH_SEGMENTS,
-    ALWAYS_HIDDEN_SUFFIXES,
-    HIDDEN_DIR_NAMES,
-    TRANSIENT_ROOT_PREFIX,
     SandboxLayout,
     logged_path,
 )
 from ptc_agent.core.sandbox.runtime import STREAM_CHUNK_BYTES
+from src.server.database.shared_workspaces import is_holder
 from src.server.database.blob_keys import RELAY_MAX_BYTES
 from src.server.database.workspace import get_workspace as db_get_workspace
 from src.server.database.workspace_folders import is_top_level
-from src.server.services.persistence.transfer import (
-    INPROCESS_MAX_INFLIGHT_BYTES,
-    ByteBudget,
-)
+from src.server.services.persistence.transfer import ByteBudget
 from src.server.services.persistence.resolve import (
     FileBytesUnavailable,
     resolve_file_byte_range,
@@ -45,8 +39,17 @@ from src.server.services.persistence.resolve import (
     too_large_to_serve,
 )
 from src.server.services.workspace_file_containment import normalize_requested_path
-from src.server.services.workspace_files import layout_for, owner_layout
+from src.server.services.served_paths import SYSTEM_DIR_PREFIXES, is_always_hidden_path
+from src.server.services.thread_folders import ThreadFolderGate
+from src.server.services.workspace_files import (
+    layout_for,
+    owner_layout,
+    owner_work_dir,
+    previous_dir_names_of,
+    to_client_path,
+)
 from src.server.utils.error_sanitization import single_line
+from src.server.utils.http_headers import content_disposition
 
 logger = logging.getLogger(__name__)
 
@@ -112,17 +115,6 @@ async def http_file_text(file_record: dict[str, Any], *, user_id: str) -> str:
     return data.decode("utf-8", errors="replace")
 
 
-# Image MIME types that benefit from HTTP caching
-_CACHEABLE_IMAGE_TYPES = frozenset(
-    {
-        "image/png",
-        "image/jpeg",
-        "image/gif",
-        "image/svg+xml",
-        "image/webp",
-    }
-)
-
 # DB-backed virtual files: rows the agent reaches through a composite route
 # (UserDataBackend, AutomationsBackend, SubagentsBackend), never files on the
 # sandbox FS. These paths bypass the system-path filter and route to the DB
@@ -148,8 +140,11 @@ async def _virtual_files_in_scope(requested_path: str, user_id: str) -> list[str
     """The virtual files a listing rooted at ``requested_path`` covers.
 
     A root inside a virtual directory covers all of its files, so a listing of
-    one of them still shows its siblings.
+    one of them still shows its siblings. A shared workspace has none: its
+    owner is a holder, whose user data no one has.
     """
+    if is_holder(user_id):
+        return []
     paths: list[str] = []
     for route in USER_DATA_ROUTES:
         directory = route.directory
@@ -172,7 +167,7 @@ async def _virtual_files_in_scope(requested_path: str, user_id: str) -> list[str
 async def _present_virtual_file(client_path: str, user_id: str) -> bool:
     """Whether ``client_path`` is a virtual file the user has."""
     route = _virtual_file(client_path)
-    if route is None:
+    if route is None or is_holder(user_id):
         return False
     try:
         return client_path.rsplit("/", 1)[-1] in await route.names(user_id)
@@ -181,15 +176,6 @@ async def _present_virtual_file(client_path: str, user_id: str) -> bool:
         logger.exception("virtual file listing failed", extra={"path": logged_path(client_path)})
         return True
 
-
-# Derived from shared constants (source of truth: ptc_agent.core.paths)
-_SYSTEM_DIR_PREFIXES = tuple(f"{d}/" for d in sorted(AGENT_SYSTEM_DIRS))
-_HIDDEN_DIR_PREFIXES = tuple(f"{d}/" for d in sorted(HIDDEN_DIR_NAMES))
-_ALWAYS_HIDDEN_SEGMENTS = ALWAYS_HIDDEN_PATH_SEGMENTS
-_ALWAYS_HIDDEN_BASENAMES = _SHARED_BASENAMES + (".file_sync_marker",)
-_ALWAYS_HIDDEN_SUFFIXES = ALWAYS_HIDDEN_SUFFIXES
-
-_ALWAYS_HIDDEN_DIR_SEGMENTS = tuple(f"/{d}/" for d in ALWAYS_HIDDEN_DIR_NAMES)
 
 # Generous but bounded defaults.
 DEFAULT_READ_LIMIT_LINES = 20_000
@@ -201,32 +187,10 @@ DEFAULT_READ_LIMIT_LINES = 20_000
 # whichever is tighter, so an upload is never accepted only to be dropped.
 MAX_UPLOAD_BYTES = RELAY_MAX_BYTES
 
-_FILES_HELD_AT_ONCE = 8
-_held_budgets: dict[asyncio.AbstractEventLoop, ByteBudget] = {}
 # A streamed download holds about one ranged read at a time, but it holds it
 # for as long as its client takes to read, so it is bounded by count.
 _STREAMS_AT_ONCE = 16
 _stream_budgets: dict[asyncio.AbstractEventLoop, ByteBudget] = {}
-
-
-def held_bytes_budget() -> ByteBudget:
-    """This worker's allowance for whole files held in memory at once.
-
-    Upload bodies are read whole before they reach the sandbox, and nothing
-    else bounds how many a worker holds at once.
-
-    Memory is the one thing a worker owns alone, so the bound is per process
-    by design. Keyed by loop because an asyncio primitive belongs to the loop
-    that first waits on it.
-    """
-    loop = asyncio.get_running_loop()
-    budget = _held_budgets.get(loop)
-    if budget is None:
-        _held_budgets.clear()
-        budget = _held_budgets[loop] = ByteBudget(
-            INPROCESS_MAX_INFLIGHT_BYTES, _FILES_HELD_AT_ONCE
-        )
-    return budget
 
 
 def streamed_download_budget() -> ByteBudget:
@@ -351,98 +315,85 @@ async def folder_unmoved(workspace_id: str, dir_name: str | None) -> bool:
     return current == dir_name and (not current or is_top_level(current))
 
 
-def _to_client_path(
-    sandbox: Any, absolute_path: str, work_dir: str | None = None
-) -> str:
-    """Convert an absolute sandbox path into a virtual client path.
-
-    The CLI and web UX prefer paths like "work/task/foo.txt" (no leading slash),
-    while still preserving true absolute /tmp paths. *work_dir* is the workspace
-    folder the route serves: a client path is relative to that folder, not to
-    the computer root the sandbox handle folds against.
-    """
-
-    if work_dir and absolute_path.startswith(f"{work_dir.rstrip('/')}/"):
-        return absolute_path[len(work_dir.rstrip("/")) + 1:]
-
-    virtual_path = sandbox.virtualize_path(absolute_path)
-
-    # Keep /tmp paths absolute.
-    if virtual_path.startswith("/tmp/"):
-        return virtual_path
-
-    # Strip the leading slash for working-directory paths.
-    if virtual_path.startswith("/"):
-        return virtual_path[1:]
-
-    return virtual_path
-
-
 def _is_system_path(client_path: str) -> bool:
     # Virtual DB-backed files live under .agents/ but are first-class
     # user data, so never hide them from the file panel.
     if _virtual_file(client_path) or _is_virtual_dir(client_path):
         return False
-    return any(client_path.startswith(prefix) for prefix in _SYSTEM_DIR_PREFIXES)
+    return any(client_path.startswith(prefix) for prefix in SYSTEM_DIR_PREFIXES)
 
 
-def _is_hidden_path(client_path: str) -> bool:
-    if client_path == SandboxLayout.INTERNAL_DIR:
-        return True
-    return any(client_path.startswith(prefix) for prefix in _HIDDEN_DIR_PREFIXES)
+class RoutePaths:
+    """One request's paths in a workspace's folder, built from the row its
+    access was checked against. A file route takes every path it serves
+    through here, as the client asked it and as it resolved on the sandbox,
+    and one the caller may not see (a private thread's folder in a shared
+    workspace, ``ThreadFolderGate``) answers as a missing file, so no route
+    serves it by judging one spelling and forgetting the other."""
 
+    def __init__(self, workspace: Mapping[str, Any], gate: ThreadFolderGate) -> None:
+        self.workspace = workspace
+        self._gate = gate
 
-def _is_always_hidden_path(client_path: str) -> bool:
-    normalized = f"/{client_path.lstrip('/')}"
+    @classmethod
+    def of(cls, workspace: Mapping[str, Any], caller: str) -> RoutePaths:
+        return cls(workspace, ThreadFolderGate.of(workspace, caller))
 
-    # A transfer's partial or staged file, whose bytes are not yet the file
-    # they will become; one a user edits or removes fails the transfer.
-    if normalized.rfind("/") == 0 and normalized[1:].startswith(TRANSIENT_ROOT_PREFIX):
-        return True
+    def at(self, workspace: Mapping[str, Any]) -> RoutePaths:
+        """The same request against the row an acquisition left, whose folder
+        may have moved."""
+        return RoutePaths(workspace, self._gate)
 
-    if normalized.endswith(_ALWAYS_HIDDEN_BASENAMES):
-        return True
+    @cached_property
+    def layout(self) -> Any:
+        return owner_layout(self.workspace)
 
-    if normalized.endswith(_ALWAYS_HIDDEN_SUFFIXES):
-        return True
+    @cached_property
+    def work_dir(self) -> str:
+        return owner_work_dir(self.workspace)
 
-    if any(seg in normalized for seg in _ALWAYS_HIDDEN_SEGMENTS):
-        return True
+    @cached_property
+    def previous_dirs(self) -> tuple[str, ...]:
+        return previous_dir_names_of(self.workspace)
 
-    if any(seg in normalized for seg in _ALWAYS_HIDDEN_DIR_SEGMENTS):
-        return True
+    def asked(self, path: str) -> str:
+        """``path`` folded into the folder, not yet judged."""
+        return normalize_requested_path(path, self.work_dir, self.previous_dirs)
 
-    return False
+    async def requested(self, path: str) -> str:
+        """``path`` folded into the folder, as the client asked it."""
+        asked = self.asked(path)
+        await self.refuse(asked)
+        return asked
 
+    async def resolved(self, sandbox: Any, canonical: str, *, detail: str = "File not found") -> str:
+        """The client path of ``canonical``, where a symlink led."""
+        client_path = to_client_path(sandbox, canonical, self.work_dir)
+        await self.refuse(client_path, detail=detail)
+        return client_path
 
-def _is_serve_blocked_path(client_path: str) -> bool:
-    """True if a path must never be served by the file-serving core.
+    async def served(self, sandbox: Any, canonical: str) -> str:
+        """:meth:`resolved`, for a file a route sends: one always hidden is
+        missing too."""
+        client_path = to_client_path(sandbox, canonical, self.work_dir)
+        if is_always_hidden_path(client_path):
+            raise HTTPException(status_code=404, detail="File not found")
+        await self.refuse(client_path)
+        return client_path
 
-    Mirrors the hidden/system/always-hidden gate the read/download/list
-    endpoints apply, so the grant-gated wsfiles route and the public share
-    serve route never expose agent-infrastructure dirs (``.agents``, ``tools``,
-    ``mcp_servers``, ``_internal``, ...) that those endpoints deliberately hide.
+    async def refuse(self, *paths: str, detail: str = "File not found") -> None:
+        await self._gate.refuse(*paths, detail=detail)
 
-    Stricter than the panel: it skips ``_is_system_path``'s carve-out for the
-    user's profile, automation and subagent files. Their owner reads them through the
-    file routes, never this core, and the file mount links them into every
-    workspace folder, so only containment would stand between a share link and
-    the user's holdings.
-    """
-    return (
-        _is_always_hidden_path(client_path)
-        or _is_hidden_path(client_path)
-        or client_path.startswith(_SYSTEM_DIR_PREFIXES)
-    )
+    async def hidden(self, paths: Iterable[str]) -> set[str]:
+        return await self._gate.hidden(paths)
+
+    async def visible(self, paths: list[str]) -> list[str]:
+        return await self._gate.keep(paths)
 
 
 def work_dir_for(workspace: dict[str, Any], *, manager: Any = None) -> str:
     """The serve root as a path, for the routes that only need the string."""
     return layout_for(workspace, manager=manager).workspace
-
-
-def owner_work_dir(workspace: dict[str, Any], *, manager: Any = None) -> str:
-    return owner_layout(workspace, manager=manager).workspace
 
 
 def previous_roots_of(workspace: Mapping[str, Any] | None) -> tuple[str, ...]:
@@ -475,18 +426,7 @@ def _requested_system_ok(
         return False
     return any(
         normalized == prefix.rstrip("/") or normalized.startswith(prefix)
-        for prefix in _SYSTEM_DIR_PREFIXES
-    )
-
-
-def _is_text_content_type(content_type: str) -> bool:
-    """True for content types whose bytes should be redacted / theme-injected."""
-    ct = content_type.split(";", 1)[0].strip().lower()
-    return (
-        ct.startswith("text/")
-        or ct in ("application/json", "application/xml", "image/svg+xml")
-        or ct.endswith("+json")
-        or ct.endswith("+xml")
+        for prefix in SYSTEM_DIR_PREFIXES
     )
 
 
@@ -540,10 +480,91 @@ def may_be_utf8(head: bytes, *, whole: bool) -> bool:
     return True
 
 
-def _is_utf8(data: bytes) -> bool:
-    """True when bytes decode cleanly as UTF-8 (i.e. text, whatever the MIME)."""
-    try:
-        data.decode("utf-8")
-    except UnicodeDecodeError:
-        return False
-    return True
+def _build_download_response(
+    content: bytes,
+    filename: str,
+    mime: str,
+    request: Request,
+    disposition: str = "inline",
+    etag: str | None = None,
+) -> Response:
+    """A download the browser revalidates on every read.
+
+    The agent rewrites a file in place (a chart re-rendered at the same path),
+    so a max-age would hand a later read the bytes it replaced; the ETag keeps
+    an unchanged file to a bodiless 304. ``etag`` is the file's version when
+    the bytes go as the file holds them; anything else is told by its bytes.
+    """
+    etag = etag or hashlib.md5(content).hexdigest()
+    headers: dict[str, str] = {
+        "Content-Disposition": content_disposition(filename, disposition=disposition),
+        "ETag": f'"{etag}"',
+        "Cache-Control": "private, no-cache",
+    }
+
+    # Return 304 if client already has this version
+    if_none_match = request.headers.get("if-none-match")
+    if if_none_match and if_none_match.strip('" ') == etag:
+        return Response(status_code=304, headers=headers)
+
+    return Response(content=content, media_type=mime, headers=headers)
+
+
+# The most one ranged answer carries, so a range of any width holds a bounded
+# slice in memory and a client loops on a short answer. It also bounds a live
+# slice's exec output, so it must not pass EXEC_READ_MAX_BYTES, the most one
+# exec read may carry.
+RANGE_MAX_BYTES = 8 * 1024 * 1024
+
+
+def _range_length(first: int, last: int) -> int:
+    """The most a range is answered with; the file's end can cut it shorter."""
+    return min(last - first + 1, RANGE_MAX_BYTES)
+
+
+def _starts_as_text(head: bytes, size: int) -> bool:
+    """Whether a file whose first bytes are ``head`` might be text, which goes
+    whole so that it is redacted like any other text answer."""
+    return may_be_utf8(head, whole=len(head) >= size)
+
+
+def _range_response(
+    content: bytes,
+    first: int,
+    size: int,
+    etag: str,
+    filename: str,
+    mime: str,
+    disposition: str,
+) -> Response:
+    """A 206 carrying ``content`` from byte ``first`` of a binary file.
+
+    Unredacted, like a streamed download and the signed link: redaction needs
+    the whole body, so only a file whose type and first bytes already rule out
+    text takes a range, and its whole answer would not be redacted either.
+    """
+    return Response(
+        content=content,
+        status_code=206,
+        media_type=mime,
+        headers={
+            "Content-Range": f"bytes {first}-{first + len(content) - 1}/{size}",
+            "Accept-Ranges": "bytes",
+            "ETag": f'"{etag}"',
+            # The reader holds what it fetched. A slice the browser stored would
+            # only be revalidated against a route that answers every range anew.
+            # Each slice is held to the first's exact ETag; re-encoding weakens it.
+            "Cache-Control": "private, no-store, no-transform",
+            "Content-Disposition": content_disposition(
+                filename, disposition=disposition
+            ),
+        },
+    )
+
+
+def _unsatisfiable(size: int) -> HTTPException:
+    return HTTPException(
+        status_code=416,
+        detail="Requested range not satisfiable",
+        headers={"Content-Range": f"bytes */{size}"},
+    )

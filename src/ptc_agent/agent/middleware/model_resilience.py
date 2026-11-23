@@ -39,6 +39,7 @@ from langchain.agents.middleware.types import (
 from langchain_core.messages import AIMessage, AnyMessage
 from langgraph.types import Command
 
+from ptc_agent.agent.middleware._utils import run_ids
 from ptc_agent.agent.middleware.thinking_binding import (
     UNSENT_THINKING_KEY,
     UnsentThinkingState,
@@ -47,15 +48,28 @@ from ptc_agent.agent.middleware.thinking_binding import (
 )
 
 from src.llms.error_classification import (
+    UnfinishedReplyError,
     extract_status_code,
     is_context_overflow,
     is_mid_stream_error,
     is_retryable_error,
     is_stalled_stream,
+    refuses_input,
 )
-from src.llms.input_transformations import INPUT_TRANSFORMATIONS, REPEATED, thinking_drops
+from src.llms.provider_errors import is_terminal_refusal
+from src.llms.input_transformations import (
+    BY_DESIGN_DROPS,
+    INPUT_TRANSFORMATIONS,
+    REPEATED,
+    thinking_drops,
+)
+from src.llms.model_identity import CATALOG_MODEL_KEY, api_model_id, catalog_model
 from src.llms.provider_compaction import is_compaction_request
-from src.llms.reasoning_payload import strip_all_reasoning
+from src.llms.reasoning_payload import (
+    is_unfinished_reply,
+    strip_all_reasoning,
+    strip_reasoning_references,
+)
 from src.observability.langsmith_run import stamp_run
 
 if TYPE_CHECKING:
@@ -76,10 +90,23 @@ _ERROR_SUMMARY_MAX_CHARS = 300
 FALLBACK_KEY = "model_fallback"
 
 _as_sent: ContextVar[bool] = ContextVar("model_resilience_as_sent", default=False)
+_fallback: ContextVar[bool] = ContextVar("model_resilience_fallback", default=False)
 
-#: Drop reasons that follow the thread rather than an edit of ours: a model
-#: switch, or a thread moved between accounts.
-_BY_DESIGN_DROPS = frozenset({"model_binding_mismatch", "organization_binding_mismatch"})
+
+def answering_as_fallback() -> bool:
+    """Whether the model call in progress is a fallback answering for the
+    primary, whose state the thread goes back to: what the primary's
+    reasoning is bound to stays as it was (``SystemPinMiddleware``)."""
+    return _fallback.get()
+
+
+@contextmanager
+def _answering(index: int) -> Iterator[None]:
+    token = _fallback.set(index > 0)
+    try:
+        yield
+    finally:
+        _fallback.reset(token)
 
 _STRIP_ERROR_MAX_CHARS = 1000
 
@@ -102,15 +129,6 @@ def _last_message_id(request: ModelRequest) -> str | None:
     state = getattr(request, "state", None)
     messages = state.get("messages") if isinstance(state, dict) else None
     return getattr(messages[-1], "id", None) if messages else None
-
-
-def _thread_id() -> str | None:
-    try:
-        from langgraph.config import get_config
-
-        return (get_config().get("configurable") or {}).get("thread_id")
-    except Exception:
-        return None
 
 
 def _stripped_ids(sent: list[AnyMessage], stripped: list[AnyMessage]) -> list[str]:
@@ -148,14 +166,24 @@ def _report_drops(response: ModelResponse, model: str, sent: list[AnyMessage]) -
         counts = thinking_drops(message, earlier)
         if not counts:
             continue
-        log = logger.info if set(counts) <= _BY_DESIGN_DROPS | {REPEATED} else logger.warning
+        log = logger.info if set(counts) <= BY_DESIGN_DROPS | {REPEATED} else logger.warning
+        thread_id, agent = run_ids()
         log(
             "[ModelResilience] earlier thinking dropped by the provider",
             model=model,
-            thread_id=_thread_id(),
+            thread_id=thread_id,
+            agent=agent,
             **counts,
         )
         stamp_run(thinking_dropped=counts)
+
+
+def _refuse_unfinished(response: Any) -> None:
+    """Raise for an answer whose stream ended before its response did, so the
+    loop retries it rather than the thread keeping it (``is_unfinished_reply``)."""
+    result = getattr(getattr(response, "model_response", response), "result", None)
+    if any(is_unfinished_reply(message) for message in result or ()):
+        raise UnfinishedReplyError("the stream ended before the response completed")
 
 
 def _summarize_error(exc: BaseException) -> str:
@@ -175,22 +203,10 @@ class _Recovery:
     request: ModelRequest | None = None
 
 
-def _model_display_name(model: Any) -> str:
-    for attr in ("model", "model_name", "model_id"):
-        value = getattr(model, attr, None)
-        if isinstance(value, str) and value:
-            return value
-    return type(model).__name__
-
-
-# The ``billing_type`` of a call the user's own credential pays for.
-_OWN_BILLING = frozenset({"byok", "oauth"})
-
-
 def _stamped(model: Any, key: str) -> str | None:
-    """A fact ``LLM.get_llm()`` stamped in a client's metadata: its models.json
-    name (``manifest_model``), the namespace fallback names are in, or who
-    pays (``billing_type``). None for an unstamped client."""
+    """A fact ``LLM.get_llm()`` stamped in a client's metadata: the namespace
+    fallback names are in, or who pays (``billing_type``). None for an
+    unstamped client."""
     metadata = getattr(model, "metadata", None)
     value = metadata.get(key) if isinstance(metadata, dict) else None
     return value if isinstance(value, str) and value else None
@@ -203,11 +219,10 @@ def _window(model: Any) -> int | None:
     return window if isinstance(window, int) and window > 0 else None
 
 
-def _mark_fallback(response: ModelResponse, name: str) -> ModelResponse:
+def _mark(response: ModelResponse, marks: dict[str, str]) -> None:
     for msg in getattr(response, "result", None) or ():
         if isinstance(msg, AIMessage):
-            msg.response_metadata = {**(msg.response_metadata or {}), FALLBACK_KEY: name}
-    return response
+            msg.response_metadata = {**(msg.response_metadata or {}), **marks}
 
 
 def _distinct(fallbacks: list[tuple[str, Any]], primary: str | None) -> list[tuple[str, Any]]:
@@ -239,7 +254,7 @@ def build_fallback_pairs(config: Any) -> list[tuple[str, Any]]:
         names = getattr(config, "fallback_llm_names", None)
         if names and len(names) == len(clients):
             return list(zip(names, clients))
-        return [(_model_display_name(client), client) for client in clients]
+        return [(api_model_id(client) or type(client).__name__, client) for client in clients]
 
     fallback_names = getattr(config.llm, "fallback", None) or []
     if not fallback_names:
@@ -288,7 +303,6 @@ class ModelResilienceMiddleware(AgentMiddleware):
         max_delay: float = 60.0,
         jitter: bool = True,
         compacts_overflow: bool = False,
-        users_fallbacks: bool = False,
     ) -> None:
         super().__init__()
         self.primary_name = primary_name
@@ -296,8 +310,6 @@ class ModelResilienceMiddleware(AgentMiddleware):
         # Repeats only; the model a request targets is dropped per request,
         # as the instance is shared into subagents on other models.
         self.fallbacks = _distinct(list(fallbacks or []), None)
-        # Whether the fallbacks are a list the user saved (see _on_its_payer).
-        self.users_fallbacks = users_fallbacks
         self.max_retries = max_retries
         self.backoff_factor = backoff_factor
         self.initial_delay = initial_delay
@@ -312,15 +324,21 @@ class ModelResilienceMiddleware(AgentMiddleware):
     # ------------------------------------------------------------------
     # Helpers
 
+    def _catalog_name(self, request: ModelRequest) -> str | None:
+        """The catalog name of the model ``request`` targets, None for an
+        unstamped client. The instance is shared into subagent stacks, so the
+        configured name is claimed only for a request on the primary client;
+        a subagent's own client names itself."""
+        if self.primary_client is None or request.model is self.primary_client:
+            return self.primary_name
+        return catalog_model(request.model)
+
     def _primary_display_name(self, request: ModelRequest) -> str:
-        # The instance is shared into subagent stacks where request.model is a
-        # subagent-specific client — only claim the configured name when the
-        # request actually targets the primary client.
-        if self.primary_client is not None and request.model is self.primary_client:
-            return self.primary_name
-        if self.primary_client is None:
-            return self.primary_name
-        return _model_display_name(request.model)
+        return (
+            self._catalog_name(request)
+            or api_model_id(request.model)
+            or type(request.model).__name__
+        )
 
     def _calculate_delay(self, retry_number: int) -> float:
         # Local copy of langchain.agents.middleware._retry.calculate_delay
@@ -499,35 +517,49 @@ class ModelResilienceMiddleware(AgentMiddleware):
         # has a summarizer of its own to fall back to.
         if is_compaction_request(request.model_settings) or _as_sent.get():
             return [primary]
-        if self.primary_client is None or request.model is self.primary_client:
-            target = self.primary_name
-        else:
-            # A subagent on its own model, which may be one of the fallbacks.
-            target = _stamped(request.model, "manifest_model")
+        # A subagent on its own model may be one of the fallbacks.
+        target = self._catalog_name(request)
         return [primary, *self._on_its_payer(request.model, _distinct(self.fallbacks, target))]
 
     def _on_its_payer(
         self, model: Any, fallbacks: list[tuple[str, Any]]
     ) -> list[tuple[str, Any]]:
-        """A call the user's own key or subscription pays for moves onto the
-        platform's key only through fallbacks the user saved.
+        """A call falls back only onto a model the same party pays for, and a
+        call a subscription pays for falls back nowhere.
 
-        The turn's fallbacks were built for the main model, so on a turn the
-        platform pays for they may run on its key; a subagent on a model of the
-        user's own would otherwise fail over onto credits.
+        The user's own key moves to another of their keys, our credits to
+        another model on credits, never across, whoever saved the list: who
+        pays for a turn stays what the user chose. The turn's list was built
+        for the main model, so a subagent on another payer's model filters it
+        too. A subscription (a ChatGPT, Claude or Grok sign-in, or Claude Code)
+        answers for itself: its limit or outage ends the call with its own
+        card, and the user picks the next model, as Claude Code's plan limit
+        always has.
         """
-        if self.users_fallbacks or _stamped(model, "billing_type") not in _OWN_BILLING:
+        billing = _stamped(model, "billing_type")
+        if billing == "oauth":
+            return []
+        if billing is None:
             return fallbacks
         return [(name, client) for name, client in fallbacks
-                if _stamped(client, "billing_type") != "platform"]
+                if _stamped(client, "billing_type") == billing]
 
     def _classify(self, exc: Exception) -> tuple[int | None, bool]:
         status = extract_status_code(exc)
-        return status, is_retryable_error(exc, status)
+        # A used-up plan or balance arrives as a 429 like any burst limit, but
+        # no retry in the next seconds gets past it: move on to the fallback.
+        return status, not is_terminal_refusal(exc) and is_retryable_error(exc, status)
 
     @staticmethod
-    def _escalate_reasoning(request: ModelRequest) -> ModelRequest | None:
+    def _escalate_reasoning(
+        request: ModelRequest, *, references_only: bool = False
+    ) -> ModelRequest | None:
         """Rebuild the request without any reasoning payload.
+
+        ``references_only`` answers a server that could not find an item the
+        input names: only reasoning sent by id alone can be missing, so that is
+        all it strips, and the rest of the history keeps its reasoning. With no
+        such item it strips everything, as for a 400.
 
         ``None`` when there is nothing to strip, so the caller never spends a
         call re-sending an identical request. Retrying in place is safe: a
@@ -542,7 +574,11 @@ class ModelResilienceMiddleware(AgentMiddleware):
         ``thinking.budget_tokens`` succeeds once thinking is off, turning a
         surfaced error into a silently thinking-free answer.
         """
-        messages = strip_all_reasoning(request.messages)
+        messages = request.messages
+        if references_only:
+            messages = strip_reasoning_references(messages)
+        if messages is request.messages:
+            messages = strip_all_reasoning(messages)
         if messages is request.messages:
             return None
         return request.override(messages=messages)
@@ -555,11 +591,14 @@ class ModelResilienceMiddleware(AgentMiddleware):
         ``None`` means give up on this candidate. A reasoning-payload 400 is the
         one non-retryable status worth another call: the provider rejected the
         history's reasoning blocks, and the same request without them can
-        succeed. Detected structurally, a 400 plus "we did send reasoning",
-        rather than by matching provider error prose, which drifts between API
-        versions and fails silently when it does. The cost is one wasted call
-        when an unrelated 400 coincides with reasoning in history, on a turn that
-        is already failing anyway.
+        succeed. So is a 404 naming the request's ``input``, an item there the
+        server does not hold, which strips only the reasoning sent by id.
+        Detected structurally, the status plus "we did send reasoning", rather
+        than by matching provider error prose, which drifts between API versions
+        and fails silently when it does. The cost is
+        one wasted call when an unrelated refusal coincides with reasoning in
+        history, on a turn that is already failing anyway. An answer the strip
+        bought is remembered for the thread, so the next call skips the wasted one.
 
         A mid-stream failure is excluded because that repair cannot apply to it.
         Stripping reasoning answers a request rejected during validation, before
@@ -573,7 +612,9 @@ class ModelResilienceMiddleware(AgentMiddleware):
         full count, whether or not its first chunk had arrived: each attempt
         waits out the whole bound before failing, so the full count held one
         candidate for most of an hour before its fallback, and stalls seen in
-        prod repeated at the same point on every attempt.
+        prod repeated at the same point on every attempt. A stream the server
+        closed before its response finished gets one too: a cut that repeats on
+        a fresh connection is the server's limit, and each attempt is billed.
 
         A context overflow gets nothing, with compaction or without: the same
         request is over the window on every attempt, with or without its
@@ -584,43 +625,54 @@ class ModelResilienceMiddleware(AgentMiddleware):
         status, retryable = self._classify(exc)
         if is_context_overflow(exc):
             return status, None
-        if retryable and is_stalled_stream(exc) and attempts > 1:
+        if retryable and attempts > 1 and (
+            is_stalled_stream(exc) or isinstance(exc, UnfinishedReplyError)
+        ):
             retryable = False
         if retryable and attempts <= self.max_retries:
             return status, _Recovery(delay=self._calculate_delay(attempts - 1))
+        missing_item = status == 404 and refuses_input(exc)
         if (
             not escalated
-            and status == 400
+            and (status == 400 or missing_item)
             and not is_mid_stream_error(exc)
+            # A 400 that names the account (Anthropic's low credit balance,
+            # DashScope's overdue account) refuses the stripped request too.
+            and not is_terminal_refusal(exc)
             and not _as_sent.get()
         ):
-            stripped = self._escalate_reasoning(req)
+            stripped = self._escalate_reasoning(req, references_only=missing_item)
             if stripped is not None:
                 logger.warning(
-                    "[ModelResilience] retrying without reasoning after a 400",
-                    model=_model_display_name(req.model),
-                    thread_id=_thread_id(),
+                    "[ModelResilience] retrying without reasoning after a refused request",
+                    status=status,
+                    model=api_model_id(req.model) or type(req.model).__name__,
+                    thread_id=run_ids()[0],
                     error=(str(exc) or type(exc).__name__)[:_STRIP_ERROR_MAX_CHARS],
                 )
                 return status, _Recovery(request=stripped)
         return status, None
 
-    @staticmethod
     def _answered(
+        self,
         response: ModelResponse,
         name: str,
         index: int,
         request: ModelRequest,
         stripped: list[str],
     ) -> ModelCallResult:
-        """The answer, with the strip it took kept for the thread's later
-        requests (``UnsentThinkingState``). Only the request's own model
-        keeps one: a fallback refusing another model's reasoning says nothing
-        about what the primary reads."""
+        """The answer, stamped with the model that wrote it, and with the
+        strip it took kept for the thread's later requests
+        (``UnsentThinkingState``). Only the request's own model keeps one: a
+        fallback refusing another model's reasoning says nothing about what
+        the primary reads."""
         _report_drops(response, name, request.messages)
-        if index:
-            return _mark_fallback(response, name)
-        if not stripped:
+        marks = {FALLBACK_KEY: name} if index else {}
+        catalog = name if index else self._catalog_name(request)
+        if catalog:
+            marks[CATALOG_MODEL_KEY] = catalog
+        _mark(response, marks)
+        if index or not stripped:
             return response
         return ExtendedModelResponse(
             model_response=response, command=Command(update={UNSENT_THINKING_KEY: set(stripped)})
@@ -654,7 +706,9 @@ class ModelResilienceMiddleware(AgentMiddleware):
             while True:
                 attempts += 1
                 try:
-                    response = handler(req)
+                    with _answering(index):
+                        response = handler(req)
+                    _refuse_unfinished(response)
                     return self._answered(response, name, index, request, stripped)
                 except Exception as exc:
                     status, recovery = self._decide(
@@ -711,7 +765,9 @@ class ModelResilienceMiddleware(AgentMiddleware):
             while True:
                 attempts += 1
                 try:
-                    response = await handler(req)
+                    with _answering(index):
+                        response = await handler(req)
+                    _refuse_unfinished(response)
                     return self._answered(response, name, index, request, stripped)
                 except Exception as exc:
                     status, recovery = self._decide(

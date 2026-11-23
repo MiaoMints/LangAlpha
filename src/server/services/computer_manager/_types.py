@@ -11,6 +11,7 @@ from typing import TYPE_CHECKING, Any, Dict, Mapping, Optional, Set, Tuple
 
 from ptc_agent.core.mcp_composite import builtin_registry_of
 from ptc_agent.core.mcp_registry import get_global_registry
+from ptc_agent.core.sandbox.browser_runtime.protocol import Choices
 from ptc_agent.core.sandbox.providers import provider_class
 from ptc_agent.core.sandbox.runtime import SandboxProvider
 from ptc_agent.core.session import Session
@@ -38,11 +39,13 @@ This is a starter template. Replace these comments with real content
 as you work. The system prompt has full guidelines on what to maintain.
 -->
 
-## Thread Index
+## Purpose
 
-## Key Findings
+## Reusable
 
-## File Index
+## Open
+
+## Deliverables
 """
 
 
@@ -89,7 +92,9 @@ class ComputerBinding:
     machine row has to supply it. files_epoch names the last arrival of the
     project's files on this machine, a move or a settled restore offer, None if
     none has come. files_backup is the machine's switch for routine backups,
-    off only where its owner chose."""
+    off only where its owner chose. browser is what its owner chose for its
+    browser, None where the binding was made without the row, which hands
+    nothing."""
 
     workspace_id: str
     computer_id: str
@@ -102,6 +107,9 @@ class ComputerBinding:
     provider_config: Optional[Dict[str, Any]] = None
     files_epoch: Optional[str] = None
     files_backup: bool = True
+    #: The machine's owner, whose policy decides whether work runs on it.
+    user_id: Optional[str] = None
+    browser: Optional[Choices] = None
 
     @property
     def provider_identity(self) -> Tuple[str, str]:
@@ -170,6 +178,9 @@ class WorkspaceToolView:
     # whose tools no snapshot or grant lets bind still has the settings the
     # rule describes.
     trading_rule: Optional["TradingRule"] = None
+    #: The organization's connector list this view was resolved from
+    #: (``ResolvedMCP.org_digest``); "" when it lists none.
+    org_digest: str = ""
     built_at: float = field(default_factory=time.monotonic)
 
     @classmethod

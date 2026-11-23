@@ -1,7 +1,7 @@
 import { useState, useCallback, useId } from 'react';
 import { useNavigate } from 'react-router';
 import { useTranslation } from 'react-i18next';
-import { Ticket, Key, Monitor, ChevronDown, ChevronRight, ChevronUp, CheckCircle2 } from 'lucide-react';
+import { Ticket, Key, Monitor, ChevronDown, ChevronRight, ChevronUp } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { WizardStepHeader } from '@/components/ui/wizard';
 import { SetupFooter } from '../SetupFooter';
@@ -18,7 +18,11 @@ import { BrandMark } from '@/pages/ChatAgent/components/mcp/BrandMark';
 import { llmProviderArt } from '@/lib/brandArt';
 import { SUBSCRIPTIONS } from '@/api/oauth';
 import type { AccessType } from '@/components/model/types';
+import type { AccountPolicy } from '@/types/api';
 import { isPlatformMode } from '@/config/hostMode';
+import { useAccount } from '@/hooks/useAccount';
+import { methodAllowed } from '@/lib/accountRules';
+import { OwnAccessNote } from '@/components/organization/OwnAccessNote';
 
 // ---------------------------------------------------------------------------
 // Ways to connect
@@ -77,13 +81,7 @@ function ConnectedSummary({
   const marks = [...new Map(providers.map((p) => [markOf(p)?.src ?? p.provider, p])).values()].slice(0, 6);
 
   return (
-    <div
-      className="rounded-lg overflow-hidden"
-      style={{
-        background: 'var(--color-bg-card)',
-        border: '1px solid var(--color-border-muted)',
-      }}
-    >
+    <div className="shell-box overflow-hidden">
       <button
         type="button"
         onClick={() => setExpanded((v) => !v)}
@@ -150,6 +148,11 @@ function ConnectedSummary({
   );
 }
 
+/** The ways to connect no rule keeps off. */
+function allowedMethods(policy: AccountPolicy | null) {
+  return METHODS.filter((m) => methodAllowed(policy, m.id));
+}
+
 // ---------------------------------------------------------------------------
 // MethodStep
 // ---------------------------------------------------------------------------
@@ -167,6 +170,9 @@ export default function MethodStep() {
   const [removing, setRemoving] = useState<ConfiguredProvider | null>(null);
 
   const headingId = useId();
+  // Ways a rule keeps off are not offered; `OwnAccessNote` says who keeps
+  // them off.
+  const { policy } = useAccount();
 
   // Invitation code state
   const [showInvitation, setShowInvitation] = useState(false);
@@ -251,32 +257,14 @@ export default function MethodStep() {
         <RemoveAccessDialog provider={removing} name={removing.display_name} onClose={() => setRemoving(null)} />
       )}
 
-      {/* Invitation-redeemed note (when no other providers configured); the
-          way on from it is the footer's skip */}
-      {!userLoading && hasPlatformAccess && !hasConfigured && (
-        <div
-          className="flex items-center gap-2 rounded-lg p-4"
-          style={{
-            background: 'var(--color-bg-card)',
-            border: '1px solid var(--color-border-muted)',
-          }}
-        >
-          <CheckCircle2 className="h-4 w-4 shrink-0" style={{ color: 'var(--color-success)' }} />
-          <span className="text-sm" style={{ color: 'var(--color-text-primary)' }}>
-            {t('setup.invitationRedeemed')}
-          </span>
-        </div>
-      )}
-
       {/* Each way goes straight on, as the rows in Settings do. */}
       <ul aria-labelledby={headingId} className="flex flex-col gap-2">
-        {METHODS.map((method) => (
+        {allowedMethods(policy).map((method) => (
           <li key={method.id}>
             <button
               type="button"
               onClick={() => choose(method.id)}
-              className="flex w-full items-center gap-3 rounded-lg px-4 py-3.5 text-left transition-colors hover:bg-(--color-bg-hover)"
-              style={{ background: 'var(--color-bg-card)', border: '1px solid var(--color-border-muted)' }}
+              className="shell-box flex w-full items-center gap-3 px-4 py-3.5 text-left transition-colors"
             >
               <span className="flex w-12 shrink-0 justify-center"><MethodMark method={method.id} /></span>
               <span className="flex min-w-0 flex-1 flex-col gap-0.5">
@@ -288,6 +276,8 @@ export default function MethodStep() {
           </li>
         ))}
       </ul>
+
+      <OwnAccessNote variant="setup" />
 
       {/* Invitation code section — hide only when user already has platform access */}
       {(userLoading || !hasPlatformAccess) && (
@@ -302,13 +292,7 @@ export default function MethodStep() {
               {t('setup.invitationCodeLink')}
             </button>
           ) : (
-            <div
-              className="flex flex-col gap-3 rounded-lg p-4"
-              style={{
-                background: 'var(--color-bg-card)',
-                border: '1px solid var(--color-border-muted)',
-              }}
-            >
+            <div className="shell-box flex flex-col gap-3 p-4">
               <label
                 className="text-sm font-medium"
                 style={{ color: 'var(--color-text-primary)' }}

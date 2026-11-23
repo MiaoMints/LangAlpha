@@ -37,8 +37,9 @@ from ptc_agent.agent.middleware.skills.registry import (
 from ptc_agent.agent.transcript import TranscriptTarget
 from ptc_agent.agent.transcript.classify import LEGACY_SUMMARY_PREFIX, is_summary_message
 from ptc_agent.agent.transcript.pointer import SummarySpan, transcript_note
+from ptc_agent.agent.transcript.sender import HARNESS_NAMED_KEY
 from src.llms.attachment_payload import FILE_BLOCK_TYPES, IMAGE_BLOCK_TYPES, block_type
-from src.llms.provider_compaction import SIDECAR_KEY, sidecar
+from src.llms.provider_compaction import SIDECAR_KEY, is_opaque, sidecar
 from ptc_agent.agent.middleware.compaction.types import (
     CONTEXT_SUMMARY_PREFIX,
     NON_CRITICAL_READ_PREFIXES,
@@ -114,7 +115,14 @@ def _extract_text_from_content(content: str | list) -> str:
 def count_tokens_tiktoken(messages: Iterable[MessageLikeRepresentation]) -> int:
     """Count tokens using tiktoken (accurate for all languages including CJK)."""
     enc = _get_tiktoken_encoder()
-    return sum(len(enc.encode(text)) + 3 for text in _sent_texts(messages))
+    return sum(len(_encoded(enc, text)) + 3 for text in _sent_texts(messages))
+
+
+def _encoded(enc: tiktoken.Encoding, text: str) -> list[int]:
+    """``text`` as tokens, a special token's spelling (``<|endoftext|>``)
+    counted as the text it is in a message: tiktoken refuses it by default,
+    which would fail the count of any thread that quotes one."""
+    return enc.encode(text, disallowed_special=())
 
 
 #: Claude's count from tiktoken's, fitted to 175 samples Claude's
@@ -146,8 +154,8 @@ def count_tokens_claude(messages: Iterable[MessageLikeRepresentation]) -> int:
     enc = _get_tiktoken_encoder()
     total = 0
     for text in _sent_texts(messages):
-        tokens = len(enc.encode(text))
-        other = sum(len(enc.encode(run)) for run in _NON_ASCII.findall(text))
+        tokens = len(_encoded(enc, text))
+        other = sum(len(_encoded(enc, run)) for run in _NON_ASCII.findall(text))
         digits = sum(map(text.count, "0123456789"))
         estimate = (
             _CLAUDE_PER_ASCII * (tokens - other)
@@ -801,20 +809,77 @@ def provider_cutoff(messages: list[AnyMessage], cutoff_index: int) -> int:
     return 0
 
 
-def turn_start_cut(messages: list[AnyMessage]) -> int:
+def _complete_step_end(messages: Sequence[AnyMessage]) -> int:
+    """Right after the newest model step in ``messages``, the human messages
+    after it aside, when that step is complete: an answer that called no tool,
+    or one whose every call has its result. 0 when it is not, or there is none.
+    """
+    i = len(messages) - 1
+    while i >= 0 and isinstance(messages[i], HumanMessage):
+        i -= 1
+    end = i + 1
+    while i >= 0 and isinstance(messages[i], ToolMessage):
+        i -= 1
+    if i < 0 or not isinstance(messages[i], AIMessage):
+        return 0
+    calls = messages[i].tool_calls
+    if not calls:
+        return end if end == i + 1 else 0
+    answered = {m.tool_call_id for m in messages[i + 1 : end]}
+    return end if all(call["id"] in answered for call in calls) else 0
+
+
+def turn_start_cut(messages: Sequence[AnyMessage], *, after_tools: bool = False) -> int:
     """Where a summary that keeps no turn ends on a turn's first call: right
     after the last answer, which called no tool, with the user's new message
     after it; 0 anywhere else. Mid-loop there is none, since a kept tool
     result needs the call it answers, and that call its thinking.
+
+    ``after_tools`` takes a complete tool group as that answer too, as a
+    turn cancelled mid-tool leaves once PatchToolCalls has answered its calls.
+    Only a run's first call may: mid-run the same shape, with a row after the
+    results, is a step whose answer is still to come. A group that steering
+    opened (its ``Task(action="resume")``) is not one: it runs before the run's
+    first call, after the user's message, which a cut there would summarize.
     """
-    for i in range(len(messages) - 1, 0, -1):
-        message = messages[i]
-        if isinstance(message, ToolMessage):
-            return 0
-        if isinstance(message, AIMessage):
-            following = messages[i + 1] if i + 1 < len(messages) else None
-            return i + 1 if not message.tool_calls and isinstance(following, HumanMessage) else 0
-    return 0
+    end = _complete_step_end(messages)
+    if not 0 < end < len(messages):
+        return 0
+    if isinstance(messages[end - 1], AIMessage):
+        return end
+    if not after_tools:
+        return 0
+    return 0 if _steered(messages, end) else end
+
+
+def step_cut(messages: Sequence[AnyMessage]) -> int:
+    """Where a summary that keeps no turn ends mid-turn: right after the
+    results of the newest step, the human messages after them aside, which
+    stay after the summary; 0 unless that step called tools and has every
+    result. Its calls and results go with the summary (see ``carry``). A
+    step steering made is not the agent's, and the user's message before it
+    must stay word for word, so it has no cut either.
+    """
+    end = _complete_step_end(messages)
+    if not end or not isinstance(messages[end - 1], ToolMessage):
+        return 0
+    return 0 if _steered(messages, end) else end
+
+
+def _steered(messages: Sequence[AnyMessage], end: int) -> bool:
+    """Whether the step ending at ``end`` is one steering opened (its
+    ``Task(action="resume")``), not one the agent's model made."""
+    step = next(m for m in reversed(messages[:end]) if isinstance(m, AIMessage))
+    return (step.additional_kwargs or {}).get("lc_source") == "steering"
+
+
+def settled_end(messages: Sequence[AnyMessage]) -> int:
+    """Where a summary of all of ``messages`` ends between turns: their end,
+    when their newest step is complete; 0 while a tool call in it has no
+    result, as after a turn cancelled mid-tool, since only the next turn's
+    start answers it.
+    """
+    return len(messages) if _complete_step_end(messages) else 0
 
 
 def strip_orphan_tool_messages(tail: list[AnyMessage]) -> list[AnyMessage]:
@@ -976,27 +1041,6 @@ _SUMMARY_SOURCE = "summarization"
 #: summarizes it: the span of turns, and the skills its note listed.
 SUMMARIZED_KEY = "summarized"
 
-#: The ``response_metadata`` key holding the summary trigger a model call ran
-#: under. The trigger is per turn (the user's or the model's compaction
-#: preset), and the checkpoint is all replay has of the turn, so it rides on
-#: the response whose usage the ring shows.
-CONTEXT_THRESHOLD_KEY = "context_threshold"
-
-
-def stamp_context_threshold(message: AIMessage, threshold: int) -> None:
-    message.response_metadata = {
-        **(message.response_metadata or {}),
-        CONTEXT_THRESHOLD_KEY: threshold,
-    }
-
-
-def context_threshold(message: Any) -> int | None:
-    """The summary trigger stamped on ``message``, or None for a message
-    saved before the stamp."""
-    value = (getattr(message, "response_metadata", None) or {}).get(CONTEXT_THRESHOLD_KEY)
-    return value if isinstance(value, int) and value > 0 else None
-
-
 #: The ``response_metadata`` key holding the summary a model call compacted
 #: to before it ran. The summary message lives only in
 #: ``_summarization_event``, which the next compaction overwrites, so each
@@ -1040,6 +1084,12 @@ def build_summary_message(
 ) -> HumanMessage:
     """Build the summary HumanMessage, pointing at the transcript when there is one.
 
+    One the server wrote (``source="server"``) names each member with the
+    harness's own tag and escapes every other word, so it is stamped as named
+    (``HARNESS_NAMED_KEY``) and a shared call sends its tags as they are;
+    a model's summary is escaped like any message no member is recorded as
+    writing.
+
     Tags with lc_source='summarization' for chain filtering, and stamps the
     emit-time ``context_window`` summarize fields into ``additional_kwargs``
     so checkpoint-sourced replay re-emits the event without the stored SSE
@@ -1061,6 +1111,7 @@ def build_summary_message(
         id=str(uuid.uuid4()),
         additional_kwargs={
             **carried,
+            **({HARNESS_NAMED_KEY: True} if source == "server" else {}),
             "lc_source": _SUMMARY_SOURCE,
             "summarize_complete": {
                 "summary_length": len(summary),
@@ -1153,6 +1204,13 @@ def handed_off(message: Any) -> bool:
     text by its model, so its text is a summary rather than a digest."""
     stamp = (getattr(message, "additional_kwargs", None) or {}).get("summarize_complete")
     return isinstance(stamp, dict) and stamp.get("handed_off") is True
+
+
+def provider_only(message: Any) -> bool:
+    """Whether ``message`` is a summary only its provider can read that its
+    model has not written out as text, so another model reads only its
+    digest."""
+    return is_opaque(message) and not handed_off(message)
 
 
 def with_summary_text(message: HumanMessage, text: str) -> HumanMessage | None:

@@ -28,7 +28,6 @@ import {
   handleHistoryTextContent,
   handleHistoryToolCalls,
   handleHistoryToolCallResult,
-  handleHistoryTodoUpdate,
   handleHistoryTaskArtifactStatus,
 } from '../ChatAgent/hooks/utils/historyEventHandlers';
 import type { PairState } from '../ChatAgent/hooks/utils/historyEventHandlers';
@@ -53,6 +52,9 @@ import { useStableHandler } from '@/hooks/useStableHandler';
 import { DispatchStatusProvider } from '../ChatAgent/hooks/usePTCDispatchStatus';
 import { useIsMobile } from '@/hooks/useIsMobile';
 import type { MessageRecord, SetMessages } from '../ChatAgent/hooks/utils/types';
+import { applyPlanSnapshot, readPlanSteps } from '@/pages/ChatAgent/session/planUpdate';
+import { eventOrder } from '@/pages/ChatAgent/session/eventOrder';
+import { threadPlans } from '../ChatAgent/components/messageList/requestPlans';
 
 
 /** The divider's bounds: a floor any tab fits, and a share of the window the thread keeps. */
@@ -68,12 +70,21 @@ const CHART_MAX_RATIO = 0.92;
  */
 interface SharedChatViewProps {
   shareToken: string;
+  /** What the replay and file routes are asked with: a member's grant, which
+   *  the page renews, or the link's own token. */
+  access?: string;
   /** Resolved by `SharePage`; the replay starts from it. */
   metadata: SharedThreadMetadata;
 }
 
-export default function SharedChatView({ shareToken, metadata }: SharedChatViewProps) {
+export default function SharedChatView({ shareToken, access = shareToken, metadata }: SharedChatViewProps) {
   const { t } = useTranslation();
+  // The latest credential, read by the loads keyed on the share itself, so a
+  // renewed grant serves the next request without replaying the thread.
+  const accessRef = useRef(access);
+  useEffect(() => {
+    accessRef.current = access;
+  }, [access]);
 
   const [messages, setMessages] = useState<MessageRecord[]>([]);
   const [loading, setLoading] = useState(true);
@@ -154,7 +165,7 @@ export default function SharedChatView({ shareToken, metadata }: SharedChatViewP
 
     (async () => {
       try {
-        await replaySharedThread(shareToken, (event: SSEEvent) => {
+        await replaySharedThread(accessRef.current, (event: SSEEvent) => {
           if (cancelled) return;
           const eventType = event.event as string | undefined;
           const contentType = event.content_type as string | undefined;
@@ -252,20 +263,14 @@ export default function SharedChatView({ shareToken, metadata }: SharedChatViewP
           // tool_call_chunks — skip
           if (eventType === 'tool_call_chunks') return;
 
-          // artifact (todo_update)
-          if (eventType === 'artifact' && event.artifact_type === 'todo_update' && hasPairIndex) {
+          // artifact (the plan)
+          const steps = eventType === 'artifact' ? readPlanSteps(event.artifact_type, event.payload) : null;
+          if (steps && hasPairIndex) {
             const pairIndex = event.turn_index as number;
             const currentAssistantMessageId = assistantMessagesByPair.get(pairIndex);
             const pairState = pairStateByPair.get(pairIndex);
             if (currentAssistantMessageId && pairState) {
-              handleHistoryTodoUpdate({
-                assistantMessageId: currentAssistantMessageId,
-                artifactType: event.artifact_type as string,
-                artifactId: event.artifact_id as string,
-                payload: (event.payload as Record<string, unknown>) || {},
-                pairState,
-                setMessages: setMessagesCompat,
-              });
+              applyPlanSnapshot(setMessagesCompat, currentAssistantMessageId, steps, eventOrder(event, () => ++pairState.contentOrderCounter));
             }
             return;
           }
@@ -378,7 +383,7 @@ export default function SharedChatView({ shareToken, metadata }: SharedChatViewP
     setFilesLoading(true);
     (async () => {
       try {
-        const result = await getSharedFiles(shareToken);
+        const result = await getSharedFiles(accessRef.current);
         if (cancelled) return;
         const listed = result.files || [];
         setFiles(listed);
@@ -405,24 +410,26 @@ export default function SharedChatView({ shareToken, metadata }: SharedChatViewP
 
   // The panel's adapter over the public endpoints. The serve prefix stands in
   // for the workspace, which a share never names.
-  const servePrefix = sharedServePrefix(shareToken);
+  const servePrefix = sharedServePrefix(access);
   const fileApiAdapter = useMemo(() => ({
-    readFile: (path: string) => readSharedFile(shareToken, path),
+    readFile: (path: string) => readSharedFile(access, path),
     // HTML files read their full source here; the public read endpoint caps at
     // its own line limit, and the preview renders via the served URL regardless.
-    readFileFull: (path: string) => readSharedFile(shareToken, path),
+    readFileFull: (path: string) => readSharedFile(access, path),
     // Previews read under the serve prefix (allow_files), matching the rendered
     // report; only the explicit save uses the download endpoint (allow_download).
     downloadFile: (path: string) => servedObjectUrl(servePrefix, path),
     downloadFileAsArrayBuffer: (path: string) => servedBytes(servePrefix, path),
-    triggerDownload: (path: string) => downloadSharedFile(shareToken, path),
+    triggerDownload: (path: string) => downloadSharedFile(access, path),
     servePrefix,
     resolveFile: (candidates: string[], recentWrites: string[]) =>
-      resolveSharedFile(shareToken, candidates, recentWrites),
-  }), [shareToken, servePrefix]);
+      resolveSharedFile(access, candidates, recentWrites),
+  }), [access, servePrefix]);
 
   const imageDownloader = useCallback((path: string) => servedObjectUrl(servePrefix, path), [servePrefix]);
 
+  // A share is a finished thread: nothing runs, and nothing will come back.
+  const plans = useMemo(() => threadPlans(messages, false, false).underMessages, [messages]);
   // The workspace's folder, so its absolute paths read as workspace paths here
   // as they do in the owner's view, a turn from before a move included. Its
   // siblings are not the viewer's, nor are the owner's other computers.
@@ -496,14 +503,14 @@ export default function SharedChatView({ shareToken, metadata }: SharedChatViewP
             // a report and then fail to save it.
             const target = await downloadTarget(
               path,
-              (candidates, recentWrites) => resolveSharedFile(shareToken, candidates, recentWrites),
+              (candidates, recentWrites) => resolveSharedFile(access, candidates, recentWrites),
               getRecentWritePaths(),
             );
             // Namesakes the lookup could not pick between leave nothing to
             // save, so the click lands on the panel that asks, exactly as Open
             // does with the same answer.
             if (!target.placed) return void handleOpenFile(path, fileWorkspaceId);
-            await downloadSharedFile(shareToken, target.path);
+            await downloadSharedFile(access, target.path);
           } catch (err: unknown) {
             console.error('[SharedChatView] Download failed:', err);
             // A reader on a shared link has no other way to learn the save did
@@ -512,7 +519,7 @@ export default function SharedChatView({ shareToken, metadata }: SharedChatViewP
           }
         }
       : undefined,
-  }), [handleOpenFile, handleOpenChart, canDownload, shareToken, getRecentWritePaths, t]);
+  }), [handleOpenFile, handleOpenChart, canDownload, access, getRecentWritePaths, t]);
 
   // Deep link: `?file=<path>` opens that report directly once metadata + file
   // permission are known. One-shot — the share-link target from §1.3b.
@@ -592,7 +599,7 @@ export default function SharedChatView({ shareToken, metadata }: SharedChatViewP
 
   return (
     <div
-      className="relative flex h-screen w-full overflow-hidden"
+      className="pf-shell relative flex h-screen w-full overflow-hidden"
       style={{ backgroundColor: 'var(--color-bg-page)' }}
     >
       {/* Left Side: Topbar + Chat Window — identical structure to ChatView,
@@ -611,7 +618,7 @@ export default function SharedChatView({ shareToken, metadata }: SharedChatViewP
             >
               <ArrowLeft className="h-5 w-5" />
             </Link>
-            <h1 className="text-base font-semibold whitespace-nowrap title-font truncate" style={{ color: 'var(--color-text-primary)' }}>
+            <h1 className="title-font text-[length:var(--cs-text-heading,1rem)] leading-6 font-semibold tracking-[var(--cs-title-track,-0.01em)] whitespace-nowrap truncate" style={{ color: 'var(--color-text-primary)' }}>
               {metadata.workspace_name || metadata.title || 'Shared Conversation'}
             </h1>
             {loading && (
@@ -670,6 +677,7 @@ export default function SharedChatView({ shareToken, metadata }: SharedChatViewP
                           messages={messages}
                           readOnly={true}
                           allowFiles={canBrowseFiles}
+                          plans={plans}
                         />
                       </DispatchStatusProvider>
                       </MessageActionsProvider>

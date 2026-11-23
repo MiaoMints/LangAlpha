@@ -15,10 +15,13 @@
  */
 import React from 'react';
 import type { FeedbackResult, SubagentInfo } from './types';
+import type { ThumbDownFollowUp, ThumbDownFollowUpOutcome } from '../../hooks/useChatFeedback';
 import type { PTCAgentProposalState, ToolApprovalPosition } from '@/types/chat';
 import type { OpenFileHandler } from '../../utils/fileLocation';
 import type { ChartTabSpec } from '../filePanel/types';
+import type { ArtifactCommentRef } from '../artifactComments/artifactCommentReply';
 import type { EditDraftStore } from '../../hooks/utils/editDrafts';
+import type { ThreadForkCut } from '@/types/api';
 
 export interface MessageActions {
   onOpenSubagentTask?: (info: SubagentInfo) => void;
@@ -39,6 +42,9 @@ export interface MessageActions {
    *  may grant reading without granting download: a copy-link share does. Its
    *  absence is what hides the deliverable card's Download item. */
   onDownloadFile?: (path: string, workspaceId?: string) => void;
+  /** Opens the host's Publish dialog on a workspace file, resolving once it
+   *  closes; absent where nobody can publish (a shared chat). */
+  onPublishFile?: (path: string, workspaceId?: string) => Promise<void>;
   /** The key a card's save is tracked under. The host builds it because only
    *  the host knows which workspace a card without its own names, and the
    *  click and the card's busy state must agree on it. */
@@ -46,6 +52,9 @@ export interface MessageActions {
   onOpenSources?: (messageId: string) => void;
   /** Opens a live chart for a symbol beside the chat; absent where there is no panel to land in. */
   onOpenChart?: (spec: ChartTabSpec) => void;
+  /** Opens a file beside the chat on one of its comments; absent where there
+   *  is no panel to land in (a shared chat). */
+  onOpenArtifactComment?: (comment: ArtifactCommentRef) => void;
   /** Opens a tool call's result by id; the host reads the live record. */
   onToolCallDetailClick?: (toolCallId: string) => void;
   onAnswerQuestion?: (answer: string, questionId: string, interruptId: string) => void;
@@ -72,11 +81,24 @@ export interface MessageActions {
   editDrafts?: EditDraftStore;
   onRegenerate?: (messageId: string) => void;
   onRetry?: () => void;
+  /** Copies the thread up to a turn into a new chat and opens it there. Unlike
+   *  edit and regenerate it changes nothing in this thread, so reading the
+   *  thread is enough to offer it. Resolves once the request has settled, so
+   *  the button can hold itself disabled meanwhile; refusals are the host's
+   *  to show. Absent where no new chat can be made (a shared or subagent view). */
+  onForkFromTurn?: (turnIndex: number, cut: ThreadForkCut) => Promise<void>;
   /** Feedback is addressed by BACKEND TURN, not by bubble — a steering
    *  continuation rates the turn it continues. MessageList supplies the index. */
   onThumbUp?: (turnIndex: number) => Promise<FeedbackResult | null>;
   onThumbDown?: (turnIndex: number, issueCategories: string[], comment: string | null, consentHumanReview: boolean) => Promise<FeedbackResult | null>;
+  /** Add to a sent thumbs-down's report, or withdraw it. */
+  onThumbDownFollowUp?: (turnIndex: number, action: ThumbDownFollowUp) => Promise<ThumbDownFollowUpOutcome>;
   onWidgetSendPrompt?: (text: string) => void;
+  /** The thread a failed turn's card offers to report, once the server has
+   *  named it. Absent where reporting is not offered (a shared view). */
+  reportThreadId?: string;
+  /** The thread's ratings are still loading, so a turn's rating is unknown. */
+  feedbackLoading?: boolean;
 }
 
 const EMPTY_ACTIONS: MessageActions = Object.freeze({});

@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Callable, Sequence
-from typing import Literal, cast
+from typing import Literal, NamedTuple, cast
 
 from langchain_core.messages import (
     AIMessage,
@@ -29,7 +29,7 @@ from ptc_agent.agent.middleware.compaction.utils import (
 from ptc_agent.agent.middleware.runtime_context.durable import (
     runtime_update_from_message,
 )
-from ptc_agent.agent.middleware.runtime_context.turn import NON_CHANGE_ROW_KINDS
+from ptc_agent.agent.middleware.runtime_context.turn import LAST_STEP_ROW_KIND, NON_CHANGE_ROW_KINDS
 from ptc_agent.agent.transcript.classify import (
     human_kind,
     is_run_boundary_message,
@@ -37,6 +37,7 @@ from ptc_agent.agent.transcript.classify import (
     is_summary_message,
 )
 from ptc_agent.agent.transcript.pointer import TranscriptTurns
+from ptc_agent.agent.transcript.sender import MemberSender, named, unnamed
 from ptc_agent.agent.transcript.store import segment_file
 from src.llms.reasoning_payload import strip_reasoning
 
@@ -164,6 +165,28 @@ write.
     )
 
 
+# The prompt for the model that held the conversation, when the user moves it
+# to a model that keeps a session of its own (Claude Code) and has seen none
+# of it. Sent as the last user message of the model's own request, so it
+# reads the conversation from its cache, and what it writes is all the next
+# model starts from.
+def _brief_prompt(after: str) -> str:
+    return (
+        f"""<context>
+This conversation is moving to another model, which has seen none of it.
+What you write now is all it starts from, beside the files the work left, so
+capture all it needs to continue the work without losing progress or
+repeating what is done. This request comes from the system, not the user,
+and is not part of the work: leave it out of what you write.
+
+{after}
+</context>
+
+"""
+        + _SUMMARY_BODY
+    )
+
+
 _NO_TAIL_STATE = """What you write is the only record of where the work stands, so record its
 current state exactly: the last step completed, what was in progress and how
 far it got, any tool result or decision still pending, any question to the
@@ -176,12 +199,32 @@ has sections, instead of restating it. Then name the details to read back from
 each note before continuing."""
 
 
-def _family(prompt: Callable[[str], str], kept: str, no_tail: str) -> tuple[str, str, str]:
-    """A family's prompt for a summary that keeps turns after it, for one that
-    keeps none (``keeps_turns``), and for one that keeps none in a thread
-    with checkpoint notes, which keep some of that state already."""
-    state = f"{no_tail}\n{_NO_TAIL_STATE}"
-    return prompt(kept), prompt(state), prompt(f"{state}\n{_NO_TAIL_NOTES}")
+class _Family(NamedTuple):
+    """A family's prompts: for a summary that keeps turns after it, for one
+    that keeps none (``keeps_turns``), and for one that keeps none but the
+    results of the last step, carried after it as a row; each of the last two
+    with ``notes`` for a thread with checkpoint notes, which keep some of
+    that state already.
+
+    A hand-off has no prompt of the third kind (None): it runs between turns,
+    after the answer the carried step was sent with, so turns always follow
+    the summary it writes out."""
+
+    kept: str
+    no_tail: str
+    no_tail_notes: str
+    carried: str | None
+    carried_notes: str | None
+
+
+def _family(
+    prompt: Callable[[str], str], kept: str, no_tail: str, carried: str | None = None
+) -> _Family:
+    def no_tail_pair(opening: str) -> tuple[str, str]:
+        state = f"{opening}\n{_NO_TAIL_STATE}"
+        return prompt(state), prompt(f"{state}\n{_NO_TAIL_NOTES}")
+
+    return _Family(prompt(kept), *no_tail_pair(no_tail), *(no_tail_pair(carried) if carried else (None, None)))
 
 
 _SUMMARY_OPEN, _SUMMARY_END = "<summary>", "</summary>"
@@ -198,7 +241,7 @@ _SELF_SUMMARY_RULES = (
     f"\n\nEnd the summary with the line `{_SUMMARY_END}` on its own."
 )
 
-SummaryKind = Literal["transcript", "native", "self", "handoff"]
+SummaryKind = Literal["transcript", "native", "self", "handoff", "brief"]
 
 _NATIVE = _family(
     _native_prompt,
@@ -208,9 +251,12 @@ conversation ends. Describe unfinished work as where it stood at that point,
 not as still to do.""",
     """Nothing above stays in context: the conversation goes on from your summary,
 so describe the work as it stands where this conversation ends.""",
+    """Nothing above stays in context but the results of the last step, which follow
+your summary word for word: describe the work as it stands where this
+conversation ends, and the step those results answer.""",
 )
 
-_PROMPTS: dict[SummaryKind, tuple[str, str, str]] = {
+_PROMPTS: dict[SummaryKind, _Family] = {
     "transcript": _family(
         _transcript_prompt,
         """The most recent messages are not in this history: they stay in context, word
@@ -219,9 +265,12 @@ this history ends. Describe unfinished work as where it stood at that point,
 not as still to do.""",
         """Nothing after this history stays in context: the conversation goes on from
 your summary, so describe the work as it stands where this history ends.""",
+        """Nothing after this history stays in context but the results of the last step,
+which follow your summary word for word: describe the work as it stands where
+this history ends, and the step those results answer.""",
     ),
     "native": _NATIVE,
-    "self": tuple(prompt + _SELF_SUMMARY_RULES for prompt in _NATIVE),
+    "self": _Family(*(prompt and prompt + _SELF_SUMMARY_RULES for prompt in _NATIVE)),
     "handoff": _family(
         _handoff_prompt,
         """The messages that came after the compacted summary stay in context, word for
@@ -232,17 +281,32 @@ what you write: describe the work as it stands where the summary ends.""",
     ),
 }
 
+_BRIEF_NO_TAIL = """Nothing above reaches that model: the conversation goes on from what you
+write, so describe the work as it stands where this conversation ends."""
+# Written by the model as text from its own request, so with the self-summary
+# rules. A brief keeps no turn after it, so its kept prompt is the no-tail one,
+# never sent, and it ends on no carried step.
+_brief = _family(_brief_prompt, _BRIEF_NO_TAIL, _BRIEF_NO_TAIL)
+_PROMPTS["brief"] = _Family(*(prompt + _SELF_SUMMARY_RULES for prompt in _brief[:3]), None, None)
 
-def summary_prompt(kind: SummaryKind, keeps: bool, notes: bool = False) -> str:
+
+def summary_prompt(kind: SummaryKind, keeps: bool, notes: bool = False, *, carried: bool = False) -> str:
     """The instructions for a summary written by ``kind``: the transcript
     summarizer, the agent's provider compacting in place, the agent's model
     writing it as text, or that model writing out a summary only its provider
-    can read. ``keeps`` says whether turns stay after it (``keeps_turns``), and
-    ``notes`` whether the thread keeps checkpoint notes (the scratchpad)."""
-    kept, no_tail, with_notes = _PROMPTS[kind]
+    can read. ``keeps`` says whether turns stay after it (``keeps_turns``),
+    ``notes`` whether the thread keeps checkpoint notes (the scratchpad), and
+    ``carried`` whether one that keeps none is followed by the last step's
+    results (see ``carry``)."""
+    family = _PROMPTS[kind]
     if keeps:
-        return kept
-    return with_notes if notes else no_tail
+        return family.kept
+    if not carried:
+        return family.no_tail_notes if notes else family.no_tail
+    prompt = family.carried_notes if notes else family.carried
+    if prompt is None:
+        raise ValueError(f"a {kind} summary is never followed by a carried step")
+    return prompt
 
 
 DEFAULT_SUMMARY_PROMPT = summary_prompt("transcript", True)
@@ -324,10 +388,12 @@ def trim_for_summary(
 
 
 def _as_rendered(messages: list[AnyMessage]) -> list[AnyMessage]:
-    """``messages`` without the reasoning ``get_buffer_string`` leaves out."""
+    """``messages`` as the history renders them, to be measured: without the
+    reasoning ``get_buffer_string`` leaves out, and with each member's tag,
+    which a shared thread's many short messages add up to."""
     rendered: list[AnyMessage] = []
     for message in messages:
-        kept = strip_reasoning(message) if isinstance(message, AIMessage) else message
+        kept = strip_reasoning(message) if isinstance(message, AIMessage) else named(message)
         if kept is not None:
             rendered.append(kept)
     return rendered
@@ -387,16 +453,17 @@ def build_summary_request(
     summary_prompt: str,
     messages: list[AnyMessage],
     turns: TranscriptTurns | None = None,
+    *,
+    shared: bool = False,
 ) -> list[AnyMessage]:
     """System = instructions, Human = nudge + rendered history.
 
-    Splitting the two channels keeps the system prompt small and cacheable,
-    lets Codex OAuth populate its ``instructions`` field cleanly, and avoids
-    Python repr inflation by rendering messages via ``get_buffer_string``.
+    Splitting the two keeps the system prompt small and cacheable, and
+    rendering messages via ``get_buffer_string`` avoids Python repr inflation.
     """
     from src.llms.api_call import create_messages
 
-    history = _render_history(messages, turns)
+    history = render_history(messages, turns, shared=shared)
     user_prompt = f"{_COMPACTION_USER_NUDGE}\n\n<messages>\n{history}\n</messages>"
     if turns is not None:
         last = turns.last(messages)
@@ -413,7 +480,9 @@ def build_summary_request(
     return create_messages(system_prompt=summary_prompt, user_prompt=user_prompt)
 
 
-def _render_history(messages: Sequence[AnyMessage], turns: TranscriptTurns | None) -> str:
+def render_history(
+    messages: Sequence[AnyMessage], turns: TranscriptTurns | None, *, shared: bool = False
+) -> str:
     """The history as text, each turn headed by its transcript file.
 
     An earlier summary is a block of its own holding its summary text alone.
@@ -425,7 +494,7 @@ def _render_history(messages: Sequence[AnyMessage], turns: TranscriptTurns | Non
     group: list[AnyMessage] = []
 
     def close() -> None:
-        text = get_buffer_string(_summarizable(group))
+        text = get_buffer_string(_summarizable(group, shared=shared))
         if text:
             blocks.append(f"{heading}\n{text}" if heading else text)
         group.clear()
@@ -453,7 +522,7 @@ def _earlier_heading(message: AnyMessage, turns: TranscriptTurns | None) -> str:
     return _EARLIER_SUMMARY_OF.format(files=first if first == last else f"{first} to {last}")
 
 
-def _summarizable(messages: list[AnyMessage]) -> list[AnyMessage]:
+def _summarizable(messages: list[AnyMessage], *, shared: bool = False) -> list[AnyMessage]:
     """History as the summarizer should read it: harness rows are not the user.
 
     A runtime-context row is persisted as a ``HumanMessage`` because that is
@@ -465,11 +534,14 @@ def _summarizable(messages: list[AnyMessage]) -> list[AnyMessage]:
     off and would otherwise leave a summary saying it is off once it is back
     on, and notes reminders, which the summary itself answers. Change rows
     are relabelled as ``System:`` so what they say survives without being
-    attributed to anyone. An orchestrator's notice of a
+    attributed to anyone, and a carried step as ``Tool:``, which is what
+    returned its text. An orchestrator's notice of a
     background task is relabelled the same way. Its steering trigger is
     dropped: it says only that someone wrote more, which the steering
     message after it shows, and the summarizer took it, under either label,
-    for a request still to be answered.
+    for a request still to be answered. A shared workspace's member message
+    reads as the model read it, under its writer's tag, so the summary can
+    keep who asked for what.
     """
     out: list[AnyMessage] = []
     for message in messages:
@@ -479,7 +551,12 @@ def _summarizable(messages: list[AnyMessage]) -> list[AnyMessage]:
             continue
         update = runtime_update_from_message(message)
         if update is None:
-            out.append(message)
+            # A message with a writer on record opens with their tag; in a
+            # shared thread one with none has a typed tag escaped, so the
+            # summarizer reads only the harness's tags as who wrote what.
+            out.append(named(message) if not shared or MemberSender.of(message) else unnamed(message))
+        elif update.kind == LAST_STEP_ROW_KIND:
+            out.append(ToolMessage(content=update.text, tool_call_id=message.id or LAST_STEP_ROW_KIND))
         elif update.kind not in NON_CHANGE_ROW_KINDS:
             out.append(SystemMessage(content=update.text))
     return out

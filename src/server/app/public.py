@@ -6,9 +6,9 @@ No auth required. workspace_id is resolved server-side and never exposed.
 A token resolves to a (workspace, path) scope; the file endpoints serve that
 path and its subtree and nothing else, whatever path the URL asks for.
 
-The metadata route also answers for a file or app share link, which is
-what the ``/a/`` page dispatches on. It takes optional auth for that: a
-private link opens for its signed-in owner and for nobody else.
+The metadata route also answers for a file or app share link, which is what
+the ``/a/`` page dispatches on. It takes optional auth for that: a private
+link opens for its signed-in owner and for nobody else.
 
 This module carries the thread itself: the metadata a viewer opens and the SSE
 replay, with the owner-only marks stripped out of every event by
@@ -35,19 +35,40 @@ from fastapi.responses import StreamingResponse
 from src.observability import observe_replay_stream
 
 from src.server.app.share_access import (
+    LINK_NOT_FOUND,
     LinkAccess,
     get_permissions,
     get_shared_thread,
     resolve_link,
 )
+from src.server.database.conversation import get_thread_by_share_token
+from src.server.services import member_grants
+from src.server.services.account import serves_public_links
+from src.server.services.share_audience import (
+    ORGANIZATION,
+    PUBLIC,
+    admits_member,
+    members_only,
+    thread_audience,
+)
 from src.server.app.share_files import share_files_router
-from src.server.app.workspace_sandbox import owner_preview_url, with_preview_path
+from src.server.app.workspace_sandbox import owner_preview, with_preview_path
+from src.server.database import artifacts as artifacts_db
+from src.server.database.artifacts import Artifact, Version
 from src.server.database.conversation.replay_rows import get_replay_thread_data
 from src.server.database.pool import DATABASE_UNAVAILABLE
 from src.server.database.share_links import KIND_APP
+from src.server.services.artifacts import grants as artifact_grants
 from src.server.services.file_grants import grant_prefix, mint_file_grant, seconds_left
+from src.server.services.artifacts.snapshot import (
+    LegacyRefused,
+    SnapshotUnavailable,
+    legacy_snapshot,
+)
+from src.server.services.preview_base import artifact_base
 from src.server.services.preview_links import signed_url_expires_at
 from src.server.utils.api import PageViewer, Viewer, database_unavailable
+from src.server.utils.error_sanitization import single_line
 from src.server.services.share_redaction import ShareRedaction
 
 logger = logging.getLogger(__name__)
@@ -62,41 +83,121 @@ router.include_router(share_files_router)
 # =============================================================================
 
 
+async def _latest_shared_version(artifact: Artifact | None) -> tuple[Artifact, Version]:
+    """The record behind a shared file link and the version its visitors see.
+
+    A link shared before versions has none until this first asks, which cuts
+    v1 from the list the share froze, from a warm session or the stored copy,
+    never waking a computer. A 404 when the link is no longer shared, its file
+    is gone, or its files are past the caps (asked once, then remembered), a
+    503 when that first version cannot be read now.
+    """
+    if artifact is None or not artifact.shared:
+        raise HTTPException(status_code=404, detail=LINK_NOT_FOUND)
+    if artifact.shared_seq == 0:
+        try:
+            artifact = await legacy_snapshot(artifact)
+        except LegacyRefused:
+            raise HTTPException(status_code=404, detail=LINK_NOT_FOUND) from None
+        except SnapshotUnavailable as e:
+            logger.warning(
+                f"First version of shared link {artifact.code} unavailable: "
+                f"{single_line(str(e))}"
+            )
+            raise HTTPException(status_code=503, detail="File unavailable") from None
+        if not artifact.shared:
+            raise HTTPException(status_code=404, detail=LINK_NOT_FOUND)
+    # The revision and the seq come from one read of the row, so the grant
+    # minted from them names a version the row named at that revision. Never
+    # ``latest_seq``: a kept record's turns cut versions for its owner alone.
+    shared = await artifacts_db.get_version(artifact.artifact_id, artifact.shared_seq)
+    if shared is None:
+        raise HTTPException(status_code=503, detail="File unavailable")
+    return artifact, shared
+
+
+async def _file_metadata(access: LinkAccess, viewer_id: str | None) -> dict[str, Any]:
+    """A file link: the live file to its owner, the shared version to anyone
+    else.
+
+    The owner reads and comments on the file as it is now, framed through the
+    workspace file grant. A visitor gets a grant for one version at the link's
+    current revision, which each of its files is checked against, so an
+    unshare or the next Update ends it and the page asks here again.
+    """
+    link = access.link
+    if access.owner:
+        grant = await mint_file_grant(link.workspace_id)
+        return {
+            "kind": "file",
+            "access": "owner",
+            "artifact_id": link.artifact_id,
+            "workspace_id": link.workspace_id,
+            "name": link.display_title,
+            "path": link.path,
+            "shared": link.shared,
+            "latest_seq": link.artifact.latest_seq if link.artifact else 0,
+            "shared_seq": link.artifact.shared_seq if link.artifact else 0,
+            "frame_base": grant_prefix(grant),
+            "expires_in": seconds_left(grant.expires_at),
+        }
+
+    artifact, latest = await _latest_shared_version(link.artifact)
+    seq = latest.seq
+    if access.member:
+        # Bound to this member, and judged again on every frame request.
+        visitor = await member_grants.mint_file_grant(
+            link.code, artifact.artifact_id, revision=artifact.revision, seq=seq,
+            viewer_id=viewer_id or "",
+        )
+    else:
+        visitor = await artifact_grants.mint_artifact_share_grant(
+            link.code, artifact.artifact_id, revision=artifact.revision, seq=seq
+        )
+    base = artifact_base()
+    entry = latest.entry_path
+    return {
+        "kind": "file",
+        "access": "public",
+        "audience": ORGANIZATION if access.member else PUBLIC,
+        "artifact_id": artifact.artifact_id,
+        "name": entry.rsplit("/", 1)[-1],
+        "path": entry,
+        "title": latest.title,
+        "seq": seq,
+        "frame_base": (
+            base.artifact_url(artifact.artifact_id, visitor.token)
+            if base
+            else artifact_grants.grant_prefix(visitor)
+        ),
+        "isolated": base is not None,
+        "expires_in": seconds_left(visitor.expires_at),
+    }
+
+
 async def _link_metadata(
     access: LinkAccess, user_id: str | None, path: str | None
 ) -> dict[str, Any]:
     """What the ``/a/`` page renders for a link ``resolve_link`` admitted.
 
     ``expires_in`` is how many seconds the credential in ``url`` or
-    ``frame_base`` has left, so the page renews it just before rather than on a
-    timer. A public file
-    has none: its route re-checks the link on every request.
+    ``frame_base`` has left, so the page renews it just before rather than on
+    a timer.
     """
     link = access.link
     if link.kind == KIND_APP:
         # An app link is never shared, so only its owner is ever here.
-        url = await owner_preview_url(link.workspace_id, user_id, link.port)
+        preview = await owner_preview(link.workspace_id, user_id, link.port)
         return {
             "kind": "app",
             "title": link.display_title,
-            "url": with_preview_path(url, path or link.path),
-            "expires_in": seconds_left(await signed_url_expires_at(url)),
+            # With the URL, so the page keys the owner's grant by the command
+            # this URL's app was started with and by no earlier one.
+            "command_key": preview.command_key,
+            "url": with_preview_path(preview.url, path or link.path),
+            "expires_in": seconds_left(await signed_url_expires_at(preview.url)),
         }
-
-    file = {"kind": "file", "name": link.display_title, "path": link.path}
-    if access.owner:
-        grant = await mint_file_grant(link.workspace_id)
-        return {
-            **file,
-            "access": "owner",
-            "frame_base": grant_prefix(grant),
-            "expires_in": seconds_left(grant.expires_at),
-        }
-    return {
-        **file,
-        "access": "public",
-        "frame_base": f"/api/v1/public/shared/{link.code}/files/serve/",
-    }
+    return await _file_metadata(access, user_id)
 
 
 @router.get("/shared/{share_token}")
@@ -118,23 +219,40 @@ async def get_shared_thread_metadata(
     # cache between here and the browser may hand it to the next visitor.
     response.headers["Cache-Control"] = "no-store"
     viewer = Viewer(None) if view_as == "visitor" else page_viewer
+    member_grant = None
     try:
         access = await resolve_link(share_token, user_id=viewer.user_id)
-        thread = None if access is not None else await get_shared_thread(share_token)
+        if access is None:
+            thread, member_grant = await _shared_thread_for(share_token, viewer.user_id)
     except HTTPException as e:
         # Not found is said only to a viewer the keys could check. Any other
-        # may be the owner, and a private link and an unknown code must still
-        # answer alike, so both wait for the keys.
-        if e.status_code == 404 and viewer.unconfirmed is not None:
+        # may be the owner or a member, and a private link and an unknown
+        # code must still answer alike, so both wait for the keys.
+        if e.status_code in (401, 404) and viewer.unconfirmed is not None:
             raise viewer.unconfirmed from None
+        # A suspended account reads as signed out, yet signing in again
+        # would open nothing: not found, as for any other non-member.
+        if e.status_code == 401 and viewer.suspended:
+            raise HTTPException(status_code=404, detail=LINK_NOT_FOUND) from None
         raise
     if access is not None:
         return await _link_metadata(access, viewer.user_id, path)
 
     perms = get_permissions(thread)
     allow_files = perms.get("allow_files", False)
+    members = (
+        {
+            "audience": ORGANIZATION,
+            # Stands in for the token on the replay and file routes.
+            "grant": member_grant.token,
+            "expires_in": seconds_left(member_grant.expires_at),
+        }
+        if member_grant is not None
+        else {}
+    )
 
     return {
+        **members,
         "kind": "thread",
         "thread_id": str(thread["conversation_thread_id"]),
         "title": thread.get("title"),
@@ -159,6 +277,30 @@ async def get_shared_thread_metadata(
             "allow_download": perms.get("allow_download", False),
         },
     }
+
+
+async def _shared_thread_for(
+    share_token: str, viewer_id: str | None
+) -> tuple[dict[str, Any], member_grants.ThreadGrant | None]:
+    """The thread a token opens for this viewer, with the grant a member's
+    page carries to the replay and file routes. A link that opens to anyone
+    answers as ``get_shared_thread`` does; a members-only one asks a
+    signed-out visitor to sign in and is not found by a non-member."""
+    thread = await get_thread_by_share_token(share_token)
+    if not thread:
+        raise HTTPException(status_code=404, detail=LINK_NOT_FOUND)
+    owner_id = thread.get("owner_id")
+    if thread_audience(get_permissions(thread)) != ORGANIZATION:
+        if not await serves_public_links(owner_id):
+            raise HTTPException(status_code=404, detail=LINK_NOT_FOUND)
+        return thread, None
+    if viewer_id is None:
+        raise members_only()
+    if not member_grants.can_hold(viewer_id) or not await admits_member(
+        viewer_id, owner_id
+    ):
+        raise HTTPException(status_code=404, detail=LINK_NOT_FOUND)
+    return thread, await member_grants.mint_thread_grant(share_token, viewer_id)
 
 
 # =============================================================================

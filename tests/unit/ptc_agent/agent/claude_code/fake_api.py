@@ -7,15 +7,28 @@ request is answered from a script chosen by what the conversation holds, and
 every request body is kept so a test can check what the CLI sent.
 
 With ``first_party=True`` the CLI keeps its own API host and signs in with a
-dummy OAuth token, so it sends the request a Claude plan login sends (the
+dummy setup token (``TOKEN``, the launcher's to hand over), so it sends the
+request a Claude plan login sends (the
 1h cache, the billing header, request diagnostics): its ``HTTPS_PROXY`` is a
 tunnel to a TLS listener that answers as api.anthropic.com with a throwaway
 CA, trusted through ``NODE_EXTRA_CA_CERTS`` in the CLI's environment only.
 
 - ``RUN_TOOL`` in the newest user text: call the ``Bash`` tool once; once the
   turn holds its result, answer quoting it.
+- ``CALLS <name>:<command> ...``: make each call in one message, in order, with
+  the command as its input; answer once the turn holds their results.
+- ``SERIAL <n>``: call ``Bash`` once per message (``step-1``, ``step-2``, ...)
+  until the turn holds ``n`` results since the prompt, then answer.
+- ``CLOSE_OUT``: answer as ``ECHO`` until asked to close out the plan (a
+  ``plan_close_out`` row), then reply with text, an ``UpdatePlan`` call
+  completing steps 1 and 2, and a ``Bash`` call; ``CLOSE_OUT_BASH_FIRST``
+  makes the same calls the other way round, ``CLOSE_OUT_BASH`` the ``Bash``
+  call alone, ``CLOSE_OUT_UNKNOWN`` a call to a tool that does not exist,
+  and ``CLOSE_OUT_FAIL`` is answered 529 on the close-out's request.
 - ``RECALL``: answer with every earlier ``FACT:`` line the CLI sent.
 - ``FAIL_AUTH`` / ``FAIL_LIMIT``: refuse with 401 / 429.
+- ``overloaded_after_compaction``: answer that many requests that resume
+  from a compaction's summary with 529.
 - ``MAX_TOKENS``: answer ``part one`` and stop at the output limit, so the CLI
   continues the reply in a request of its own.
 - Anything else: ``ECHO <text>``.
@@ -36,6 +49,49 @@ from typing import Any
 from aiohttp import web
 
 API_HOST = "api.anthropic.com"
+#: The dummy setup token a first-party test launches with.
+TOKEN = "sk-ant-oat01-" + "0" * 80
+#: A ``limits`` entry holding this key is answered with a 429.
+STATUS_429 = "x-fake-status-429"
+#: What the plan's close-out ask says, which ``CLOSE_OUT`` answers.
+CLOSE_OUT_ASK = "not marked finished"
+#: The text of the close-out's reply, which must never reach the stream.
+CLOSE_OUT_TEXT = "Closing out the plan now."
+#: The calls each ``CLOSE_OUT`` prompt's close-out reply makes, in order.
+CLOSE_OUT_CALLS = {
+    "CLOSE_OUT": ["UpdatePlan", "Bash"],
+    "CLOSE_OUT_BASH_FIRST": ["Bash", "UpdatePlan"],
+    "CLOSE_OUT_BASH": ["Bash"],
+    "CLOSE_OUT_UNKNOWN": ["NoSuchTool"],
+}
+
+
+def unified(status: str = "allowed", *, five_hour: float | None = None, seven_day: float | None = None,
+            resets: dict[str, int] | None = None, claim: str | None = None, overage: str | None = None,
+            overage_in_use: bool = False, disabled: str | None = None, refused: bool = False) -> dict[str, str]:
+    """The ``anthropic-ratelimit-unified-*`` headers a plan login's response
+    carries: the overall ``status`` and the window it claims, each window's
+    use as a fraction with its reset (epoch seconds, ``resets``), and the
+    usage credits' status. ``refused`` answers the request with a 429."""
+    p = "anthropic-ratelimit-unified-"
+    resets = resets or {}
+    out = {p + "status": status}
+    for name, short, used in (("five_hour", "5h", five_hour), ("seven_day", "7d", seven_day)):
+        if used is not None:
+            out[p + short + "-utilization"] = str(used)
+            out[p + short + "-reset"] = str(resets[name])
+    if claim is not None:
+        out[p + "representative-claim"] = claim
+        out[p + "reset"] = str(resets[claim])
+    if overage is not None:
+        out[p + "overage-status"] = overage
+    if overage_in_use:
+        out[p + "overage-in-use"] = "true"
+    if disabled is not None:
+        out[p + "overage-disabled-reason"] = disabled
+    if refused:
+        out[STATUS_429] = "1"
+    return out
 
 
 def _sse(event: str, data: dict[str, Any]) -> bytes:
@@ -66,11 +122,34 @@ def plan(body: dict[str, Any]) -> list[dict[str, Any]]:
         elif _texts(blocks):
             result = None
     think = {"type": "thinking", "thinking": "Reasoning about it.", "signature": "sig-" + uuid.uuid4().hex}
+    if "CLOSE_OUT" in prompt and turns and any(CLOSE_OUT_ASK in b.get("text", "") for b in turns[-1]):
+        mode = next(word for word in prompt.split() if word.startswith("CLOSE_OUT"))
+        names = CLOSE_OUT_CALLS.get(mode, CLOSE_OUT_CALLS["CLOSE_OUT"])
+        inputs = {"Bash": {"command": "never"}, "UpdatePlan": {"done": [1, 2]}}
+        calls = [{"type": "tool_use", "id": "toolu_" + uuid.uuid4().hex[:20], "name": name, "input": inputs.get(name, {})}
+                 for name in names]
+        return [think, {"type": "text", "text": CLOSE_OUT_TEXT}, *calls]
+    if "SERIAL" in prompt:
+        held = 0
+        for blocks in turns:
+            held = 0 if _texts(blocks) else held + sum(b.get("type") == "tool_result" for b in blocks)
+        if held < int(prompt.split("SERIAL", 1)[1].split()[0]):
+            return [think, {"type": "tool_use", "id": "toolu_" + uuid.uuid4().hex[:20], "name": "Bash",
+                            "input": {"command": f"step-{held + 1}"}}]
+        return [think, {"type": "text", "text": f"Done after {held} steps."}]
+    if any("<summary>" in t for t in _texts(turns[-1] if turns else [])):
+        # The CLI's summary request asks for a <summary> block, and it retries
+        # a reply without one as a failed summary.
+        return [think, {"type": "text", "text": f"<analysis>Reviewing.</analysis>\n<summary>ECHO {prompt.strip()[:120]}</summary>"}]
     if result is not None:
         content = result.get("content")
         if isinstance(content, list):
             content = " ".join(b.get("text", "") for b in content if b.get("type") == "text")
         return [think, {"type": "text", "text": f"The tool said: {str(content).strip()[:300]}"}]
+    if "CALLS" in prompt:
+        calls = [word.split(":", 1) for word in prompt.split("CALLS", 1)[1].split()]
+        return [think, *({"type": "tool_use", "id": "toolu_" + uuid.uuid4().hex[:20], "name": name, "input": {"command": command}}
+                         for name, command in calls)]
     if "RUN_TOOL" in prompt and any(t.get("name") == "Bash" for t in body.get("tools", [])):
         return [think, {"type": "tool_use", "id": "toolu_" + uuid.uuid4().hex[:20], "name": "Bash",
                         "input": {"command": "echo spike-$((6*7))"}}]
@@ -82,6 +161,12 @@ def plan(body: dict[str, Any]) -> list[dict[str, Any]]:
 
 async def _anything(request: web.Request) -> web.Response:
     return web.json_response({})
+
+
+async def _policy_limits(request: web.Request) -> web.Response:
+    # A first-party CLI asks this before its first request and retries an
+    # answer it can't read for about 5s, which every launch would wait out.
+    return web.json_response({"restrictions": {}})
 
 
 def _api_host_cert(folder: Path) -> tuple[str, str, str]:
@@ -128,9 +213,18 @@ async def _pipe(src: asyncio.StreamReader, dst: asyncio.StreamWriter) -> None:
 class FakeMessagesAPI:
     """The server and the request bodies it was sent."""
 
-    def __init__(self, *, first_party: bool = False) -> None:
+    def __init__(self, *, first_party: bool = False, refused: frozenset[str] = frozenset(),
+                 overloaded_after_compaction: int = 0, limits: list[dict[str, str]] | None = None) -> None:
         self.first_party = first_party
+        #: The plan's rate-limit headers each model request is answered with,
+        #: in order; one with ``STATUS_429`` is refused with them instead.
+        self.limits = list(limits or [])
+        #: Credentials answered with a 401, as Anthropic answers a revoked token.
+        self.refused = refused
+        self.overloaded_after_compaction = overloaded_after_compaction
         self.requests: list[dict[str, Any]] = []
+        #: The credential each request carried: its bearer token, else its API key.
+        self.credentials: list[str | None] = []
         self._runner: web.AppRunner | None = None
         self._tunnel: asyncio.Server | None = None
         self._dir = tempfile.TemporaryDirectory(prefix="fake-api-")
@@ -140,6 +234,7 @@ class FakeMessagesAPI:
     async def __aenter__(self) -> FakeMessagesAPI:
         app = web.Application(client_max_size=64 * 1024 * 1024)
         app.router.add_post("/v1/messages", self._messages)
+        app.router.add_get("/api/claude_code/policy_limits", _policy_limits)
         app.router.add_route("*", "/{tail:.*}", _anything)
         self._runner = web.AppRunner(app)
         await self._runner.setup()
@@ -164,11 +259,11 @@ class FakeMessagesAPI:
         self._dir.cleanup()
 
     def cli_env(self) -> dict[str, str]:
-        """What the CLI's environment needs to reach this API, with a dummy credential."""
+        """What the CLI's environment needs to reach this API: a dummy key, or first-party the route to it alone."""
         if not self.first_party:
             return {"ANTHROPIC_BASE_URL": self.url, "ANTHROPIC_API_KEY": "sk-ant-test-fake"}
         proxy = f"http://127.0.0.1:{self._tunnel.sockets[0].getsockname()[1]}"  # type: ignore[union-attr]
-        return {"HTTPS_PROXY": proxy, "NODE_EXTRA_CA_CERTS": self._ca, "CLAUDE_CODE_OAUTH_TOKEN": "sk-ant-oat01-" + "0" * 80}
+        return {"HTTPS_PROXY": proxy, "NODE_EXTRA_CA_CERTS": self._ca}
 
     async def _connect(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter, port: int) -> None:
         """A CONNECT to api.anthropic.com reaches the TLS listener; any other host is refused."""
@@ -189,7 +284,22 @@ class FakeMessagesAPI:
     async def _messages(self, request: web.Request) -> web.StreamResponse:
         body = await request.json()
         self.requests.append(body)
+        auth = request.headers.get("authorization", "")
+        credential = auth.removeprefix("Bearer ") if auth else request.headers.get("x-api-key")
+        self.credentials.append(credential)
+        if credential in self.refused:
+            return web.json_response({"type": "error", "error": {"type": "authentication_error", "message": "invalid token"}}, status=401)
         prompt = " ".join(t for blocks in _user_blocks(body)[-1:] for t in _texts(blocks))
+        opening = " ".join(t for blocks in _user_blocks(body)[:1] for t in _texts(blocks))
+        if self.overloaded_after_compaction and opening.startswith("This session is being continued"):
+            self.overloaded_after_compaction -= 1
+            return web.json_response({"type": "error", "error": {"type": "overloaded_error", "message": "Overloaded"}}, status=529)
+        if "CLOSE_OUT_FAIL" in opening and any(CLOSE_OUT_ASK in b.get("text", "") for b in _user_blocks(body)[-1]):
+            return web.json_response({"type": "error", "error": {"type": "overloaded_error", "message": "Overloaded"}}, status=529)
+        headers = self.limits.pop(0) if self.limits else {}
+        if headers.pop(STATUS_429, None):
+            error = {"type": "error", "error": {"type": "rate_limit_error", "message": "usage limit reached"}}
+            return web.json_response(error, status=429, headers=headers)
         for word, (status, kind) in {"FAIL_AUTH": (401, "authentication_error"), "FAIL_LIMIT": (429, "rate_limit_error")}.items():
             if word in prompt:
                 return web.json_response({"type": "error", "error": {"type": kind, "message": word}}, status=status)
@@ -199,7 +309,7 @@ class FakeMessagesAPI:
         if "MAX_TOKENS" in prompt:
             blocks, stop = [{"type": "text", "text": "part one"}], "max_tokens"
         usage = {"input_tokens": 120, "output_tokens": 0, "cache_read_input_tokens": 3000, "cache_creation_input_tokens": 40}
-        resp = web.StreamResponse(headers={"content-type": "text/event-stream"})
+        resp = web.StreamResponse(headers={"content-type": "text/event-stream", **headers})
         await resp.prepare(request)
         await resp.write(_sse("message_start", {"type": "message_start", "message": {
             "id": msg_id, "type": "message", "role": "assistant", "model": body.get("model"), "content": [],

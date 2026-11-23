@@ -2,15 +2,29 @@ from __future__ import annotations
 
 import hashlib
 import inspect
+import json
 import os
+import sys
 import tempfile
+from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
+import anyio
 import pytest
 from claude_agent_sdk import ClaudeAgentOptions
 from claude_agent_sdk._internal.transport.subprocess_cli import SubprocessCLITransport
 
-from ptc_agent.agent.claude_code.launcher import SDK_CONNECT_SHA256, LocalLauncher, session_file_path, thread_dir
+from ptc_agent.agent.claude_code.machine_token import TOKEN_FD_ENV
+from ptc_agent.agent.claude_code.launcher import (
+    SDK_CONNECT_SHA256,
+    Credential,
+    LocalLauncher,
+    _token_socket,
+    session_file_path,
+    thread_dir,
+)
 
 
 def test_the_transport_is_a_copy_of_the_pinned_sdks():
@@ -20,18 +34,29 @@ def test_the_transport_is_a_copy_of_the_pinned_sdks():
     )
 
 
-async def child_env(launcher: LocalLauncher, tmp_path: Path) -> dict[str, str]:
-    dump = tmp_path / "env"
-    cli = tmp_path / "claude"
-    cli.write_text(f"#!/bin/sh\nenv > {dump}\n")
-    cli.chmod(0o755)
-    transport = LocalLauncher(env=launcher.env, cli_path=str(cli), machine_login=launcher.machine_login).transport(
-        ClaudeAgentOptions(env={"CLAUDE_CONFIG_DIR": "/c"}, cwd=str(tmp_path))
+async def launch(launcher: LocalLauncher, tmp_path: Path) -> tuple[dict[str, str], str, str]:
+    """Start a stand-in CLI that records its environment, its argv and what the token's descriptor holds."""
+    cli, seen = tmp_path / "claude", tmp_path / "seen.json"
+    cli.write_text(
+        f"#!{sys.executable}\nimport json, os, socket, sys\n"
+        f"fd = os.environ.get({TOKEN_FD_ENV!r})\n"
+        "token = socket.socket(fileno=int(fd)).recv(4096).decode().strip() if fd else ''\n"
+        f"json.dump({{'env': dict(os.environ), 'argv': sys.argv[1:], 'token': token}}, open({str(seen)!r}, 'w'))\n"
     )
+    cli.chmod(0o755)
+    launcher = replace(launcher, cli_path=str(cli))
+    prepared = await launcher.scratch()
+    transport = launcher.transport(ClaudeAgentOptions(env={"CLAUDE_CONFIG_DIR": "/c"}, cwd=str(tmp_path)))
     await transport.connect()
     await transport._process.wait()
     await transport.close()
-    return dict(line.split("=", 1) for line in dump.read_text().splitlines() if "=" in line)
+    await launcher.release(prepared)
+    got = json.loads(seen.read_text())
+    return got["env"], " ".join(got["argv"]), got["token"]
+
+
+async def child_env(launcher: LocalLauncher, tmp_path: Path) -> dict[str, str]:
+    return (await launch(launcher, tmp_path))[0]
 
 
 @pytest.mark.asyncio
@@ -45,13 +70,50 @@ async def test_the_child_gets_the_allowlist_and_the_runtimes_variables_only(monk
     assert env["USER"] == "alan" and env["ANTHROPIC_BASE_URL"] == "http://127.0.0.1:1"
     assert env["HTTPS_PROXY"] == "http://proxy.example:3128"
     assert env["CLAUDE_CONFIG_DIR"] == "/c" and env["PWD"] == str(tmp_path)
-    assert "CLAUDE_SECURESTORAGE_CONFIG_DIR" not in env
+    assert TOKEN_FD_ENV not in env
 
 
 @pytest.mark.asyncio
-async def test_only_a_machine_login_launcher_points_the_cli_at_the_machines_login(tmp_path):
-    env = await child_env(LocalLauncher(machine_login=True), tmp_path)
-    assert env["CLAUDE_SECURESTORAGE_CONFIG_DIR"] == ""
+async def test_the_cli_looks_for_its_credential_in_the_turns_dir_only(monkeypatch, tmp_path):
+    monkeypatch.setenv("CLAUDE_SECURESTORAGE_CONFIG_DIR", "")
+    env = await child_env(LocalLauncher(), tmp_path)
+    assert env["CLAUDE_CONFIG_DIR"] == "/c" and "CLAUDE_SECURESTORAGE_CONFIG_DIR" not in env
+
+
+@pytest.mark.asyncio
+async def test_the_token_reaches_the_cli_through_a_socket_never_its_environment_or_argv(tmp_path):
+    token = "sk-ant-oat01-" + "7" * 80
+    env, argv, handed = await launch(LocalLauncher(token=token), tmp_path)
+    assert handed == token
+    assert token not in argv and not any(token in v for v in env.values())
+
+
+class _Store:
+    def __init__(self, credential: Credential) -> None:
+        self.credential = credential
+
+    async def read(self) -> Credential:
+        return self.credential
+
+    async def refused(self, credential: Credential) -> None: ...
+
+
+@pytest.mark.skipif(not os.path.isdir("/proc"), reason="reads open descriptors from /proc")
+@pytest.mark.parametrize("uvloop", [False, True])
+def test_no_other_process_spawned_while_the_token_is_held_gets_its_socket(uvloop):
+    if uvloop:
+        pytest.importorskip("uvloop")
+
+    async def spawn_meanwhile() -> tuple[int, list[str]]:
+        held = _token_socket("sk-ant-oat01-held")
+        try:
+            done = await anyio.run_process(["ls", "/proc/self/fd"])
+            return held.fileno(), done.stdout.decode().split()
+        finally:
+            held.close()
+
+    fd, seen = anyio.run(spawn_meanwhile, backend_options={"use_uvloop": uvloop})
+    assert str(fd) not in seen
 
 
 @pytest.mark.asyncio
@@ -106,3 +168,101 @@ async def test_a_prepare_that_fails_midway_removes_its_config_dir(monkeypatch, t
     with pytest.raises(OSError, match="no space"):
         await LocalLauncher().prepare("t-full", "sid", [{"uuid": "a"}], identity="u", system_prompt="s")
     assert not any(tmp_path.iterdir())
+
+
+@pytest.mark.asyncio
+async def test_a_run_on_the_saved_setup_token_names_it_to_the_plan_once_read(monkeypatch):
+    plan = SimpleNamespace(took=AsyncMock())
+    monkeypatch.setattr("ptc_agent.agent.claude_code.launcher.local_managed", AsyncMock(return_value=()))
+    await LocalLauncher(saved=_Store(Credential("sk-ant-oat01-saved")), plan=plan)._ready()
+    await LocalLauncher(token="sk-ant-oat01-checked", plan=plan)._ready()
+    plan.took.assert_awaited_once_with("sk-ant-oat01-saved")
+
+
+class _Exiting:
+    """A CLI whose closed stdin is seen before its exit is reaped."""
+
+    def __init__(self, exits: bool) -> None:
+        self.returncode: int | None = None
+        self._exits = exits
+
+    async def wait(self) -> int:
+        if not self._exits:
+            await anyio.sleep_forever()
+        self.returncode = 1
+        return 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("exits", [True, False], ids=["exiting", "running"])
+async def test_a_write_that_fails_as_the_cli_exits_fails_in_the_clis_words(monkeypatch, exits):
+    """An exiting CLI closes its stdin before its exit is reaped, so the
+    write that fails then would say only that the pipe broke. It waits for
+    the exit; a CLI still running keeps the write's own error."""
+    from collections import deque
+
+    from claude_agent_sdk import CLIConnectionError, ProcessError
+
+    from ptc_agent.agent.claude_code import launcher
+    from ptc_agent.agent.claude_code.launcher import ScopedEnvTransport
+
+    async def broken(self, data):
+        raise CLIConnectionError("Failed to write to process stdin: ")
+
+    monkeypatch.setattr(SubprocessCLITransport, "write", broken)
+    monkeypatch.setattr(launcher, "EXIT_REAP_WAIT_S", 0.05)
+    transport = ScopedEnvTransport.__new__(ScopedEnvTransport)
+    transport._process = _Exiting(exits)
+    transport._stderr = deque(["enterprise MCP config is present"])
+    transport._stderr_task = None
+
+    with pytest.raises(ProcessError if exits else CLIConnectionError) as raised:
+        await transport.write("{}\n")
+    if exits:
+        assert raised.value.exit_code == 1 and "enterprise MCP config" in raised.value.stderr
+
+
+@pytest.mark.asyncio
+async def test_a_cli_cut_off_mid_character_fails_with_its_exit_code_and_stderr(tmp_path):
+    """anyio raises on a character cut off at the end of a text stream, which
+    would fail the read before the exit code and stderr are read."""
+    cli = tmp_path / "claude"
+    cli.write_text(
+        f"#!{sys.executable}\nimport sys\n"
+        "sys.stderr.write('disk full\\n'); sys.stderr.flush()\n"
+        "sys.stdout.buffer.write(b'{\"type\":\"system\",\"x\":\"\\xe4\\xb8\\xad\"}\\n{\"type\":\"assistant\",\"text\":\"ab\\xc3')\n"
+        "sys.stdout.flush(); sys.exit(3)\n"
+    )
+    cli.chmod(0o755)
+    from claude_agent_sdk import ProcessError
+
+    from ptc_agent.agent.claude_code.launcher import ScopedEnvTransport
+
+    transport = ScopedEnvTransport(options=ClaudeAgentOptions(cli_path=str(cli)), base_env={}, credential=None)
+    await transport.connect()
+    try:
+        with pytest.raises(ProcessError) as raised:
+            async for _ in transport.read_messages():
+                pass
+    finally:
+        await transport.close()
+    assert raised.value.exit_code == 3 and "disk full" in raised.value.stderr
+
+
+def test_a_session_resumes_in_the_directory_its_records_name():
+    """A session copied into another thread (a fork) keeps the working
+    directory it began in, whichever launcher wrote it: the CLI's environment
+    block names it, so moving it would change the session's prompt."""
+    from ptc_agent.agent.claude_code.launcher import session_thread_key
+
+    local = [{"type": "user", "cwd": "/private/tmp/langalpha-claude/source-thread"}]
+    remote = [{"type": "user", "cwd": "/home/me/langalpha/_internal/claude-code/threads/src-task1/"}]
+    assert session_thread_key(local, "fork-thread") == "source-thread"
+    assert session_thread_key(remote, "fork-thread") == "src-task1"
+    # The first record that names one wins, wherever the CLI moved after; none,
+    # or no plain key, keeps the thread's.
+    moved = local + [{"type": "user", "cwd": "/private/tmp/langalpha-claude/source-thread/repo"}]
+    assert session_thread_key(moved, "fork-thread") == "source-thread"
+    assert session_thread_key([{"type": "summary"}] + local, "fork-thread") == "source-thread"
+    assert session_thread_key([{"type": "summary"}], "fork-thread") == "fork-thread"
+    assert session_thread_key([{"cwd": "/tmp/has space/x y"}], "fork-thread") == "fork-thread"

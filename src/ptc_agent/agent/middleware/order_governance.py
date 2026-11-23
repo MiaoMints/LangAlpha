@@ -45,6 +45,7 @@ from ptc_agent.agent.middleware.direct_mcp import (
 )
 from ptc_agent.agent.middleware.tool.argument_parsing import parse_tool_args
 from ptc_agent.agent.middleware.tool.error_handling import format_tool_error
+from ptc_agent.agent.pending_calls import pending_calls
 
 # What the interrupt payload calls itself, and the artifact key a receipt
 # rides under. Both are read by the client.
@@ -81,6 +82,18 @@ class ExecutionGrant:
     """The single execution an approved attempt hands out."""
 
     token: str
+
+
+@dataclass(frozen=True)
+class Settled:
+    """What recording the vendor's answer produced, for the client and the model."""
+
+    #: The attempt's receipt. Opaque here; the client reads it.
+    receipt: dict[str, Any] | None = None
+    #: Read by the model after the vendor's own answer: the state the ledger
+    #: recorded, which the vendor spells its own way, and what will follow it
+    #: up. None adds nothing.
+    note: str | None = None
 
 
 @dataclass(frozen=True)
@@ -129,8 +142,8 @@ class OrderLedger(Protocol):
         """Take the one execution, or say what state was found instead."""
         ...
 
-    async def complete(self, attempt_id: str, result: ToolMessage) -> dict[str, Any] | None:
-        """Settle the attempt with the vendor's answer; returns the receipt."""
+    async def complete(self, attempt_id: str, result: ToolMessage) -> Settled:
+        """Settle the attempt with the vendor's answer."""
         ...
 
     async def refuse(self, attempt_id: str, reason: str) -> dict[str, Any] | None:
@@ -141,10 +154,31 @@ class OrderLedger(Protocol):
         """
         ...
 
+    async def abandon(self, message_id: str, tool_call_id: str) -> None:
+        """Refuse this call's attempt if it is still proposed: the thread went
+        on without the call, so no answer to its card may place it."""
+        ...
+
+
+def _with_note(result: ToolMessage, note: str | None) -> ToolMessage:
+    """Add the ledger's line after the vendor's answer, in the answer's own shape."""
+    if not note:
+        return result
+    if isinstance(result.content, str):
+        result.content = f"{result.content}\n\n{note}" if result.content else note
+    else:
+        result.content = [*result.content, {"type": "text", "text": note}]
+    return result
+
 
 def _order_of(stamp: Mapping[str, Any] | None) -> dict[str, Any] | None:
     order = (stamp or {}).get("order")
     return order if isinstance(order, dict) else None
+
+
+def places_order(tool: BaseTool) -> bool:
+    """Whether the binder stamped ``tool`` as one that places an order."""
+    return _order_of(direct_tool_meta(tool)) is not None
 
 
 def _describe(tool_call: Mapping[str, Any], stamp: Mapping[str, Any]) -> str:
@@ -208,16 +242,20 @@ class OrderGovernanceMiddleware(AgentMiddleware):
     # -- proposal and verdict ------------------------------------------------
 
     def _order_calls(self, state: Any) -> tuple[AIMessage | None, list[dict[str, Any]]]:
+        """The last assistant message and its order calls still waiting on a result."""
         messages = (state or {}).get("messages") or []
-        last_ai = next(
-            (m for m in reversed(messages) if isinstance(m, AIMessage)), None
-        )
-        if last_ai is None or not last_ai.tool_calls:
-            return None, []
-        calls = [
-            call for call in last_ai.tool_calls if call.get("name") in self._stamps
-        ]
-        return last_ai, calls
+        at, pending = pending_calls(messages)
+        calls = [call for call in pending if call.get("name") in self._stamps]
+        return (messages[at], calls) if calls else (None, [])
+
+    async def abandon(self, message: AIMessage, calls: Sequence[Mapping[str, Any]]) -> None:
+        """Refuse the proposals of ``message``'s ``calls``, which a later run
+        cut off with their cards unanswered."""
+        if not message.id:
+            return
+        for call in calls:
+            if call.get("name") in self._stamps:
+                await self._ledger.abandon(message.id, call["id"])
 
     def _blocked(
         self,
@@ -437,5 +475,7 @@ class OrderGovernanceMiddleware(AgentMiddleware):
 
         if not isinstance(result, ToolMessage):
             return result
-        receipt = await self._ledger.complete(attempt_id, result)
-        return _with_receipt(_stamped(result, dict(stamp)), receipt)
+        settled = await self._ledger.complete(attempt_id, result)
+        return _with_receipt(
+            _stamped(_with_note(result, settled.note), dict(stamp)), settled.receipt
+        )

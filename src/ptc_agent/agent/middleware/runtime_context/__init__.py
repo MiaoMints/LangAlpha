@@ -17,8 +17,6 @@ from .baseline import (
     AGENT_MD_PATH,
     BLOCK_KINDS,
     DEFAULT_REBUILD_AFTER_UPDATES,
-    MAX_AGENT_MD_SIZE,
-    MAX_MEMORY_BLOCK_SIZE,
     BaselineContextMiddleware,
     BaselineSources,
     BlockReader,
@@ -26,7 +24,6 @@ from .baseline import (
     MemoryTierSource,
 )
 from .carrier import (
-    Carrier,
     CarrierShape,
     ComposedRequest,
     PinSite,
@@ -88,7 +85,7 @@ from .turn import (
     TimeUpToolStopMiddleware,
     TurnContextMiddleware,
 )
-from .turn_context import TurnContext
+from .turn_context import HomeAway, TurnContext
 
 __all__ = [
     "AGENT_MD_PATH",
@@ -103,8 +100,6 @@ __all__ = [
     "ENVELOPE_STEADY_TOKENS",
     "HARNESS_BLOCKS",
     "KNOWN_SURFACES",
-    "MAX_AGENT_MD_SIZE",
-    "MAX_MEMORY_BLOCK_SIZE",
     "NON_CHANGE_ROW_KINDS",
     "NOTICE_ROW_KINDS",
     "RUNTIME_UPDATE_KEY",
@@ -119,12 +114,12 @@ __all__ = [
     "BaselineEpoch",
     "BaselineSources",
     "BlockReader",
-    "Carrier",
     "CarrierShape",
     "ComposedRequest",
     "DurableUpdate",
     "FrozenPromptMiddleware",
     "HarnessBlock",
+    "HomeAway",
     "MemoSource",
     "MemoryTierSource",
     "Observations",

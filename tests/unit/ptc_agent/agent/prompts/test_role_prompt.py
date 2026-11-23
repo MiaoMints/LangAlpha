@@ -8,7 +8,7 @@ model then follows both.
 
 from ptc_agent.agent.prompts import get_loader
 
-_BASE = dict(current_time="2026-10-03 11:00 ET", subagent_summary="")
+_BASE = dict(current_time="2026-10-03 11:00 ET")
 
 
 def test_only_the_chief_of_staff_reads_the_role_section():
@@ -38,8 +38,8 @@ def test_no_shared_section_tells_the_chief_of_staff_to_keep_a_workspace_index():
     analyst = loader.get_system_prompt(**_BASE)
     chief = loader.get_system_prompt(**_BASE, role="chief_of_staff")
     for analyst_only in (
-        "index of what each task produced",
-        "Key findings, what each task produced",
+        "Workspace map: purpose, reusable tools",
+        "one line for what the task produced and where",
         "`agent.md` is about the workspace",
         "What this workspace is doing",
         "project_q2_rebalance_thesis.md",
@@ -58,7 +58,7 @@ def test_an_empty_home_notebook_is_not_seeded_as_a_workspace_index():
             "envelope/baseline_agentmd.md.j2", path="/agent.md", content="", **role
         )
 
-    assert "Thread Index" in empty()
+    assert "Purpose, Reusable, Open, Deliverables" in empty()
     chief = empty(role="chief_of_staff")
-    assert "Thread Index" not in chief
+    assert "Purpose, Reusable, Open, Deliverables" not in chief
     assert "<role>" in chief

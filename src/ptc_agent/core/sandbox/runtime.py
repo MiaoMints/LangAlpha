@@ -1,9 +1,10 @@
 """Abstract runtime and provider interfaces for sandbox backends."""
 
+import asyncio
 import base64
 import shlex
 from abc import ABC, abstractmethod
-from collections.abc import AsyncIterator, Sequence
+from collections.abc import AsyncIterator, Awaitable, Callable, Collection, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
@@ -84,12 +85,20 @@ class HostUnavailablePolicy(ABC):
     """
 
     @abstractmethod
-    async def rebuild_now(self, sandbox_id: str) -> datetime | None:
-        """The host refused to start *sandbox_id*.
+    async def rebuild_now(
+        self, sandbox_id: str, stuck_in: str | None = None
+    ) -> datetime | None:
+        """The host refused to start *sandbox_id*, or left it in *stuck_in*.
 
         When the outage that authorizes rebuilding instead began, or None to
-        keep waiting for the host.
+        keep waiting for the host. A sandbox stuck in a transition counts only
+        while it stays in that one, since a slow transition is also sighted.
         """
+
+    @abstractmethod
+    async def observed(self, sandbox_id: str, state: str) -> None:
+        """A read found *sandbox_id* in *state*: if a clock caught it stuck in
+        another transition, it moved on, and that outage is over."""
 
     @abstractmethod
     async def reconnected(self, sandbox_id: str) -> bool | None:
@@ -158,6 +167,18 @@ class PreviewInfo:
     process_local: bool = False
 
 
+class PreviewPortInUse(RuntimeError):
+    """The port asked for is held by something else on the computer. One
+    message for every place that finds it, since the agent reads it as the
+    preview tool's result and the routes answer it as their 409."""
+
+    def __init__(self, port: int) -> None:
+        super().__init__(
+            f"Port {port} is already in use on this computer. Choose another port."
+        )
+        self.port = port
+
+
 @dataclass
 class SessionCommandResult:
     """Result of a command executed in a background session."""
@@ -199,9 +220,100 @@ class MetricSample:
     disk_total_bytes: int | None = None
 
 
+@dataclass(frozen=True, slots=True)
+class SandboxAllocation:
+    """What the provider holds for a sandbox now: its state and its size.
+
+    A sandbox is never resized, so its size is the one every run on it had.
+    A size the provider does not report is None.
+    ``archive_after_s`` is how long the sandbox may sit stopped before the
+    provider archives it, which ends the hold on its disk; None where it is
+    never archived, or the provider does not say when.
+    """
+
+    # None for a state the provider names that says neither up nor down.
+    state: RuntimeState | None
+    cpu: float | None = None
+    memory_gb: float | None = None
+    disk_gb: float | None = None
+    archive_after_s: int | None = None
+
+
 # One ranged read of a streamed download. Large enough that a file costs few
 # execs, small enough that a stream holds little memory at any moment.
 STREAM_CHUNK_BYTES = 8 * 1024 * 1024
+
+
+class StreamProcess(ABC):
+    """One process in the sandbox whose stdin and stdout stream both ways for as long as it runs.
+
+    A stream is faithful to lines, not bytes, which is what a line protocol
+    such as stream-json needs and all that every provider can promise: input
+    may reach the process only once a write ends its line, output may gain a
+    final newline, output bytes that are not UTF-8 read as U+FFFD, and where
+    the provider takes input as text, ``write`` raises ValueError on input that
+    is not UTF-8.
+
+    A signal reaches every process the command started, unless one left its
+    process group (``setsid``). The exit status
+    follows the shell's convention, as ``exec`` reports it on every provider:
+    a process a signal ended reads 128 plus the signal's number (137 for a
+    kill, 143 for a TERM). -1 means the stream failed, which ``failure`` says
+    why, or the provider could not say how the process ended.
+    """
+
+    stdout: asyncio.StreamReader
+    # Never mixed into stdout, which carries a protocol.
+    stderr: asyncio.StreamReader
+
+    @property
+    @abstractmethod
+    def returncode(self) -> int | None:
+        """None while it runs."""
+
+    @property
+    @abstractmethod
+    def failure(self) -> str | None:
+        """Why the stream failed and killed the process (it lost track of it,
+        could not signal it, lost a send to it, or too much output went
+        unread); None unless it failed."""
+
+    @abstractmethod
+    async def write(self, data: bytes) -> None:
+        """Send *data* to its stdin after every earlier write.
+
+        Raises ConnectionError once the process ended or the stream was lost,
+        and ValueError, sending none of it, where the provider takes text and
+        whole lines: on bytes that are not UTF-8, or on a line it would hold
+        past its line limit.
+        """
+
+    @abstractmethod
+    async def write_eof(self) -> bool:
+        """Close its stdin after every earlier write.
+
+        False, with nothing done, where the provider cannot, so the caller
+        ends the process another way.
+        """
+
+    @abstractmethod
+    async def wait(self) -> int:
+        """Its exit status, once it ended and both readers reached EOF."""
+
+    @abstractmethod
+    async def terminate(self) -> None:
+        """SIGTERM the command and what it started in its process group; a
+        no-op once it ended."""
+
+    @abstractmethod
+    async def kill(self) -> None:
+        """SIGKILL the command and what it started in its process group; a
+        no-op once it ended."""
+
+    @abstractmethod
+    async def close(self) -> None:
+        """Free what the stream holds on the provider, killing a process still
+        running. Safe to call again, and to cancel: the teardown still runs."""
 
 
 class SandboxRuntime(ABC):
@@ -309,6 +421,14 @@ class SandboxRuntime(ABC):
         traffic through its preview proxy, and Docker never stops on idle.
         """
 
+    async def hold_awake(self, seconds: int) -> bool:
+        """Keep the machine from idle sleep for ``seconds``, while work the
+        machine cannot see (a turn thinking between its calls) is under way.
+        False where the machine never sleeps on its own, so the caller stops
+        asking.
+        """
+        return False
+
     # -- Execution --
 
     @abstractmethod
@@ -335,12 +455,41 @@ class SandboxRuntime(ABC):
         keeps this default."""
         return await self.exec(command, timeout, env=env)
 
+    async def open_stream(self, command: str) -> StreamProcess:
+        """Start ``bash -c command`` as the user ``exec`` runs as, its pipes
+        streaming both ways until it ends.
+
+        For a process that speaks a protocol over its pipes for a whole turn,
+        which neither ``exec`` nor a session can carry: both are bounded and
+        read output only after the fact. It starts where the provider starts
+        commands, and no login or interactive startup file runs before it, so a
+        caller that needs a folder, a variable or a PATH says so in the
+        command. The one exception is Daytona's: the command runs inside a
+        session whose shell is zsh where the image has it, which reads
+        ``/etc/zshenv`` and ``~/.zshenv`` as it starts, and Daytona's API has no
+        way to start without it. A runtime with no way to stream raises
+        NotImplementedError.
+        """
+        raise NotImplementedError(
+            f"{type(self).__name__} does not support streaming a process"
+        )
+
     async def login_home(self) -> str:
         """The home ``~`` names for the user commands run as; empty when the
         machine does not say."""
         result = await self.exec('printf %s "$HOME"', timeout=15)
         home = result.stdout.strip() if result.exit_code == 0 else ""
         return home if home.startswith("/") else ""
+
+    # Whether ``login_config_home`` asks the machine. One that does not
+    # answers without reaching it, so its answer is no call the machine served.
+    says_config_home: ClassVar[bool] = False
+
+    async def login_config_home(self) -> str:
+        """That user's ``$XDG_CONFIG_HOME``, which places LangAlpha's config
+        folder (its Claude Code tokens) on a machine of the user's own; empty
+        when unset or not said. Only an SSH machine says: no other keeps one."""
+        return ""
 
     # -- File I/O --
 
@@ -486,6 +635,9 @@ class SandboxProvider(ABC):
     # Whether its sandboxes run off this host, where only a publicly routable
     # address reaches the server.
     runs_remote: ClassVar[bool] = True
+    # Whether its sandboxes see this host's loopback under another name, so a
+    # loopback relay base must be rewritten for them to dial it.
+    reaches_host_through_alias: ClassVar[bool] = False
     # False for a backend that caps how long a sandbox runs, so a computer on it
     # cannot be kept always-on.
     holds_always_on: ClassVar[bool] = True
@@ -506,6 +658,8 @@ class SandboxProvider(ABC):
     # Whether ``metrics_since`` can answer, so a caller holding only the kind
     # skips building a provider for one that never will.
     reports_metrics: ClassVar[bool] = False
+    # Whether ``allocation`` can answer, read the same way.
+    reports_allocation: ClassVar[bool] = False
     # True where the machine outlives every create, so a change to the env
     # this deployment gives a new computer reaches it only by being written
     # again at each open (``SandboxRuntime.replace_env``).
@@ -513,6 +667,10 @@ class SandboxProvider(ABC):
     # Whether the file mount may run on the machine. It needs root and
     # /dev/fuse, which a machine the server does not own need not grant.
     mounts_livefs: ClassVar[bool] = True
+    # Whether this kind's machines set the agent's browser up themselves
+    # (``browser_runtime/install.py``) rather than having it from the sandbox
+    # image: a machine someone brings has only what it has.
+    installs_browser: ClassVar[bool] = False
     # The layout version a sandbox whose manifest has no stamp was made at, so
     # a failed first manifest write cannot replay older layout moves.
     first_layout_version: ClassVar[int] = 1
@@ -534,6 +692,16 @@ class SandboxProvider(ABC):
         """Whether a sandbox built from *settings* measures its own disk, rather
         than its host's."""
         return True
+
+    @classmethod
+    async def default_root_dir(
+        cls, taken: Callable[[], Awaitable[Collection[str]]]
+    ) -> str | None:
+        """The folder a new computer here works in unless told otherwise, on a
+        machine whose paths are not the deployment's configured root; None
+        where they are. *taken* reads the roots of its owner's other computers
+        of this kind, for a kind that needs them."""
+        return None
 
     @classmethod
     def trusted_host(cls, sandbox: Any) -> bool:
@@ -594,6 +762,22 @@ class SandboxProvider(ABC):
     ) -> None:
         """Providers with mutable limits can repair an existing runtime before use."""
 
+    async def allocation(self, sandbox_id: str) -> SandboxAllocation:
+        """The sandbox's state and size, read from the provider without connecting.
+
+        A lookup only, so a stopped or paused sandbox stays as it is. Raises
+        when the provider cannot answer, and as ``classify_error`` reads
+        ``SANDBOX_GONE`` when the sandbox no longer exists. Only a provider
+        with ``reports_allocation`` answers.
+        """
+        raise NotImplementedError(f"{type(self).__name__} reports no allocation")
+
+    @property
+    def default_archive_after_s(self) -> int | None:
+        """How long this provider is configured to keep a new sandbox stopped
+        before archiving it; None where it never archives one."""
+        return None
+
     async def metrics_since(
         self,
         sandbox_id: str,
@@ -616,6 +800,15 @@ class SandboxProvider(ABC):
     async def close(self) -> None:
         """Release provider resources (HTTP clients, etc.)."""
         ...
+
+    async def remove_abandoned(self, ref: str) -> bool:
+        """Delete *ref*, a sandbox a create of this provider gave up on.
+
+        True once nothing answers to *ref*; False while the backend refuses to
+        delete it yet, as it does mid-transition. Only a provider that reports
+        abandoned sandboxes (``ptc_agent.core.sandbox.abandoned``) has any.
+        """
+        raise NotImplementedError(f"{type(self).__name__} reports no abandoned sandboxes")
 
     def is_transient_error(self, exc: Exception) -> bool:
         """Return True if *exc* is a transient error that may be retried.

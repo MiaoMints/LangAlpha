@@ -234,7 +234,7 @@ export function WidgetFrame({
   // reason: a click under 3px of movement stays a click.
   //
   // The card is the chat's term card: its title set into the top edge (inside
-  // it, in the Quiet style), the widget's sub and meta beside and opposite it.
+  // it, in the Balanced style), the widget's sub and meta beside and opposite it.
   // The actions follow the title rather than the meta, so the paperclip that
   // a hover reveals takes room nothing else is using and the meta never moves.
   return (
@@ -261,11 +261,11 @@ export function WidgetFrame({
               <GripVertical size={12} />
             </span>
           )}
-          <span className="term-card-title">
+          <h2 className="term-card-title">
             <span className="term-bracket" aria-hidden="true">[</span>
             <span className="term-card-title-text">{t(definition.cardTitleKey ?? definition.titleKey)}</span>
             <span className="term-bracket" aria-hidden="true">]</span>
-          </span>
+          </h2>
           <span ref={setSubSlot} className="term-card-sub" />
           <span className="widget-card__actions widget-drag-cancel">
             {editMode && hasSettings && (
@@ -281,7 +281,8 @@ export function WidgetFrame({
             )}
             <button
               type="button"
-              className={cn('widget-card__icon-btn widget-card__attach', !editMode && 'widget-card__attach--view')}
+              // Not in edit mode, where Settings and the menu sit 2px either side.
+              className={cn('widget-card__icon-btn widget-card__attach', !editMode && 'widget-card__attach--view tap-target')}
               onClick={handleAddToContext}
               disabled={attachDisabled}
               aria-label={attachTooltip}

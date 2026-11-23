@@ -15,7 +15,6 @@ from collections.abc import Collection, Mapping, Sequence
 from datetime import date, datetime, time, timezone as dt_timezone
 from decimal import Decimal
 from typing import Any
-from zoneinfo import ZoneInfo
 
 from ptc_agent.agent.middleware.runtime_context.epoch import MACHINE_PHRASES
 from src.server.database.automation_executions import list_settled_since
@@ -23,11 +22,8 @@ from src.server.database.conversation.threads_read import get_recent_threads_for
 from src.server.database.portfolio import get_user_portfolio
 from src.server.database.workspace import get_workspaces_for_user
 from src.server.services.thread_lifecycle import project_lifecycle
-from src.tools.secretary.utils import (
-    ComputerPlacement,
-    PlacedComputer,
-    user_zone,
-)
+from src.tools.secretary.utils import ComputerPlacement, PlacedComputer
+from src.tools.wakeups.clock import Zone, user_zone_of, zone_name
 
 logger = logging.getLogger(__name__)
 
@@ -81,6 +77,8 @@ _RUN_STATUS = {"completed": "finished", "failed": "failed", "timeout": "timed ou
 # The two failures the user has to act on, not the automation.
 _RUN_FAILURE = {
     "usage_limit": "a usage limit stopped it",
+    "claude_plan": "the Claude plan's limit stopped it",
+    "plan_limit": "a subscription's usage limit stopped it",
     "provider_auth": "the provider rejected the user's own key",
 }
 
@@ -101,7 +99,7 @@ async def read_activity(
     ``computers`` is the roster the build read once for this block and for
     its tools, so the block never names a computer the tools cannot take.
     """
-    zone = user_zone(timezone)
+    zone = user_zone_of(timezone)
     today = _now().astimezone(zone).date()
     try:
         (workspaces, total), threads, runs, holdings = await asyncio.wait_for(
@@ -145,7 +143,7 @@ def render_activity(
     runs: list[dict[str, Any]],
     holdings: list[dict[str, Any]],
     home_id: str,
-    zone: ZoneInfo,
+    zone: Zone,
     today: date,
     placement: ComputerPlacement = ComputerPlacement(),
 ) -> str:
@@ -185,7 +183,7 @@ def render_activity(
         sections.append(
             "\n".join(
                 [
-                    f"Automation runs today, {today.isoformat()} ({zone.key}):",
+                    f"Automation runs today, {today.isoformat()} ({zone_name(zone)}):",
                     *(_run_line(run, zone) for run in runs),
                 ]
             )
@@ -239,7 +237,7 @@ def _computer_line(computer: PlacedComputer) -> str:
 
 
 def _workspace_line(
-    ws: dict[str, Any], placement: ComputerPlacement, zone: ZoneInfo
+    ws: dict[str, Any], placement: ComputerPlacement, zone: Zone
 ) -> str:
     name = _one_line(ws.get("name"), _TITLE_CHARS) or "Untitled"
     described = _one_line(ws.get("description"), _EXCERPT_CHARS)
@@ -259,7 +257,7 @@ def _workspace_line(
     return f"- {name}{f': {described}' if described else ''} ({', '.join(facts)})"
 
 
-def _thread_line(thread: dict[str, Any], home_id: str, zone: ZoneInfo) -> str:
+def _thread_line(thread: dict[str, Any], home_id: str, zone: Zone) -> str:
     where = (
         "Home"
         if str(thread["workspace_id"]) == home_id
@@ -274,7 +272,7 @@ def _thread_line(thread: dict[str, Any], home_id: str, zone: ZoneInfo) -> str:
     )
 
 
-def _run_line(run: dict[str, Any], zone: ZoneInfo) -> str:
+def _run_line(run: dict[str, Any], zone: Zone) -> str:
     name = _one_line(run.get("automation_name"), _TITLE_CHARS) or "Untitled"
     status = str(run["status"])
     said = (
@@ -321,7 +319,13 @@ def _currency(holding: dict[str, Any]) -> str:
 
 
 def _holding(holding: dict[str, Any]) -> str:
-    text = f"{_one_line(holding.get('symbol'), 24)} {_number(holding.get('quantity'))}"
+    return f"{_one_line(holding.get('symbol'), 24)} {holding_position(holding)}"
+
+
+def holding_position(holding: dict[str, Any]) -> str:
+    """``qty @ cost CURRENCY``, the cost in the holding's own currency and left
+    out when none is on record. The insight prompt lists holdings this way too."""
+    text = _number(holding.get("quantity"))
     cost = holding.get("average_cost")
     if cost is not None:
         text += f" @ {_number(cost)}"
@@ -338,7 +342,7 @@ def _number(value: Any) -> str:
     return format(_decimal(value).normalize(), "f")
 
 
-def _date(value: datetime, zone: ZoneInfo) -> str:
+def _date(value: datetime, zone: Zone) -> str:
     return value.astimezone(zone).date().isoformat()
 
 

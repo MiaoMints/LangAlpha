@@ -19,13 +19,16 @@ import shlex
 import tarfile
 import time
 import uuid
-from collections.abc import AsyncIterator, Sequence
+from collections.abc import AsyncIterator, Iterator, Sequence
+from contextlib import contextmanager
 from typing import Any
 
 import structlog
 
 from ptc_agent.config.core import DockerConfig, PlatformSecretDefinition
 from ptc_agent.core.sandbox._defaults import sandbox_thread_env
+from ptc_agent.core.sandbox.providers._docker_image import ensure_image
+from ptc_agent.core.sandbox.providers._docker_stream import open_docker_stream
 from ptc_agent.core.sandbox.providers._exec_sessions import ExecSessionRuntime
 from ptc_agent.core.sandbox.providers._tiers import (
     TierSizing,
@@ -41,6 +44,7 @@ from ptc_agent.core.sandbox.runtime import (
     SandboxGoneError,
     SandboxFailureKind,
     SandboxTransientError,
+    StreamProcess,
     STREAM_CHUNK_BYTES,
 )
 
@@ -111,6 +115,32 @@ async def _remove_quietly(container: Any, name: str) -> None:
 # ---------------------------------------------------------------------------
 
 
+@contextmanager
+def _gone_if_removed(sandbox_id: str) -> Iterator[None]:
+    """A call on this sandbox's own container that finds it missing (404)
+    raises Gone, as a lookup does, so a stop of a container removed outside
+    us counts as done rather than refused."""
+    try:
+        yield
+    except Exception as e:
+        from aiodocker.exceptions import DockerError
+
+        if isinstance(e, DockerError) and e.status == 404:
+            raise SandboxGoneError(sandbox_id, "Docker container was removed") from e
+        raise
+
+
+def _published_ports(info: dict[str, Any], proxy_ports: list[int]) -> dict[int, int]:
+    """The host ports Docker picked for *proxy_ports*, from an inspect; none while stopped."""
+    bindings = info.get("NetworkSettings", {}).get("Ports") or {}
+    published: dict[int, int] = {}
+    for port in proxy_ports:
+        bound = bindings.get(f"{port}/tcp") or []
+        if bound and bound[0].get("HostPort"):
+            published[port] = int(bound[0]["HostPort"])
+    return published
+
+
 class DockerRuntime(ExecSessionRuntime):
     """Runtime that wraps a single Docker container."""
 
@@ -152,13 +182,26 @@ class DockerRuntime(ExecSessionRuntime):
     async def fetch_working_dir(self) -> str:
         return self._working_dir
 
+    @property
+    def raw(self) -> Any:
+        """The aiodocker container, for code that needs what the runtime
+        interface does not surface."""
+        return self._container
+
     # -- Lifecycle --
 
     async def start(self, timeout: int = 120) -> None:
         await self._container.start()
+        # A start picks new dynamic host ports, and a runtime made while the
+        # container was stopped read none. Its forwarders died with the stop too.
+        info = await self._container.show()
+        self._host_port_map = _published_ports(info, self._proxy_ports)
+        self._port_map.clear()
+        self._forwarder_pids.clear()
 
     async def stop(self, timeout: int = 60, *, force: bool = False) -> None:
-        await self._container.stop(t=0 if force else timeout)
+        with _gone_if_removed(self._id):
+            await self._container.stop(t=0 if force else timeout)
 
     async def delete(self) -> None:
         try:
@@ -174,7 +217,9 @@ class DockerRuntime(ExecSessionRuntime):
         return _DOCKER_STATE_MAP.get(status, RuntimeState.ERROR)
 
     async def get_state(self) -> RuntimeState:
-        return self._state_from_inspect(await self._container.show())
+        with _gone_if_removed(self._id):
+            info = await self._container.show()
+        return self._state_from_inspect(info)
 
     # -- Execution --
 
@@ -188,17 +233,21 @@ class DockerRuntime(ExecSessionRuntime):
     ) -> ExecResult:
         return await self._exec(command, timeout, user="root", env=env)
 
+    async def open_stream(self, command: str) -> StreamProcess:
+        return await open_docker_stream(self, command)
+
     async def _exec(
         self,
         command: str,
         timeout: int,
         user: str = "",
         env: dict[str, str] | None = None,
+        workdir: str | None = None,
     ) -> ExecResult:
         try:
             exec_obj = await self._container.exec(
                 cmd=["bash", "-c", command],
-                workdir=self._working_dir,
+                workdir=workdir or self._working_dir,
                 user=user,
                 environment=env,
             )
@@ -551,6 +600,7 @@ class DockerProvider(SandboxProvider):
 
     label = "Docker"
     runs_remote = False
+    reaches_host_through_alias = True
     default_computer_name = "Local computer"
     # Commands run as the image's user, but a write goes through the daemon as
     # root, and in bind-mount mode a path outside the root lands in the host
@@ -691,7 +741,7 @@ class DockerProvider(SandboxProvider):
             tier: Resource tier name. ``None`` resolves to the configured default.
         """
         client = await self._get_client()
-        await self._ensure_image(client)
+        await ensure_image(client, self._config.image)
 
         runtime_id = f"docker-{uuid.uuid4().hex[:12]}"
         container_name = f"langalpha-sandbox-{runtime_id}"
@@ -779,13 +829,7 @@ class DockerProvider(SandboxProvider):
                 await self._verify_tier_applied(container_obj, info, sizing)
 
             # Read actual host port mappings (dynamic ports picked by Docker)
-            host_port_map: dict[int, int] = {}
-            if proxy_ports:
-                port_bindings = info.get("NetworkSettings", {}).get("Ports", {})
-                for cp in proxy_ports:
-                    bindings = port_bindings.get(f"{cp}/tcp", [])
-                    if bindings and bindings[0].get("HostPort"):
-                        host_port_map[cp] = int(bindings[0]["HostPort"])
+            host_port_map = _published_ports(info, proxy_ports)
         except BaseException:
             # No runtime/provider reference exists yet, so this method is the
             # only owner capable of removing a container that started but could
@@ -856,12 +900,7 @@ class DockerProvider(SandboxProvider):
 
         # Read actual host port mappings from running container
         proxy_ports = _parse_proxy_port_range(self._config.preview_proxy_ports)
-        host_port_map: dict[int, int] = {}
-        port_bindings = info.get("NetworkSettings", {}).get("Ports", {})
-        for cp in proxy_ports:
-            bindings = port_bindings.get(f"{cp}/tcp", [])
-            if bindings and bindings[0].get("HostPort"):
-                host_port_map[cp] = int(bindings[0]["HostPort"])
+        host_port_map = _published_ports(info, proxy_ports)
 
         return DockerRuntime(
             container_obj,
@@ -946,99 +985,6 @@ class DockerProvider(SandboxProvider):
         )
         return any(marker in msg for marker in transient_markers)
 
-    # -- Internal --
-
-    async def _ensure_image(self, client: Any) -> None:
-        """Ensure the sandbox image exists, auto-building from Dockerfile.sandbox if needed."""
-        try:
-            await client.images.inspect(self._config.image)
-            logger.debug("Docker image found", image=self._config.image)
-            return
-        except Exception:
-            pass  # Image not found -- try to build
-
-        logger.info(
-            "Docker image not found, attempting to build",
-            image=self._config.image,
-        )
-
-        # Look for Dockerfile.sandbox relative to the repo root
-        dockerfile_name = "Dockerfile.sandbox"
-        # Try common locations
-        search_paths = [
-            os.path.join(os.getcwd(), dockerfile_name),
-        ]
-        # Also check relative to this file's location (up to repo root)
-        module_dir = os.path.dirname(os.path.abspath(__file__))
-        for _ in range(6):  # Walk up to 6 levels
-            candidate = os.path.join(module_dir, dockerfile_name)
-            search_paths.append(candidate)
-            module_dir = os.path.dirname(module_dir)
-
-        dockerfile_path = None
-        for path in search_paths:
-            if os.path.isfile(path):
-                dockerfile_path = path
-                break
-
-        if dockerfile_path is None:
-            raise RuntimeError(
-                f"Docker image {self._config.image!r} not found and "
-                f"{dockerfile_name} not found in any search path. "
-                f"Build the image manually or place {dockerfile_name} in the repo root."
-            )
-
-        dockerfile_basename = os.path.basename(dockerfile_path)
-        image_tag = self._config.image
-
-        logger.info(
-            "Building Docker sandbox image",
-            dockerfile=dockerfile_path,
-            tag=image_tag,
-        )
-
-        # Use aiodocker to build. It expects a tar stream via ``fileobj`` and
-        # the Dockerfile path via ``path_dockerfile``.
-        try:
-            build_tar = io.BytesIO()
-            with tarfile.open(fileobj=build_tar, mode="w") as tar:
-                tar.add(dockerfile_path, arcname=dockerfile_basename)
-            build_tar.seek(0)
-
-            proxy = os.environ.get('HTTPS_PROXY') or os.environ.get('https_proxy')
-            buildargs = None
-            if proxy:
-                # Image build runs in a sibling container on docker0.
-                # host.docker.internal is injected only into this backend.
-                proxy = proxy.replace('host.docker.internal', '172.17.0.1')
-                buildargs = {
-                    'HTTP_PROXY': proxy,
-                    'HTTPS_PROXY': proxy,
-                    'NO_PROXY': 'localhost,127.0.0.1',
-                }
-            async for log_line in client.images.build(
-                fileobj=build_tar,
-                path_dockerfile=dockerfile_basename,
-                tag=image_tag,
-                rm=True,
-                stream=True,
-                encoding='identity',
-                buildargs=buildargs,
-            ):
-                if isinstance(log_line, dict) and "stream" in log_line:
-                    line = log_line["stream"].strip()
-                    if line:
-                        logger.debug("Docker build", log=line)
-                elif isinstance(log_line, dict) and "error" in log_line:
-                    raise RuntimeError(f"Docker build failed: {log_line['error']}")
-        except RuntimeError:
-            raise
-        except Exception as e:
-            raise RuntimeError(
-                f"Failed to build Docker image {image_tag!r}: {e}"
-            ) from e
-
-        logger.info("Docker sandbox image built", image=image_tag)
 
 
 # ---------------------------------------------------------------------------

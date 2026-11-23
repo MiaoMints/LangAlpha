@@ -24,10 +24,10 @@ Endpoints (/api/v1/automations):
 """
 
 import logging
-from typing import Any, Optional
+from typing import Any, Literal, Optional
 from uuid import UUID
 
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, HTTPException, Query, Request
 from fastapi.responses import JSONResponse, Response
 from pydantic import ValidationError
 
@@ -46,6 +46,15 @@ from src.server.models.automation import (
     AutomationUpdate,
     DeliveryDefaultUpdate,
     ExecutionStatus,
+)
+from src.server.dependencies import cli_approval
+from src.server.dependencies.principal import (
+    ReadPrincipal,
+    ReadUserId,
+    RunPrincipal,
+    WorkspaceDeletePrincipal,
+    WorkspaceSendPrincipal,
+    WorkspaceWriteUserId,
 )
 from src.server.utils.api import (
     CurrentUserId,
@@ -68,11 +77,13 @@ router = APIRouter(prefix="/api/v1", tags=["Automations"])
 @handle_api_exceptions("create automation", logger, conflict_on_value_error=True)
 async def create_automation(
     request: AutomationCreate,
-    user_id: CurrentUserId,
+    principal: WorkspaceSendPrincipal,
+    http_request: Request,
 ):
     """Create a new scheduled automation."""
+    await cli_approval.automation_runs(http_request, principal, "create", body=request)
     try:
-        automation = await handler.create_automation(user_id=user_id, data=request)
+        automation = await handler.create_automation(user_id=principal.user_id, data=request)
     except handler.DeliveryRefused as e:
         return _delivery_refused(e)
     return AutomationResponse.model_validate(automation)
@@ -81,14 +92,17 @@ async def create_automation(
 @router.get("/automations", response_model=AutomationsListResponse)
 @handle_api_exceptions("list automations", logger)
 async def list_automations(
-    user_id: CurrentUserId,
+    principal: ReadPrincipal,
     status: str | None = Query(None, description="Filter by status"),
     limit: int = Query(50, ge=1, le=100),
     offset: int = Query(0, ge=0),
 ):
     """List automations for the current user, each with its newest execution."""
     automations, total = await auto_db.list_automations(
-        user_id, status=status, limit=limit, offset=offset,
+        principal.user_id,
+        status=status,
+        limit=limit,
+        offset=offset,
     )
     return AutomationsListResponse(
         automations=[AutomationResponse.model_validate(a) for a in automations],
@@ -106,12 +120,18 @@ async def list_automation_runs(
     offset: int = Query(0, ge=0),
     thread_id: Optional[UUID] = Query(None),
     status: Optional[ExecutionStatus] = Query(None),
+    wait_reason: Literal["thread_busy", "computer_unreachable"] | None = Query(None),
 ):
-    """List executions across all of the current user's automations."""
+    """List executions across all of the current user's automations.
+
+    ``wait_reason`` narrows on the server, before the page is cut, so runs
+    waiting for one reason cannot push those waiting for the other off it.
+    """
     return await _runs_page(
         user_id,
         thread_id=str(thread_id) if thread_id else None,
         status=status,
+        wait_reason=wait_reason,
         limit=limit,
         offset=offset,
     )
@@ -155,7 +175,7 @@ async def _delivery_workspace(user_id: str, workspace_id: Optional[UUID]) -> Opt
 @router.get("/automations/delivery-options")
 @handle_api_exceptions("list delivery options", logger)
 async def get_delivery_options(
-    user_id: CurrentUserId,
+    user_id: ReadUserId,
     workspace_id: Optional[UUID] = Query(None),
 ) -> dict[str, Any]:
     """The chats each linked app offers an automation's runs, and the one an
@@ -201,7 +221,7 @@ async def set_delivery_default(
 @handle_api_exceptions("get automation", logger)
 async def get_automation(
     automation_id: UUID,
-    user_id: CurrentUserId,
+    user_id: ReadUserId,
 ):
     """Get a specific automation."""
     automation = await auto_db.get_automation(str(automation_id), user_id)
@@ -215,9 +235,14 @@ async def get_automation(
 async def update_automation(
     automation_id: UUID,
     request: AutomationUpdate,
-    user_id: CurrentUserId,
+    principal: WorkspaceSendPrincipal,
+    http_request: Request,
 ):
     """Partial update of an automation."""
+    user_id = principal.user_id
+    await cli_approval.automation_runs(
+        http_request, principal, "edit", automation_id=str(automation_id), body=request
+    )
     try:
         automation = await handler.update_automation(
             automation_id=str(automation_id),
@@ -242,10 +267,12 @@ async def update_automation(
 @handle_api_exceptions("delete automation", logger)
 async def delete_automation(
     automation_id: UUID,
-    user_id: CurrentUserId,
+    principal: WorkspaceDeletePrincipal,
+    http_request: Request,
 ):
     """Delete an automation (cascade deletes executions)."""
-    deleted = await auto_db.delete_automation(str(automation_id), user_id)
+    await cli_approval.automation_delete(http_request, principal, str(automation_id))
+    deleted = await auto_db.delete_automation(str(automation_id), principal.user_id)
     if not deleted:
         raise_not_found("Automation")
     return Response(status_code=204)
@@ -260,10 +287,16 @@ async def delete_automation(
 @handle_api_exceptions("trigger automation", logger, conflict_on_value_error=True)
 async def trigger_automation(
     automation_id: UUID,
-    user_id: CurrentUserId,
+    principal: RunPrincipal,
+    http_request: Request,
 ):
     """Manually trigger an automation immediately (doesn't affect next_run_at)."""
-    result = await handler.trigger_automation(str(automation_id), user_id)
+    checked = await cli_approval.automation_runs(
+        http_request, principal, "trigger", automation_id=str(automation_id)
+    )
+    result = await handler.trigger_automation(
+        str(automation_id), principal.user_id, checked_computer_id=checked
+    )
     return result
 
 
@@ -271,7 +304,7 @@ async def trigger_automation(
 @handle_api_exceptions("pause automation", logger, conflict_on_value_error=True)
 async def pause_automation(
     automation_id: UUID,
-    user_id: CurrentUserId,
+    user_id: WorkspaceWriteUserId,
 ):
     """Pause an active automation."""
     automation = await handler.pause_automation(str(automation_id), user_id)
@@ -284,10 +317,16 @@ async def pause_automation(
 @handle_api_exceptions("resume automation", logger, conflict_on_value_error=True)
 async def resume_automation(
     automation_id: UUID,
-    user_id: CurrentUserId,
+    # Re-arms runs into the automation's thread, so not the call's own.
+    principal: WorkspaceSendPrincipal,
+    http_request: Request,
 ):
     """Resume a paused or disabled automation."""
-    automation = await handler.resume_automation(str(automation_id), user_id)
+    # Its runs start again where it runs, so off the token's computer it asks.
+    await cli_approval.automation_runs(
+        http_request, principal, "resume", automation_id=str(automation_id)
+    )
+    automation = await handler.resume_automation(str(automation_id), principal.user_id)
     if not automation:
         raise_not_found("Automation")
     return AutomationResponse.model_validate(automation)
@@ -298,7 +337,7 @@ async def resume_automation(
 async def skip_execution(
     automation_id: UUID,
     execution_id: UUID,
-    user_id: CurrentUserId,
+    user_id: WorkspaceWriteUserId,
 ):
     """Skip a run that is waiting for its thread's current turn to end."""
     result = await handler.skip_execution(
@@ -317,7 +356,7 @@ async def skip_execution(
 async def dismiss_execution(
     automation_id: UUID,
     execution_id: UUID,
-    user_id: CurrentUserId,
+    user_id: WorkspaceWriteUserId,
 ):
     """Take a failed run out of Needs attention until another run fails."""
     automation = await handler.dismiss_execution(
@@ -340,7 +379,7 @@ async def dismiss_execution(
 @handle_api_exceptions("list executions", logger)
 async def list_executions(
     automation_id: UUID,
-    user_id: CurrentUserId,
+    user_id: ReadUserId,
     limit: int = Query(20, ge=1, le=100),
     offset: int = Query(0, ge=0),
 ):

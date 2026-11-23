@@ -7,14 +7,22 @@ import { AnimatePresence, motion, useReducedMotion } from '@/lib/framer';
 import { compactNumber } from '@/lib/format';
 import { DURATION, EASE_COLLAPSE, TWEEN } from '@/lib/motion';
 import { useLocale } from '@/hooks/useLocale';
-import type { ModelStatus } from '../../session/types';
+import { useModelName } from '@/hooks/useModelName';
+import type { ModelStatus, TurnStatus } from '../../session/types';
 import type { RetiredModel } from '../../hooks/useThreadModel';
-import type { WarmingDisplay } from '../../utils/warmWorkspace';
 import { useWaitingAutomations } from '../../../Automations/hooks/useWaitingAutomations';
 import { QueuedAutomationNotice } from '../QueuedAutomationNotice';
+import { CliQueueLine } from '../CliQueueNotice';
 import { ModelStatusPill } from './ModelStatusPill';
-import { RetiredModelNotice } from './ThreadModelBanner';
+import { RetiredModelNotice } from './RetiredModelNotice';
 import { StatusLine } from './StatusLine';
+
+/** A row with a surface of its own under the lines (the thread's error, its
+ *  computer's warnings), which decides on its own whether it shows. */
+export interface ThreadNotice {
+  key: string;
+  node: React.ReactNode;
+}
 
 /** Finds the block TranscriptStatus renders (its `data-transcript-status`). */
 export const TRANSCRIPT_STATUS_SELECTOR = '[data-transcript-status]';
@@ -23,9 +31,11 @@ interface TranscriptStatusProps {
   modelStatus: ModelStatus | null;
   isLoading: boolean;
   retired: RetiredModel | null;
-  workspaceStarting: WarmingDisplay;
-  /** Why this send waits on a thread mutation, null when it is not held. */
-  turnHeld: string | null;
+  /** What the turn waits on, its workspace's start merged with the warm
+   *  the page itself watches. */
+  turnStatus: TurnStatus;
+  /** The model the thread runs, which a hand-off's wait names. */
+  model: string | null;
   isCompacting: string | false;
   /** About how many tokens the summary being written has written. */
   compactionTokens: number | null;
@@ -33,6 +43,12 @@ interface TranscriptStatusProps {
   /** The thread whose due automations wait for its turn to end. */
   threadId: string;
   active: boolean;
+  /** In the block so a reader at the end sees one arrive as they see a line. */
+  notices?: readonly ThreadNotice[];
+  /** The notices went to the docked composer: they leave here at once, since
+   *  closing would keep a second copy mounted (and a warning's alert read out
+   *  twice) while the composer already shows them. */
+  noticesDocked?: boolean;
 }
 
 /* The thread's status lines, under the last reply and in the transcript's
@@ -47,18 +63,24 @@ interface TranscriptStatusProps {
    A line fades in, and leaves by fading as its height closes, gap included:
    under a reader at the end, a line that vanished at once would drop the
    reply by its height in one frame. Lines already showing when the transcript
-   mounts (a thread opening, a tab coming back) are simply there. */
+   mounts (a thread opening, a tab coming back) are simply there.
+   A notice leaves the same way when the host takes it away (an error
+   cleared, the workspace's computer gone). One that hides itself (dismissed,
+   or its condition read as cleared) still goes at once: only it knows, and
+   the block sees no more than an empty row. */
 export function TranscriptStatus({
   modelStatus,
   isLoading,
   retired,
-  workspaceStarting,
-  turnHeld,
+  turnStatus: { workspaceStarting, turnHeld, cliQueue },
+  model,
   isCompacting,
   compactionTokens,
   queuedSend,
   threadId,
   active,
+  notices = [],
+  noticesDocked = false,
 }: TranscriptStatusProps): React.ReactElement {
   const { t } = useTranslation();
   const locale = useLocale();
@@ -71,7 +93,8 @@ export function TranscriptStatus({
   if (workspaceStarting) {
     lines.push({ key: 'workspace', node: <WorkspaceStartingLine archived={workspaceStarting === 'archived'} /> });
   }
-  if (turnHeld !== null) lines.push({ key: 'turnHeld', node: <TurnHeldLine reason={turnHeld} /> });
+  if (turnHeld !== null) lines.push({ key: 'turnHeld', node: <TurnHeldLine reason={turnHeld} model={model} /> });
+  if (cliQueue) lines.push({ key: 'cliQueue', node: <CliQueueLine wait={cliQueue} /> });
   if (isCompacting) {
     lines.push({
       key: 'compacting',
@@ -107,9 +130,24 @@ export function TranscriptStatus({
   const waiting = useWaitingAutomations(threadId, active);
   if (waiting.length) lines.push({ key: 'automations', node: <QueuedAutomationNotice runs={waiting} /> });
   const exit = reducedMotion ? { duration: 0 } : { duration: DURATION.exit, ease: EASE_COLLAPSE };
+  const row = {
+    className: 'overflow-hidden',
+    initial: { opacity: 0 },
+    animate: { opacity: 1, transition: reducedMotion ? { duration: 0 } : TWEEN.quick },
+    exit: { opacity: 0, height: 0, transition: exit },
+  };
+  // A leaving child has no props left to read, so whether it closes or goes
+  // at once reaches it through AnimatePresence's `custom`.
+  const noticeRow = {
+    ...row,
+    variants: {
+      gone: (docked: boolean) => ({ opacity: 0, height: 0, transition: docked ? { duration: 0 } : exit }),
+    },
+    exit: 'gone',
+  };
   return (
     <div data-transcript-status className="flex flex-col">
-      <AnimatePresence initial={false}>
+      <AnimatePresence initial={false} custom={noticesDocked}>
         {/* Its own box rather than the first line's, which a line leaving
             from the top would hand to the next one in a frame while its own
             was still closing. It closes with the block's last line. */}
@@ -117,14 +155,15 @@ export function TranscriptStatus({
           <motion.div key="gap" aria-hidden className="h-3" exit={{ height: 0, transition: exit }} />
         )}
         {lines.map(({ key, node }) => (
-          <motion.div
-            key={key}
-            className="overflow-hidden"
-            initial={{ opacity: 0 }}
-            animate={{ opacity: 1, transition: reducedMotion ? { duration: 0 } : TWEEN.quick }}
-            exit={{ opacity: 0, height: 0, transition: exit }}
-          >
+          <motion.div key={key} {...row}>
             {node}
+          </motion.div>
+        ))}
+        {/* Each notice's gap is inside its own closing box, and hidden with
+            it while the notice renders nothing. */}
+        {notices.map(({ key, node }) => (
+          <motion.div key={`notice:${key}`} {...noticeRow} custom={noticesDocked}>
+            <div className="flex flex-col gap-3 pt-3 empty:hidden">{node}</div>
           </motion.div>
         ))}
       </AnimatePresence>
@@ -138,11 +177,19 @@ function turnHeldKey(reason: string): string {
   return 'chat.turnHeld.other';
 }
 
-function TurnHeldLine({ reason }: { reason: string }): React.ReactElement {
+/** The wait's line. A hand-off names the model it goes to, never who writes
+ *  the brief, which is settled only once one is written. */
+function TurnHeldLine({ reason, model }: { reason: string; model: string | null }): React.ReactElement {
   const { t } = useTranslation();
+  const name = useModelName();
+  const text = reason !== 'brief'
+    ? t(turnHeldKey(reason))
+    : model
+      ? t('chat.turnHeld.brief', { model: name(model) })
+      : t('chat.turnHeld.briefNoModel');
   return (
     <StatusLine glyph={<Loader size={12} className="text-(--color-accent-primary)" />}>
-      {t(turnHeldKey(reason))}
+      {text}
     </StatusLine>
   );
 }

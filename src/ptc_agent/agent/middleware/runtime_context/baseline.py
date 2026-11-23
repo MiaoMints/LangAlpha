@@ -14,9 +14,10 @@ changed underneath reaches the model as a durable row written into history
 An epoch survives until compaction, because compaction is the one event that can
 remove the block from the model's retained history: "the file did not change" is
 not enough after a summarization dropped the injection it is measured against.
-Where Claude's thinking is in view the block outlives that too, since it is the
-prefix every thinking block after it was produced on: nothing rebuilds it, and
-after a summary one row restates every section that moved instead.
+Where reasoning bound to the prefix is in view (see ``thinking_binding``) the
+block outlives that too, since that reasoning was produced on it: nothing
+rebuilds it, and after a summary one row restates every section that moved
+instead.
 
 The split of work is the point. This module does the IO and the rendering; the
 record itself, and the decision between rebuilding it and filing rows against
@@ -27,7 +28,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from html import escape
@@ -66,6 +67,8 @@ from ptc_agent.agent.middleware.runtime_context.epoch import (
 )
 from ptc_agent.agent.middleware.runtime_context.harness_blocks import (
     HARNESS_BLOCKS,
+    MCP_SERVERS_BLOCK,
+    SKILLS_BLOCK,
     harness_update_kind,
 )
 from ptc_agent.agent.middleware.runtime_context.profile import (
@@ -89,7 +92,7 @@ from ptc_agent.agent.middleware.runtime_context.turn import (
     NOTICE_ROW_KINDS,
 )
 from ptc_agent.agent.roles import AgentRole
-from ptc_agent.agent.tools.context_file_policy import MAX_AGENT_MD_SIZE, MAX_MEMORY_BLOCK_SIZE
+from ptc_agent.agent.tools.context_file_policy import AGENT_MD, MEMORY_INDEX
 from ptc_agent.core.paths import (
     MEMO_INDEX_FILENAME,
     MEMO_USER_DIR,
@@ -99,6 +102,11 @@ from ptc_agent.core.paths import (
 logger = logging.getLogger(__name__)
 
 AGENT_MD_PATH = "/agent.md"
+
+# The sections rendered from a file read, keyed by its read kind: agent.md's,
+# and one per memory tier, ``memory:<tier>``.
+SECTION_AGENT_MD = "agent_md"
+SECTION_MEMORY_PREFIX = "memory:"
 
 
 
@@ -236,6 +244,11 @@ class BaselineContextMiddleware(AgentMiddleware):
             without being told to write it, and its scratchpad has no notes.
             One instance serves every run of its definition in a parent turn,
             each with its own epoch in that run's checkpoint.
+        shared: A shared workspace's baseline, built with no profile and no
+            zone: its identity block states nothing of one person and says
+            instead that each member message names its writer. Fixed for the
+            workspace's life, as its owner is, so the block holds still
+            within an epoch.
     """
 
     def __init__(
@@ -258,9 +271,11 @@ class BaselineContextMiddleware(AgentMiddleware):
         role: AgentRole = "analyst",
         switches: ProfileSwitches = ProfileSwitches(),
         subagent: bool = False,
+        shared: bool = False,
     ) -> None:
         super().__init__()
         self._subagent = subagent
+        self._shared = shared
         self._session = session
         self._role = role
         self._files_mounted = files_mounted
@@ -308,13 +323,13 @@ class BaselineContextMiddleware(AgentMiddleware):
         self._model_name = model_name
         self._rebuild_after_updates = max(0, rebuild_after_updates)
         self._read_timeout_s = read_timeout_s
-        # Rendered blocks, memoized per epoch. The memo is what makes
+        # Each block's rendered sections, memoized per epoch. The memo is what makes
         # byte-identity a property of the code rather than of the templates
         # happening to be deterministic. More than one entry because a
         # subagent's instance renders for every run of its definition at once,
         # and the scratchpad is in the key because it is what tells two runs'
         # blocks apart.
-        self._block_cache: dict[tuple[Any, ...], str] = {}
+        self._block_cache: dict[tuple[Any, ...], dict[str, str]] = {}
 
     # -- rendering inputs ---------------------------------------------------
 
@@ -512,7 +527,7 @@ class BaselineContextMiddleware(AgentMiddleware):
                 path=AGENT_MD_PATH,
                 available=False,
                 provenance=provenance,
-                cap=MAX_AGENT_MD_SIZE,
+                cap=AGENT_MD,
             )
         return SourceRead(
             kind="agent_md",
@@ -520,7 +535,7 @@ class BaselineContextMiddleware(AgentMiddleware):
             path=AGENT_MD_PATH,
             text=content,
             provenance=provenance,
-            cap=MAX_AGENT_MD_SIZE,
+            cap=AGENT_MD,
         )
 
     async def _read_memory(self, tier: str) -> SourceRead:
@@ -531,7 +546,7 @@ class BaselineContextMiddleware(AgentMiddleware):
             path=source.display_path,
             available=False,
             provenance={"source": "store", "tier": tier},
-            cap=MAX_MEMORY_BLOCK_SIZE,
+            cap=MEMORY_INDEX,
         )
         try:
             namespace = source.namespace_factory()
@@ -599,7 +614,7 @@ class BaselineContextMiddleware(AgentMiddleware):
         Reads the frozen epoch and nothing else, which is what makes the block
         byte-identical for the life of that epoch.
         """
-        return "\n\n".join(self._render_sections(epoch).values())
+        return block_of(self._render_sections(epoch))
 
     def _render_sections(self, epoch: BaselineEpoch) -> dict[str, str]:
         """Each section of the block, in its fixed order, keyed by what it states.
@@ -624,6 +639,7 @@ class BaselineContextMiddleware(AgentMiddleware):
         parts[SECTION_IDENTITY] = render_template(
             "envelope/baseline_identity.md.j2",
             guidance=guidance,
+            shared=self._shared,
             **identity.to_state(),
         )
 
@@ -644,7 +660,7 @@ class BaselineContextMiddleware(AgentMiddleware):
             )
 
         if epoch.agent_md is not None:
-            parts["agent_md"] = render_template(
+            parts[SECTION_AGENT_MD] = render_template(
                 "envelope/baseline_agentmd.md.j2",
                 path=epoch.agent_md.path or AGENT_MD_PATH,
                 content=epoch.agent_md.text,
@@ -656,7 +672,7 @@ class BaselineContextMiddleware(AgentMiddleware):
             entry = epoch.memory.get(tier)
             if entry is None:
                 continue
-            parts[f"memory:{tier}"] = render_template(
+            parts[f"{SECTION_MEMORY_PREFIX}{tier}"] = render_template(
                 "envelope/baseline_memory.md.j2",
                 path=entry.path or tier,
                 content=entry.text,
@@ -687,6 +703,12 @@ class BaselineContextMiddleware(AgentMiddleware):
         this turn's snapshot, and one that froze no ``channels`` or
         ``wakeups`` to this build's.
         """
+        if self._shared:
+            # Built with no profile; a thread that froze its first sender's
+            # before shared baselines left it out carries that one forward
+            # (``profile_available`` is false here), and it is not the
+            # thread's either.
+            return ""
         snapshot = frozen if frozen is not None else self._profile_snapshot()
         if channels is None:
             channels = self._switches.channels
@@ -732,14 +754,7 @@ class BaselineContextMiddleware(AgentMiddleware):
         boundary or captured at agent build. A read on this path is what made
         the old middlewares re-write the whole history at the write rate.
         """
-        try:
-            epoch = BaselineEpoch.from_state(
-                state_get(getattr(request, "state", None), STATE_BASELINE)
-            )
-            block = self._cached_block(epoch)
-        except Exception:  # noqa: BLE001 - context is never worth failing a turn for
-            logger.warning("[Baseline] render failed; sending the call without it", exc_info=True)
-            return await handler(request)
+        block = self.sent_block(getattr(request, "state", None))
         if not block:
             return await handler(request)
 
@@ -751,21 +766,66 @@ class BaselineContextMiddleware(AgentMiddleware):
                 system_message = SystemMessage(content=tagged)
         return await handler(request.override(system_message=system_message))
 
-    def _cached_block(self, epoch: BaselineEpoch) -> str:
+    def sent_block(self, state: Any) -> str:
+        """The block a call is sent for the epoch frozen in ``state``, or ""
+        when it fails to render, so the call goes without it: context is never
+        worth failing a turn for."""
+        return block_of(self.sent_sections(state))
+
+    def sent_sections(self, state: Any) -> dict[str, str]:
+        """The sections of the block a call is sent, keyed as
+        ``_render_sections`` keys them, for a reader that sizes each; empty
+        where ``sent_block`` is."""
+        try:
+            epoch = BaselineEpoch.from_state(state_get(state, STATE_BASELINE))
+            return self._cached_sections(epoch)
+        except Exception:  # noqa: BLE001
+            logger.warning("[Baseline] render failed; sending the call without it", exc_info=True)
+            return {}
+
+    def frozen_block(self, state: Any) -> tuple[str, str]:
+        """The epoch frozen in ``state`` as one block, and a key naming that
+        epoch, for a carrier that has to know whether the model already holds it."""
+        epoch = BaselineEpoch.from_state(state_get(state, STATE_BASELINE))
+        return f"{epoch.epoch}:{epoch.built_at}", block_of(self._cached_sections(epoch))
+
+    def _cached_sections(self, epoch: BaselineEpoch) -> dict[str, str]:
         scratchpad = epoch.blocks.get("scratchpad")
         key = (epoch.epoch, epoch.built_at, scratchpad.text if scratchpad else None)
-        block = self._block_cache.get(key)
-        if block is None:
-            block = self._render_block(epoch)
+        sections = self._block_cache.get(key)
+        if sections is None:
+            sections = self._render_sections(epoch)
             if len(self._block_cache) >= _BLOCK_CACHE_SIZE:
                 self._block_cache.pop(next(iter(self._block_cache)))
-            self._block_cache[key] = block
-        return block
+            self._block_cache[key] = sections
+        return sections
 
 
 # ---------------------------------------------------------------------------
 # Reading and rendering helpers (kept out of the class: pure over their inputs)
 # ---------------------------------------------------------------------------
+
+
+def block_of(sections: Mapping[str, str]) -> str:
+    """The one block ``sections`` are sent as."""
+    return "\n\n".join(sections.values())
+
+
+#: The part of the context panel a section counts under, by its key; any other
+#: section is the environment the agent runs in.
+_SECTION_PARTS = {
+    MCP_SERVERS_BLOCK: "mcp",
+    SKILLS_BLOCK: "skills",
+    SECTION_AGENT_MD: "memory",
+    SECTION_MEMO: "memory",
+}
+
+
+def section_part(key: str) -> str:
+    """The part of the context a section keyed ``key`` (``_render_sections``) is shown under."""
+    if key.startswith(SECTION_MEMORY_PREFIX):
+        return "memory"
+    return _SECTION_PARTS.get(key, "environment")
 
 
 

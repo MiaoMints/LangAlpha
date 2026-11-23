@@ -10,7 +10,7 @@
  * `contentProjection.ts`: the stream code reads turns from here and must not
  * load the render stack to do it.
  */
-import { isSteeringContinuation, isSteeringUserMessage, type MessageLike } from './messagePredicates';
+import { isReportRow, isSteeringContinuation, isSteeringUserMessage, opensTurn, type MessageLike } from './messagePredicates';
 import type { MessageRecord } from './types';
 
 /** The fields the projection reads, structural for the same reason as `MessageLike`. */
@@ -113,8 +113,12 @@ export function hiddenOpenerTurns(projected: readonly ProjectedMessage<TurnLike>
  * after it, and a parked message has not opened one yet.
  */
 export function newestTurn(messages: readonly TurnLike[]): number | null {
+  return newestProjected(projectTurns(messages));
+}
+
+function newestProjected(projected: readonly ProjectedMessage<TurnLike>[]): number | null {
   let newest: number | null = null;
-  for (const { message, turnIndex } of projectTurns(messages)) {
+  for (const { message, turnIndex } of projected) {
     if (message.role === 'assistant' && turnIndex !== null && (newest === null || turnIndex > newest)) newest = turnIndex;
   }
   return newest;
@@ -160,6 +164,25 @@ export function computeTurnTails(visible: readonly ProjectedMessage<TurnLike>[])
 }
 
 /**
+ * Per-bubble "does this bubble close a reply", over the VISIBLE list: the
+ * turn's tail, or the last bubble before a steer the user sent into the turn.
+ * The agent takes a steer in only at its next model call, so what it wrote
+ * last before one is what the reader was answering, often a whole answer.
+ */
+export function computeReplyEnds(visible: readonly ProjectedMessage<TurnLike>[], turnTails: readonly boolean[]): boolean[] {
+  const ends = turnTails.slice();
+  for (let i = 0; i < visible.length; i++) {
+    if (ends[i] || visible[i].message.role !== 'assistant') continue;
+    let j = i + 1;
+    while (j < visible.length && visible[j].message.role === 'notification') j++;
+    const next = visible[j]?.message;
+    // A report-back's row is drawn as a steer but nobody wrote it.
+    ends[i] = !!next && isSteeringUserMessage(next) && !next.queueError && !isReportRow(next);
+  }
+  return ends;
+}
+
+/**
  * A bubble's time as epoch ms. It arrives as a Date from the chat session and
  * as an ISO string from the market-chat reducer. Reading only the Date dropped
  * the clock for the market transcript, and a turn with no start gets no fold
@@ -171,6 +194,42 @@ export function messageTimeMs(value: unknown): number | undefined {
       : typeof value === 'string' ? Date.parse(value)
         : NaN;
   return Number.isFinite(ms) ? ms : undefined;
+}
+
+/**
+ * When each turn started, epoch ms. A turn's clock starts at the message that
+ * opened it, the later of two on one count; a steer rides a turn it did not
+ * open, and its replayed time is not history time. A turn with no row of its
+ * own to take its clock from (a report-back whose row names no source, or one
+ * attached live) starts at its first reply, the nearest thing.
+ */
+export function turnStartTimes(entries: readonly ProjectedMessage<TurnLike & { timestamp?: unknown }>[]): Map<number, number> {
+  const opened = new Map<number, number>();
+  const firstReply = new Map<number, number>();
+  for (const { message, turnIndex } of entries) {
+    if (turnIndex === null) continue;
+    if (message.role === 'user') {
+      if (!opensTurn(message)) continue;
+      const ts = messageTimeMs(message.timestamp);
+      if (ts !== undefined) opened.set(turnIndex, ts);
+      else opened.delete(turnIndex);
+      firstReply.delete(turnIndex);
+    } else if (message.role === 'assistant' && !firstReply.has(turnIndex)) {
+      const ts = messageTimeMs(message.timestamp);
+      if (ts !== undefined) firstReply.set(turnIndex, ts);
+    }
+  }
+  for (const [turnIndex, ts] of firstReply) {
+    if (!opened.has(turnIndex)) opened.set(turnIndex, ts);
+  }
+  return opened;
+}
+
+/** When the newest turn started, by {@link turnStartTimes}; undefined with no turn. */
+export function newestTurnStart(messages: readonly (TurnLike & { timestamp?: unknown })[]): number | undefined {
+  const projected = projectTurns(messages);
+  const newest = newestProjected(projected);
+  return newest === null ? undefined : turnStartTimes(projected).get(newest);
 }
 
 /**

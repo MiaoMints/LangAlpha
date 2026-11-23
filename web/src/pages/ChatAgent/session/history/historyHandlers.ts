@@ -3,6 +3,7 @@
  * Handles events from history replay (SSE stream of past conversations)
  */
 
+import { readSender } from '../turnSender';
 import { isToolResultFailure, toolNameOf } from '../subagents/subagentStatus';
 import { ownerOfToolCall } from '../toolCallOwner';
 import { isTaskAgentId } from '../../utils/agentId';
@@ -10,13 +11,15 @@ import { opensTurn } from '../../components/messageList/messagePredicates';
 import { deriveTaskSegment, applyTaskSegment, applyLaunchReply } from '../subagents/taskSegmentBuilder';
 import { reportRow, senderProvenance, type SenderMetadata } from '../provenance';
 import { deliveredEntryRow, steeringDeliveredEntries } from '../stream/steeringDelivery';
+import { readHomeFallback } from '../stream/turnPlacement';
 import type { ReportSource } from '@/types/api';
 import { isDeliveredNotice, isDeliveredSteer, type DeliveredSteer } from '@/types/sse';
-import type { SubagentTaskRecord, TextSegment } from '@/types/chat';
-import type { MessageRecord, SetMessages, ToolCallRecord, ToolCallResultRecord, TodoPayload, HtmlWidgetData } from '../../hooks/utils/types';
+import type { SubagentTaskRecord, TextSegment, TurnStop } from '@/types/chat';
+import type { MessageRecord, SetMessages, ToolCallRecord, ToolCallResultRecord, HtmlWidgetData } from '../../hooks/utils/types';
 import type { PairState } from '../types';
 import type { StructuredError } from '@/utils/rateLimitError';
 import { wakeTurnOpener } from '../wakeupEvents';
+import { openerMatchText, readArtifactCommentsShown } from '../../components/artifactComments/artifactCommentSend';
 
 
 /** Shape of an SSE history event. */
@@ -154,11 +157,16 @@ function turnOpenerRow(event: HistoryEvent, pairIndex: number, text: string): Me
     ? wakeTurnOpener(pairIndex, event.metadata, timestamp, event.query_type)
     : null;
   if (wake) return { ...wake, isHistory: true };
+  // In a shared workspace the replay names who each turn is for. A row that
+  // draws its own label (a report, another agent's message) keeps that as
+  // data, not a caption: it is what says whose turns a rewrite would replace.
+  const sender = readSender(event.sender);
   if (event.query_type === 'system') {
     const source = event.metadata?.report_source;
     return source ? reportRow(source, {
       id, timestamp, isHistory: true, turnIndex: pairIndex,
       ...(event.report_run_id ? { runId: event.report_run_id } : {}),
+      ...(sender ? { sender } : {}),
     }) : null;
   }
   if (!text) return null;
@@ -168,6 +176,7 @@ function turnOpenerRow(event: HistoryEvent, pairIndex: number, text: string): Me
   };
   const provenance = senderProvenance(event.metadata);
   if (provenance) row.provenance = provenance;
+  if (sender) row.sender = sender;
   return row;
 }
 
@@ -231,8 +240,14 @@ export function handleHistoryUserMessage({
       return entry?.type === 'skills' && entry.name === 'onboarding';
     });
 
+  // A send of file comments stores the block the agent read as its query,
+  // and the note and comments the chat shows beside it. Its row shows the
+  // note, and the tracker knows a view's own copy by its comments and note.
+  const artifactComments = readArtifactCommentsShown(event.metadata?.artifact_comments);
+  const matchText = openerMatchText(messageContent, artifactComments);
+
   // Check if this message was recently sent (to avoid duplicates)
-  const isDuplicate = messageContent && recentlySentTracker.isRecentlySent(messageContent);
+  const isDuplicate = messageContent && recentlySentTracker.isRecentlySent(matchText);
 
   // A turn a stream is still writing keeps its live bubbles, and the replay
   // maps onto them. Any other copy on screen gives way to the replay's below.
@@ -252,14 +267,16 @@ export function handleHistoryUserMessage({
     // The live turn was counted on the client; the replay names it. Every
     // live bubble that count stamped moves with it: the reply, its user
     // bubble (the turn's only one, as the replay's is dropped) and any
-    // steering stamped from the reply.
+    // steering stamped from the reply. The user bubble also takes where a
+    // Home turn ran, which a stream joined past its first frame never said.
+    const homeFallback = readHomeFallback(event.metadata?.home_fallback);
     setMessages((prev: MessageRecord[]) => {
       const counted = prev.find((m) => m.id === liveId)?.turnIndex;
-      return prev.map((m) =>
-        m.id === liveId || (!m.isHistory && counted !== undefined && m.turnIndex === counted)
-          ? { ...m, turnIndex: pairIndex }
-          : m,
-      );
+      return prev.map((m) => {
+        if (!(m.id === liveId || (!m.isHistory && counted !== undefined && m.turnIndex === counted))) return m;
+        const placed = homeFallback && m.role === 'user' ? { homeFallback } : null;
+        return { ...m, turnIndex: pairIndex, ...placed };
+      });
     });
     return true;
   } else {
@@ -296,6 +313,15 @@ export function handleHistoryUserMessage({
         userMessage.chartSelections = event.metadata!.chart_selections;
       }
 
+      // A Home turn that ran on the cloud stand-in, as the live frame says it.
+      const homeFallback = readHomeFallback(event.metadata?.home_fallback);
+      if (homeFallback) userMessage.homeFallback = homeFallback;
+
+      if (artifactComments) {
+        userMessage.content = artifactComments.note;
+        userMessage.artifactComments = artifactComments;
+      }
+
       // A live attach that drew this turn's row before a reload keeps it
       // through the reload, which keeps live rows; this row, which knows its
       // turn, replaces it. A report's row is found by its run, and a wake's
@@ -310,7 +336,7 @@ export function handleHistoryUserMessage({
         const kept = prev.filter((m) => m.isHistory || (m.id !== rowId && !(runId && m.runId === runId)));
         const { rest, removedAbove } = streaming
           ? { rest: kept, removedAbove: 0 }
-          : dropLiveCopy(kept, messageContent, pairIndex, newMessagesStartIndexRef.current);
+          : dropLiveCopy(kept, String(userMessage.content ?? '').trim(), pairIndex, newMessagesStartIndexRef.current);
         const insertIndex = newMessagesStartIndexRef.current - removedAbove;
         const newMessages = [
           ...rest.slice(0, insertIndex),
@@ -494,10 +520,12 @@ export function handleHistoryReasoningContent({ assistantMessageId, content, pai
 }
 
 /** Handles text content chunks and finish_reason in history replay. */
-export function handleHistoryTextContent({ assistantMessageId, content, finishReason, pairState, setMessages, eventId, phase }: {
+export function handleHistoryTextContent({ assistantMessageId, content, finishReason, stop = true, pairState, setMessages, eventId, phase }: {
   assistantMessageId: string;
   content: string;
   finishReason: string | undefined;
+  /** How a stopped turn was stopped. */
+  stop?: TurnStop;
   pairState: PairState;
   setMessages: SetMessages;
   eventId?: number | null;
@@ -539,7 +567,7 @@ export function handleHistoryTextContent({ assistantMessageId, content, finishRe
     setMessages((prev: MessageRecord[]) =>
       prev.map((msg: MessageRecord) =>
         msg.id === assistantMessageId
-          ? { ...msg, isStreaming: false, ...(isStopped ? { stopped: true } : {}) }
+          ? { ...msg, isStreaming: false, ...(isStopped ? { stopped: stop } : {}) }
           : msg
       )
     );
@@ -882,77 +910,6 @@ export function handleHistoryTaskArtifactStatus({ toolCallId, taskId, status, se
       return msg;
     })
   );
-
-  return true;
-}
-
-/** Handles artifact events with artifact_type "todo_update" in history replay. */
-export function handleHistoryTodoUpdate({ assistantMessageId, artifactType, artifactId, payload, pairState, setMessages, eventId }: {
-  assistantMessageId: string;
-  artifactType: string;
-  artifactId: string;
-  payload: TodoPayload | null;
-  pairState: PairState;
-  setMessages: SetMessages;
-  eventId?: number | null;
-}): boolean {
-  // Only handle todo_update artifacts
-  if (artifactType !== 'todo_update' || !payload) {
-    return false;
-  }
-
-  const { total, completed, in_progress, pending } = payload;
-  const todos = Array.isArray(payload.todos) ? payload.todos : [];
-
-  // Use artifactId as the base todoListId to track updates to the same logical todo list
-  // But create a unique segmentId for each event to preserve chronological order
-  const baseTodoListId = artifactId || `history-todo-list-base-${Date.now()}`;
-  // Create a unique segment ID that includes timestamp to ensure chronological ordering
-  const segmentId = `${baseTodoListId}-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
-
-  // Use backend event ID when available for consistent ordering across live/reconnect/replay
-  const currentOrder = eventId != null ? eventId : ++pairState.contentOrderCounter;
-
-  setMessages((prev: MessageRecord[]) => {
-    const updated = prev.map((msg: MessageRecord) => {
-      if (msg.id !== assistantMessageId) return msg;
-
-      const todoListProcesses = { ...((msg.todoListProcesses as Record<string, unknown>) || {}) };
-      const contentSegments = [...((msg.contentSegments as Record<string, unknown>[]) || [])];
-
-      // Check if this segment already exists (prevent duplicates from React batching)
-      const segmentExists = contentSegments.some((s: Record<string, unknown>) => s.todoListId === segmentId);
-      if (segmentExists) return msg;
-
-      // Add new segment at the current chronological position
-      contentSegments.push({
-        type: 'todo_list',
-        todoListId: segmentId, // Use unique segmentId for this specific event
-        order: currentOrder, // Use the captured order value
-      });
-
-      // Store the todo list data with the segmentId
-      // If this is an update to an existing logical todo list (same artifactId),
-      // we still create a new segment but can reference the base ID for data updates
-      todoListProcesses[segmentId] = {
-        todos,
-        total: total || 0,
-        completed: completed || 0,
-        in_progress: in_progress || 0,
-        pending: pending || 0,
-        order: currentOrder,
-        baseTodoListId: baseTodoListId, // Keep reference to base ID for potential future use
-      };
-
-      return {
-        ...msg,
-        contentSegments,
-        todoListProcesses,
-      };
-    });
-
-    return updated;
-  });
 
   return true;
 }

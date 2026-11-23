@@ -3,14 +3,15 @@
  */
 import { api, type RequestConfig } from '@/api/client';
 import { authSessionCheck } from '@/lib/authResets';
-import type { Thread } from '@/types/api';
+import type { Thread, ThreadForkCut, ThreadsResponse } from '@/types/api';
 import type { WakeupCancelResponse, WakeupsResponse } from '@/types/wakeups';
 import type { CommandStopResponse, CommandsResponse } from '@/types/commands';
 
 export interface ThreadCreatedInfo {
   thread_id: string;
   workspace_id: string;
-  thread_index: number;
+  /** Null in a shared workspace, whose threads carry no number. */
+  thread_index: number | null;
   title: string;
   msg_type: string;
   /** The tuning overrides the create stored, echoed back; null follows Settings. */
@@ -40,6 +41,9 @@ export async function createThreadWithTitle(opts: {
   timezone?: string;
   /** Left out, the thread stores no value and follows the owner's default. */
   subagentsAllowed?: boolean;
+  /** In a shared workspace, start the thread shared with everyone there;
+   *  left out, it is the starter's alone. */
+  sharedWithWorkspace?: boolean;
   /** The thread's own effort and fast mode, picked before it existed. Left
    *  out, the thread follows Settings. */
   reasoningEffort?: string;
@@ -47,7 +51,8 @@ export async function createThreadWithTitle(opts: {
   timeoutMs?: number;
 }): Promise<ThreadCreatedInfo> {
   const {
-    workspaceId, firstQuery, title, platform, timezone, subagentsAllowed, reasoningEffort, fastMode, timeoutMs = 8000,
+    workspaceId, firstQuery, title, platform, timezone, subagentsAllowed, reasoningEffort, fastMode, sharedWithWorkspace,
+    timeoutMs = 8000,
   } = opts;
 
   const body: Record<string, unknown> = { first_query: firstQuery };
@@ -58,8 +63,24 @@ export async function createThreadWithTitle(opts: {
   if (subagentsAllowed !== undefined) body.subagents_allowed = subagentsAllowed;
   if (reasoningEffort !== undefined) body.reasoning_effort = reasoningEffort;
   if (fastMode !== undefined) body.fast_mode = fastMode;
+  if (sharedWithWorkspace) body.shared_with_workspace = true;
 
   const { data } = await api.post<ThreadCreatedInfo>('/api/v1/threads', body, { timeout: timeoutMs });
+  return data;
+}
+
+/** The thread after the change, and whether making it private turned its link off. */
+export type ThreadVisibilityResult = Thread & { link_turned_off?: boolean };
+
+/**
+ * Share a shared workspace's thread with everyone in it, or make it its
+ * starter's alone again. Answers the thread as `getThread` reads it after the
+ * change; a 409 (`others_sent`) means someone else has written in it.
+ */
+export async function setThreadVisibility(threadId: string, sharedWithWorkspace: boolean): Promise<ThreadVisibilityResult> {
+  const { data } = await api.put<ThreadVisibilityResult>(`/api/v1/threads/${threadId}/visibility`, {
+    shared_with_workspace: sharedWithWorkspace,
+  });
   return data;
 }
 
@@ -71,6 +92,32 @@ export async function createThreadWithTitle(opts: {
 export async function getThread(threadId: string): Promise<Thread> {
   if (!threadId) throw new Error('Thread ID is required');
   const { data } = await api.get<Thread>(`/api/v1/threads/${threadId}`);
+  return data;
+}
+
+export interface ThreadForkResult {
+  /** The new thread, as `GET /threads/{id}` reads it. */
+  thread: Thread;
+  turns_copied: number;
+  /** The cut turn's message on a `before_turn` fork, else null. */
+  prefill: string | null;
+}
+
+/**
+ * Copy a thread's conversation up to a turn into a new thread. The new thread
+ * starts no run; the user's next send to it is an ordinary send. A refusal
+ * (409 while the cut turn is unfinished or the chat moved, 404, 400) carries
+ * `detail.message` written for the user.
+ */
+export async function forkThread(
+  threadId: string,
+  opts: { cut: ThreadForkCut; turnIndex: number; title?: string; platform?: string },
+): Promise<ThreadForkResult> {
+  if (!threadId) throw new Error('Thread ID is required');
+  const body: Record<string, unknown> = { cut: opts.cut, turn_index: opts.turnIndex };
+  if (opts.title) body.title = opts.title;
+  if (opts.platform) body.platform = opts.platform;
+  const { data } = await api.post<ThreadForkResult>(`/api/v1/threads/${threadId}/fork`, body);
   return data;
 }
 
@@ -120,6 +167,30 @@ export async function fetchCommands(threadId: string): Promise<CommandsResponse>
   return data;
 }
 
+/** Why a thread's context could not be broken down: its computer is not
+ *  running, the agent keeps no count, or the thread's model could not be
+ *  resolved. The panel words only the first; the rest show the window alone. */
+export type ThreadContextUnavailable = 'computer_stopped' | 'no_compaction' | 'refused';
+
+/** The parts the thread's next model call sends ahead of its messages. */
+export type ThreadContextPart = 'system' | 'tools' | 'mcp' | 'skills' | 'memory' | 'environment';
+
+/** Tokens per part; a part may be absent. `parts` is null when they cannot
+ *  be counted, and `reason` says why. */
+export interface ThreadContextResponse {
+  thread_id: string;
+  parts: Partial<Record<ThreadContextPart, number>> | null;
+  reason?: ThreadContextUnavailable;
+}
+
+/** Counted on request, which takes the server about half a second, so it is
+ *  read when the context panel opens rather than with every call. */
+export async function fetchThreadContext(threadId: string): Promise<ThreadContextResponse> {
+  if (!threadId) throw new Error('Thread ID is required');
+  const { data } = await api.get<ThreadContextResponse>(`/api/v1/threads/${threadId}/context`);
+  return data;
+}
+
 /** Stop a background command. A stopped command does not report back. */
 export async function stopCommand(threadId: string, commandId: string): Promise<CommandStopResponse> {
   if (!threadId) throw new Error('Thread ID is required');
@@ -158,7 +229,7 @@ export async function getWorkspaceThreads(
  * returns threads across every workspace the user owns, sorted by updated_at.
  */
 export async function getRecentThreads(limit: number = 20, offset: number = 0) {
-  const { data } = await api.get('/api/v1/threads', {
+  const { data } = await api.get<ThreadsResponse>('/api/v1/threads', {
     params: { limit, offset, sort_by: 'updated_at', sort_order: 'desc' },
   });
   return data;

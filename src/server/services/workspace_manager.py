@@ -12,21 +12,27 @@ import logging
 import time
 from collections.abc import Callable, Collection
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, NamedTuple, Optional
+from typing import TYPE_CHECKING, Any, Dict, NamedTuple, Optional
 
+from ptc_agent.core.sandbox.providers import SELF_STOPPING_KINDS, is_machine_kind
 from ptc_agent.core.sandbox.runtime import RuntimeState, SandboxTransientError
 from ptc_agent.core.session import Session
 
 from src.observability import safe_add, workspace_created
 from src.server.database.computer import (
     DEFAULT_ROOT_DIR,
+    REMOVAL_INTENT,
+    end_removal_intent,
     get_computer,
     get_computer_for_workspace,
     get_computers_by_status,
+    list_removals_after_home_moves,
+    take_removal_intent,
     update_computer_status,
 )
 from src.server.database.conversation import forget_workspace_exists
-from src.server.database.home_workspace import is_home_row
+from src.server.database.home_stand_in import stand_in_on
+from src.server.database.home_workspace import is_home_row, is_reserved_row
 from src.server.database.workspace import (
     ACTIVE_WORK_DELETE_REFUSAL,
     MOVING_DELETE_REFUSAL,
@@ -49,7 +55,8 @@ from src.server.database.workspace_folders import (
     workspace_folder_in_use,
 )
 from src.server.database.workspace_names import checked_workspace_name
-from src.server.models.computer import ComputerStatus
+from src.server.models.computer import ComputerRemoveResponse, ComputerStatus
+from src.server.services.computer_usage.events import note_start_failure
 from src.server.services.path_lock_coordination import STOP_HEARTBEAT_UNAVAILABLE_RECOVERY_S
 from src.server.services.computer_errors import (
     ComputerNotFoundError,
@@ -58,14 +65,38 @@ from src.server.services.computer_errors import (
     Retirement,
 )
 from src.server.services.computer_manager import ComputerManager
+from src.server.services.account import refuse_machine_use
 from src.server.services.computer_manager._types import (
     MachineTarget,
     WorkspaceNotFound,
     WorkspaceNotOnComputer,
 )
+from src.server.services.idle_policy import spared_by_idle_sweep
 from src.server.services.persistence.file import FilePersistenceService
 
+if TYPE_CHECKING:
+    from src.server.services.ssh_removal import MachineLeft
+
 logger = logging.getLogger(__name__)
+
+
+class RemovedComputer(NamedTuple):
+    """The workspaces a removal deleted, and what it left on an ssh machine."""
+
+    deleted: list[str]
+    left: Optional["MachineLeft"] = None
+
+    def response(self) -> ComputerRemoveResponse:
+        left = self.left
+        return ComputerRemoveResponse(
+            key=left.key if left else None,
+            files=left.files if left else None,
+            token=left.token if left else None,
+            workspaces_deleted=self.deleted,
+        )
+
+
+_HOME_MOVE_CANCELLED = "Home's move was cancelled, so this computer stays."
 
 
 class IdleWindow(NamedTuple):
@@ -208,7 +239,9 @@ class WorkspaceManager(ComputerManager):
 
         Args:
             workspace_id: Workspace UUID
-            user_id: Optional user ID for syncing user data to sandbox
+            user_id: The caller, for whom the computer's tokens are kept
+                (``_keep_computer_tokens``). Everything else the computer is
+                given is read for its owner (``ComputerBinding.user_id``).
             on_state_observed: Optional sync callback invoked with the
                 initial sandbox state ("archived", "running", ...) as
                 soon as the reconnect path observes it. Used by the chat
@@ -250,7 +283,7 @@ class WorkspaceManager(ComputerManager):
             # and an idle computer's token is left to run out, so this is
             # what has one in place before the turn's code runs. A read of
             # the row when the token has time left.
-            await self._keep_data_token(binding.computer_id, user_id, session.sandbox)
+            await self._keep_computer_tokens(binding.computer_id, user_id, session.sandbox)
             await self._settle_folders(
                 binding.computer_id, runtime, root=binding.root_dir, own_run_id=run_id
             )
@@ -269,8 +302,10 @@ class WorkspaceManager(ComputerManager):
                     raise WorkspaceMovingError(workspace_id)
                 # Per project, not per machine: the acquire above may have handed
                 # back the session a sibling started, which prepared only that
-                # sibling's folder and only that sibling's tool overlay.
-                await self._ensure_project_attached(binding, session, user_id=user_id)
+                # sibling's folder and only that sibling's tool overlay. What
+                # the folder is given (connectors, skills, the file mount) is
+                # the computer's owner's, never the caller's.
+                await self._ensure_project_attached(binding, session, user_id=binding.user_id)
         except WorkspaceFolderMoving as e:
             raise SandboxTransientError(
                 "This workspace's folder is being moved. Try again in a moment."
@@ -293,7 +328,7 @@ class WorkspaceManager(ComputerManager):
             raise RuntimeError(f"Computer {computer_id} has no sandbox to run on")
         runtime = sandbox.runtime
         binding = self._binding_from_computer("", computer)
-        await self._keep_data_token(computer_id, user_id, sandbox)
+        await self._keep_computer_tokens(computer_id, user_id, sandbox)
         await self._settle_folders(computer_id, runtime, root=binding.root_dir)
         await self.restore_owed_folders(session, binding)
         if (computer.get("layout_version") or 0) >= FOLDER_LAYOUT_VERSION:
@@ -340,6 +375,8 @@ class WorkspaceManager(ComputerManager):
             or not computer.get("provider_ref")
         ):
             return None
+        # As an acquire asks, since a ready handle is handed back without one.
+        await refuse_machine_use(computer["kind"], computer.get("user_id"))
         provider_ref = str(computer["provider_ref"])
         session = self.get_session_if_ready(
             workspace_id,
@@ -389,7 +426,7 @@ class WorkspaceManager(ComputerManager):
                 return False
             # Read again, for the arrival the settle recorded.
             binding = await self.resolve_binding(workspace_id)
-            await self._ensure_project_attached(binding, session, user_id=user_id)
+            await self._ensure_project_attached(binding, session, user_id=binding.user_id)
             return True
 
     async def archive_workspace(self, workspace_id: str) -> Dict[str, Any]:
@@ -405,6 +442,7 @@ class WorkspaceManager(ComputerManager):
         *,
         delete_files: bool = False,
         on_computer: Optional[str] = None,
+        owner_removing: bool = False,
     ) -> bool:
         """
         Delete a workspace: the project only, never its machine by itself.
@@ -425,6 +463,8 @@ class WorkspaceManager(ComputerManager):
             delete_files: The owner asked for the folder on their machine to go too.
             on_computer: Only from this computer; a workspace a move has
                 taken elsewhere is left alone.
+            owner_removing: Its owner is removing the computer, so a
+                retirement this delete ends in is their remove.
 
         Returns:
             True if deleted successfully
@@ -432,7 +472,8 @@ class WorkspaceManager(ComputerManager):
         Raises:
             WorkspaceNotFound: It is deleted already, or not on ``on_computer``.
             WorkspaceBusyError: A move or a turn holds it.
-            ValueError: It is Home, or has no computer.
+            ValueError: It is Home or Home's stand-in, which goes only with its
+                computer, or has no computer.
         """
         binding = await self.resolve_binding(workspace_id)
         computer_id = binding.computer_id
@@ -448,7 +489,7 @@ class WorkspaceManager(ComputerManager):
             workspace = await self.workspace_row(workspace_id)
             if not workspace:
                 raise WorkspaceNotFound(workspace_id)
-            if is_home_row(workspace):
+            if is_reserved_row(workspace):
                 # Here rather than only at the route: an agent's tool deletes
                 # through this method too.
                 raise ValueError("Cannot delete Home")
@@ -492,7 +533,11 @@ class WorkspaceManager(ComputerManager):
                 )
 
                 retired = await self._retire_machine_if_empty(
-                    computer_id, workspace_id, workspace, keep_folder=keep_folder
+                    computer_id,
+                    workspace_id,
+                    workspace,
+                    keep_folder=keep_folder,
+                    owner_removing=owner_removing,
                 )
 
                 logger.info(f"Workspace {workspace_id} deleted successfully")
@@ -525,6 +570,50 @@ class WorkspaceManager(ComputerManager):
 
         return True
 
+    async def removal_refusal(
+        self,
+        computer: Dict[str, Any],
+        named: Collection[str] = (),
+        *,
+        workspace_ids: Optional[Collection[str]] = None,
+        home_leaves: bool = False,
+    ) -> Optional[Retirement]:
+        """What would refuse removing ``computer`` with the workspaces
+        ``named``, before anything is deleted or anyone asked to approve it:
+        the primary or the user's only computer (``removal_refused``), a
+        transition, a workspace not named, Home, a workspace a move holds or a
+        run is working in, and files Home's stand-in holds that Home is owed.
+        ``workspace_ids`` are the user's on it as the caller read them, read
+        here when not given; the stand-in is never one, as it goes with its
+        computer (``RetirementMixin._why_machine_is_kept``). ``home_leaves``
+        asks for a primary whose Home moves off first: neither its being
+        primary nor Home on it refuses, the move answering for both."""
+        if home_leaves:
+            held = self.removal_held({**computer, "is_primary": False})
+        else:
+            held = await self.removal_refused(computer)
+        if held is not None:
+            return held
+        if workspace_ids is None:
+            workspace_ids = await get_live_workspace_ids_for_computer(
+                str(computer["computer_id"]), exclude_stand_in=True
+            )
+        shown = {str(i) for i in named}
+        for workspace_id in workspace_ids:
+            row = await self.workspace_row(workspace_id)
+            if home_leaves and row and is_home_row(row):
+                continue
+            if str(workspace_id) not in shown or (row and is_home_row(row)):
+                return Retirement.HAS_WORKSPACES
+            if await workspace_is_moving(workspace_id) or await workspace_has_active_work(
+                workspace_id
+            ):
+                return Retirement.BUSY
+        stand_in = await stand_in_on(computer)
+        if stand_in is not None and stand_in.owed:
+            return Retirement.HANDBACK_OWED
+        return None
+
     async def remove_computer_with_workspaces(
         self,
         computer_id: str,
@@ -537,10 +626,8 @@ class WorkspaceManager(ComputerManager):
 
         ``named`` are the workspaces its owner was shown, and every one on it
         must be among them, so an empty computer needs none. What would refuse
-        the remove anyway is asked first (``removal_held``), so a refusal
-        deletes nothing: the primary, a transition, a workspace not named, a
-        workspace a move holds or a run is working in, and Home, which no
-        delete takes. A named one no longer on it is left alone, and is not
+        the remove anyway is asked first (``removal_refusal``), so a refusal
+        deletes nothing. A named one no longer on it is left alone, and is not
         among those answered, so the client forgets only what went. Each goes
         as its own delete would take it, so a machine the user brought keeps
         its folders unless ``delete_files``. On a provider that builds machines
@@ -555,26 +642,20 @@ class WorkspaceManager(ComputerManager):
         computer = await get_computer(computer_id)
         if computer is None:
             raise ValueError(f"Computer {computer_id} not found")
-        held = self.removal_held(computer)
-        workspace_ids = await get_live_workspace_ids_for_computer(computer_id)
-        shown = {str(i) for i in named}
-        for workspace_id in workspace_ids if held is None else ():
-            row = await self.workspace_row(workspace_id)
-            if str(workspace_id) not in shown or (row and is_home_row(row)):
-                held = Retirement.HAS_WORKSPACES
-            elif await workspace_is_moving(workspace_id) or await workspace_has_active_work(
-                workspace_id
-            ):
-                held = Retirement.BUSY
-            if held is not None:
-                break
+        workspace_ids = await get_live_workspace_ids_for_computer(
+            computer_id, exclude_stand_in=True
+        )
+        held = await self.removal_refusal(computer, named, workspace_ids=workspace_ids)
         if held is not None:
             raise ComputerRemovalRefused(held)
         deleted: list[str] = []
         for workspace_id in workspace_ids:
             try:
                 await self.delete_workspace(
-                    workspace_id, delete_files=delete_files, on_computer=computer_id
+                    workspace_id,
+                    delete_files=delete_files,
+                    on_computer=computer_id,
+                    owner_removing=True,
                 )
             except WorkspaceBusyError:
                 # A move or a run that started since the check above.
@@ -593,6 +674,173 @@ class WorkspaceManager(ComputerManager):
             raise ComputerRemovalRefused(e.code, deleted=deleted) from None
         return deleted
 
+    async def remove_computer_for_owner(
+        self,
+        computer: Dict[str, Any],
+        named: Collection[str] = (),
+        *,
+        delete_files: bool = False,
+        remove_key: bool = True,
+    ) -> RemovedComputer:
+        """``remove_computer_with_workspaces``, then what an ssh computer owes
+        its machine (``ssh_removal.leave_machine``), its tunnel released in the
+        background when the delete's connection could not.
+
+        ``computer`` is the row as it was before the removal.
+        """
+        from src.server.services.background_starts import schedule_start
+        from src.server.services.ssh_computers import SSH_KIND, tunnel_of
+        from src.server.services.ssh_removal import leave_machine
+        from src.server.services.ssh_tunnel_sweep import release_tunnel
+
+        computer_id = str(computer["computer_id"])
+        user_id = str(computer["user_id"])
+        deleted = await self.remove_computer_with_workspaces(
+            computer_id, named, delete_files=delete_files
+        )
+        logger.info("Removed computer %s for user %s", computer_id, user_id)
+        if computer.get("kind") != SSH_KIND:
+            return RemovedComputer(deleted)
+        settings = self.config.sandbox.settings_for(SSH_KIND)
+        left = await leave_machine(
+            user_id,
+            computer,
+            settings=settings,
+            remove_key=remove_key,
+            delete_files=delete_files,
+        )
+        if tunnel_of(computer) and not left.tunnel_released:
+            schedule_start(
+                f"tunnel-release:{computer_id}",
+                lambda: release_tunnel(user_id, computer, settings=settings),
+            )
+        return RemovedComputer(deleted, left)
+
+    async def move_home_then_remove(
+        self,
+        computer: Dict[str, Any],
+        home_to: str,
+        named: Collection[str] = (),
+        *,
+        delete_files: bool = False,
+        remove_key: bool = True,
+    ) -> Optional[Dict[str, Any]]:
+        """Remove the user's primary once Home is off it, on ``home_to``.
+
+        Home moves as Make primary moves it (``make_primary``), from its last
+        backup when the machine it lives on can't be reached. None when the flip landed now, Home having nothing to move: the caller
+        removes the computer as any other. Otherwise the move's row, the
+        removal recorded on the computer in the move's claim, for
+        ``remove_after_home_move``, which the move's runner calls as it ends
+        and every worker's sweep calls too.
+
+        Raises:
+            MoveRefused: as Make primary would refuse.
+        """
+        computer_id = str(computer["computer_id"])
+        user_id = str(computer["user_id"])
+        move = await self.make_primary(
+            user_id,
+            home_to,
+            then=lambda: self.remove_after_home_move(computer_id),
+            removal=(
+                computer_id,
+                {
+                    "state": "waiting_for_home",
+                    "delete_workspaces": list(named),
+                    "delete_files": delete_files,
+                    "remove_key": remove_key,
+                },
+            ),
+        )
+        if move is None:
+            return None
+        logger.info(
+            "Computer %s is removed once Home's move %s to %s commits",
+            computer_id, move["move_id"], home_to,
+        )
+        return move
+
+    async def remove_after_home_move(self, computer_id: Optional[str] = None) -> None:
+        """Settle every removal waiting on Home's move off its computer once
+        that move has ended, or only ``computer_id``'s.
+
+        Run when the move's runner ends and by every worker's sweep, so one
+        whose runner died is settled after a restart; each removal is taken
+        by one worker at a time (``take_removal_intent``). Home moved: the
+        computer is removed as its owner asked, a busy one left for the next
+        pass. Home did not: it stays primary, and ``removal`` says why.
+        """
+        from src.server.services.workspace_move import MOVE_MESSAGES
+
+        try:
+            rows = await list_removals_after_home_moves(computer_id)
+        except Exception:
+            logger.exception("Could not list removals waiting on Home's move")
+            return
+        for row in rows:
+            removing = str(row["computer_id"])
+            intent = row["config"][REMOVAL_INTENT]
+            move_id = intent["move_id"]
+            taken_at = await take_removal_intent(removing, move_id)
+            if taken_at is None:
+                continue
+            if row["move_phase"] != "done":
+                error = row.get("move_error") or {}
+                if row["move_phase"] == "cancelled":
+                    code, message = "cancelled", _HOME_MOVE_CANCELLED
+                else:
+                    code = error.get("code") or "unknown"
+                    message = error.get("message") or MOVE_MESSAGES.get(
+                        code, MOVE_MESSAGES["unknown"]
+                    )
+                logger.info(
+                    "Home's move %s off computer %s ended %s (%s); it stays",
+                    move_id, removing, row["move_phase"], code,
+                )
+                await end_removal_intent(
+                    removing,
+                    taken_at,
+                    {"state": "home_did_not_move", "error": {"code": code, "message": message}},
+                )
+                continue
+            try:
+                removed = await self.remove_computer_for_owner(
+                    row,
+                    intent.get("delete_workspaces") or (),
+                    delete_files=bool(intent.get("delete_files")),
+                    remove_key=intent.get("remove_key", True) is not False,
+                )
+            except ComputerRemovalRefused as e:
+                if e.code is Retirement.BUSY:
+                    await end_removal_intent(removing, taken_at)
+                    continue
+                logger.info(
+                    "Home moved off computer %s, but its removal was refused: %s",
+                    removing, e.code,
+                )
+                await end_removal_intent(
+                    removing,
+                    taken_at,
+                    {"state": "not_removed", "error": {"code": str(e.code), "message": str(e)}},
+                )
+            except ValueError:
+                # Removed meanwhile by its owner, which a read of it answers.
+                continue
+            except Exception:
+                logger.exception(
+                    "Could not remove computer %s after Home's move %s", removing, move_id
+                )
+                await end_removal_intent(removing, taken_at)
+            else:
+                # What a removal answering at once would have said, for its
+                # owner to read off the row it leaves.
+                await end_removal_intent(
+                    removing,
+                    taken_at,
+                    {"state": "removed", "removed": removed.response().model_dump(mode="json")},
+                )
+
     async def cleanup_idle_workspaces(self) -> int:
         """Stop computers that have gone quiet, and reconcile always-on.
 
@@ -601,6 +849,14 @@ class WorkspaceManager(ComputerManager):
         and a machine with five idle projects is stopped once rather than five
         times. Activity is the computer's own stamp, which any project's turn
         refreshes.
+
+        A whole machine, one the user brings or the server's own, is never
+        stopped here (``is_machine_kind``): only this worker's session for a
+        quiet one goes. The stop exists to end what a sandbox costs while
+        nobody uses it; such a machine costs the deployment nothing running,
+        and a stop ends the user's own work there, such as a command left
+        running that nobody has checked on in an hour, so only its owner
+        stops it.
 
         Returns:
             Number of computers stopped.
@@ -635,6 +891,7 @@ class WorkspaceManager(ComputerManager):
 
             try:
                 window = self._idle_window(computer)
+                own = is_machine_kind(computer["kind"])
             except ValueError as e:
                 # Settings the stop could not build a provider from either.
                 self._note_idle_reap_failure(computer_id, e)
@@ -643,6 +900,9 @@ class WorkspaceManager(ComputerManager):
                 continue
             idle_seconds = window.timeout_s + (now - window.stop_at).total_seconds()
             if now <= window.stop_at:
+                continue
+            if own:
+                await self._retire_idle_session(computer)
                 continue
 
             # Skip machines that still have an active agent workflow. The gate
@@ -726,21 +986,45 @@ class WorkspaceManager(ComputerManager):
         An always-on flag exempts it. The sweep exempts exactly the flagged
         machines once it has reconciled them, since it clears the flag of one
         whose owner lost the entitlement before it reaps; a machine whose
-        settings no provider can be built from is never stopped either.
+        settings no provider can be built from is never stopped either, nor
+        a whole machine (``is_machine_kind``).
         """
-        if computer.get("is_always_on"):
-            return None
         try:
+            if spared_by_idle_sweep(computer):
+                return None
             return self._idle_window(computer)
         except ValueError:
             return None
 
+    async def _retire_idle_session(self, computer: Dict[str, Any]) -> None:
+        """Drop this worker's session for a quiet machine the sweep does not
+        stop, so a worker does not hold one for every machine it ever served.
+        Nothing on the machine is touched and the row stays running: the next
+        turn attaches again. Kept while a turn or a background command there
+        is still followed, since those read the machine through it."""
+        from src.server.database.runs.command_runs import computer_has_running_command
+
+        computer_id = str(computer["computer_id"])
+        if self._cached_session(computer_id) is None:
+            return
+        try:
+            if await self._machine_has_active_tasks(computer_id):
+                return
+            if await computer_has_running_command(computer_id):
+                return
+            await self.retire_computer_session_if_present(
+                computer_id, reason="its machine has been quiet past its idle limit"
+            )
+        except Exception as e:  # noqa: BLE001 - the next sweep tries again
+            logger.warning(f"Could not retire the idle session of computer {computer_id}: {e}")
+
     def _idle_timeout_for(self, computer: Dict[str, Any]) -> int:
         """Seconds idle before the sweep stops this computer.
 
-        Ten minutes ahead of its own provider's auto-stop, overrides included,
-        so the server cleans up before the provider stops the sandbox; never
-        under five minutes.
+        Its provider's ``auto_stop_interval``, overrides included. Where the
+        provider stops the sandbox on its own at that interval, the sweep runs
+        ten minutes ahead, so the server backs up and records the stop rather
+        than finding it done; never under five minutes.
 
         Raises:
             ValueError: The computer's provider settings are unreadable.
@@ -748,7 +1032,8 @@ class WorkspaceManager(ComputerManager):
         settings = self._provider_settings(
             computer["kind"], computer.get("provider_config") or None
         )
-        return max(settings.auto_stop_interval - 600, 300)
+        lead = 600 if computer["kind"] in SELF_STOPPING_KINDS else 0
+        return max(settings.auto_stop_interval - lead, 300)
 
     def _note_idle_reap_failure(self, computer_id: str, error: Exception) -> None:
         """Park a machine the sweep cannot stop, so one warning replaces a loop.
@@ -858,6 +1143,9 @@ class WorkspaceManager(ComputerManager):
                 machine = self._machine_if_known(computer_id)
                 if machine is not None:
                     machine.pending_lazy_sync = False
+                # Its owner died or hung, so nothing else will say the start
+                # failed: without this it reads as a claim handed back.
+                note_start_failure(computer_id, "abandoned")
                 reverted += 1
             except Exception as e:
                 logger.error(
@@ -912,12 +1200,12 @@ class WorkspaceManager(ComputerManager):
         return settled
 
     async def start_cleanup_task(self) -> None:
-        """Start the background cleanup task, and the left-folder, usage and
-        stuck-stop sweeps beside it.
+        """Start the background cleanup task, and the left-folder, usage,
+        stuck-stop and primary-intent sweeps beside it.
 
-        Both sweeps dial machines or providers, any of which may be dark or
+        Those sweeps dial machines or providers, any of which may be dark or
         slow, so each runs in a loop of its own rather than ahead of idle
-        reaping.
+        reaping: removing a computer after Home's move ends on its machine.
         """
         if self._cleanup_task is not None:
             return
@@ -964,13 +1252,30 @@ class WorkspaceManager(ComputerManager):
                 except Exception as e:
                     logger.error(f"Error in stuck-stop sweep loop: {e}")
 
-        async def usage_loop():
-            # First at once, so a deploy opens runs for the computers already
-            # running rather than a cycle later.
+        async def primary_intents_loop():
             while not self._shutdown:
                 try:
-                    await self.sweep_usage()
                     await asyncio.sleep(self.cleanup_interval)
+                    if not self._shutdown:
+                        await self.remove_after_home_move()
+                        await self.apply_pending_make_primary()
+                except asyncio.CancelledError:
+                    break
+                except Exception as e:
+                    logger.error(f"Error in primary-intent sweep loop: {e}")
+
+        async def usage_loop():
+            # First at once, so a deploy opens runs for the computers already
+            # running rather than a cycle later. A pass may take most of the
+            # interval pacing its metrics reads, so the next starts an
+            # interval after this one started, not after it ended.
+            while not self._shutdown:
+                try:
+                    started = time.monotonic()
+                    await self.sweep_usage()
+                    await asyncio.sleep(
+                        max(0.0, self.cleanup_interval - (time.monotonic() - started))
+                    )
                 except asyncio.CancelledError:
                     break
                 except Exception as e:
@@ -981,6 +1286,7 @@ class WorkspaceManager(ComputerManager):
         self._left_folders_task = asyncio.create_task(left_folders_loop())
         self._usage_task = asyncio.create_task(usage_loop())
         self._stuck_stopping_task = asyncio.create_task(stuck_stopping_loop())
+        self._primary_intents_task = asyncio.create_task(primary_intents_loop())
         logger.info("Workspace cleanup task started")
 
 

@@ -6,6 +6,9 @@ import { useTradingPermissionChoice } from '@/hooks/useTradingPermissionChoice';
 import { TRADING_LEVELS, TRADING_LEVEL_INFO, TRADING_PERMISSION_ANCHOR } from '@/lib/tradingPermission';
 import { cn } from '@/lib/utils';
 import type { TradingLevel } from '@/types/api';
+import { useRule } from '@/hooks/useAccount';
+import { RULE } from '@/lib/accountRules';
+import { RuleNote } from '@/components/organization/RuleRow';
 
 /**
  * The user's trading permission: how far the agent may go with orders at their
@@ -19,12 +22,15 @@ export function TradingPermissionSection() {
   const groupName = useId();
   const { permission, shown, pendingLevel, agreedDate, select, dialog } = useTradingPermissionChoice();
   const loaded = permission.data !== undefined;
+  // Under a rule against trading no level places an order, so none is offered.
+  const trading = useRule(RULE.trading);
+  const tradingOff = !trading.allowed;
 
   return (
     <section aria-labelledby={headingId} className="space-y-2">
       <div className="mx-0.5">
         <div className="flex items-baseline justify-between gap-3">
-          <h2 id={headingId} className="settings-group-title">
+          <h2 id={headingId} className="settings-group-title open-style:label-voice">
             {t('settings.tradingPermission.title')}
           </h2>
           {pendingLevel && (
@@ -58,7 +64,11 @@ export function TradingPermissionSection() {
         <p className="text-xs" style={{ color: 'var(--color-text-tertiary)' }}>{t('common.loading')}</p>
       )}
 
-      {loaded && (
+      {tradingOff && (
+        <RuleNote>{t('organization.trading.off', { who: trading.who.start })}</RuleNote>
+      )}
+
+      {loaded && !tradingOff && (
         // The anchor is on the levels, which draw once the permission has
         // loaded: a link or a search lands on them, not on an empty section.
         <div
@@ -117,11 +127,17 @@ function LevelCard({
       aria-labelledby={labelId}
       aria-describedby={descId}
       markClassName="mt-0.5"
+      // The open card styles draw each level as an open box and the chosen
+      // one by its edge in full ink, with no wash.
       className={cn(
-        'items-start gap-3 rounded-lg px-3 py-2.5 transition-colors',
-        checked ? 'bg-(--color-bg-tag)' : 'bg-(--color-bg-card) hover:bg-(--color-bg-hover)',
+        'items-start gap-3 rounded-[var(--cs-radius-choice,0.5rem)] px-3 py-2.5 transition-colors',
+        checked
+          ? 'bg-[var(--color-shell-fill,var(--color-bg-tag))]'
+          : 'bg-[var(--color-shell-fill,var(--color-bg-card))] hover:bg-[var(--color-shell-fill,var(--color-bg-hover))]',
       )}
-      style={{ border: `1px solid ${checked ? 'var(--color-text-primary)' : 'var(--color-border-muted)'}` }}
+      style={{
+        border: `1px solid ${checked ? 'var(--color-shell-ink, var(--color-text-primary))' : 'var(--color-shell-edge, var(--color-border-muted))'}`,
+      }}
     >
       <span className="min-w-0 flex-1">
         {/* No glyph per level here, so the warning is drawn on the name. */}

@@ -15,10 +15,12 @@ from langchain_core.tools import StructuredTool
 from ptc_agent.agent.limits import pending_read
 from ptc_agent.agent.middleware.background_subagent.outcomes import (
     is_credit_stop,
+    is_restart_stop,
     is_time_limit_stop,
 )
 from ptc_agent.agent.middleware.background_subagent.task import bare_task_id
 from src.server.contracts.status import REPORT_BACK_STATUSES
+from src.tools.turn_tool import input_schema
 
 if TYPE_CHECKING:
     from ptc_agent.agent.middleware.background_subagent.middleware import (
@@ -225,6 +227,13 @@ async def _compose_missing_reply(registry, task_id: str, run: dict | None) -> st
                 f'with Task(action="resume", task_id="{task_id}") if the work '
                 f"is still needed."
             )
+        if is_restart_stop(failure):
+            return (
+                f"Task-{task_id} was paused by a routine deployment before it "
+                f"finished; no result was produced. Its prior work is preserved. "
+                f'Resume it with Task(action="resume", task_id="{task_id}") if '
+                f"the work is still needed."
+            )
         # Otherwise deliberately silent on *why*: the ledger spells a timeout
         # kill 'cancelled' too, so claiming the stop was intentional here would
         # tell the agent not to retry a task that merely ran long. The live
@@ -404,6 +413,7 @@ def create_task_output_tool(middleware: BackgroundSubagentMiddleware) -> Structu
         name="TaskOutput",
         description=TASK_OUTPUT_DESCRIPTION,
         coroutine=task_output,
+        args_schema=input_schema("TaskOutput", task_output),
         response_format="content_and_artifact",
     )
 

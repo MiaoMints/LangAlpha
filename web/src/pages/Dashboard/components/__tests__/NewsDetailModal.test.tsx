@@ -37,9 +37,22 @@ import NewsDetailModal from '../NewsDetailModal';
 describe('NewsDetailModal — imageless (TickerTick) article', () => {
   beforeEach(() => {
     getNewsArticle.mockClear();
+    // The modal always asks for the by-id article (the list payload stays
+    // compact, so a row never carries page text) and renders the clicked row
+    // meanwhile. Cases that assert on the row alone leave the request pending.
+    getNewsArticle.mockReturnValue(new Promise(() => {}));
   });
 
-  it('renders from the row with no by-id fetch when the body is inlined', async () => {
+  it('renders the row at once and then the body the by-id fetch returns', async () => {
+    getNewsArticle.mockResolvedValue({
+      ...IMAGELESS_ARTICLE,
+      id: 'inlined-1',
+      title: 'Inlined Body Story',
+      description: 'The full summary that shipped in the list payload.',
+      content: 'The first paragraph of the page.\nThe second paragraph of the page.',
+      keywords: ['cloud'],
+    });
+
     render(
       <NewsDetailModal
         newsId="inlined-1"
@@ -60,8 +73,11 @@ describe('NewsDetailModal — imageless (TickerTick) article', () => {
       await screen.findByRole('heading', { name: 'Inlined Body Story' }),
     ).toBeInTheDocument();
     expect(screen.getByText(/shipped in the list payload/i)).toBeInTheDocument();
-    // The whole point of Option A: no second round-trip when the row is complete.
-    expect(getNewsArticle).not.toHaveBeenCalled();
+    // One round-trip per open: that request is what carries the page text,
+    // which the compact list payload never includes.
+    expect(getNewsArticle).toHaveBeenCalledWith('inlined-1');
+    expect(await screen.findByText(/first paragraph of the page/i)).toBeInTheDocument();
+    expect(screen.getByText(/second paragraph of the page/i)).toBeInTheDocument();
   });
 
   it('renders the headline even when the article has no hero image', async () => {
@@ -124,6 +140,60 @@ describe('NewsDetailModal — imageless (TickerTick) article', () => {
 
     fireEvent.keyDown(window, { key: 'Escape' });
     expect(onClose).toHaveBeenCalledTimes(1);
+  });
+
+  it('says the ticker table is the vendor\'s AI estimate, and shows an unscored ticker as Unscored rather than Neutral', async () => {
+    render(
+      <NewsDetailModal
+        newsId="mixed-1"
+        onClose={vi.fn()}
+        fallback={{
+          title: 'Mixed Scores Story',
+          description: 'Summary text.',
+          tickers: ['AAPL', 'MSFT', 'NVDA'],
+          sentiments: [
+            { ticker: 'AAPL', sentiment: 'negative', reasoning: 'Scored with a note.' },
+            { ticker: 'MSFT', sentiment: null },
+          ],
+        }}
+      />,
+    );
+
+    expect(await screen.findByText('Negative')).toBeInTheDocument();
+    expect(screen.getByTitle(/estimated by the news vendor's AI model/i)).toBeInTheDocument();
+    expect(screen.getAllByText('Unscored')).toHaveLength(2);
+    expect(screen.queryByText('Neutral')).not.toBeInTheDocument();
+  });
+
+  it('lists the tickers of a story the feed did not score as Unscored, with no AI attribution', async () => {
+    render(
+      <NewsDetailModal
+        newsId="unscored-1"
+        onClose={vi.fn()}
+        fallback={{ title: 'Unscored Story', description: 'Summary text.', tickers: ['AAPL'] }}
+      />,
+    );
+
+    expect(await screen.findByText('Unscored')).toBeInTheDocument();
+    expect(screen.queryByTitle(/news vendor's AI model/i)).not.toBeInTheDocument();
+  });
+
+  it('makes no AI claim when the feed returned sentiments but scored none', async () => {
+    render(
+      <NewsDetailModal
+        newsId="all-null-1"
+        onClose={vi.fn()}
+        fallback={{
+          title: 'Nothing Scored Story',
+          description: 'Summary text.',
+          tickers: ['AAPL'],
+          sentiments: [{ ticker: 'AAPL', sentiment: null }],
+        }}
+      />,
+    );
+
+    expect(await screen.findByText('Unscored')).toBeInTheDocument();
+    expect(screen.queryByTitle(/news vendor's AI model/i)).not.toBeInTheDocument();
   });
 
   it('does not close on the Escape that abandons an IME composition', async () => {

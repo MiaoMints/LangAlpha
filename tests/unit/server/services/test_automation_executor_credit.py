@@ -66,8 +66,8 @@ async def _one_event_gen(*args, **kwargs):
 # ---------------------------------------------------------------------------
 
 _PATCHES = {
-    "is_byok_active": "src.server.services.automation_executor.is_byok_active",
-    "has_any_oauth": "src.server.services.automation_executor.has_any_oauth_token",
+    "is_byok_active": "src.server.database.api_keys.is_byok_active",
+    "has_any_oauth": "src.server.database.oauth_tokens.has_any_oauth_token",
     "enforce_credit": "src.server.services.automation_executor.enforce_credit_limit",
     "auto_db": "src.server.services.automation_executor",
     "settlement_db": "src.server.services.automation_settlement",
@@ -83,7 +83,8 @@ _ROWS = {
 
 @contextmanager
 def _route_reads():
-    """The rows the turn route reads, and the Home bind."""
+    """The rows the turn route reads, its computer reachable, and the Home
+    bind."""
     with (
         patch(
             "src.server.services.workspace_manager.WorkspaceManager.get_instance",
@@ -92,6 +93,10 @@ def _route_reads():
         patch(
             "src.server.database.workspace.get_workspace",
             new=AsyncMock(side_effect=_ROWS.get),
+        ),
+        patch(
+            "src.server.services.ssh_computers.computer_away",
+            new=AsyncMock(return_value=None),
         ),
     ):
         yield
@@ -344,6 +349,32 @@ class TestCredentialGate:
         assert settled["error_message"].startswith("HTTPException: ")
 
 
+class TestClaudePlan:
+    """A firing the Claude plan refused at admission."""
+
+    @pytest.mark.asyncio
+    async def test_a_used_up_claude_plan_settles_the_firing_with_no_strike_in_its_owners_time(self):
+        detail = {
+            "message": "Your Claude plan's 5-hour limit is used up until Jan 3, 20:40 UTC. Pick another model, or "
+            "send this again after it resets.",
+            "type": "claude_code_off", "model": "claude-haiku-5-5-code", "reason": "plan_limited",
+            "window": "five_hour", "until": "2030-01-03T20:40:00+00:00", "held_until": "2030-01-03T20:40:00+00:00",
+        }
+        with patch(
+            "src.server.database.automation.get_user_timezone", new=AsyncMock(return_value="America/New_York")
+        ):
+            mock_adb, mock_astream, mock_settled = await _gated(HTTPException(status_code=400, detail=detail))
+
+        words = (
+            "Your Claude plan's 5-hour limit is used up until Thu Jan 3, 3:40 PM EST. Pick another model, or send "
+            "this again after it resets."
+        )
+        settled = mock_adb.settle_execution.await_args.kwargs
+        assert (settled["strike"], settled["failure_reason"], settled["error_message"]) == (None, "claude_plan", words)
+        assert mock_settled.await_args.kwargs["error"] == words
+        assert mock_settled.await_args.kwargs["failure_reason"] == "claude_plan"
+
+
 async def _gated(exc):
     """Fire an automation whose credit gate raises ``exc``."""
     patches = _patch_all(is_byok=False, has_oauth=False, credit_raises=exc)
@@ -456,3 +487,11 @@ def _setup_auto_db(mock_adb):
     )
     mock_adb.record_delivery = AsyncMock()
     mock_adb.update_automation = AsyncMock()
+
+
+@pytest.fixture(autouse=True)
+def _home_runs_at_home():
+    """Home's turn runs on Home's own computer here; where it runs while that
+    computer can't be reached is ``test_home_placement``'s."""
+    with patch("src.server.services.home_placement.place_home_turn", new=AsyncMock(return_value=None)):
+        yield

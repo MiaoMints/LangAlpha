@@ -28,6 +28,7 @@ from psycopg.rows import dict_row
 from src.server.database.order_attempts import row_as_json
 from src.server.database.pool import get_db_connection
 from src.server.database.session_lock import try_session_lock
+from src.server.database.wakeups.contract import pending_sql
 from src.server.database.wakeups.fire import fire_order_wakeups
 from src.server.services.brokerage_capabilities import OrderAction
 from src.server.services.brokerage_orders import OPEN_STATUSES, AttemptStatus
@@ -35,6 +36,7 @@ from src.server.services.brokerage_orders.models import (
     CREATING_ACTIONS,
     TERMINAL_STATUSES,
     UNLISTED_ACTIONS,
+    WAKEUP_ACTIONS,
 )
 from src.server.utils.pg_sanitize import SafeJson, strip_pg_nul_str
 
@@ -385,6 +387,17 @@ async def list_stale_attempts(
                                   AND updated_at < NOW() - make_interval(secs => %s)
                                 )
                            )
+                       -- A watch made no order and is read only for the wakeup
+                       -- waiting on it: with none pending (refused, lapsed,
+                       -- cancelled or fired), a read tells no one anything.
+                       AND (
+                             COALESCE(action, '') <> '{OrderAction.WATCH}'
+                             OR EXISTS (
+                                  SELECT 1 FROM wakeups w
+                                   WHERE w.attempt_id = order_attempts.attempt_id
+                                     AND {pending_sql("w")}
+                                )
+                           )
                        -- And not taken within the poll interval, by this worker
                        -- or any other. A read that settles nothing writes only
                        -- swept_at, so a row past the updated_at windows above
@@ -529,13 +542,18 @@ _ABANDONED = {
 
 
 async def refuse_abandoned_proposals(*, grace_seconds: float) -> list[dict[str, Any]]:
-    """Refuse the proposals whose run ended without putting them to the user.
+    """Refuse the proposals no answer can reach any more.
 
     A run that asks for a verdict ends ``interrupted`` and waits however long
     the user takes, so only a run stopped or finished first abandons one, as a
-    Stop between the write and the card does. An errored run keeps its
-    proposals: ``/retry`` resumes it from its last checkpoint, which proposes
-    the same attempt again and has to find it still waiting.
+    Stop between the write and the card does, or a later turn the user started
+    with a new message once it has ended, since its first step went past the
+    card and answered its call with a cancellation. One stopped or failed
+    before that step carries the ``pending_input`` stamp and leaves the card
+    the newest thing on the thread, still answerable. A later answer's run
+    never counts: its ``/retry`` raises the same card. An errored run keeps
+    its proposals: ``/retry`` resumes it from its last checkpoint, which
+    proposes the same attempt again and has to find it still waiting.
     """
     async with get_db_connection() as conn:
         async with conn.cursor(row_factory=dict_row) as cur:
@@ -551,7 +569,20 @@ async def refuse_abandoned_proposals(*, grace_seconds: float) -> list[dict[str, 
                  WHERE a.status = 'proposed'
                    AND a.updated_at < NOW() - make_interval(secs => %s)
                    AND r.conversation_response_id = a.conversation_response_id
-                   AND r.status IN ('cancelled', 'completed')
+                   AND (
+                         r.status IN ('cancelled', 'completed')
+                      OR (r.status = 'interrupted' AND EXISTS (
+                            SELECT 1 FROM conversation_responses later
+                              JOIN conversation_queries q
+                                ON q.conversation_thread_id = later.conversation_thread_id
+                               AND q.turn_index = later.turn_index
+                             WHERE later.conversation_thread_id = r.conversation_thread_id
+                               AND later.run_seq > r.run_seq
+                               AND later.status <> 'in_progress'
+                               AND NOT (later.metadata ? 'pending_input')
+                               AND q.type <> 'resume_feedback'
+                         ))
+                       )
                 RETURNING a.attempt_id, a.user_id, a.vendor, a.tool
                 """,
                 (SafeJson(_ABANDONED), float(grace_seconds)),
@@ -559,29 +590,77 @@ async def refuse_abandoned_proposals(*, grace_seconds: float) -> list[dict[str, 
             return [row_as_json(row) for row in await cur.fetchall()]  # type: ignore[misc]
 
 
+async def refuse_cut_off_proposal(
+    user_id: str, message_id: str, tool_call_id: str
+) -> dict[str, Any] | None:
+    """Refuse the proposal of a call a later run cut off, or None when it was
+    not still proposed.
+
+    Its run paused for the card and stays ``interrupted``, so the sweep never
+    takes it, and a resume that names the paused checkpoint would still put
+    the card to the user after the thread went on without the call.
+    """
+    async with get_db_connection() as conn:
+        async with conn.cursor(row_factory=dict_row) as cur:
+            await cur.execute(
+                """
+                UPDATE order_attempts
+                   SET status = 'refused',
+                       failure = %s,
+                       decided_at = COALESCE(decided_at, NOW()),
+                       completed_at = NOW(),
+                       updated_at = NOW()
+                 WHERE user_id = %s AND message_id = %s AND tool_call_id = %s
+                   AND status = 'proposed'
+                RETURNING attempt_id, user_id, vendor, tool
+                """,
+                (SafeJson(_ABANDONED), user_id, message_id, tool_call_id),
+            )
+            return row_as_json(await cur.fetchone())
+
+
 async def claimed_vendor_order_ids(
     user_id: str, vendor: str, account_ref: str | None
-) -> set[str]:
-    """Vendor order ids already bound to one of this account's attempts.
+) -> dict[str, datetime | None]:
+    """Vendor order ids already bound to one of this account's attempts, each
+    with when it was first watched, or None when a placement owns it.
 
     An attempt with no id has to be recognized by what was ordered, and two
     identical orders minutes apart are indistinguishable that way. Excluding
     the ids a placement already owns is what keeps a re-placed order from being
-    matched to the earlier attempt that is still open.
+    matched to the earlier attempt that is still open. A watch made no order,
+    so it excludes its id only from attempts made after the watch began: the
+    order existed before them, while an attempt that lost its answer and was
+    then watched is still that order's.
     """
     async with get_db_connection() as conn:
-        async with conn.cursor() as cur:
+        async with conn.cursor(row_factory=dict_row) as cur:
             await cur.execute(
                 """
-                SELECT vendor_order_id FROM order_attempts
-                 WHERE user_id = %s AND vendor = %s
-                   AND account_ref IS NOT DISTINCT FROM %s
+                SELECT vendor_order_id,
+                       CASE WHEN action = ANY(%(creating)s) THEN NULL ELSE created_at END AS since
+                  FROM order_attempts
+                 WHERE user_id = %(user)s AND vendor = %(vendor)s
+                   AND account_ref IS NOT DISTINCT FROM %(account)s
                    AND vendor_order_id IS NOT NULL
-                   AND action = ANY(%s)
+                   AND action = ANY(%(claiming)s)
                 """,
-                (user_id, vendor, account_ref, [str(a) for a in CREATING_ACTIONS]),
+                {
+                    "user": user_id,
+                    "vendor": vendor,
+                    "account": account_ref,
+                    "creating": [str(a) for a in CREATING_ACTIONS],
+                    "claiming": [str(a) for a in WAKEUP_ACTIONS],
+                },
             )
-            return {row[0] for row in await cur.fetchall()}
+            claimed: dict[str, datetime | None] = {}
+            for row in await cur.fetchall():
+                order_id, since = row["vendor_order_id"], row["since"]
+                if order_id not in claimed:
+                    claimed[order_id] = since
+                elif claimed[order_id] is not None:
+                    claimed[order_id] = None if since is None else min(claimed[order_id], since)
+            return claimed
 
 
 async def unanswered_attempts(

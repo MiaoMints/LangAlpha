@@ -1,17 +1,17 @@
 import { useCallback, useMemo, useState } from 'react';
-import { queryOptions, useQuery, useQueryClient } from '@tanstack/react-query';
+import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { useToast } from '@/components/ui/use-toast';
 import {
   addWatchlistItem,
   deleteWatchlistItem,
   listWatchlists,
-  listWatchlistItems,
 } from '../utils/api';
+import { watchlistItemsQuery } from '@/hooks/membershipQueries';
 import { useQuotes, snapshotToStockPrice } from '@/lib/quotes';
 import { quoteCurrency } from '@/lib/bars/exchanges';
+import { quotePlaces } from '@/lib/bars/currencyDisplay';
 import type { QuoteRow } from '../widgets/framework/snapshotSerializers';
-import { registerAuthReset } from '@/lib/authResets';
-import type { StockPrice } from '@/types/market';
+import type { ExtendedSessionFields, StockPrice } from '@/types/market';
 
 export interface WatchlistRow {
   watchlist_item_id: string;
@@ -21,9 +21,6 @@ export interface WatchlistRow {
   changePercent: number;
   isPositive: boolean;
   quoteAvailable?: boolean;
-  previousClose: number | null;
-  earlyTradingChangePercent: number | null;
-  lateTradingChangePercent: number | null;
   /** ISO code the snapshot was quoted in; null on a payload that predates it. */
   currency: string | null;
   /** The snapshot's asset class: an `index` row prints a level, not a price. */
@@ -32,6 +29,9 @@ export interface WatchlistRow {
   name?: string;
   /** The venue's own instrument kind (`crypto`, `stock`, `etf`, `index`). */
   instrumentType?: string;
+  /** Places its prices print up to (lib/bars `quotePlaces`), from the quote's own currency and asset class. */
+  places: number;
+  session?: ExtendedSessionFields;
   [key: string]: unknown;
 }
 
@@ -46,17 +46,6 @@ export function watchlistQuoteRow(r: WatchlistRow): QuoteRow {
     changePercent: hasQuote ? r.changePercent : undefined,
     currency: quoteCurrency(r.currency, r.symbol, r.assetClass),
   };
-}
-
-interface WatchlistItem {
-  watchlist_item_id: string;
-  symbol: string;
-  [key: string]: unknown;
-}
-
-interface WatchlistItemsData {
-  items: WatchlistItem[];
-  currentWatchlistId: string | null;
 }
 
 interface WatchlistItemData {
@@ -75,70 +64,6 @@ interface ApiError {
   };
   message?: string;
 }
-
-// Last resolved watchlist id — lets the next fetch request the membership in
-// parallel with the watchlist list instead of serializing on it. Persisted so
-// the first dashboard paint after a reload is parallel too. A stale id is
-// harmless: the speculative call is discarded on mismatch or failure and the
-// exact sequential path runs as before.
-const LAST_WATCHLIST_ID_KEY = 'watchlist_last_id';
-
-function readLastWatchlistId(): string | null {
-  try {
-    return localStorage.getItem(LAST_WATCHLIST_ID_KEY);
-  } catch {
-    return null;
-  }
-}
-
-function storeLastWatchlistId(id: string): void {
-  try {
-    localStorage.setItem(LAST_WATCHLIST_ID_KEY, id);
-  } catch {
-    // localStorage unavailable — every fetch stays sequential, as before
-  }
-}
-
-// The speculative id outlives React and is account-scoped: after an account
-// switch it would aim the parallel prefetch at the previous user's watchlist.
-registerAuthReset(() => {
-  try {
-    localStorage.removeItem(LAST_WATCHLIST_ID_KEY);
-  } catch {
-    // localStorage unavailable — nothing was persisted to clear
-  }
-});
-
-/**
- * The watchlist's membership alone, for a reader that needs what is on the
- * list but not its quotes (the welcome flow's holdings entry). The same entry
- * the hook below polls, so a symbol added anywhere shows everywhere. The
- * hook adds the polling; a reader that only needs the list does not poll.
- */
-export const watchlistItemsQuery = queryOptions({
-  queryKey: ['watchlistData'],
-  queryFn: async (): Promise<WatchlistItemsData> => {
-    const speculativeId = readLastWatchlistId();
-    const speculative = speculativeId
-      ? (listWatchlistItems(speculativeId) as Promise<{ items?: WatchlistItem[] }>).catch(() => null)
-      : null;
-
-    const { watchlists } = await listWatchlists() as { watchlists?: Array<{ watchlist_id: string; [key: string]: unknown }> };
-    const firstWatchlist = watchlists?.[0];
-    const watchlistId = firstWatchlist?.watchlist_id || 'default';
-    storeLastWatchlistId(watchlistId);
-
-    let items: WatchlistItem[] | undefined;
-    if (speculative && speculativeId === watchlistId) {
-      items = (await speculative)?.items;
-    }
-    if (items === undefined) {
-      ({ items } = await listWatchlistItems(watchlistId) as { items?: WatchlistItem[] });
-    }
-    return { items: items ?? [], currentWatchlistId: watchlistId };
-  },
-  staleTime: 1000 * 30, // 30s fresh
-});
 
 /**
  * Shared hook for watchlist data fetching and CRUD operations.
@@ -181,21 +106,26 @@ export function useWatchlistData() {
       const sym = String(i.symbol || '').trim().toUpperCase();
       const p = bySym[sym] || {} as Partial<StockPrice>;
       const quoteAvailable = p.quoteAvailable !== false && p.price != null;
+      const price = quoteAvailable ? p.price ?? 0 : 0;
+      const currency = p.currency ?? null;
+      const assetClass = quotes[sym]?.asset_class ?? null;
       return {
         watchlist_item_id: i.watchlist_item_id,
         symbol: sym,
-        price: quoteAvailable ? p.price ?? 0 : 0,
+        price,
         change: quoteAvailable ? p.change ?? 0 : 0,
         changePercent: quoteAvailable ? p.changePercent ?? 0 : 0,
         isPositive: quoteAvailable ? p.isPositive ?? true : true,
         quoteAvailable,
-        previousClose: p.previousClose ?? null,
-        earlyTradingChangePercent: p.earlyTradingChangePercent ?? null,
-        lateTradingChangePercent: p.lateTradingChangePercent ?? null,
-        currency: p.currency ?? null,
-        assetClass: quotes[sym]?.asset_class ?? null,
+        previousClose: p.session?.previousClose ?? null,
+        earlyTradingChangePercent: p.session?.earlyTradingChangePercent ?? null,
+        lateTradingChangePercent: p.session?.lateTradingChangePercent ?? null,
+        currency,
+        assetClass,
         name: String(i.name || '').trim(),
         instrumentType: String(i.instrument_type || ''),
+        session: p.session,
+        places: p.places ?? quotePlaces(sym, {}),
       };
     });
   }, [items, symbols, quotes]);
@@ -209,7 +139,7 @@ export function useWatchlistData() {
   }, [refetchItems, refetchQuotes]);
 
   const handleAdd = useCallback(
-    async (itemData: WatchlistItemData, watchlistId?: string | null) => {
+    async (itemData: WatchlistItemData, watchlistId?: string | null): Promise<boolean> => {
       try {
         let targetWatchlistId = watchlistId || currentWatchlistId;
         if (!targetWatchlistId) {
@@ -225,12 +155,15 @@ export function useWatchlistData() {
           title: 'Stock added',
           description: `${itemData.symbol} has been added to your watchlist.`,
         });
+        return true;
       } catch (e: unknown) {
         const err = e as ApiError;
         console.error('Add watchlist item failed:', err?.response?.status, err?.response?.data, err?.message);
 
         const status = err?.response?.status;
-        const msg = err?.response?.data?.detail || err?.response?.data?.message || '';
+        // A 422's detail is a list, not text; only a string can be shown or matched.
+        const raw = err?.response?.data?.detail || err?.response?.data?.message;
+        const msg = typeof raw === 'string' ? raw : '';
 
         if (status === 409 || msg.toLowerCase().includes('already exists')) {
           toast({
@@ -245,6 +178,7 @@ export function useWatchlistData() {
             description: msg || 'Failed to add to watchlist. Please try again.',
           });
         }
+        return false;
       }
     },
     [currentWatchlistId, queryClient, toast]

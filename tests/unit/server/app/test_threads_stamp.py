@@ -20,10 +20,13 @@ from src.server.database.conversation import ExternalIdConflictError
 from src.server.utils.api import get_current_user_id, get_stamp_auth
 from tests.conftest import create_test_app
 
+from tests.unit.server.access_stub import as_owner  # noqa: E402
+
 THREADS_MOD = "src.server.app.threads.crud"
 AUTH_MOD = "src.server.utils.api"
 
 USER = "test-user-123"
+RUNS_CLAUDE_CODE = "src.server.services.llm.thread_model.next_turn_runs_claude_code"
 
 # Sentinel so _stamp_app() can distinguish "use the default user-scoped caller"
 # from an explicit ``None`` (the privileged service caller, resolved user_id None).
@@ -105,7 +108,7 @@ async def test_stamp_success():
     app = _stamp_app()
     row = _thread_row(platform="telegram", external_id="chat:42")
     with (
-        patch(f"{AUTH_MOD}.require_thread_owner", new=AsyncMock()),
+        as_owner(THREADS_MOD),
         patch(
             f"{THREADS_MOD}.update_thread_external_id",
             new=AsyncMock(return_value=row),
@@ -124,7 +127,7 @@ async def test_stamp_idempotent_restamp():
     app = _stamp_app()
     row = _thread_row(platform="telegram", external_id="chat:42")
     with (
-        patch(f"{AUTH_MOD}.require_thread_owner", new=AsyncMock()),
+        as_owner(THREADS_MOD),
         patch(
             f"{THREADS_MOD}.update_thread_external_id",
             new=AsyncMock(return_value=row),
@@ -141,7 +144,7 @@ async def test_stamp_idempotent_restamp():
 async def test_stamp_conflict_returns_409():
     app = _stamp_app()
     with (
-        patch(f"{AUTH_MOD}.require_thread_owner", new=AsyncMock()),
+        as_owner(THREADS_MOD),
         patch(
             f"{THREADS_MOD}.update_thread_external_id",
             new=AsyncMock(
@@ -224,7 +227,7 @@ async def test_stamp_thread_missing_is_404():
     """update_thread_external_id returns None (thread vanished) → 404."""
     app = _stamp_app()
     with (
-        patch(f"{AUTH_MOD}.require_thread_owner", new=AsyncMock()),
+        as_owner(THREADS_MOD),
         patch(
             f"{THREADS_MOD}.update_thread_external_id",
             new=AsyncMock(return_value=None),
@@ -247,7 +250,7 @@ async def test_stamp_service_no_user_skips_ownership():
     app = _stamp_app(None)
     row = _thread_row(platform="telegram", external_id="chat:42")
     with (
-        patch(f"{AUTH_MOD}.require_thread_owner", new=AsyncMock()) as owner,
+        as_owner(THREADS_MOD) as owner,
         patch(
             f"{THREADS_MOD}.update_thread_external_id",
             new=AsyncMock(return_value=row),
@@ -266,7 +269,7 @@ async def test_stamp_service_with_user_keeps_ownership():
     app = _stamp_app(USER)
     row = _thread_row(platform="telegram", external_id="chat:42")
     with (
-        patch(f"{AUTH_MOD}.require_thread_owner", new=AsyncMock()) as owner,
+        as_owner(THREADS_MOD) as owner,
         patch(
             f"{THREADS_MOD}.update_thread_external_id",
             new=AsyncMock(return_value=row),
@@ -284,7 +287,7 @@ async def test_stamp_service_conflict_still_409():
     """The service path surfaces the same 409 conflict body as the user path."""
     app = _stamp_app(None)
     with (
-        patch(f"{AUTH_MOD}.require_thread_owner", new=AsyncMock()),
+        as_owner(THREADS_MOD),
         patch(
             f"{THREADS_MOD}.update_thread_external_id",
             new=AsyncMock(
@@ -313,7 +316,7 @@ async def test_stamp_real_service_token_no_user_id():
     row = _thread_row(platform="telegram", external_id="chat:42")
     with (
         patch("src.server.utils.api._SERVICE_TOKEN", "svc-secret"),
-        patch(f"{AUTH_MOD}.require_thread_owner", new=AsyncMock()) as owner,
+        as_owner(THREADS_MOD) as owner,
         patch(
             f"{THREADS_MOD}.update_thread_external_id",
             new=AsyncMock(return_value=row),
@@ -338,7 +341,7 @@ async def test_stamp_real_service_token_with_user_enforces_ownership():
     row = _thread_row(platform="telegram", external_id="chat:42")
     with (
         patch("src.server.utils.api._SERVICE_TOKEN", "svc-secret"),
-        patch(f"{AUTH_MOD}.require_thread_owner", new=AsyncMock()) as owner,
+        as_owner(THREADS_MOD) as owner,
         patch(
             f"{THREADS_MOD}.update_thread_external_id",
             new=AsyncMock(return_value=row),
@@ -385,7 +388,7 @@ async def test_patch_title_renames():
     app = _title_app()
     row = _thread_row(title="Renamed")
     with (
-        patch(f"{AUTH_MOD}.require_thread_owner", new=AsyncMock()),
+        as_owner(THREADS_MOD),
         patch(
             f"{THREADS_MOD}.update_thread_fields",
             new=AsyncMock(return_value=row),
@@ -408,7 +411,7 @@ async def test_patch_title_service_no_user_is_401():
     app.dependency_overrides.pop(get_current_user_id, None)
     with (
         patch("src.server.utils.api._SERVICE_TOKEN", "svc-secret"),
-        patch(f"{AUTH_MOD}.require_thread_owner", new=AsyncMock()) as owner,
+        as_owner(THREADS_MOD) as owner,
         patch(f"{THREADS_MOD}.update_thread_fields", new=AsyncMock()) as title,
     ):
         resp = await _patch(
@@ -430,11 +433,12 @@ async def test_patch_model_keeps_a_runnable_model():
     app = _title_app()
     row = _thread_row(llm_model="m-a")
     with (
-        patch(f"{AUTH_MOD}.require_thread_owner", new=AsyncMock()),
+        as_owner(THREADS_MOD),
         patch(f"{THREADS_MOD}.require_selectable_model", new=AsyncMock()) as check,
         patch(
             f"{THREADS_MOD}.update_thread_fields", new=AsyncMock(return_value=row)
         ) as update,
+        patch(RUNS_CLAUDE_CODE, new=AsyncMock(return_value=False)),
     ):
         resp = await _patch(app, {"llm_model": "m-a"})
 
@@ -450,7 +454,7 @@ async def test_patch_model_refuses_an_unknown_model_before_writing():
 
     app = _title_app()
     with (
-        patch(f"{AUTH_MOD}.require_thread_owner", new=AsyncMock()),
+        as_owner(THREADS_MOD),
         patch(
             f"{THREADS_MOD}.require_selectable_model",
             new=AsyncMock(side_effect=lambda _u, name: raise_model_unavailable(name)),
@@ -468,7 +472,7 @@ async def test_patch_model_refuses_an_unknown_model_before_writing():
 async def test_patch_model_null_returns_the_thread_to_the_default():
     app = _title_app()
     with (
-        patch(f"{AUTH_MOD}.require_thread_owner", new=AsyncMock()),
+        as_owner(THREADS_MOD),
         patch(f"{THREADS_MOD}.require_selectable_model", new=AsyncMock()) as check,
         patch(
             f"{THREADS_MOD}.update_thread_fields",
@@ -487,7 +491,7 @@ async def test_patch_model_null_returns_the_thread_to_the_default():
 async def test_patch_model_empty_name_is_422():
     app = _title_app()
     with (
-        patch(f"{AUTH_MOD}.require_thread_owner", new=AsyncMock()),
+        as_owner(THREADS_MOD),
         patch(f"{THREADS_MOD}.update_thread_fields", new=AsyncMock()) as update,
     ):
         resp = await _patch(app, {"llm_model": ""})
@@ -497,6 +501,7 @@ async def test_patch_model_empty_name_is_422():
 
 
 HAND_OFF = "src.server.handlers.thread_maintenance.hand_off_on_switch"
+BRIEF = "src.server.handlers.handoff_brief.brief_on_switch"
 
 
 @pytest.mark.asyncio
@@ -511,7 +516,7 @@ async def test_patch_model_says_whether_the_summary_is_handed_off(before, after,
     provider can read, naming that model (None for the account default)."""
     app = _title_app()
     with (
-        patch(f"{AUTH_MOD}.require_thread_owner", new=AsyncMock()),
+        as_owner(THREADS_MOD),
         patch(f"{THREADS_MOD}.require_selectable_model", new=AsyncMock()),
         patch(
             f"{THREADS_MOD}.get_thread_auth_meta",
@@ -522,6 +527,7 @@ async def test_patch_model_says_whether_the_summary_is_handed_off(before, after,
             new=AsyncMock(return_value=_thread_row(llm_model=after)),
         ) as update,
         patch(HAND_OFF, new=AsyncMock(return_value=handed_off)) as hand_off,
+        patch(RUNS_CLAUDE_CODE, new=AsyncMock(return_value=False)),
     ):
         resp = await _patch(app, {"llm_model": after})
 
@@ -529,6 +535,62 @@ async def test_patch_model_says_whether_the_summary_is_handed_off(before, after,
     assert resp.json()["summary_handoff"] is handed_off
     update.assert_awaited_once_with("t-1", llm_model=after)
     hand_off.assert_awaited_once_with("t-1", USER, before)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("briefed", [True, False])
+async def test_patch_onto_claude_code_has_the_model_it_leaves_write_a_brief_instead(briefed):
+    """Claude Code reads none of the thread's messages, so a switch onto it
+    asks for a brief of the whole thread, not a summary only the old
+    provider can read."""
+    app = _title_app()
+    with (
+        as_owner(THREADS_MOD),
+        patch(f"{THREADS_MOD}.require_selectable_model", new=AsyncMock()),
+        patch(
+            f"{THREADS_MOD}.get_thread_auth_meta",
+            new=AsyncMock(return_value={"llm_model": "m-a", "workspace_id": "ws-1"}),
+        ),
+        patch(
+            f"{THREADS_MOD}.update_thread_fields",
+            new=AsyncMock(return_value=_thread_row(llm_model="claude-sonnet-5-5-code")),
+        ),
+        patch(HAND_OFF, new=AsyncMock()) as hand_off,
+        patch(BRIEF, new=AsyncMock(return_value=briefed)) as brief,
+        patch(RUNS_CLAUDE_CODE, new=AsyncMock(return_value=True)),
+    ):
+        resp = await _patch(app, {"llm_model": "claude-sonnet-5-5-code"})
+
+    assert resp.status_code == 200
+    assert resp.json()["brief_handoff"] is briefed and resp.json()["summary_handoff"] is None
+    brief.assert_awaited_once_with("t-1", USER, "claude-sonnet-5-5-code")
+    hand_off.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_a_committed_switch_whose_routing_cannot_be_read_still_succeeds():
+    app = _title_app()
+    with (
+        as_owner(THREADS_MOD),
+        patch(f"{THREADS_MOD}.require_selectable_model", new=AsyncMock()),
+        patch(
+            f"{THREADS_MOD}.get_thread_auth_meta",
+            new=AsyncMock(return_value={"llm_model": "m-a", "workspace_id": "ws-1"}),
+        ),
+        patch(
+            f"{THREADS_MOD}.update_thread_fields",
+            new=AsyncMock(return_value=_thread_row(llm_model="claude-sonnet-5-5-code")),
+        ),
+        patch(HAND_OFF, new=AsyncMock()) as hand_off,
+        patch(BRIEF, new=AsyncMock()) as brief,
+        patch(RUNS_CLAUDE_CODE, new=AsyncMock(side_effect=RuntimeError("pool closed"))),
+    ):
+        resp = await _patch(app, {"llm_model": "claude-sonnet-5-5-code"})
+
+    assert resp.status_code == 200
+    assert resp.json()["brief_handoff"] is None and resp.json()["summary_handoff"] is None
+    brief.assert_not_awaited()
+    hand_off.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -543,7 +605,7 @@ async def test_patch_model_says_whether_the_summary_is_handed_off(before, after,
 async def test_patch_without_a_switch_asks_for_no_hand_off(body, row):
     app = _title_app()
     with (
-        patch(f"{AUTH_MOD}.require_thread_owner", new=AsyncMock()),
+        as_owner(THREADS_MOD),
         patch(f"{THREADS_MOD}.require_selectable_model", new=AsyncMock()),
         patch(
             f"{THREADS_MOD}.get_thread_auth_meta",

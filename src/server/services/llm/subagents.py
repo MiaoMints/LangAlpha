@@ -22,18 +22,23 @@ from ptc_agent.agent.subagents.merge import (
 )
 from ptc_agent.agent.roles import AgentRole
 from ptc_agent.config.agent import SubagentModel, SubagentsConfig
+from src.llms.claude_code import is_claude_code_model
+from src.llms.model_identity import catalog_model
 from src.llms.preferences import resolve_tuning
 
 from . import logger, user_models
-from .availability import model_on_plan, model_resolves
+from src.server.services.policy import Policy
+
+from .availability import model_on_plan, policy_refuses
 from .capabilities import TierPermits, gate_search
+from .claude_code import role_resolves
 from .clients import LLMRole
 
 #: The user's rows, their bases and the base names offered to them.
 SubagentReads = tuple[list[dict[str, Any]], dict[str, BaseSubagent], tuple[str, ...]]
 
 
-async def read_user_subagents(user_id: str, subagents: SubagentsConfig) -> SubagentReads:
+async def read_user_subagents(user_id: str, subagents: SubagentsConfig | None) -> SubagentReads:
     """What the merge reads, from one snapshot.
 
     An uninstall or update changes a plugin's subagents and the user's
@@ -52,6 +57,37 @@ async def read_user_subagents(user_id: str, subagents: SubagentsConfig) -> Subag
     return rows, bases, offered
 
 
+async def builtin_subagent_reads(subagents: SubagentsConfig | None) -> SubagentReads:
+    """:func:`read_user_subagents` with nothing of any one person's: the
+    deployment's subagents alone, for a turn in a shared workspace."""
+    from ptc_agent.agent.subagents.merge import add_plugin_bases, base_subagents
+    from src.server.services.subagents.context import _agent_config
+
+    subagents = subagents or _agent_config().subagents
+    bases, offered = add_plugin_bases(base_subagents(subagents), subagents.enabled, ())
+    return [], bases, offered
+
+
+def pins_claude_code(reads: SubagentReads) -> bool:
+    """Whether any of the user's subagents may pin a Claude Code row, read
+    off the rows and bases before the merge, so that only a turn with such a
+    pin asks where Claude Code runs."""
+    rows, bases, _ = reads
+    pins = [(row.get("fields") or {}).get("model") for row in rows]
+    pins += [base.definition.model for base in bases.values()]
+    return any(is_claude_code_model(pin) for pin in pins)
+
+
+async def pinned_to_claude_code(user_id: str, name: str, role: AgentRole) -> bool:
+    """Whether a ``role`` turn compiles the user's subagent ``name`` now with
+    a Claude Code pin, read as a turn's merge reads it, for a caller that
+    holds no turn: a pin the user changed, removed or moved off ``role`` since
+    a run counts as gone."""
+    rows, bases, offered = await read_user_subagents(user_id, None)
+    resolved = merge_subagents(bases, offered, rows)
+    return any(d.name == name and is_claude_code_model(d.model) for d in resolved.for_role(role))
+
+
 async def resolve_user_subagents(
     user_id: str,
     reads: SubagentReads,
@@ -62,11 +98,15 @@ async def resolve_user_subagents(
     search_api: str,
     search_depth: str,
     requested: list[str] | None = None,
+    claude_code: bool = False,
+    policy: Policy,
 ) -> ResolvedSubagents:
     """The roster this user's turn compiles, before any client is built.
 
     ``search_api`` and ``search_depth`` are the user's own pair, already
     gated, which a subagent's search settings inherit and fall back to.
+    ``claude_code`` keeps a Claude Code pin, which runs only where Claude
+    Code runs the turn's subagents.
 
     A failed read of the rows raises rather than resolving without them: a
     user's off-switch is a restriction, and a turn that silently drops it
@@ -91,6 +131,7 @@ async def resolve_user_subagents(
         )
     resolved = await _demote_unservable(
         user_id, resolved, bases, model_pref=model_pref, permits=permits, is_byok=is_byok,
+        claude_code=claude_code, policy=policy,
     )
     return await _gate_search(
         user_id, resolved, search_api=search_api, search_depth=search_depth, permits=permits,
@@ -152,10 +193,15 @@ async def _demote_unservable(
     model_pref: dict,
     permits: TierPermits,
     is_byok: bool,
+    claude_code: bool = False,
+    policy: Policy,
 ) -> ResolvedSubagents:
     """Pinned models this turn cannot run, as Inherit.
 
-    By name for every pin, since a name the manifest lacks fails the build.
+    By name for every pin, since a name the manifest lacks fails the build,
+    and so does a Claude Code row where Claude Code does not run the turn's
+    subagents (``claude_code``), and by the policy for every pin, the
+    deployment's own included.
     By plan only for a model the user chose, a plugin's pin included since
     the user installed it: a deployment's own pin is the operator's call, and
     gating it would change the turn of a user who never touched their
@@ -168,7 +214,10 @@ async def _demote_unservable(
         defn = definitions[name]
         if not defn.model:
             continue
-        if model_resolves(model_pref, defn.model) and (
+        if (
+            role_resolves(model_pref, defn.model, claude_code=claude_code)
+            and policy_refuses(policy, model_pref, defn.model) is None
+        ) and (
             not plan_gated(defn, bases.get(name))
             or await model_on_plan(
                 user_id, defn.model, model_pref=model_pref, permits=permits,
@@ -248,21 +297,23 @@ def subagent_models(
     names for one API model (a model and its subscription twin) count as the
     same, since the user picked that model either way.
     """
-    main_id = _api_model_id(model_pref, turn_model)
     models: dict[str, SubagentModel] = {}
     for defn in turn_roster(config.subagents).for_role(role):
         client = config.subsidiary_llm_clients.get(f"subagent:{defn.name}")
-        runs = (
-            (getattr(client, "metadata", None) or {}).get("manifest_model")
-            if client is not None
-            else defn.model
-        )
-        if not runs or _api_model_id(model_pref, runs) == main_id:
-            continue
-        provider = _serving_provider(model_pref, runs)
-        if provider:
-            models[defn.name] = {"id": runs, "provider": provider}
+        runs = catalog_model(client) if client is not None else defn.model
+        if model := card_model(model_pref, runs, turn_model):
+            models[defn.name] = model
     return models
+
+
+def card_model(model_pref: dict, runs: str | None, turn_model: str) -> SubagentModel | None:
+    """What a run's card names for a run on the catalog model ``runs``: None
+    where that is the turn's own API model, since the user picked that model
+    under either name, and where no catalog provider serves it."""
+    if not runs or _api_model_id(model_pref, runs) == _api_model_id(model_pref, turn_model):
+        return None
+    provider = _serving_provider(model_pref, runs)
+    return {"id": runs, "provider": provider} if provider else None
 
 
 def _api_model_id(model_pref: dict, name: str) -> str:

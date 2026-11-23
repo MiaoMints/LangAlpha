@@ -28,8 +28,9 @@ from unittest.mock import AsyncMock, patch
 import pytest
 
 from ptc_agent.core.paths import SandboxLayout
+from ptc_agent.core.sandbox import livefs_mount
 from ptc_agent.core.sandbox.livefs_mount import CallContext
-from ptc_agent.core.sandbox.livefs_runtime import lifecycle
+from ptc_agent.core.sandbox.livefs_runtime import lifecycle, protocol
 from ptc_agent.core.sandbox.livefs_runtime.protocol import CONFIG_ENV, MountError
 from src.server.database.livefs_tokens import Served, TokenRow
 from src.server.services import transcripts
@@ -86,6 +87,23 @@ class _Sandbox:
         return shlex.split(self.commands[index])
 
 
+class _Shipping(_Sandbox):
+    """A sandbox the daemon's own files can be shipped to."""
+
+    def __init__(self, *answers: dict, upload_fails: bool = False) -> None:
+        super().__init__(*answers)
+        #: Each upload, as the (destination, bytes) pairs it carried.
+        self.uploads: list[list[tuple[str, bytes]]] = []
+        self._upload_fails = upload_fails
+        self.runtime.exec = AsyncMock()
+        self.runtime.upload_files = self._upload
+
+    async def _upload(self, files):
+        if self._upload_fails:
+            raise RuntimeError("upload lost")
+        self.uploads.append([(dest, data) for data, dest in files])
+
+
 @pytest.fixture
 def server(monkeypatch):
     """The server's side of a bring-up, with its database and tree stood in for."""
@@ -95,7 +113,7 @@ def server(monkeypatch):
             WS_A: [(f"workspaces/{WS_A}/transcripts", FOLDER_A.transcripts)],
         },
         expires_at=_in(59),
-        mint=AsyncMock(return_value=MintedToken("lfs1.comp-test-1.fresh", _in(60))),
+        mint=AsyncMock(return_value=MintedToken("lfs1.comp-test-1.fresh", _in(60), _in(0))),
         settling=False,
         #: The sandbox that took the current token, as its row says.
         held_by="sb-test-1",
@@ -280,7 +298,8 @@ async def test_a_failed_link_of_the_computers_own_counts_against_every_folder(se
 async def test_a_link_the_daemon_did_not_answer_for_says_nothing_of_what_is_linked(
     server, stdout
 ):
-    sandbox = _Sandbox()
+    # The daemon's files ship and the second ask answers the same.
+    sandbox = _Shipping()
     sandbox.runtime.exec_as_root = AsyncMock(
         return_value=SimpleNamespace(stdout=stdout, stderr="killed")
     )
@@ -289,6 +308,58 @@ async def test_a_link_the_daemon_did_not_answer_for_says_nothing_of_what_is_link
 
     assert state.linked is None
     assert state.error in (MountError.STALE_CODE, MountError.UNANSWERED)
+
+
+# -- stale code ----------------------------------------------------------------
+
+STALE = {"ok": False, "error": "stale_code"}
+SHIPPED = f"{LAYOUT.internal_src}/{protocol.PACKAGE_NAME}"
+
+
+@pytest.mark.asyncio
+async def test_a_command_refused_for_stale_code_ships_the_daemon_and_asks_once_more():
+    """The mount comes up beside the asset sync that ships the daemon, so it
+    must not depend on that sync having got there first."""
+    sandbox = _Shipping(STALE, {"ok": True})
+
+    outcome = await livefs_mount.link(sandbox, [("user", LAYOUT.join(".agents/user"))])
+
+    assert outcome.ok and len(sandbox.commands) == 2
+    [upload] = sandbox.uploads
+    assert {dest for dest, _ in upload} == {
+        f"{SHIPPED}/{name}" for name in lifecycle.code_manifest()
+    }
+
+
+@pytest.mark.asyncio
+async def test_code_still_stale_after_shipping_is_answered_stale_without_a_loop():
+    sandbox = _Shipping(STALE)
+
+    outcome = await livefs_mount.link(sandbox, [])
+
+    assert outcome.error == MountError.STALE_CODE
+    assert len(sandbox.commands) == 2 and len(sandbox.uploads) == 1
+
+
+@pytest.mark.asyncio
+async def test_a_ship_that_failed_answers_stale_code_without_asking_again():
+    """Asking again with the old files on disk could only answer the same."""
+    sandbox = _Shipping(STALE, {"ok": True}, upload_fails=True)
+
+    outcome = await livefs_mount.link(sandbox, [])
+
+    assert outcome.error == MountError.STALE_CODE
+    assert len(sandbox.commands) == 1
+
+
+@pytest.mark.asyncio
+async def test_an_answer_other_than_stale_code_ships_nothing():
+    sandbox = _Shipping({"ok": False, "error": "start_failed"})
+
+    outcome = await livefs_mount.start(sandbox, config=None, base_url="http://x.test")
+
+    assert outcome.error == MountError.START_FAILED
+    assert sandbox.uploads == [] and len(sandbox.commands) == 1
 
 
 # -- the token the sandbox holds -----------------------------------------------
@@ -585,6 +656,30 @@ async def test_a_reconnect_the_rows_say_is_served_is_handed_the_mount(clock, mon
         await manager._keep_livefs(COMPUTER, USER, reconnected, WS_A)
     serve.assert_not_awaited()
     assert await reconnected.livefs.ready(WS_A)
+
+
+@pytest.mark.parametrize("mounts", [True, False], ids=["mounts", "never-mounts"])
+@pytest.mark.asyncio
+async def test_every_sandbox_the_host_loads_files_its_calls_for_its_computer(
+    monkeypatch, mounts
+):
+    """Whatever mounts it: a save through the mount reads the filing, and so
+    does a call the ``la`` CLI makes, which names its thread only through it."""
+    from src.server.services.livefs import history_files
+
+    open_call = AsyncMock()
+    monkeypatch.setattr(mount.outcomes, "open_call", open_call)
+    monkeypatch.setattr(mount, "view", AsyncMock(return_value=None))
+    monkeypatch.setattr(history_files, "computer_history", AsyncMock(return_value=None))
+    sandbox = _Sandbox()
+    sandbox.mounts_livefs = mounts
+    sandbox.history = None
+    context = CallContext(workspace_id=WS_A, thread_id="thread-test-1", timezone="Asia/Tokyo")
+
+    await _manager()._load_livefs(COMPUTER, USER, sandbox)
+    await sandbox.call_filer("c0ffee00c0ffee00", context)
+
+    open_call.assert_awaited_once_with(COMPUTER, "c0ffee00c0ffee00", context)
 
 
 @pytest.mark.parametrize(
@@ -1404,23 +1499,6 @@ async def test_a_command_still_running_on_a_forgotten_machine_mints_nothing():
 
     serve.assert_not_awaited()
     renew.assert_not_awaited()
-
-
-@pytest.mark.asyncio
-async def test_a_command_files_who_it_runs_for_only_with_both_its_id_and_context(
-    monkeypatch,
-):
-    open_call = AsyncMock()
-    monkeypatch.setattr(mount.outcomes, "open_call", open_call)
-    sandbox = _Sandbox()
-    handle = _handle(_serving(sandbox, WS_A), sandbox)
-    context = CallContext(workspace_id=WS_A, thread_id="thread-test-1", timezone="Asia/Tokyo")
-
-    await handle.prepare("c0ffee00c0ffee00", context)
-    await handle.prepare("c0ffee00c0ffee01")
-    await handle.prepare(None, context)
-
-    open_call.assert_awaited_once_with(COMPUTER, "c0ffee00c0ffee00", context)
 
 
 @pytest.mark.asyncio

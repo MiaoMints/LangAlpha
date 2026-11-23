@@ -136,10 +136,22 @@ describe('createComputer', () => {
     expect(computer.resource_tier).toBe('performance');
   });
 
-  it('defaults to standard and omits an absent name so the server names it', async () => {
+  it('omits an absent tier and name so the server picks both', async () => {
     mockPost.mockResolvedValueOnce({ data: {} });
     await createComputer();
+    expect(mockPost.mock.calls[0][1]).toEqual({});
+  });
+
+  it('sends standard when the caller picked it', async () => {
+    mockPost.mockResolvedValueOnce({ data: {} });
+    await createComputer({ resource_tier: 'standard' });
     expect(mockPost.mock.calls[0][1]).toEqual({ resource_tier: 'standard' });
+  });
+
+  it('asks the server to make the new computer primary once it starts', async () => {
+    mockPost.mockResolvedValueOnce({ data: {} });
+    await createComputer({ kind: 'ssh', make_primary: true });
+    expect(mockPost.mock.calls[0][1]).toEqual({ kind: 'ssh', make_primary: true });
   });
 
   it('carries the backup choice for a machine the user brings, off included', async () => {
@@ -150,7 +162,7 @@ describe('createComputer', () => {
     };
     await createComputer({ name: 'devbox', kind: 'ssh', ssh, files_backup: false });
     expect(mockPost.mock.calls[0][1]).toEqual({
-      name: 'devbox', resource_tier: 'standard', kind: 'ssh', ssh, files_backup: false,
+      name: 'devbox', kind: 'ssh', ssh, files_backup: false,
     });
   });
 
@@ -245,6 +257,13 @@ describe('deleteComputer', () => {
     const opts = mockDelete.mock.calls[0][1];
     expect(String(opts.params)).toBe('remove_key=false');
     expect(opts.data).toEqual({ delete_workspaces: ids });
+  });
+
+  it('names where Home goes when it removes the primary, and answers the move a 202 started', async () => {
+    const body = { key: null, move_id: 'mv-1' };
+    mockDelete.mockResolvedValueOnce({ data: body, status: 202, headers: {} });
+    await expect(deleteComputer('c1', { removeKey: false, homeTo: 'c2' })).resolves.toEqual(body);
+    expect(String(mockDelete.mock.calls[0][1].params)).toBe('remove_key=false&home_to=c2');
   });
 
   it('refuses an empty id rather than deleting a route with a hole in it', async () => {

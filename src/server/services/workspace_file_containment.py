@@ -12,16 +12,15 @@ import base64
 import binascii
 import logging
 import posixpath
-import re
 import shlex
 from collections.abc import Sequence
 from dataclasses import dataclass
-from decimal import Decimal
 from typing import Any
 from urllib.parse import unquote
 from uuid import uuid4
 
 from ptc_agent.core.paths import SANDBOX_ROOTS, SandboxLayout, strip_previous_dir_name
+from ptc_agent.core.sandbox.file_version import FileStamp, line_size, version_line
 from ptc_agent.core.sandbox.runtime import SandboxTransientError
 from src.server.utils.error_sanitization import single_line
 
@@ -38,6 +37,8 @@ READ_CONTAINMENT = 3
 READ_TOO_LARGE = 5
 # A ranged read whose offset is at or past the file's end.
 READ_UNSATISFIABLE = 6
+# A versioned whole read of a file still at the version the caller holds.
+READ_NOT_MODIFIED = 7
 # The read returns the file as base64 on the exec's stdout. Daytona fails an
 # exec whose output passes ~128 MiB (a ~95 MiB file) with a 502 and stops the
 # sandbox, so a read stays well under that; larger files go through the
@@ -81,23 +82,8 @@ _RESOLVE_SH = (
 
 # How much of a file's start decides whether a range of it may go unredacted.
 UTF8_SNIFF_BYTES = 8192
-# A ranged read's version line: size, mtime, ctime and inode from one stat,
-# GNU's nanoseconds, then its seconds, then BSD's fraction. Each attempt fills
-# ``v`` on its own, since a failed one can still print (GNU reads ``-f`` as file
-# system status). ``wc`` is the last resort, for the size alone, as BusyBox's
-# reads every byte; BSD's pads it with spaces.
-_VERSION_LINE = (
-    "v=$(stat -c '%s %.9Y %.9Z %i' -- \"$tt\" 2>/dev/null) "
-    "|| v=$(stat -c '%s %Y %Z %i' -- \"$tt\" 2>/dev/null) "
-    "|| v=$(stat -f '%z %Fm %Fc %i' -- \"$tt\" 2>/dev/null) "
-    "|| v=$(wc -c < \"$tt\" | tr -d ' '); "
-)
-_TIMESTAMP = re.compile(r"\d+(\.\d+)?", re.ASCII)
-# How far the sandbox clock must have left a file's ctime behind before no
-# write still to come can share it. A write moves the ctime only by the clock's
-# step, a kernel tick or a whole second; the second beyond that covers a
-# filesystem clock a little off the sandbox's.
-_VERSION_MIN_AGE_S = 2
+# The resolved file's version line, into ``v``.
+_VERSION_LINE = version_line('"$tt"')
 
 
 class FileChangedWhileRead(Exception):
@@ -119,13 +105,38 @@ class FileTooLargeToServe(Exception):
 
 
 @dataclass(frozen=True)
+class ContainedFile:
+    """A contained file read whole, with the stamp it was read at.
+
+    ``content`` is None when the file is still at a stamp the caller named,
+    which the read then leaves unread. ``stamp`` is the one the read saw
+    however recent, for a save to name: checked exactly on the machine, not
+    trusted as a cache validator. None where stat gave none, or the file
+    changed while it was read. ``settled`` is whether it also tells the file
+    from its next write (:meth:`FileStamp.settled`).
+    """
+
+    canonical: str
+    size: int
+    content: bytes | None
+    stamp: FileStamp | None = None
+    settled: bool = False
+
+    @property
+    def version(self) -> str | None:
+        """The file's ETag value, for a stamp that has settled."""
+        return self.stamp.etag if self.stamp is not None and self.settled else None
+
+
+@dataclass(frozen=True)
 class ContainedSlice:
     """Bytes of a contained file from an offset, with its size, its version and
     its first bytes, all from the one exec, so the range, its validator and
     whether it is text describe one file.
 
     ``content`` is None when the offset is at or past the end, and ``version``
-    None when the file has none that tells it from its next write.
+    (an ETag value) None when the file has none that tells it from its next
+    write.
     """
 
     canonical: str
@@ -383,8 +394,14 @@ def contained_read_command(
     denied_roots: Sequence[str] = (),
     byte_range: tuple[int, int] | None = None,
     read_max: int | None = None,
+    versioned: bool = False,
+    unless: Sequence[str] = (),
 ) -> str:
-    """``byte_range`` is ``(offset, length)``: the read prints the file's
+    """``versioned`` has a whole read print the file's version line and the
+    sandbox clock ahead of its base64, on one line, and the version line again
+    after it; with ``unless``, version lines as stat printed them, a file still
+    at one of them exits ``READ_NOT_MODIFIED`` before a byte is read.
+    ``byte_range`` is ``(offset, length)``: the read prints the file's
     version line and the sandbox clock, then its first ``UTF8_SNIFF_BYTES`` and
     at most ``length`` bytes from ``offset``, each base64 on a line of its own,
     then the version line again. It skips the size limit, since a range is how
@@ -412,7 +429,26 @@ def contained_read_command(
         if denied_patterns
         else ""
     )
-    if byte_range is None:
+    if byte_range is None and versioned:
+        limit = EXEC_READ_MAX_BYTES if read_max is None else read_max
+        read = [
+            _VERSION_LINE,
+            'printf "%s\\n%s\\n" "$v" "$(date +%s 2>/dev/null)"; ',
+            *(
+                [
+                    f'case "$v" in {"|".join(shlex.quote(line) for line in unless)}) '
+                    f"exit {READ_NOT_MODIFIED} ;; esac; "
+                ]
+                if unless
+                else []
+            ),
+            f'sz=$(wc -c < "$tt"); [ "$sz" -le {limit} ] ',
+            f'|| {{ printf %s "$sz"; exit {READ_TOO_LARGE}; }}; ',
+            'base64 < "$tt" | tr -d "\\n"; printf "\\n"; ',
+            _VERSION_LINE,
+            'printf "%s\\n" "$v"',
+        ]
+    elif byte_range is None:
         limit = EXEC_READ_MAX_BYTES if read_max is None else read_max
         read = [
             f'sz=$(wc -c < "$tt"); [ "$sz" -le {limit} ] ',
@@ -462,6 +498,8 @@ async def _contained_read(
     *,
     work_dir: str,
     byte_range: tuple[int, int] | None = None,
+    versioned: bool = False,
+    unless: Sequence[str] = (),
 ) -> tuple[int, str, str] | None:
     """Run the contained read and recheck where it landed.
 
@@ -484,6 +522,8 @@ async def _contained_read(
                 denied_roots=denied_roots,
                 byte_range=byte_range,
                 read_max=_exec_read_max(runtime),
+                versioned=versioned,
+                unless=unless,
             ),
             timeout=_PROBE_TIMEOUT_S,
         )
@@ -498,7 +538,9 @@ async def _contained_read(
     if exit_code in (READ_MISSING, READ_CONTAINMENT):
         return None
     stopped = READ_TOO_LARGE if byte_range is None else READ_UNSATISFIABLE
-    if exit_code not in (0, stopped):
+    if exit_code not in (0, stopped) and not (
+        versioned and exit_code == READ_NOT_MODIFIED
+    ):
         raise SandboxTransientError(
             f"Contained file read failed with exit code {exit_code}"
         )
@@ -540,6 +582,53 @@ async def read_contained_sandbox_file(
     return canonical, content
 
 
+async def read_contained_sandbox_file_versioned(
+    sandbox: Any,
+    absolute_path: str,
+    *,
+    work_dir: str,
+    unless: Sequence[FileStamp] = (),
+) -> ContainedFile | None:
+    """``read_contained_sandbox_file`` with the stamp the file was read at,
+    and no read of a file still at one of ``unless``.
+
+    Raises :class:`FileTooLargeToServe` as the plain read does.
+    """
+    read = await _contained_read(
+        sandbox,
+        absolute_path,
+        work_dir=work_dir,
+        versioned=True,
+        unless=[stamp.line for stamp in unless],
+    )
+    if read is None:
+        return None
+    exit_code, canonical, rest = read
+    lines = rest.split("\n")
+    before = _stat(lines[0])
+    if before is None or len(lines) < 3:
+        return None
+    size, stamp = before
+    settled = stamp is not None and stamp.settled(lines[1])
+    if exit_code == READ_NOT_MODIFIED:
+        return ContainedFile(canonical, size, None, stamp, settled)
+    if exit_code == READ_TOO_LARGE:
+        try:
+            raise FileTooLargeToServe(canonical, int(lines[2].strip()))
+        except ValueError:
+            return None
+    try:
+        content = base64.b64decode(lines[2], validate=True)
+    except (binascii.Error, ValueError):
+        return None
+    after = _stat(lines[3]) if len(lines) > 3 else None
+    if after != before or len(content) != size:
+        # Rewritten while it was read: the bytes are good, the stamp is not
+        # theirs.
+        return ContainedFile(canonical, len(content), content)
+    return ContainedFile(canonical, size, content, stamp, settled)
+
+
 async def read_contained_sandbox_range(
     sandbox: Any, absolute_path: str, *, work_dir: str, offset: int, length: int
 ) -> ContainedSlice | None:
@@ -556,11 +645,12 @@ async def read_contained_sandbox_range(
         return None
     exit_code, canonical, rest = read
     lines = rest.split("\n")
-    before = _size_and_stamps(lines[0])
+    before = _stat(lines[0])
     if before is None:
         return None
-    size, stamps = before
-    version = _version(stamps, lines[1] if len(lines) > 1 else "")
+    size, stamp = before
+    clock = lines[1] if len(lines) > 1 else ""
+    version = stamp.etag if stamp is not None and stamp.settled(clock) else None
     if exit_code == READ_UNSATISFIABLE:
         return ContainedSlice(canonical, size, version, b"", None)
     if len(lines) < 5:
@@ -570,60 +660,17 @@ async def read_contained_sandbox_range(
         content = base64.b64decode(lines[3], validate=True)
     except (binascii.Error, ValueError):
         return None
-    if _size_and_stamps(lines[4]) != before or len(content) != min(
+    if _stat(lines[4]) != before or len(content) != min(
         length, size - offset
     ):
         raise FileChangedWhileRead(canonical)
     return ContainedSlice(canonical, size, version, head, content)
 
 
-def _size_and_stamps(
-    line: str,
-) -> tuple[int, tuple[str, str, str] | None] | None:
-    """A version line's size, and its mtime, ctime and inode when stat gave
-    all three.
-
-    They land in an ETag, so anything but stat's digits is none.
-    """
-    fields = line.split()
-    if not fields or not fields[0].isascii() or not fields[0].isdigit():
-        return None
-    size = int(fields[0])
-    if len(fields) != 4:
-        return size, None
-    mtime, ctime, inode = fields[1:]
-    if not (
-        _TIMESTAMP.fullmatch(mtime)
-        and _TIMESTAMP.fullmatch(ctime)
-        and inode.isascii()
-        and inode.isdigit()
-    ):
-        return size, None
-    return size, (mtime, ctime, inode)
-
-
-def _version(stamps: tuple[str, str, str] | None, clock: str) -> str | None:
-    """The stamps as one version, or None when they cannot tell the file from
-    its next write.
-
-    mtime alone cannot, since a writer can set it (``cp -p``, ``touch -r``, an
-    unpacked archive). No writer sets the ctime, and a file renamed over the
-    name brings its own inode; but a write moves the ctime only by the clock's
-    step, a kernel tick or a whole second, so two same-size writes within one
-    step share every stamp, however many digits the ctime shows. A version
-    counts only once the sandbox clock has left the last write behind, as
-    Apache's ETags do.
-    """
-    if stamps is None:
-        return None
-    clock = clock.strip()
-    if not (clock.isascii() and clock.isdigit()):
-        return None
-    mtime, ctime, inode = stamps
-    # Exact, so a fractional ctime is held to the same two seconds.
-    if Decimal(clock) - Decimal(ctime) < _VERSION_MIN_AGE_S:
-        return None
-    return f"{mtime}-{ctime}-{inode}"
+def _stat(line: str) -> tuple[int, FileStamp | None] | None:
+    """A version line's size, and its stamp where stat gave one."""
+    size = line_size(line)
+    return None if size is None else (size, FileStamp.from_line(line))
 
 
 def batch_probe_command(

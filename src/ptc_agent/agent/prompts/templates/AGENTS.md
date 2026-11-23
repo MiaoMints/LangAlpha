@@ -25,8 +25,8 @@ uv run python scripts/utils/render_prompt.py --role chief_of_staff
 
 The service is model-agnostic — the same prompt has to serve frontier models
 and small self-hosted ones. Frontier models regress when given procedural
-scaffolding they already fold in; a 20b model falls apart without it. So every
-template renders at one of two levels, resolved per request (see
+scaffolding they already fold in; a 20b model falls apart without it. So the
+system prompts render at one of two levels, resolved per request (see
 `../guidance.py`):
 
 ```
@@ -35,6 +35,17 @@ user model_preference.prompt_guidance → config.yaml prompt.guidance → models
 
 `detailed` is the fail-safe default: an unannotated or unknown model gets more
 scaffolding, never less.
+
+### Which text has levels
+
+Only text inside a guidance fence differs by level: the PTC and subagent system
+prompts (`system.md.j2`, `subagent_base.md.j2` and the files they include) and
+the market-watch block's `envelope/updates.md.j2`. Everything else has one
+version for every model: the other `envelope/` fragments (see below), tool
+names, docstrings and argument descriptions on both surfaces, tool results and
+errors, skills, AGENTS.md files, and the `prompt` the agent writes in a `Task`
+call. Review that text for sentences its readers do not need; it has no
+lean copy to diff.
 
 ### You never write the lean version
 
@@ -136,6 +147,9 @@ uv run python scripts/utils/render_prompt.py --model claude-opus-5-5
 `test_lean_subset_invariant.py` enforces the subset property across PTC and all
 five subagents. If it fails, lean is rendering text detailed never
 sees — move it outside the fence, or register it as an either/or.
+`--diff` renders only the system prompts; `test_runtime_context_templates.py`
+holds each `envelope/` fragment to the same subset rule and pins the ones that
+must render the same at both levels.
 
 ## Other conventions
 
@@ -145,8 +159,9 @@ sees — move it outside the fence, or register it as an either/or.
   would become prompt text about itself. The keys of
   `STRUCTURED_PREFERENCES["agent_preference"]`
   (`src/server/models/profile_vocabulary.py`) are the knobs that may:
-  `render_user_profile` hands the template each one whose value is in its
-  vocabulary as `agent_steering`, which selects the main agent's paragraphs
+  `answer_preferences` (`middleware/runtime_context/profile.py`) hands the
+  template each one whose value is in its vocabulary as `preferences.steering`,
+  which selects the main agent's paragraphs
   (the `output_format` ranking one ordered list of formats),
   and prints the rest. A subagent gets none of the paragraphs, and
   `research_depth` is worded for the role, because the Chief of Staff's
@@ -171,7 +186,11 @@ sees — move it outside the fence, or register it as an either/or.
   Subagents are bound no order tools, so their copy of the profile drops it.
   Beside it, `trading_asks_on` names the brokerages (by server) whose switch
   still asks at a level that skips approval, so the rule does not tell the
-  model those orders go straight out.
+  model those orders go straight out, and `trading_order_skill` (set in
+  `agent.py` from the user's skill switch, not from this turn's bound tools)
+  adds the one pointer to the order-execution skill. It rides this block
+  rather than the static prompt so a thread pinned before the user connected
+  a brokerage still gets it, as a row.
 - **The static prompt excludes every per-request value.** The clock, the user's
   identity, the surface this turn is running on, and anything that changes
   between turns are rendered from `templates/envelope/` and appended after the
@@ -186,23 +205,38 @@ sees — move it outside the fence, or register it as an either/or.
   own text on the request (`ChatRequest.surface_rules`) and the template renders
   that verbatim in place of a built-in line.
 
+- **A static prompt change reaches a running thread at its next rebuild, not
+  at the deploy.** A Claude thread keeps sending the static prompt its thinking
+  was produced under until a summary that keeps no turns lets it take the
+  current one (`runtime_context/frozen_prompt.py`), so most edits reach it at
+  its next compaction. When the old text is unsafe or contradicts the deployed
+  code (a safety or trading rule, a tool or path that no longer exists), raise
+  `prompt_version` in `../config/prompts.yaml` by one and set
+  `rebuild_before` to the new value: every thread pinned below it rebuilds at
+  its next turn start, whatever its size, at one summary each. Leave both
+  alone for any other change. A build whose `prompt_version` is below a
+  thread's pin, a rollback, never forces that rebuild.
+
 ## `templates/envelope/`
 
 Fragments of the runtime context, rendered by `middleware/runtime_context/`
 rather than included from a system template. Three lifetimes share the
 directory:
 
-- **Tail fragments** (`header`, `updates`) re-render per model call, after the
-  last breakpoint, so their cost is a few hundred tokens rather than the whole
-  history. They emit bare markdown lines: the envelope supplies the
-  `<system-reminder>` wrapper, so a fragment that adds one nests it.
+- **The market-watch block** (`header`, `updates`) is rendered once, at the
+  turn's guidance level, when `middleware/market_watch.py` writes it into
+  history as a `market_watch` row, and the model reads a stamp only until the
+  next user message or tool result (`runtime_context/carrier.py`). Both
+  fragments emit bare markdown lines, because the carrier picks the wrapper
+  per call (a `<system-reminder>` block or an operator-role message), and a
+  fragment that adds one nests it.
 - **Baseline fragments** (`baseline_files`, `baseline_agentmd`,
   `baseline_memory`, `baseline_identity`, and the harness blocks
-  `baseline_mcp_servers`, `baseline_skills` and the Chief of Staff's
-  `baseline_activity`) land *inside* the cached per-thread
-  prefix, so they must be byte-identical for equal inputs: no timestamps, no
-  dict iteration, and no guidance fence. A guidance flip must not move them,
-  because the model can change mid-thread.
+  `baseline_model`, `baseline_mcp_servers`, `baseline_skills`,
+  `baseline_subagents` and the Chief of Staff's `baseline_activity`) land
+  *inside* the cached per-thread prefix, so they must be byte-identical for
+  equal inputs: no timestamps, no dict iteration, and no guidance fence. A
+  guidance flip must not move them, because the model can change mid-thread.
 - **Row fragments** (`turn`, `surface_rules`, `update_row`) are rendered once,
   at the turn boundary, and persisted as messages in history. `turn` is the
   stamp the turn opened with, `surface_rules` is the paragraph it carries about

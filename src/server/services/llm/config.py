@@ -10,28 +10,42 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from ptc_agent.agent.roles import AgentRole
 from ptc_agent.agent.subagents.merge import turn_roster
 
+from src.llms.claude_code import FEATURE, is_claude_code_model, rows_available
 from src.llms.preferences import (
     Tuning,
     compaction_profile_for,
     custom_model,
     resolve_tuning,
 )
+from fastapi import HTTPException
+
 from src.server.services.features import effective_flags_for_user
+from src.server.services.policy import (
+    MODELS_ALLOWED,
+    Policy,
+    raise_model_denied,
+    raise_no_model_allowed,
+)
+from src.server.services.account import own_access, require_policy
 from src.tools.web.fetch import fetch_llm_client_override, fetch_model_override
 from src.utils.concurrency import cancel_and_join
 
 from .availability import (
     _MODEL_PREF_KEYS,
+    builtins_only,
     cleanup_stale_model_preferences,
     drop_dead_models,
     drop_off_plan_models,
+    drop_policy_refused,
     model_on_plan,
     on_subscription,
+    plan_covers,
+    policy_refuses,
     raise_byok_key_required,
     raise_model_not_on_plan,
     raise_model_removed,
@@ -40,15 +54,22 @@ from .availability import (
 from . import logger
 
 from .capabilities import PlanTier, gate_capabilities
+from .claude_code import chief_of_staff_default_runs, claude_code_placement, drop_claude_code_roles, require_runnable
 from .clients import resolve_clients
 from .subagents import (
     demote_clientless,
+    builtin_subagent_reads,
+    pins_claude_code,
     read_user_subagents,
     resolve_user_subagents,
     subagent_models,
     subagent_roles,
 )
+from .task_model import TaskModelGate
 from . import user_models
+
+if TYPE_CHECKING:
+    from src.server.services.shared_workspaces.turn import TurnIdentity
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -89,19 +110,41 @@ def saved_default_model(model_pref: dict, slot: str) -> str | None:
 
     An unset Background default is the primary one, as Settings says ("Same as
     Primary model"), unless the user chose Auto for it, which keeps the
-    deployment's Background model even beside a saved primary.
+    deployment's Background model even beside a saved primary. A Claude Code
+    primary is never followed: a Background job is one chat model call, which
+    such a row does not make (``drop_claude_code_roles``).
     """
     saved = model_pref.get(_SLOT_MODEL_MAP[slot][1])
     if saved or slot != "background" or model_pref.get("background_follows") == "deployment":
         return saved or None
-    return model_pref.get("preferred_model") or None
+    primary = model_pref.get("preferred_model")
+    return None if is_claude_code_model(primary) else primary or None
+
+
+def deployment_llm():
+    """The deployment's own ``LLMConfig``, or None when it names no model."""
+    from src.server.app import setup
+
+    return setup.agent_config.llm if setup.agent_config and setup.agent_config.llm else None
+
+
+def plan_exempt_models(llm, slot: str) -> frozenset[str]:
+    """The deployment's own models a turn in ``slot`` runs whatever the plan.
+
+    They are the operator's call, as a subagent's own pin is, and pass where
+    they would run unasked: the main model anywhere, the Background model only
+    in the Background slot and the roles that inherit it, not as a primary
+    turn's own model.
+    """
+    if not llm:
+        return frozenset()
+    main = frozenset({llm.name})
+    return main | {slot_model(llm, "background")} if slot == "background" else main
 
 
 def system_default_models() -> dict[str, str]:
     """The deployment's default models, as the models API publishes them."""
-    from src.server.app import setup
-
-    llm = setup.agent_config.llm if setup.agent_config and setup.agent_config.llm else None
+    llm = deployment_llm()
     return {
         "default_model": llm.name if llm else "",
         "background_model": (llm.background or "") if llm else "",
@@ -181,16 +224,10 @@ def deployment_serves_default() -> bool:
 
 @dataclass(frozen=True)
 class ModelSelection:
-    """Which model this turn runs, and the ``LLMConfig`` field that named it.
-
-    ``users_fallbacks`` is whether ``llm.fallback`` is a list the user saved,
-    even an empty one, rather than the deployment's: only theirs may move an
-    own-key turn onto the platform's key.
-    """
+    """Which model this turn runs, and the ``LLMConfig`` field that named it."""
 
     effective_model: str
     model_field: str
-    users_fallbacks: bool
 
 
 def select_model(
@@ -280,7 +317,6 @@ def select_model(
     return ModelSelection(
         effective_model=slot_model(config.llm, slot),
         model_field=model_field,
-        users_fallbacks=user_fallback is not None,
     )
 
 
@@ -296,32 +332,26 @@ async def gate_models_by_plan(
     not ask. Every saved model reads as unset instead
     (``drop_off_plan_models``), the Default included, so a turn that names
     none runs the deployment's, as the composer starts on it. The
-    deployment's defaults are the operator's call, as a subagent's own pin
-    is, and pass where they would run unasked: its main model anywhere, its
-    Background only in the Background slot and the roles that inherit it,
-    not as a primary turn's own model.
+    deployment's own defaults pass where they would run unasked
+    (``plan_exempt_models``).
     """
     llm = base_config.llm
-    main = frozenset({llm.name}) if llm else frozenset()
-    background = main | {slot_model(llm, "background")} if llm else frozenset()
-    exempt = {key: background for key in _MODEL_PREF_KEYS}
+    main = plan_exempt_models(llm, "primary")
+    exempt = {key: plan_exempt_models(llm, "background") for key in _MODEL_PREF_KEYS}
     exempt["preferred_model"] = exempt["fallback_models"] = main
-    named_exempt = background if slot == "background" else main
+    named_exempt = plan_exempt_models(llm, slot)
     byok_cache: dict[str, dict | None] = {}
 
-    async def on_plan(name: str) -> bool:
-        return await model_on_plan(
-            user_id, name, model_pref=model_pref, permits=permits,
+    if request_model and request_model not in named_exempt:
+        covered = await plan_covers(
+            user_id, request_model, model_pref=model_pref, permits=permits,
             is_byok=is_byok, byok_cache=byok_cache,
         )
+        if covered is None:
+            from src.server.services.platform_client import quota_service_unavailable
 
-    if request_model and request_model not in named_exempt and not await on_plan(request_model):
-        await permits.refresh()
-        if not await on_plan(request_model):
-            if await permits.tier() is None:
-                from src.server.dependencies.usage_limits import quota_service_unavailable
-
-                raise quota_service_unavailable()
+            raise quota_service_unavailable()
+        if not covered:
             raise_model_not_on_plan(request_model)
 
     view, dropped = await drop_off_plan_models(
@@ -333,17 +363,154 @@ async def gate_models_by_plan(
     return view
 
 
+def gate_models_by_policy(
+    user_id: str, model_pref: dict, request_model: str | None, *, policy: Policy,
+) -> dict:
+    """``model_pref`` once the policy has had its say, as the plan gate's.
+
+    A model the turn names is refused; every saved one the policy refuses
+    reads as unset, so the turn falls through to the next choice, and
+    ``apply_policy_to_roles`` judges what it falls through to.
+    """
+    if policy.unrestricted:
+        return model_pref
+    if request_model and (rule := policy_refuses(policy, model_pref, request_model)):
+        raise_model_denied(policy, rule, request_model)
+    view, dropped = drop_policy_refused(policy, model_pref)
+    if dropped:
+        logger.info(f"[CHAT] Ignoring saved models the policy refuses for user={user_id}: {dropped}")
+    return view
+
+
+async def _serves(
+    user_id: str, name: str, model_pref: dict, *,
+    policy: Policy, permits: PlanTier, is_byok: bool, byok_cache: dict,
+) -> bool:
+    """Whether a turn naming ``name`` would run for this user without asking
+    anything of them: on their own key, a local server, or the deployment's
+    key their plan reaches. A model needing a sign-in or Claude Code is left
+    out, since such a turn is refused rather than moved on when it is absent."""
+    from src.llms.llm import LLM as LLMFactory
+    from src.server.services.platform_client import platform_gating_active
+
+    from .availability import model_resolves
+    from .clients import DeploymentRoute, OwnKeyRoute, credential_route
+
+    if (
+        is_claude_code_model(name)
+        or not model_resolves(model_pref, name)
+        or policy_refuses(policy, model_pref, name) is not None
+    ):
+        return False
+    route = await credential_route(
+        user_id, name, is_byok=is_byok, policy=policy,
+        _pref_cache=model_pref, _byok_cache=byok_cache,
+    )
+    if isinstance(route, OwnKeyRoute):
+        return True
+    if not isinstance(route, DeploymentRoute) or not route.provider:
+        return False
+    if platform_gating_active():
+        return await model_on_plan(
+            user_id, name, model_pref=model_pref, permits=permits,
+            is_byok=is_byok, byok_cache=byok_cache,
+        )
+    local = LLMFactory.get_model_config().get_provider_info(route.provider).get("access_type") == "local"
+    return local or deployment_key(route.provider) is not None
+
+
+async def default_to_first_allowed(
+    config, user_id: str, model_pref: dict, slot: str, request_model: str | None,
+    *, policy: Policy, permits: PlanTier, is_byok: bool,
+) -> None:
+    """Where the deployment's default for ``slot`` is not allowed, make the
+    first allowed model the user can be served the default, in place.
+
+    Only for a turn that names no model and has no saved one left: a named
+    model the policy refuses is refused, never swapped. Without this, a member
+    who never picked a model, and every automation they own, would be refused
+    on every turn. Refused when no allowed model can be served.
+    """
+    if (
+        policy.models_allowed is None
+        or request_model
+        or config.llm is None
+        or saved_default_model(model_pref, slot)
+    ):
+        return
+    default = slot_model(config.llm, slot)
+    if policy_refuses(policy, model_pref, default) != MODELS_ALLOWED:
+        return
+    byok_cache: dict[str, dict | None] = {}
+    for name in policy.allowed_in_order:
+        if await _serves(
+            user_id, name, model_pref,
+            policy=policy, permits=permits, is_byok=is_byok, byok_cache=byok_cache,
+        ):
+            logger.info(f"[CHAT] Default {default} not allowed for user={user_id}; running {name}")
+            setattr(config.llm, _SLOT_MODEL_MAP[slot][0], name)
+            config.llm_client = None
+            return
+    raise_no_model_allowed(policy, default)
+
+
+def apply_policy_to_roles(
+    config, model_pref: dict, selection: ModelSelection, slot: str, *, policy: Policy,
+) -> None:
+    """Hold every model the turn's config names to the policy, in place.
+
+    The saved models are judged already; what is left is the deployment's own
+    defaults, which ``select_model`` wrote in. A turn whose own model is
+    refused has nothing left to fall to (``default_to_first_allowed`` has
+    tried the allow-list) and is refused. Every other role falls
+    to the turn's model, so a role built by name, a summary's fallback
+    (``compact._at_summary_level``) or the fetch tool's default included, can
+    only reach an allowed model.
+    """
+    if policy.unrestricted:
+        return
+    effective = selection.effective_model
+    if rule := policy_refuses(policy, model_pref, effective):
+        if rule == MODELS_ALLOWED:
+            raise_no_model_allowed(policy, effective)
+        raise_model_denied(policy, rule, effective)
+
+    def refused(name: str | None) -> bool:
+        return bool(name) and policy_refuses(policy, model_pref, name) is not None
+
+    llm = config.llm
+    if refused(llm.name):
+        llm.name = effective
+    if refused(llm.background):
+        llm.background = effective
+    if refused(llm.compaction):
+        llm.compaction = effective
+    # Blank, web_fetch reads the deployment's file for its model, past the policy.
+    if refused(llm.fetch_name) or (not llm.fetch_name and policy.models_allowed is not None):
+        llm.fetch = effective
+    if llm.fallback:
+        llm.fallback = [m for m in llm.fallback if not refused(m)]
+
+
 async def load_user_context(
-    config, user_id: str, workspace_id: str | None, model_pref: dict
+    config,
+    user_id: str,
+    workspace_id: str | None,
+    model_pref: dict,
+    *,
+    owner_id: str | None = None,
 ) -> None:
     """Per-user feature flags and skill tier, onto ``config`` in place.
 
     Resolved once here so every build surface reads ``config.feature_enabled()``
     instead of global state. ``workspace_id`` scopes the skill tier: workspace
     rows shadow user rows and workspace disables apply; ``None`` (maintenance
-    paths) resolves the user tier alone.
+    paths) resolves the user tier alone. The flags are the sender's
+    (``user_id``); the skills are what the computer is given, so they are the
+    workspace owner's (``owner_id``), who is the sender when no workspace is
+    named.
     """
-    from src.server.services.user_skills import load_user_skill_bundle
+    from src.server.services.user_skills import load_user_skill_bundle, shared_computer_withheld
 
     # Reuses this turn's prefs read; plan gates fetch the platform tier lazily
     # inside the flag resolver, only when a plan feature exists.
@@ -354,9 +521,10 @@ async def load_user_context(
 
     # One query + the prefs read above; a skill-less user costs a single
     # indexed SELECT and sets nothing.
-    bundle = await load_user_skill_bundle(user_id, workspace_id)
+    bundle = await load_user_skill_bundle(owner_id or user_id, workspace_id)
     config.user_skills = list(bundle.skills)
     config.disabled_skills = bundle.disabled_builtins
+    config.withheld_skills = shared_computer_withheld(owner_id or user_id)
     config.user_skill_dir = bundle.dir
     config.workspace_skill_dir = bundle.workspace_dir
     config.skill_command_overrides = dict(bundle.command_overrides)
@@ -392,6 +560,8 @@ def apply_compaction(
     from ptc_agent.config.agent import COMPACTION_PROFILES
 
     config.compaction.native = not custom and tuning.native_compaction is not False
+    if tuning.cold_compaction is False:
+        config.compaction.cold_compact_tokens = 0
     profile = tuning.compaction_profile
     if not isinstance(profile, str):
         profile = compaction_profile_for(entry)
@@ -492,13 +662,19 @@ async def resolve_llm_config(
     *,
     enabled_subagents: list[str] | None = None,
     workspace_id: str | None = None,
+    identity: TurnIdentity | None = None,
     user_facing: bool = True,
     role: AgentRole = "analyst",
 ):
     """Resolve the final LLM config for one turn: which model runs, how it is
     tuned, what it is allowed to reach, and every client it can call.
 
-    ``is_byok=None`` self-resolves via ``is_byok_active`` (guards future entry
+    ``user_id`` is the sender, whose models, keys, rules and plan these are.
+    ``identity`` is the turn's, for a turn in ``workspace_id``: only the
+    skills the computer is given are read for its owner, and a shared
+    workspace's turn compiles none of the sender's own subagents.
+
+    ``is_byok=None`` self-resolves via ``own_access`` (guards future entry
     points; all current callers pass it explicitly). ``enabled_subagents``
     narrows the user's subagents to the request's list; ``None`` is all of
     them, and ``role`` is the agent the turn builds, whose subagents alone get
@@ -508,15 +684,18 @@ async def resolve_llm_config(
     """
     reads: asyncio.Task | None = None
     try:
+        # Free with nothing configured. Own keys the policy denies are not
+        # used, whatever the caller found stored.
+        policy = await require_policy(user_id)
         if is_byok is None:
-            from src.server.database.api_keys import is_byok_active
-
-            is_byok = await is_byok_active(user_id)
+            is_byok = (await own_access(user_id, sign_ins=False, policy=policy)).api_keys
+        is_byok = policy.byok(is_byok)
 
         # One copy up front. Everything below mutates the request's own config, so
         # nothing has to reason about whether it is still aliased to the caller's.
         config = base_config.model_copy(deep=True)
-        saved_pref = await user_models.get_model_preference(user_id)
+        # Every role below, the clients and the subagent pins read this view.
+        saved_pref = builtins_only(policy, await user_models.get_model_preference(user_id))
 
         # A role or fallback saved as a model this manifest lacks resolves as if
         # never set: without this a platform user's role reaches the name-based
@@ -528,6 +707,17 @@ async def resolve_llm_config(
         model_pref, dropped = drop_dead_models(saved_pref, role_keys)
         if dropped:
             logger.info(f"[CHAT] Ignoring saved models not in the manifest for user={user_id}: {dropped}")
+        # A Background job reads a Claude Code default as unset and runs the
+        # deployment's model (one chat model call, which such a row does not
+        # make); a Claude Code row named for the turn is refused there.
+        default_key = _SLOT_MODEL_MAP[slot][1]
+        model_pref, _ = drop_claude_code_roles(
+            model_pref, [*role_keys, default_key] if slot == "background" else role_keys,
+        )
+
+        # Before the plan gate, so a model the policy refuses is refused as
+        # that, not as off the plan.
+        model_pref = gate_models_by_policy(user_id, model_pref, request_model, policy=policy)
 
         # One tier read for every plan gate the turn runs.
         permits = PlanTier(user_id)
@@ -540,11 +730,59 @@ async def resolve_llm_config(
         # depend on nothing below, so they start now and the merge waits for
         # them; not before the plan check, whose refusal is routine and would
         # cancel them inside their transaction.
+        # A shared workspace's computer runs nothing of one member's own: its
+        # turns compile the deployment's subagents only.
+        shared = identity is not None and identity.shared
         if slot == "primary" and user_facing:
-            reads = asyncio.create_task(read_user_subagents(user_id, base_config.subagents))
+            reads = asyncio.create_task(
+                builtin_subagent_reads(base_config.subagents)
+                if shared
+                else read_user_subagents(user_id, base_config.subagents)
+            )
 
-        await load_user_context(config, user_id, workspace_id, model_pref)
+        await load_user_context(
+            config, user_id, workspace_id, model_pref,
+            owner_id=identity.owner if identity is not None else None,
+        )
+        # So does the Chief of Staff where it would not run that default
+        # (``chief_of_staff_default_runs``), read once the user's flags are,
+        # unless the turn names its model; where it would, admission reads the
+        # placement it found.
+        where = None
+        if (
+            role == "chief_of_staff" and request_model is None
+            and is_claude_code_model(model_pref.get(default_key) or "")
+        ):
+            if rows_available() and config.feature_enabled(FEATURE):
+                where = await chief_of_staff_default_runs(user_id, workspace_id)
+            if where is None:
+                model_pref, _ = drop_claude_code_roles(model_pref, [default_key])
+        await default_to_first_allowed(
+            config, user_id, model_pref, slot, request_model,
+            policy=policy, permits=permits, is_byok=is_byok,
+        )
         selection = select_model(config, model_pref, slot, request_model)
+        apply_policy_to_roles(config, model_pref, selection, slot, policy=policy)
+        if shared and is_claude_code_model(selection.effective_model):
+            # Its session files would be laid out on a member's own computer.
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "type": "claude_code_shared_workspace",
+                    "message": "Claude Code is not available in a shared workspace. "
+                    "Choose another model.",
+                    "model": selection.effective_model,
+                },
+            )
+        if is_claude_code_model(selection.effective_model):
+            config.claude_code_admitted = await require_runnable(
+                config, selection.effective_model, user_id=user_id, workspace_id=workspace_id,
+                thread_id=thread_id, where=where,
+            )
+            config.claude_code = True
+            # A Claude Code turn stops when its plan runs out rather than move
+            # to another model.
+            config.llm.fallback = []
 
         # The model running this turn is settled here: everything below tunes it
         # rather than choosing it. Tuning reads go through the per-model resolver so
@@ -564,10 +802,19 @@ async def resolve_llm_config(
         # After the gate, whose tier check the merge reuses, and before the
         # clients, which read the merged definitions for their roles.
         if reads is not None:
+            subagent_reads = await reads
+            # A Claude Code pin on a turn of another model runs on Claude
+            # Code where the workspace has it now, else on the turn's model.
+            if not shared and not config.claude_code and pins_claude_code(subagent_reads):
+                config.claude_code_pins = await claude_code_placement(
+                    config, user_id=user_id, workspace_id=workspace_id,
+                )
             config.subagents.resolved = await resolve_user_subagents(
-                user_id, await reads, model_pref=model_pref, permits=permits,
+                user_id, subagent_reads, model_pref=model_pref, permits=permits,
                 is_byok=is_byok, search_api=config.search_api,
                 search_depth=config.search_depth, requested=enabled_subagents,
+                claude_code=config.claude_code or config.claude_code_pins is not None,
+                policy=policy,
             )
     finally:
         # A stage above that raises must not leave the reads running, or let
@@ -600,12 +847,18 @@ async def resolve_llm_config(
         reasoning_effort=reasoning_effort,
         fast_mode=fast_mode,
         user_defined=user_defined,
-        users_fallbacks=selection.users_fallbacks,
+        policy=policy,
     )
     demote_clientless(config)
     if slot == "primary":
         config.subagent_models = subagent_models(
             config, model_pref, selection.effective_model, role=role,
+        )
+        config.task_models = TaskModelGate(
+            config, user_id=user_id, workspace_id=workspace_id, thread_id=thread_id,
+            model_pref=model_pref, permits=permits, is_byok=is_byok,
+            turn_model=selection.effective_model,
+            plan_exempt=plan_exempt_models(base_config.llm, "primary"),
         )
 
     return config

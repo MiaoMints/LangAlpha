@@ -11,11 +11,11 @@ from __future__ import annotations
 import asyncio
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, call, patch
 
 import pytest
 
-from ptc_agent.core.sandbox.jobs import JobState
+from ptc_agent.core.sandbox.jobs import JobState, Outbox
 from src.server.database.runs.command_runs import Outcome
 from src.server.services.commands import settle
 from src.server.services.commands import watcher as w
@@ -62,6 +62,9 @@ def _state(**over):
         ({"status": "starting", "provider_ref": "sbx"}, "between"),
         ({"status": "stopping", "provider_ref": "sbx"}, "between"),
         ({"status": "stopped", "provider_ref": "sbx"}, "gone"),
+        ({"status": "stopped", "provider_ref": "sbx", "kind": "daytona"}, "gone"),
+        ({"status": "stopped", "provider_ref": "sbx", "kind": "ssh"}, "own_stopped"),
+        ({"status": "stopped", "provider_ref": None, "kind": "ssh"}, "gone"),
         ({"status": "error"}, "gone"),
         ({"status": "deleted"}, "gone"),
         (None, "gone"),
@@ -156,8 +159,18 @@ class _Harness:
     reads back as stopped."""
 
     def __init__(
-        self, computer, states, *, window=IdleWindow(NOW + timedelta(minutes=50), TIMEOUT_S)
+        self,
+        computer,
+        states,
+        *,
+        window=IdleWindow(NOW + timedelta(minutes=50), TIMEOUT_S),
+        machine_runs=False,
+        unanswered=None,
     ):
+        # A stopped computer whose machine still marks it running.
+        self.machine_runs = machine_runs
+        # What reaching the computer raises: its machine away.
+        self.unanswered = unanswered
         self.calls = MagicMock()
         self.runtime = MagicMock()
         self.manager = MagicMock()
@@ -168,10 +181,16 @@ class _Harness:
         self.stopped: set[str] = set()
         self.judged: dict = {}
         self.read = AsyncMock(side_effect=self._read)
-        self.trace = AsyncMock(return_value=[{"tool": "t"}])
+        self.trace = [{"tool": "t"}]
+        self.outbox = Outbox()
+        self.read_end = AsyncMock(side_effect=self._read_end)
         self.mirror = AsyncMock()
+        self.finalize_wins = True
         # What a fresh read of the threads finds before the hour's stop.
         self.fresh_coverage: dict = {}
+
+    async def _read_end(self, exec_fn, ref, *, trace):
+        return (self.trace if trace else None), self.outbox
 
     async def _read(self, exec_fn, refs, **kw):
         self.calls.read([r.command_id for r in refs])
@@ -189,12 +208,21 @@ class _Harness:
 
         @asynccontextmanager
         async def jobs_runtime(computer):
-            yield runtime if computer and computer.get("status") == "running" else None
+            if self.unanswered is not None:
+                raise self.unanswered
+            reached = computer and (computer.get("status") == "running" or self.machine_runs)
+            yield runtime if reached else None
 
         async def finalize(judged, outcome, **kw):
             calls.finalize(judged["command_id"], outcome, **kw)
             self.judged[judged["command_id"]] = judged
-            return {**judged, "status": outcome.status}
+            if not self.finalize_wins:
+                return None
+            ended = {**judged, "status": outcome.status}
+            # The finalize stores the outbox's layers; its row keeps their entries.
+            if (outbox := kw.get("outbox")) and outbox.layers:
+                ended["outbox_layers"] = list(outbox.layers)
+            return ended
 
         async def discard(exec_fn, refs):
             calls.discard([r.command_id for r in refs])
@@ -217,7 +245,7 @@ class _Harness:
             ),
             patch.object(w, "computer_jobs_runtime", jobs_runtime),
             patch.object(jobs, "read_job_states", new=self.read),
-            patch.object(jobs, "collect_job_trace", new=self.trace),
+            patch.object(jobs, "read_job_end", new=self.read_end),
             patch.object(jobs, "discard_jobs", new=discard),
             patch.object(jobs, "end_jobs", new=end_jobs),
             patch.object(w.cr_db, "finalize", new=finalize),
@@ -269,11 +297,11 @@ async def test_one_read_settles_ended_jobs_with_their_tail_and_trace_then_drops_
     h.calls.read.assert_called_once_with(["bg-00000000000a", "bg-00000000000b", "bg-00000000000c"])
     h.calls.finalize.assert_any_call(
         "bg-00000000000a", Outcome("completed", exit_code=0), tail="done\n",
-        trace=[{"tool": "t"}], oom_kill_on=None,
+        trace=[{"tool": "t"}], outbox=None, oom_kill_on=None,
     )
     h.calls.finalize.assert_any_call(
         "bg-00000000000b", Outcome("failed", "exit", 3), tail="boom\n",
-        trace=[{"tool": "t"}], oom_kill_on=None,
+        trace=[{"tool": "t"}], outbox=None, oom_kill_on=None,
     )
     # Each job's state goes only after its finalize, so a pass that dies
     # between them still finds the job ended rather than gone.
@@ -285,7 +313,7 @@ async def test_one_read_settles_ended_jobs_with_their_tail_and_trace_then_drops_
     h.calls.nudge.assert_called()
     # The trace is read and left for the discard: a finalize that fails finds
     # it again on the next pass.
-    assert all(c.kwargs == {"delete": False} for c in h.trace.await_args_list)
+    assert all(c.kwargs == {"trace": True} for c in h.read_end.await_args_list)
     # Each end recorded is the mirror's to judge; the running one is not.
     assert [c.args[0]["command_id"] for c in h.mirror.await_args_list] == [
         "bg-00000000000a", "bg-00000000000b",
@@ -303,10 +331,129 @@ async def test_a_failed_trace_read_leaves_the_row_and_its_trace_for_the_next_pas
     the read was kept for."""
     row = _row("bg-00000000000a")
     with _Harness(_computer(), {"bg-00000000000a": state}) as h:
-        h.trace.side_effect = w.jobs.JobReplyError("no reply")
+        h.read_end.side_effect = w.jobs.JobReplyError("no reply")
         assert await _pass(h, [row]) == 0
     h.calls.finalize.assert_not_called()
     h.calls.discard.assert_not_called()
+
+
+_ENTRY = {
+    "workspace_id": "22222222-2222-2222-2222-222222222222",
+    "chart_id": "NVDA:1day", "symbol": "NVDA", "timeframe": "1day",
+    "layer_id": "x", "title": "X", "summary": None, "as_of": None,
+}
+
+
+def _layer_line() -> str:
+    import json
+
+    # The layer contract's own sample, kept with chartkit's suite.
+    from libs.chartkit.tests.samples import sample
+
+    return json.dumps(sample("intraday"))
+
+
+@pytest.fixture
+def writer():
+    w_ = MagicMock()
+    with patch("langgraph.config.get_stream_writer", return_value=w_):
+        yield w_
+
+
+@pytest.mark.asyncio
+async def test_an_ended_jobs_layers_are_stored_by_its_finalize_then_streamed(writer):
+    """A handed-off job's chart layers are validated when it is settled, in
+    the workspace it ran in, and handed to the finalize, which stores them
+    with the end; they stream only once it has, and the outbox is discarded
+    after."""
+    row = _row("bg-00000000000a")
+    with _Harness(_computer(), {"bg-00000000000a": _state(exit_code=0)}) as h, patch(
+        "src.server.database.chart_annotation.add_layers", new=AsyncMock()
+    ) as add:
+        writer.side_effect = lambda _: h.calls.event()
+        h.outbox = Outbox((_layer_line(),))
+        assert await _pass(h, [row]) == 1
+    # Never stored apart from the finalize.
+    add.assert_not_awaited()
+    outbox = h.calls.finalize.call_args.kwargs["outbox"]
+    [(ref, body)] = outbox.rows
+    assert (ref.workspace_id, ref.chart_id, ref.layer_id) == (
+        row["workspace_id"], "SPY:5min", body["id"],
+    )
+    assert outbox.report.startswith(f"Published chart layer {body['id']} ")
+    assert [e["layer_id"] for e in outbox.layers] == [body["id"]]
+    assert outbox.unsaved_report.startswith(f"Chart layer {body['id']!r} NOT published")
+    assert [c for c in h.order() if c in ("finalize", "event", "discard")] == [
+        "finalize", "event", "discard",
+    ]
+    assert writer.call_args.args[0]["payload"]["op"] == "add"
+
+
+@pytest.mark.asyncio
+async def test_a_settle_that_loses_its_finalize_stores_and_streams_nothing(writer):
+    """A stopper and the watcher racing, or a retry of a settle that already
+    committed: the finalize that finds the row ended stores nothing (it is
+    the one place layers are stored), and nothing streams."""
+    row = _row("bg-00000000000a")
+    with _Harness(_computer(), {"bg-00000000000a": _state(exit_code=0)}) as h:
+        h.finalize_wins = False
+        h.outbox = Outbox((_layer_line(),))
+        await _pass(h, [row])
+    assert h.calls.finalize.call_args.kwargs["outbox"].rows
+    writer.assert_not_called()
+
+
+def test_a_settled_rows_published_layers_reach_its_command_report():
+    from datetime import datetime
+
+    from src.server.services.commands.notice import command_report
+
+    row = {
+        "command_id": "bg-00000000000a", "tool": "Bash", "description": None,
+        "status": "completed", "failure_reason": None, "tool_call_id": "toolu_1",
+        "outbox_layers": [_ENTRY], "ended_at": datetime(2026, 1, 1),
+    }
+    assert command_report(row).chart_layers == [_ENTRY]
+
+
+@pytest.mark.asyncio
+async def test_staging_is_total_so_a_broken_outbox_still_ends_the_command(writer):
+    """``stage_outbox`` never raises: the read-back says it failed, and the
+    command's end is still recorded."""
+    row = _row("bg-00000000000a")
+    with _Harness(_computer(), {"bg-00000000000a": _state(exit_code=0)}) as h, patch(
+        "src.tools.chart_annotation.layers._stage", side_effect=RuntimeError("bug"),
+    ):
+        h.outbox = Outbox(('{"id":"x"}',))
+        assert await _pass(h, [row]) == 1
+    outbox = h.calls.finalize.call_args.kwargs["outbox"]
+    assert outbox.report == (
+        "Chart layers NOT published: they could not be processed. "
+        "Publish them again in a moment."
+    )
+    assert not outbox.rows and outbox.layers is None
+    writer.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_a_job_that_wrote_nothing_publishes_nothing():
+    with _Harness(_computer(), {"bg-00000000000a": _state(exit_code=0)}) as h, patch(
+        "src.tools.chart_annotation.layers._stage"
+    ) as stage:
+        assert await _pass(h, [_row("bg-00000000000a")]) == 1
+    stage.assert_not_called()
+    assert h.calls.finalize.call_args.kwargs["outbox"] is None
+
+
+@pytest.mark.asyncio
+async def test_no_trace_is_read_when_the_end_reports_nothing():
+    """The one end read still asks for the trace only when the end is reported."""
+    row = _row("bg-00000000000a", stopped_by="agent")
+    with _Harness(_computer(), {"bg-00000000000a": _state(exit_code=0, tail="x")}) as h:
+        await _pass(h, [row])
+    outcome = h.outcomes()["bg-00000000000a"]
+    for c in h.read_end.await_args_list:
+        assert c.kwargs["trace"] is (outcome.report != "none")
 
 
 @pytest.mark.asyncio
@@ -384,7 +531,7 @@ async def test_a_command_past_the_hour_is_marked_then_stopped_and_held_for_the_n
     h.calls.request_stop.assert_called_once_with(late["command_id"], AFTER_TURN_LIMIT, over=late)
     h.calls.finalize.assert_called_once_with(
         late["command_id"], Outcome("failed", "after_turn_limit"), tail="end",
-        trace=[{"tool": "t"}], oom_kill_on=None,
+        trace=[{"tool": "t"}], outbox=None, oom_kill_on=None,
     )
     assert h.judged[late["command_id"]]["stopped_by"] == AFTER_TURN_LIMIT
 
@@ -408,6 +555,139 @@ async def test_an_always_on_computer_keeps_a_command_past_the_hour():
         assert await _pass(h, [late], coverage=settle.Coverage(last_end=NOW - timedelta(hours=2))) == 0
     h.calls.finalize.assert_not_called()
     h.manager.keep_computer_alive.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_an_own_machine_stopped_while_asleep_has_its_commands_read_from_the_machine():
+    """The stop never reached the machine, so its commands ran on: one still
+    running is watched past any hour, and the ends report at the thread's
+    next turn rather than starting the computer its owner stopped."""
+    run = _row("bg-00000000000a", handed_off_at=NOW - timedelta(hours=3))
+    done, vanished = _row("bg-00000000000b"), _row("bg-00000000000c")
+    states = {
+        "bg-00000000000a": _state(),
+        "bg-00000000000b": _state(exit_code=0, tail="done\n"),
+        "bg-00000000000c": _state(vanished=True),
+    }
+    machine = _computer(kind="ssh", status="stopped", stopped_at=NOW - timedelta(hours=2))
+    with _Harness(machine, states, window=None, machine_runs=True) as h:
+        assert await _pass(h, [run, done, vanished], coverage=settle.Coverage()) == 2
+    assert h.outcomes() == {
+        "bg-00000000000b": Outcome("completed", exit_code=0, up=False),
+        "bg-00000000000c": Outcome("failed", "vanished", up=False),
+    }
+    h.calls.request_stop.assert_not_called()
+    h.calls.nudge.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_an_own_machine_that_says_its_computer_stopped_ends_the_commands_as_lost():
+    """A stop the machine answered, or a reboot, ended them."""
+    row = _row()
+    machine = _computer(kind="ssh", status="stopped", stopped_at=NOW - timedelta(minutes=1))
+    with _Harness(machine, {}, window=None) as h:
+        await _pass(h, [row])
+    assert h.outcomes() == {row["command_id"]: Outcome("failed", "lost", up=False)}
+    h.read.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_an_away_machines_commands_are_looked_at_again_quietly_without_a_dial():
+    lease = NOW + timedelta(seconds=w.CLAIM_LEASE_S)
+    reached = _row("bg-00000000000a", next_check_at=lease)
+    asleep = {**_row("bg-00000000000b", next_check_at=lease), "computer_id": "away"}
+
+    async def check_computer(self, computer_id, rows, coverage, now):
+        if computer_id == "away":
+            return w._StillAway(w.AWAY_RECHECK_S)
+        return 0
+
+    scheduled, away = AsyncMock(), AsyncMock()
+    with (
+        patch.object(w.CommandWatcher, "_check_computer", check_computer),
+        patch.object(w.cr_db, "thread_coverage", new=AsyncMock(return_value={})),
+        patch.object(w.cr_db, "schedule_next_check", new=scheduled),
+        patch.object(w.cr_db, "schedule_away_check", new=away),
+        patch.object(w.logger, "warning") as warned,
+    ):
+        await w.CommandWatcher().check([reached, asleep])
+
+    assert scheduled.await_args_list == [call([("bg-00000000000a", lease)], w.CHECK_INTERVAL_S)]
+    assert away.await_args_list == [call([("bg-00000000000b", lease)], w.AWAY_RECHECK_S)]
+    warned.assert_not_called()
+
+
+def _dial_unanswered():
+    """A direct dial the machine did not answer, as the runtime raises it."""
+    from ptc_agent.core.sandbox.providers.ssh_errors import SSHConnectError
+    from ptc_agent.core.sandbox.runtime import SandboxTransientError
+
+    try:
+        raise SSHConnectError("timeout", "mini did not answer within 10 seconds.")
+    except SSHConnectError as e:
+        try:
+            raise SandboxTransientError(str(e)) from e
+        except SandboxTransientError as wrapped:
+            return wrapped
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("unanswered", "status", "away_for", "recheck_s"),
+    [
+        (w.ComputerAway("its machine is not connected"), "running", None, w.AWAY_RECHECK_S),
+        (w.ComputerAway("its machine is not connected"), "stopped", timedelta(days=6), w.AWAY_RECHECK_S),
+        (_dial_unanswered(), "running", timedelta(days=6), w.DIAL_RECHECK_S),
+        (_dial_unanswered(), "stopped", timedelta(hours=20), w.DIAL_RECHECK_S),
+    ],
+    ids=["tunnel-down", "tunnel-down-a-while", "dial-a-while", "stopped-dial-a-while"],
+)
+async def test_an_away_machines_commands_wait_for_it_until_their_limit(
+    unanswered, status, away_for, recheck_s
+):
+    """Asleep or offline is how a user's own machine spends much of its time:
+    its commands are looked at again later, a dialed one less often."""
+    row = _row(away_since=None if away_for is None else NOW - away_for)
+    machine = _computer(kind="ssh", status=status, stopped_at=NOW - timedelta(days=9))
+    with _Harness(machine, {}, window=None, unanswered=unanswered) as h:
+        assert await _pass(h, [row]) == w._StillAway(recheck_s)
+    h.calls.finalize.assert_not_called()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("unanswered", "status", "away_for"),
+    [
+        (w.ComputerAway("its machine is not connected"), "running", timedelta(days=7)),
+        (_dial_unanswered(), "running", timedelta(days=8)),
+        (_dial_unanswered(), "stopped", timedelta(days=1)),
+    ],
+    ids=["tunnel-down", "dial", "stopped-dial"],
+)
+async def test_a_machine_that_never_comes_back_has_its_commands_settled_as_lost(
+    unanswered, status, away_for
+):
+    """Looked at forever otherwise: a week away (as long as a command's
+    notice is kept), or a day of unanswered dials for a computer its owner
+    stopped, settles them as on a computer that is gone."""
+    row = _row(away_since=NOW - away_for)
+    machine = _computer(kind="ssh", status=status, stopped_at=NOW - timedelta(days=9))
+    with _Harness(machine, {}, window=None, unanswered=unanswered) as h:
+        assert await _pass(h, [row]) == 1
+    assert h.outcomes() == {row["command_id"]: Outcome("failed", "lost", up=False)}
+
+
+@pytest.mark.asyncio
+async def test_the_tunnel_gateway_down_is_not_the_machine_away():
+    """Ours to fix, and no reason to give the machine's commands up."""
+    from ptc_agent.core.sandbox.providers.ssh_errors import SSHConnectError
+
+    row = _row(away_since=NOW - timedelta(days=30))
+    gateway = SSHConnectError("gateway_unreachable", "The tunnel is not answering.")
+    with _Harness(_computer(kind="ssh"), {}, window=None, unanswered=gateway) as h:
+        with pytest.raises(SSHConnectError):
+            await _pass(h, [row])
+    h.calls.finalize.assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -504,7 +784,7 @@ async def test_a_computer_stuck_between_states_settles_its_commands_as_gone(stat
     }
     h.calls.finalize.assert_any_call(
         "bg-00000000000b", Outcome("stopped", stopped_by="user"), tail=None, trace=None,
-        oom_kill_on=None,
+        outbox=None, oom_kill_on=None,
     )
     h.read.assert_not_called()
 
@@ -553,7 +833,7 @@ async def test_a_job_ended_by_a_stop_that_began_after_the_read_reports_at_the_ne
             assert await _pass(h, [row]) == 1
     h.calls.finalize.assert_called_once_with(
         row["command_id"], Outcome("failed", "exit", 143, up=False), tail="",
-        trace=[{"tool": "t"}], oom_kill_on=None,
+        trace=[{"tool": "t"}], outbox=None, oom_kill_on=None,
     )
     h.calls.nudge.assert_not_called()
 

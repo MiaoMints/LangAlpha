@@ -16,6 +16,8 @@ from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Protocol
 
+import structlog
+
 from ptc_agent.core.paths import (
     MEMO_USER_DIR,
     MEMORY_USER_DIR,
@@ -39,6 +41,8 @@ _ANSWERS = "livefs-mount-answers"
 #: Prints ``_ANSWERS`` when something answers at the mount's path. Killed at
 #: 2 s: a stat on a daemon that hangs waits until killed.
 PROBE = f"timeout -s KILL 2 test -e {shlex.quote(protocol.MOUNT + '/.')} && echo {_ANSWERS}"
+
+logger = structlog.get_logger(__name__)
 
 
 def answered(stdout: str | None) -> bool:
@@ -69,9 +73,6 @@ class MountHandle(Protocol):
         first; whether the mount then serves ``workspace_id``'s folder (None:
         the computer's root). A command run without it would write beside
         the files the store holds."""
-
-    async def prepare(self, call_id: str, context: CallContext | None = None) -> None:
-        """File who ``call_id`` runs for."""
 
     async def report(
         self, call_id: str, output: str, context: CallContext | None = None
@@ -124,23 +125,36 @@ class TranscriptReach:
     shell: bool
 
 
+#: Files who a command runs for under its call id. The host sets one on every
+#: sandbox (``PTCSandbox.call_filer``): a save through the mount reads it, and
+#: so does a call the ``la`` CLI makes, on a machine whatever mounts it.
+CallFiler = Callable[[str, CallContext], Awaitable[None]]
+
+
 async def through_mount(
     mount: MountHandle | None,
+    filer: CallFiler | None,
     context: CallContext | None,
     run: Callable[[str | None], Awaitable[tuple[str, dict[str, Any]]]],
 ) -> tuple[str, dict[str, Any]]:
-    """Run one command under a fresh call id while the mount serves, and add
-    to its output what its saves through the mount reported.
+    """Run one command under a fresh call id, filed with who it runs for, and
+    while the mount serves add to its output what its saves through the
+    mount reported.
 
     The id is collected once ``run`` returns, so the later saves of a command
     it handed off reach the next command's result. A cancelled run reports
-    nothing.
+    nothing. With neither a mount nor anything to file, the command runs
+    under no id.
     """
-    if mount is None:
+    filing = filer is not None and context is not None
+    if mount is None and not filing:
         return await run(None)
     call_id = secrets.token_hex(8)
-    await mount.prepare(call_id, context)
+    if filing:
+        await filer(call_id, context)
     text, artifact = await run(call_id)
+    if mount is None:
+        return text, artifact
     report = await mount.report(call_id, text, context)
     return (f"{text}\n\n{report}" if report else text), artifact
 
@@ -194,9 +208,13 @@ def code_version() -> str:
     return _boot()[2]
 
 
+def _shipped_dir(layout: SandboxLayout) -> str:
+    return f"{layout.internal_src}/{protocol.PACKAGE_NAME}"
+
+
 def _command(layout: SandboxLayout, action: str, *args: str) -> str:
     script, private, code, manifest = _boot()
-    shipped = f"{layout.internal_src}/{protocol.PACKAGE_NAME}"
+    shipped = _shipped_dir(layout)
     argv = (script, private, shipped, code, manifest, action, "--root", layout.root, *args)
     # Root runs the host's own text, which runs the package from a checked
     # copy: the shipped one is the sandbox user's to rewrite.
@@ -211,13 +229,53 @@ def _parse(result: Any) -> dict[str, Any] | None:
         return None
 
 
+async def _ship_code(sandbox: PTCSandbox) -> bool:
+    """Put the daemon's files where ``boot`` checks them, saying whether they
+    landed. The asset sync ships the same files with the other internal
+    packages; this is for a command that ran before it got to them."""
+    assert sandbox.runtime is not None
+    shipped = _shipped_dir(sandbox.layout)
+    try:
+        await sandbox._runtime_call(
+            sandbox.runtime.exec,
+            f"mkdir -p {shlex.quote(shipped)}",
+            retry_policy=RetryPolicy.SAFE,
+        )
+        await sandbox._runtime_call(
+            sandbox.runtime.upload_files,
+            [(data, f"{shipped}/{name}") for name, data in lifecycle.package_files()],
+            retry_policy=RetryPolicy.SAFE,
+        )
+    except Exception as e:  # noqa: BLE001 - the caller answers stale_code as before
+        logger.warning("Could not ship the file mount's code", error=str(e))
+        return False
+    return True
+
+
 async def _run(
     sandbox: PTCSandbox,
     action: str,
     args: list[str],
     config: dict[str, Any] | None,
 ) -> MountOutcome:
-    """Run one daemon command as root, carrying ``config`` in when given."""
+    """Run one daemon command as root, carrying ``config`` in when given.
+
+    The daemon's code reaches the machine with the asset sync, which the
+    mount comes up beside. A command refused for stale code ships the
+    daemon's own files and asks once more, so the mount never depends on
+    that sync having got there first."""
+    outcome = await _ask(sandbox, action, args, config)
+    if outcome.error == MountError.STALE_CODE and await _ship_code(sandbox):
+        outcome = await _ask(sandbox, action, args, config)
+    return outcome
+
+
+async def _ask(
+    sandbox: PTCSandbox,
+    action: str,
+    args: list[str],
+    config: dict[str, Any] | None,
+) -> MountOutcome:
     assert sandbox.runtime is not None
     env = None if config is None else {protocol.CONFIG_ENV: json.dumps(config)}
     result = await sandbox._runtime_call(

@@ -24,20 +24,28 @@ export interface PriceTriggerConfig {
  *  `active` while they run, and only their execution row says `running`. */
 export type AutomationStatus = 'active' | 'paused' | 'completed' | 'disabled' | 'executing';
 
-/** `waiting` is a firing held until the turn running in its thread ends;
+/** `waiting` is a firing held until the turn running in its thread ends, or
+ *  until the computer its turn runs on can be reached (`wait_reason`);
  *  `skipped` is one that never ran, and is not a failure. */
 export type ExecutionStatus = 'pending' | 'waiting' | 'running' | 'completed' | 'failed' | 'timeout' | 'skipped';
 
 /** Why a run was skipped: the reader chose to, its thread stayed busy (or an
- *  earlier firing was already waiting), or the server stopped mid-wait. */
-export type SkipReason = 'user' | 'thread_busy' | 'interrupted';
+ *  earlier firing was already waiting), the server stopped mid-wait, or the
+ *  user's own computer it runs on could not be reached. */
+export type SkipReason = 'user' | 'thread_busy' | 'interrupted' | 'computer_unreachable';
+
+/** What a waiting run waits for: the turn running in its thread, or the
+ *  computer its turn runs on. Kept once the wait ends; null on a run that
+ *  never waited, or from a server that predates it. */
+export type WaitReason = 'thread_busy' | 'computer_unreachable';
 
 /** A failed run's cause, where the server knows it: a usage limit refused
  *  the firing or paused its run (`error_message` is then the quota service's
- *  own words), the model provider rejected the user's own key, the run failed
+ *  own words), a Claude plan's or another subscription's usage limit ended
+ *  it, the model provider rejected the user's own key, the run failed
  *  on the server's side, or the server cut it off. Only the first two are the
  *  reader's to act on. */
-export type FailureReason = 'usage_limit' | 'provider_auth' | 'server_error' | 'interrupted';
+export type FailureReason = 'usage_limit' | 'claude_plan' | 'plan_limit' | 'provider_auth' | 'server_error' | 'interrupted';
 
 /** Why the server switched an automation off. Cleared by a resume. */
 export type DisableReason = 'provider_auth' | 'max_failures';
@@ -105,6 +113,8 @@ export interface AutomationExecution {
   completed_at: string | null;
   error_message: string | null;
   skip_reason: SkipReason | null;
+  /** Absent from a server that predates it. */
+  wait_reason?: WaitReason | null;
   failure_reason: FailureReason | null;
   delivery_result: DeliveryAttempt[] | null;
   created_at: string;

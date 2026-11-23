@@ -28,11 +28,9 @@ from src.llms.llm import LLM
 from src.llms.operator_channel import (
     OPERATOR_CHANNEL_KEY,
     INLINE_TOOLS_BETA,
-    TURN_SCOPED_BETA,
     anthropic_serves_midturn_system,
     build_operator_message,
     carries_tool_changes,
-    carries_turn_scoped,
     is_operator_system_message,
     operator_request,
     resolve_operator_channel,
@@ -415,11 +413,10 @@ def test_developer_message_reaches_the_wire_as_developer_role():
         ],
         stop=None,
     )
-    # The base system prompt is promoted to `instructions`; the developer item
-    # survives in the input array because the codex filter keys on role
-    # "system" alone.
-    assert codex_payload["instructions"] == "base prompt"
-    assert [item["role"] for item in codex_payload["input"]] == ["user", "developer"]
+    # The base system prompt goes out as the leading developer item; the
+    # envelope keeps its own place after the user message.
+    assert "instructions" not in codex_payload
+    assert [item["role"] for item in codex_payload["input"]] == ["developer", "user", "developer"]
 
 
 # ---------------------------------------------------------------------------
@@ -723,32 +720,4 @@ def test_the_role_cutoff_is_per_family(model, takes):
     named fails closed."""
     assert anthropic_serves_midturn_system(None, model) is takes
 
-
-def _turn_scoped(text: str) -> SystemMessage:
-    message = build_operator_message(text, "system", source="runtime_update")
-    message.additional_kwargs["clear_at"] = "next_user_message"
-    return message
-
-
-def test_a_turn_scoped_entry_keeps_its_clear_at_and_its_own_entry():
-    """Joining it to a row's entry would clear the row, or render it forever."""
-    row = build_operator_message("row", "system", source="runtime_update")
-    payload = _payload([SystemMessage("base prompt"), HumanMessage("hi"), row, _turn_scoped("stamp")])
-
-    entries = [m for m in payload["messages"] if m["role"] == "system"]
-    assert len(entries) == 2
-    assert "clear_at" not in entries[0]
-    assert entries[1]["clear_at"] == "next_user_message"
-    assert entries[1]["content"] == [{"type": "text", "text": "stamp"}]
-
-
-@pytest.mark.parametrize("key", ["anthropic-beta", "Anthropic-Beta"])
-def test_turn_scoped_needs_the_beta_in_the_clients_own_header(key):
-    """A header name is case-insensitive on the wire, so any casing sends it."""
-    with provider_entry("anthropic-test", {"sdk": "anthropic", "operator_channel": "system"}):
-        assert carries_turn_scoped(_official()) is False
-        with_beta = _official(default_headers={key: f"other-beta, {TURN_SCOPED_BETA}"})
-        assert carries_turn_scoped(with_beta) is True
-        assert carries_turn_scoped(_official("claude-sonnet-5", default_headers={"anthropic-beta": TURN_SCOPED_BETA})) is False
-    assert carries_turn_scoped(_openai()) is False
 

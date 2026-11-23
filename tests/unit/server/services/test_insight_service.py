@@ -8,6 +8,7 @@ user context building, and schedule computation.
 import asyncio
 import json
 from datetime import datetime, timedelta, timezone
+from decimal import Decimal
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -519,6 +520,70 @@ class TestResearch:
         assert fetch.fetch_llm_client_override.get() is None
 
 
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "policy,falls_back",
+        [
+            ("allow_all", True),
+            ("restricted", False),
+            (None, False),  # the account is unknown
+        ],
+    )
+    async def test_the_deployments_models_stand_in_only_for_an_unrestricted_user(
+        self, policy, falls_back
+    ):
+        """They were never held to the user's policy, so a failure resolving
+        the user's own must not run them over a restricted user's data."""
+        from langchain_core.messages import AIMessage
+
+        from src.config.models import PolicyLayer
+        from src.server.services.policy import ALLOW_ALL, merge
+
+        policies = {
+            "allow_all": ALLOW_ALL,
+            "restricted": merge(None, PolicyLayer.model_validate({"models": {"allowed": ["m"]}})),
+            None: None,
+        }
+
+        class Graph:
+            async def ainvoke(self, state, config):
+                return {"messages": [AIMessage(content="brief")]}
+
+        with patch("src.server.app.setup.agent_config", MagicMock()), \
+             patch(
+                 "src.server.services.llm.config.resolve_llm_config",
+                 AsyncMock(side_effect=RuntimeError("no client")),
+             ), \
+             patch(
+                 "src.server.services.account.policy_for",
+                 AsyncMock(return_value=policies[policy]),
+             ), \
+             patch("ptc_agent.agent.insight_graph.build_insight_graph", return_value=Graph()):
+            if falls_back:
+                assert await _research("p", user_id="u", insight_type="personalized") == "brief"
+            else:
+                with pytest.raises(RuntimeError, match="no client"):
+                    await _research("p", user_id="u", insight_type="personalized")
+
+    @pytest.mark.asyncio
+    async def test_a_suspended_account_gets_no_run_on_the_deployments_models(self):
+        from src.server.services.account_contract import Account, Org
+        from src.server.services.account import AccountSuspended, Standing
+
+        suspended = Account(org=Org("o", "Acme", suspended=True))
+        refusal = Standing(suspended, suspended).refusal()
+        fallback = AsyncMock()
+        with patch("src.server.app.setup.agent_config", MagicMock()), \
+             patch(
+                 "src.server.services.llm.config.resolve_llm_config",
+                 AsyncMock(side_effect=refusal),
+             ), \
+             patch("src.server.services.account.policy_for", fallback), \
+             pytest.raises(AccountSuspended):
+            await _research("p", user_id="u", insight_type="personalized")
+        fallback.assert_not_awaited()
+
+
 class TestBuildUserContext:
     """Test InsightService._build_user_context."""
 
@@ -570,6 +635,24 @@ class TestBuildUserContext:
         # Only two lines total -- no duplicate "- AAPL" entry
         main_entries = [l for l in lines if l.startswith("- AAPL")]
         assert len(main_entries) == 1
+
+    @pytest.mark.asyncio
+    async def test_a_holding_reads_in_its_own_currency(self):
+        holdings = [
+            {"symbol": "600519.SH", "name": "Kweichow Moutai", "quantity": Decimal("100.00000000"),
+             "average_cost": Decimal("1400.0000"), "currency": "CNY"},
+            {"symbol": "NVDA", "name": "NVIDIA", "quantity": Decimal("5"),
+             "average_cost": None, "currency": "USD"},
+        ]
+
+        with patch("src.server.database.watchlist.get_user_watchlists", new_callable=AsyncMock, return_value=[]), \
+             patch("src.server.database.portfolio.get_user_portfolio", new_callable=AsyncMock, return_value=holdings):
+            result = await InsightService()._build_user_context("user-cny")
+
+        assert result.split("\n") == [
+            "- 600519.SH (Kweichow Moutai) [portfolio: 100 @ 1400 CNY]",
+            "- NVDA (NVIDIA) [portfolio: 5]",
+        ]
 
 
 # ---------------------------------------------------------------------------
@@ -700,6 +783,45 @@ class TestGenerateInsight:
     def teardown_method(self):
         InsightService._instance = None
 
+    @pytest.fixture(autouse=True)
+    def a_key_serves(self):
+        with patch(
+            "src.server.services.insight_service._no_key_serves",
+            new=AsyncMock(return_value=False),
+        ) as asked:
+            yield asked
+
+    @pytest.mark.asyncio
+    @patch("src.server.services.insight_service._research", new_callable=AsyncMock)
+    @patch("src.server.services.insight_service.insight_db")
+    async def test_no_key_skips_before_claiming_a_row(self, mock_db, mock_research, a_key_serves):
+        """Self-hosted with no model connected yet is no failure: nothing is
+        claimed, nothing runs, and the next job asks again."""
+        a_key_serves.return_value = True
+        mock_db.claim_system_insight = AsyncMock()
+
+        await InsightService()._generate_insight(
+            "market_update", datetime(2025, 3, 15, 14, 0, tzinfo=ET)
+        )
+
+        mock_db.claim_system_insight.assert_not_called()
+        mock_research.assert_not_called()
+
+    @pytest.mark.asyncio
+    @patch("src.server.services.insight_service._research", new_callable=AsyncMock)
+    @patch("src.server.services.insight_service.insight_db")
+    async def test_a_hosted_deployment_is_never_asked(self, mock_db, mock_research, a_key_serves):
+        """A hosted brief runs on the deployment's own keys, as it always has."""
+        mock_db.claim_system_insight = AsyncMock(return_value=SystemInsightClaim(row=None))
+
+        with patch("src.config.settings.HOST_MODE", "platform"):
+            await InsightService()._generate_insight(
+                "market_update", datetime(2025, 3, 15, 14, 0, tzinfo=ET)
+            )
+
+        a_key_serves.assert_not_called()
+        mock_db.claim_system_insight.assert_called_once()
+
     @pytest.mark.asyncio
     @patch("src.server.services.insight_service._research", new_callable=AsyncMock)
     @patch("src.server.services.insight_service.insight_db")
@@ -816,6 +938,48 @@ class TestGenerateInsight:
 
         mock_db.complete_market_insight.assert_not_called()
         assert "Timeout" in mock_db.fail_market_insight.call_args[0][1]
+
+
+class TestNoKeyServes:
+    """A saved Background model with no key skips the brief only when the
+    deployment's, which ``_research`` falls back to, has none either."""
+
+    async def _ask(self, deployment_paid: bool) -> bool:
+        from types import SimpleNamespace
+
+        from src.server.services.insight_service import _no_key_serves
+        from src.server.services.llm.payers import ModelPayer
+
+        rows = [
+            ModelPayer(name="saved-model", provider="p", custom=True, payer=None, needs="key"),
+            ModelPayer(
+                name="deployment-model",
+                provider="p",
+                custom=False,
+                payer="server_key" if deployment_paid else None,
+            ),
+        ]
+        llm = SimpleNamespace(name="main-model", background="deployment-model")
+        with (
+            patch(
+                "src.server.services.llm.user_models.get_model_preference",
+                AsyncMock(return_value={"preferred_background_model": "saved-model"}),
+            ),
+            patch("src.server.services.llm.config.deployment_llm", return_value=llm),
+            patch(
+                "src.server.services.llm.payers.model_payers",
+                AsyncMock(return_value=rows),
+            ),
+        ):
+            return await _no_key_serves("user-1")
+
+    @pytest.mark.asyncio
+    async def test_the_deployment_model_serves_the_brief(self):
+        assert await self._ask(deployment_paid=True) is False
+
+    @pytest.mark.asyncio
+    async def test_nothing_serves_it(self):
+        assert await self._ask(deployment_paid=False) is True
 
 
 # ---------------------------------------------------------------------------

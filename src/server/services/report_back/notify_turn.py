@@ -19,7 +19,11 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Awaitable, Callable, Mapping, Optional, Protocol
 
-from src.server.contracts.status import is_user_stop
+from src.server.contracts.status import (
+    asked_for,
+    is_restart_interrupted,
+    restart_resume_expired,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -39,6 +43,67 @@ _TERMINAL_POLL = 5.0
 _BUSY_STATUSES = ("interrupted", "in_progress")
 
 
+async def holds_notifications(thread_id: str, latest: Mapping[str, Any] | None) -> bool:
+    """Whether the thread cannot take a notification turn now: its latest
+    attempt is live, waits on the user, or is a turn a restart stopped,
+    which holds the thread for its resume (``report_back.restart``) for as
+    long as one may come. The resume takes the held reports in."""
+    if not latest:
+        return False
+    if latest.get("status") == "in_progress":
+        return True
+    if is_restart_interrupted(latest) and not restart_resume_expired(
+        latest["cancel_requested_at"]
+    ):
+        return True
+    return await waits_on_user(thread_id, latest)
+
+
+async def waits_on_user(thread_id: str, latest: Mapping[str, Any]) -> bool:
+    """Whether the thread's latest attempt leaves it waiting on the user: it
+    is interrupted, or it was stopped or failed over a card an earlier run
+    paused on, which a notification turn would go past, answering the call
+    it holds with a cancellation."""
+    status = latest.get("status")
+    if status == "interrupted":
+        return True
+    if status not in ("cancelled", "error"):
+        return False
+    return await _card_waits(thread_id)
+
+
+async def _card_waits(thread_id: str) -> bool:
+    """Whether the step the thread's next turn starts from holds a pending
+    interrupt.
+
+    That step is read where a turn starts (``turn_base_checkpoint_id``, so a
+    fork that pinned the branch back to a card counts) and beneath an update
+    on top that marked no node as run, as a stop's flush wrote one. An update
+    written as the waiting node (an agent change answering its calls) ended
+    the step, so nothing beneath it waits.
+    """
+    from src.server.utils.checkpoint_helpers import (
+        build_checkpoint_config,
+        get_checkpointer,
+        interrupt_records,
+        turn_base_checkpoint_id,
+    )
+
+    checkpointer = get_checkpointer()
+    base = await turn_base_checkpoint_id(checkpointer, thread_id)
+    cp = await checkpointer.aget_tuple(build_checkpoint_config(thread_id, base))
+    while cp is not None and (cp.metadata or {}).get("source") == "update":
+        if cp.parent_config is None:
+            return False
+        parent = await checkpointer.aget_tuple(cp.parent_config)
+        if parent is None or (
+            parent.checkpoint["versions_seen"] != cp.checkpoint["versions_seen"]
+        ):
+            return False
+        cp = parent
+    return cp is not None and bool(interrupt_records(cp.pending_writes))
+
+
 @dataclass(frozen=True)
 class NotOwed:
     """A report nothing is owed for any more: its executor drops it, and a
@@ -48,6 +113,15 @@ class NotOwed:
     # Whether watchers riding the report's pending chip are told to reconcile
     # now rather than at the drainer's close.
     wake: bool = True
+
+
+@dataclass(frozen=True)
+class NotYet:
+    """A report that cannot be decided until its thread settles: its job asks
+    again after ``wait_s``, the claim not counted."""
+
+    reason: str
+    wait_s: int
 
 
 def stop_already_covered(parent: Mapping[str, Any] | None, settled_at: datetime | None) -> bool:
@@ -70,9 +144,10 @@ def stop_already_covered(parent: Mapping[str, Any] | None, settled_at: datetime 
 
     Undecidable without both stamps, and silence is the worse failure, so a
     missing one notifies. A shutdown or recovery cancels a turn too, and asked
-    for nothing, so only the user's own stop counts.
+    for nothing, so only the user's own stop counts, and the account's
+    suspension's, after which no turn may run for the report.
     """
-    if not is_user_stop(parent):
+    if not asked_for(parent):
         return False
     stopped_at = parent.get("cancel_requested_at")
     if stopped_at is None or settled_at is None:
@@ -96,6 +171,21 @@ class Owed(Protocol):
     def message(self, *, steered: bool) -> str: ...
 
 
+def message_turn(owed: Owed, request_key: str) -> tuple[str, dict]:
+    """The thread route and body of a turn that tells the agent ``owed``,
+    hidden from the user."""
+    body = {
+        "messages": [{"role": "user", "content": owed.message(steered=False)}],
+        "workspace_id": owed.workspace_id,
+        "query_type": "system",
+        "request_key": request_key,
+    }
+    # The message is hidden, so history captions the turn from this.
+    if owed.report_source:
+        body["report_source"] = owed.report_source
+    return "messages", body
+
+
 @dataclass(frozen=True)
 class ReportPipeline:
     """One kind of report-back on its thread's own chain: how its executor
@@ -108,8 +198,9 @@ class ReportPipeline:
     request_ns: uuid.UUID
     #: How long a POST waits out a busy thread before the job re-parks.
     busy_cap: float
-    #: How long the job stays open waiting for its turn to end.
-    terminal_cap: float
+    #: How long the job stays open waiting for its turn to end; None acks it
+    #: once its turn is admitted.
+    terminal_cap: Optional[float]
     #: ``NotOwed`` or an ``Owed``, against the ledger: the one eligibility
     #: the executor and a live turn decide by.
     verdict: Callable[[Mapping[str, Any]], Awaitable["Owed | NotOwed"]]
@@ -124,14 +215,23 @@ class ReportPipeline:
     #: posts as, where the verdict cannot read them for free; only the
     #: executor needs them, so a live turn's offer never pays the read.
     owner: Optional[Callable[[Mapping[str, Any], Any], Awaitable["Owed | NotOwed"]]] = None
+    #: The thread route and body of the turn an owed report posts.
+    turn: Callable[[Any, str], tuple[str, dict]] = message_turn
+    #: Park behind a thread that holds notifications, until a turn's ending
+    #: releases the job. False for a kind the thread is held for, whose
+    #: verdict decides when it may post: a refused POST asks again by the
+    #: clock instead.
+    parks: bool = True
 
     def request_key(self, job_id: str) -> str:
         """The request key a job's notification turn is admitted under."""
         return str(uuid.uuid5(self.request_ns, job_id))
 
 
-async def run_report_back(job: dict, p: ReportPipeline) -> None:
-    """Execute one report-back job of pipeline ``p``.
+async def run_report_back(job: dict, p: ReportPipeline) -> Optional[NotOwed]:
+    """Execute one report-back job of pipeline ``p``; the ``NotOwed`` it
+    ended on when it posts no turn and never will, None when a turn ran or
+    the job comes back.
 
     Sole caller is the hook-outbox drainer: raising nacks, returning acks.
     The job stays open (lease-heartbeated) until the notification run ends,
@@ -156,7 +256,7 @@ async def run_report_back(job: dict, p: ReportPipeline) -> None:
 
     if not thread_id:
         logger.warning(f"{log} Job {job_id} missing thread; dropping")
-        return
+        return NotOwed("its job names no thread", wake=False)
     # psycopg returns uuid columns as UUID objects; wake payloads are
     # json.dumps'd.
     thread_id = str(thread_id)
@@ -179,6 +279,13 @@ async def run_report_back(job: dict, p: ReportPipeline) -> None:
         # The job was enqueued unconditionally with the work's end; whether a
         # notification is still owed is decided here, at claim time.
         verdict = await p.verdict(job)
+        if isinstance(verdict, NotYet):
+            logger.info(
+                f"{log} Asking again in {verdict.wait_s}s for {subject} on thread "
+                f"{thread_id}: {verdict.reason}"
+            )
+            await outbox_db.wait_for_room(job_id, attempts=attempts, wait_s=verdict.wait_s)
+            return None
         if p.owner is not None and not isinstance(verdict, NotOwed):
             verdict = await p.owner(job, verdict)
         if isinstance(verdict, NotOwed):
@@ -187,12 +294,12 @@ async def run_report_back(job: dict, p: ReportPipeline) -> None:
                 # Watchers may be riding the pending chip on this job: tell
                 # them to reconcile now instead of via the backstop.
                 await publish_cleared_wake(thread_id)
-            return
+            return verdict
         if not verdict.user_id:
             logger.warning(
                 f"{log} Job {job_id} on thread {thread_id}: owner unresolvable; dropping"
             )
-            return
+            return NotOwed("its owner is unresolvable", wake=False)
 
         # Read before the look: a turn whose finalize runs while this job is
         # claimed releases nothing for it, and this is how a capped wait
@@ -201,20 +308,18 @@ async def run_report_back(job: dict, p: ReportPipeline) -> None:
 
         # A live turn takes the report in as a steer before its next model
         # call (``report_back.steer``).
-        if await park_while_thread_busy(
-            job_id, attempts, thread_id, log_prefix=log, subject=subject
+        if await park_unless_ready(
+            job_id,
+            attempts,
+            thread_id,
+            workspace_id=verdict.workspace_id,
+            log_prefix=log,
+            subject=subject,
+            wait_for_thread=p.parks,
         ):
-            return
+            return None
 
-        body = {
-            "messages": [{"role": "user", "content": verdict.message(steered=False)}],
-            "workspace_id": verdict.workspace_id,
-            "query_type": "system",
-            "request_key": p.request_key(job_id),
-        }
-        # The message is hidden, so history captions the turn from this.
-        if verdict.report_source:
-            body["report_source"] = verdict.report_source
+        route, body = p.turn(verdict, p.request_key(job_id))
 
         async def _still_due() -> bool:
             return not isinstance(await p.verdict(job), NotOwed)
@@ -228,12 +333,20 @@ async def run_report_back(job: dict, p: ReportPipeline) -> None:
             log_prefix=log,
             subject=subject,
             still_due=_still_due if p.recheck else None,
+            room_fails_fast=True,
+            route=route,
         )
         if outcome == "lost":
-            return  # reclaimed: the live owner resumes; no teardown
+            return None  # reclaimed: the live owner resumes; no teardown
+        if outcome == "full":
+            await outbox_db.wait_for_room(job_id, attempts=attempts, wait_s=TURN_ROOM_WAIT_S)
+            return None
         if outcome == "superseded":
             await publish_cleared_wake(thread_id)
-            return
+            return NotOwed("a newer turn took its place", wake=False)
+        if outcome == "cap" and not p.parks:
+            await outbox_db.wait_for_room(job_id, attempts=attempts, wait_s=TURN_ROOM_WAIT_S)
+            return None
         if outcome == "cap":
             # Busy thread. Not a failure: park until the next dead-turn
             # finalize re-releases the job, or now if a turn ended while this
@@ -247,9 +360,10 @@ async def run_report_back(job: dict, p: ReportPipeline) -> None:
                     f"{log} A turn on thread {thread_id} ended during the claim; "
                     f"released {subject} for one more look"
                 )
-            return
+            return None
         if outcome in ("deleted", "drop"):
-            return  # thread gone or terminal rejection: ack, nothing owed
+            # Thread gone or terminal rejection: ack, nothing owed.
+            return NotOwed(f"the thread refused it ({outcome})", wake=False)
         if rb_run_id is None:
             raise RuntimeError(
                 f"{log} {subject} dispatched without a run_id; nacking to recover "
@@ -283,6 +397,8 @@ async def run_report_back(job: dict, p: ReportPipeline) -> None:
     if p.on_dispatched is not None:
         # Again on a resume: the claim that dispatched may have died before it.
         await p.on_dispatched(job)
+    if p.terminal_cap is None:
+        return None
 
     outcome = await await_run_terminal(
         job_id, attempts, rb_run_id, wait_cap=p.terminal_cap, log_prefix=log
@@ -297,6 +413,49 @@ async def run_report_back(job: dict, p: ReportPipeline) -> None:
     # No recovery-ledger write here: the drainer's ack (status='done' +
     # completed_at) is the ledger, which the status slice derives its
     # recents from.
+    return None
+
+
+async def park_unless_ready(
+    job_id: str,
+    attempts: int,
+    thread_id: str,
+    *,
+    workspace_id: Optional[str],
+    log_prefix: str,
+    subject: str,
+    wait_for_thread: bool = True,
+    wait_for_computer: bool = True,
+    parks_at_ceiling: bool = False,
+) -> bool:
+    """Park a claimed notification until the turn it posts can run: while its
+    thread holds notifications (``park_while_thread_busy``), then while the
+    computer that turn runs on cannot be reached
+    (``park_while_computer_away``). True when it parked and the caller must
+    stop; False when the turn may be posted now.
+
+    ``wait_for_thread`` is False for a notification a live turn takes in some
+    other way, ``wait_for_computer`` False for a turn someone watches (the
+    user's own steer, theirs to see fail and retry). ``parks_at_ceiling`` is
+    as for ``park_while_thread_busy``.
+    """
+    if wait_for_thread and await park_while_thread_busy(
+        job_id,
+        attempts,
+        thread_id,
+        log_prefix=log_prefix,
+        subject=subject,
+        parks_at_ceiling=parks_at_ceiling,
+    ):
+        return True
+    return wait_for_computer and await park_while_computer_away(
+        job_id,
+        attempts,
+        thread_id,
+        workspace_id=workspace_id,
+        log_prefix=log_prefix,
+        subject=subject,
+    )
 
 
 async def park_while_thread_busy(
@@ -322,25 +481,77 @@ async def park_while_thread_busy(
     target's or a wakeup's notice, held for the thread's next turn), so the
     re-read covers it there too; a steer settled there instead is not
     parked, and has nothing to release.
+
+    Held by a card under a stopped or failed attempt, the park does not spend
+    the claim: each stop over the card releases the job again, and a user
+    stopping a few sends before answering must not run it dead.
     """
     from src.server.database.runs import lifecycle as tl_db
     from src.server.database.runs import outbox as outbox_db
     from src.server.services.hook_outbox import MAX_ATTEMPTS
 
     latest = await tl_db.get_latest_attempt(thread_id)
-    if not latest or latest.get("status") not in _BUSY_STATUSES:
+    if not await holds_notifications(thread_id, latest):
         return False
     parked = await outbox_db.defer_claimed_job(
-        job_id, attempts=attempts, max_attempts=MAX_ATTEMPTS
+        job_id,
+        attempts=attempts,
+        max_attempts=MAX_ATTEMPTS,
+        waits_on_user=latest.get("status") not in _BUSY_STATUSES,
     )
     logger.info(
         f"{log_prefix} Parked job {job_id} for {subject} while thread "
-        f"{thread_id} is {latest.get('status')} (status={parked})"
+        f"{thread_id} holds it, latest run {latest.get('status')} (status={parked})"
     )
     if parked == "pending" or (parked == "exhausted" and parks_at_ceiling):
         latest = await tl_db.get_latest_attempt(thread_id, wait_for_finalize=True)
-        if not latest or latest.get("status") not in _BUSY_STATUSES:
+        if not await holds_notifications(thread_id, latest):
             await release_parked_notifications(thread_id)
+    return True
+
+
+async def park_while_computer_away(
+    job_id: str,
+    attempts: int,
+    thread_id: str,
+    *,
+    workspace_id: Optional[str],
+    log_prefix: str,
+    subject: str,
+) -> bool:
+    """Park a claimed notification while the computer its turn would run on
+    cannot be reached, until that computer connects again; True when the
+    caller must stop.
+
+    A wake or report-back is nobody's request now: posted while the user's
+    machine sleeps, its turn would fail at the connect after its notice was
+    read as delivered, and nothing would deliver it again. Held instead, a
+    wakeup's notice stays unread, so the slots its series reaches meanwhile
+    are skipped and the machine's return brings one wake, not a burst. The
+    drainer releases it once the computer's tunnel is live again
+    (``outbox.release_for_reachable_computers``).
+    """
+    from src.server.database.runs import outbox as outbox_db
+    from src.server.services.ssh_computers import computer_away
+
+    if not workspace_id:
+        from src.server.database import conversation as conv_db
+
+        thread = await conv_db.get_thread_by_id(thread_id)
+        workspace_id = str((thread or {}).get("workspace_id") or "") or None
+    if not workspace_id:
+        return False
+    away = await computer_away(str(workspace_id))
+    if away is None:
+        return False
+    parked = await outbox_db.park_for_computer(
+        job_id, attempts=attempts, computer_id=str(away["computer_id"])
+    )
+    logger.info(
+        f"{log_prefix} Parked job {job_id} for {subject} on thread {thread_id} "
+        f"until computer {away['computer_id']} can be reached again "
+        f"(parked={parked})"
+    )
     return True
 
 
@@ -382,7 +593,7 @@ async def release_if_a_turn_ended(thread_id: str, since: tuple[str, str] | None)
 
     # Behind a finalize in flight, as the park's re-read is.
     latest = await tl_db.get_latest_attempt(thread_id, wait_for_finalize=True)
-    if not latest or latest.get("status") in _BUSY_STATUSES:
+    if not latest or await holds_notifications(thread_id, latest):
         return False
     if run_marker(latest) == since:
         return False
@@ -425,6 +636,10 @@ async def post_notification_turn(
     busy_fails_fast: bool = False,
     refusal_fails_fast: bool = False,
     on_unanswered=None,
+    on_plan_limited=None,
+    room_fails_fast: bool = False,
+    suspension_waits: bool = False,
+    route: str = "messages",
 ) -> tuple[str, str | None]:
     """POST a synthetic turn to ``thread_id``, deferring through admission.
 
@@ -446,12 +661,23 @@ async def post_notification_turn(
     each such POST, for a caller that must record it outlasting this call.
     ``busy_fails_fast`` returns ``"busy"`` on the first 409 that is not our
     own duplicate, for a caller with a better move than waiting out the
-    thread's run (handing its message to that run).
+    thread's run (handing its message to that run). A turn refused for a
+    suspended account is ``"drop"`` at once, or ``"suspended"`` with
+    ``suspension_waits``, for a caller that keeps its message for the account
+    to come back to (``SUSPENDED_WAIT_S``).
     ``refusal_fails_fast`` returns ``"refused"`` on the first refusal no wait
     here outlives (``_lasting_refusal``), for a caller that can hand its
     message to the thread's next turn instead of retrying it.
+    ``on_plan_limited`` (async, given the refusal's detail) runs on a turn
+    the Claude plan refused until it resets (``plan_limited``), which then
+    returns ``"plan_limited"``, for a caller that holds its message until then.
+    ``room_fails_fast`` returns ``"full"`` on the first refusal for the
+    user's Claude Code turns at once (``too_many_turns``), for a caller that
+    asks again by the clock (``outbox.wait_for_room``) rather than waiting
+    here for turns on other threads to end.
     ``subject`` is a short label for log lines (e.g. the source PTC thread
-    or task id).
+    or task id). ``route`` is the thread route posted to: ``messages``, or
+    ``retry`` with a retry body.
     """
     import aiohttp
 
@@ -478,7 +704,7 @@ async def post_notification_turn(
         "X-User-Id": user_id,
         "X-Dispatch": "background",
     }
-    url = f"{self_base_url}/api/v1/threads/{thread_id}/messages"
+    url = f"{self_base_url}/api/v1/threads/{thread_id}/{route}"
 
     deadline = asyncio.get_running_loop().time() + wait_cap
     backoff = 1.0
@@ -547,6 +773,37 @@ async def post_notification_turn(
                             return "taken", None
                         if busy_fails_fast:
                             return "busy", None
+                    if await _account_suspended(resp):
+                        if suspension_waits:
+                            logger.info(
+                                f"{log_prefix} The account is suspended; the "
+                                f"notification for {subject or 'background work'} "
+                                f"on thread {thread_id} waits"
+                            )
+                            return "suspended", None
+                        # Lifted only by the organization, and a turn started
+                        # after that would not be the one this was for.
+                        logger.info(
+                            f"{log_prefix} The account is suspended; dropping "
+                            f"the notification for {subject or 'background work'} "
+                            f"on thread {thread_id}"
+                        )
+                        return "drop", None
+                    if on_plan_limited is not None and (plan := await _plan_limited(resp)):
+                        logger.info(
+                            f"{log_prefix} The Claude plan refused the notification "
+                            f"for {subject or 'background work'} on thread {thread_id} "
+                            f"until {plan['held_until']}"
+                        )
+                        await on_plan_limited(plan)
+                        return "plan_limited", None
+                    if room_fails_fast and await _too_many_turns(resp):
+                        logger.info(
+                            f"{log_prefix} Thread {thread_id} has no room for another "
+                            f"Claude Code turn for {subject or 'background work'}; "
+                            f"asking again in {TURN_ROOM_WAIT_S}s"
+                        )
+                        return "full", None
                     if refusal_fails_fast and await _lasting_refusal(resp):
                         logger.info(
                             f"{log_prefix} Thread {thread_id} refused the "
@@ -559,6 +816,7 @@ async def post_notification_turn(
                         resp.status == 409
                         or resp.status >= 500
                         or resp.status in DEFER_STATUSES
+                        or await _too_many_turns(resp)
                     ):
                         # Don't log the body here: a 429 (credit/burst)
                         # response can carry the user's balance/limit figures.
@@ -600,6 +858,63 @@ async def post_notification_turn(
                     f"on thread {thread_id}"
                 )
                 return "cap", None
+
+
+async def _account_suspended(resp) -> bool:
+    """A turn refused because the account is suspended."""
+    from src.server.services.account import ACCOUNT_SUSPENDED
+
+    if resp.status != 403:
+        return False
+    try:
+        detail = (await resp.json()).get("detail")
+    except Exception:
+        return False
+    return isinstance(detail, dict) and detail.get("type") == ACCOUNT_SUSPENDED
+
+
+async def _plan_limited(resp) -> dict | None:
+    """The detail of a turn admission refused because the Claude plan is used
+    up until ``held_until`` (``require_plan``), else None."""
+    if resp.status != 400:
+        return None
+    try:
+        detail = (await resp.json()).get("detail")
+    except Exception:
+        return None
+    if (
+        isinstance(detail, dict)
+        and detail.get("type") == "claude_code_off"
+        and detail.get("reason") == "plan_limited"
+        and isinstance(detail.get("held_until"), str)
+    ):
+        return detail
+    return None
+
+
+# How long a notification refused for the user's Claude Code turns at once
+# waits before it asks again (``room_fails_fast``).
+TURN_ROOM_WAIT_S = 60
+
+# How long a notification refused for a suspended account waits before it
+# asks again (``suspension_waits``): as long as a one-time automation's
+# firing is put off (``automation_executions.DEFER_INTERVAL``), so a
+# reinstated account gets it within the hour, and a long suspension costs
+# one refused request an hour.
+SUSPENDED_WAIT_S = 3600
+
+
+async def _too_many_turns(resp) -> bool:
+    """A Claude Code turn refused because the user runs as many at once as
+    they may (``too_many_turns``), which lifts as those end: wakes held for
+    one plan reset all come due in the same minute."""
+    if resp.status != 400:
+        return False
+    try:
+        detail = (await resp.json()).get("detail")
+    except Exception:
+        return False
+    return isinstance(detail, dict) and detail.get("type") == "claude_code_off" and detail.get("reason") == "too_many_turns"
 
 
 async def _lasting_refusal(resp) -> bool:

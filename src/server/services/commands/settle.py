@@ -3,9 +3,9 @@ the watcher's pass, every stop, and a computer that went away.
 
 ``decide`` judges one row against one read of its job: still running, to be
 stopped for the after-turn hour, or ended, and how. ``settle`` records an end:
-the job's MCP trace when the end will be reported, the guarded finalize, the
-job's state discarded after it, a nudge to the drainer when the notice is due
-now, and a mirror of the computer when it is not the thread's (``mirror``). A stop is mark, kill, re-read, decide, settle, so a stopped row is
+the job's MCP trace when the end will be reported and its outbox, read in
+one exec, the outbox staged, the guarded finalize that stores its layers, the job's state discarded after it, a nudge to the
+drainer when the notice is due now, and a mirror of the computer when it is not the thread's (``mirror``). A stop is mark, kill, re-read, decide, settle, so a stopped row is
 judged on the job as its kill left it.
 
 A command is covered while its thread has a live turn or task, and for an
@@ -33,6 +33,7 @@ from ptc_agent.core.sandbox.runtime import SandboxRuntime
 from src.server.database.runs import command_runs as cr_db
 from src.server.database.runs.command_runs import Outcome
 from src.server.services.commands.mirror import mirror_after_end
+from src.tools.chart_annotation.layers import Staged, stage_outbox
 
 logger = logging.getLogger(__name__)
 
@@ -114,7 +115,8 @@ def decide(
     row: Mapping[str, Any],
     state: JobRead,
     *,
-    up: bool,
+    machine_runs: bool,
+    reports_now: bool,
     hour_applies: bool = False,
     cov: Coverage = Coverage(),
     now: Optional[datetime] = None,
@@ -122,11 +124,16 @@ def decide(
 ) -> Union[Outcome, Verdict]:
     """What became of one command, from one read of its job.
 
-    ``up``: its computer still runs the sandbox the read reached.
-    ``computer_stopped_at``: when it last stopped. A job gone with no exit
-    while its computer runs was ended by that stop if it came after the job
-    started, or went with its record when the computer was rebuilt (both
-    ``lost``), and otherwise was killed from outside (``vanished``).
+    ``machine_runs``: the machine still runs the sandbox the read reached.
+    ``reports_now``: an end read now is told at once, its computer still up;
+    otherwise at the thread's next turn, since a turn of its own would start
+    the computer again (one stopped since, or one its owner stopped that the
+    machine missed). ``computer_stopped_at``: when it last stopped. A job
+    gone with no exit while its computer runs was ended by that stop if it
+    came after the job started, or went with its record when the computer
+    was rebuilt (both ``lost``), and otherwise was killed from outside
+    (``vanished``). A stop the machine missed (it runs while the end does not
+    report now) ended nothing.
     ``hour_applies``, ``cov`` and ``now`` judge the after-turn hour, which
     only an unmarked row needs (for a computer that is gone, ``now`` is when
     it stopped, so a watcher that was down does not turn a stop inside the
@@ -143,7 +150,7 @@ def decide(
     mark = row.get("stopped_by")
     exit_code = None if state is GONE else state.exit_code
     if mark in (AFTER_TURN_LIMIT, "user") and exit_code is not None:
-        return Outcome.exited(exit_code, up=up)
+        return Outcome.exited(exit_code, up=reports_now)
     if mark == AFTER_TURN_LIMIT:
         return Outcome("failed", "after_turn_limit")
     if mark:
@@ -153,17 +160,23 @@ def decide(
         late = hour_applies and not is_covered(row, cov, at)
         return Outcome("failed", "after_turn_limit" if late else "lost", up=False)
     if exit_code is not None:
-        return Outcome.exited(exit_code, up=up)
+        return Outcome.exited(exit_code, up=reports_now)
     if not state.running:
         if state.stopped:
             # A stop reached it and left no mark on the row: none is under way
             # (a stopper marks the row before it kills, and the finalize
             # yields to a mark written since), so it simply stopped.
             return Outcome("stopped")
-        if not up:
+        if not machine_runs:
             return WATCH
-        stopped_since = computer_stopped_at is not None and computer_stopped_at >= row["started_at"]
-        return Outcome("failed", "lost" if stopped_since or not state.found else "vanished")
+        stopped_since = (
+            reports_now
+            and computer_stopped_at is not None
+            and computer_stopped_at >= row["started_at"]
+        )
+        return Outcome(
+            "failed", "lost" if stopped_since or not state.found else "vanished", up=reports_now
+        )
     if hour_applies and not is_covered(row, cov, now or datetime.now(UTC)):
         return STOP_AFTER_TURN
     return WATCH
@@ -191,24 +204,41 @@ async def settle(
     guarded finalize found it ended or re-marked meanwhile. Raises what the
     computer raises, leaving the row to the next attempt.
 
-    The trace is read, and kept, before the finalize, so a finalize that
-    fails finds it again; the job's state goes only after, so a settle that
-    dies first still finds the job ended rather than gone. The log stays: it
-    is the agent's."""
+    The trace and the outbox are read, and kept, before the finalize, so a
+    finalize that fails finds them again; the job's state goes only after,
+    so a settle that dies first still finds the job ended rather than gone.
+    The log stays: it is the agent's.
+
+    The outbox is published as the job's call would have published it had
+    the job ended there: validated here (``stage_outbox``, which never
+    raises), and stored by the guarded finalize, in its transaction, so its
+    layers are stored once, by the settle that ends the command, with the
+    read-back and the card entries that ride its notice. A settle that loses
+    the finalize (a stopper and the watcher racing, a retry of one that
+    committed) stores nothing, so a layer deleted since never comes back.
+    The live events go out after the commit, and reach only a turn whose
+    own call settles it (a stop from ThreadStatus); from the watcher there
+    is no stream, and the notice's card and the row are what show it."""
     found = runtime is not None and state is not GONE and state.found
     ref = jobs.JobRef.from_dict(row["job_ref"])
-    trace = None
-    if found and outcome.report != "none":
-        trace = await jobs.collect_job_trace(runtime.exec, ref, delete=False)
+    trace, staged = None, Staged()
+    if found:
+        trace, outbox = await jobs.read_job_end(
+            runtime.exec, ref, trace=outcome.report != "none"
+        )
+        staged = await stage_outbox(outbox, str(row["workspace_id"]))
     ended = await cr_db.finalize(
         row,
         outcome,
         tail=state.tail if found else None,
         trace=trace,
+        outbox=staged.command_outbox(),
         oom_kill_on=oom_kill_on(computer, outcome.exit_code),
     )
     if ended is None:
         return None
+    if ended.get("outbox_layers"):
+        staged.emit()
     if found:
         try:
             await jobs.discard_jobs(runtime.exec, [ref])

@@ -4,16 +4,9 @@
    box, so the title cuts the edge with the ground's own fill: a surface that
    puts the cards on another fill sets --term-ground. */
 
-/* The voice, Terminal's: the words' case and tracking (a multiplier on each
-   rule's own), their face, and the brackets around a tag, a state or a door.
-   The other card styles flip these (termCardStyles.css). */
-:root {
-  --term-case: uppercase;
-  --term-track: 1;
-  --term-words: var(--font-mono);
-  --term-open: '[';
-  --term-close: ']';
-}
+/* The voice (--term-case, --term-track, --term-words, --term-open/close) is
+   the app's, declared per card style in styles/cardStyle.css, which loads
+   with the app; this sheet loads with the cards. */
 
 .term-card,
 .term-pill {
@@ -124,6 +117,8 @@
 }
 .term-card-title {
   display: inline-flex;
+  /* The text sets the baseline the head aligns on, not a leading logo. */
+  align-items: baseline;
   min-width: 0;
   font-family: var(--term-words);
   font-weight: 600;
@@ -149,11 +144,18 @@ button.term-card-title {
   color: var(--color-term-text-tertiary);
   font-weight: 400;
 }
-.term-bracket:first-child {
+.term-bracket:first-child,
+.term-bracket-open {
   margin-right: 0.5ch;
 }
-.term-bracket:last-child {
+.term-bracket:last-child,
+.term-bracket-close {
   margin-left: 0.5ch;
+}
+/* A logo leads the title, centred on the line its text sets. */
+.term-title-logo {
+  align-self: center;
+  margin-right: 0.625ch;
 }
 /* The sub-title shares the title's cut. Whichever of the two the card keeps
    holds its width, and the other gives way; a long kept title still stops at
@@ -256,10 +258,12 @@ button.term-card-title {
 /* [EOD], [LAST CLOSE]: a word in brackets. */
 .term-tag {
   display: inline-flex;
-  align-items: center;
+  /* The word sets the baseline the line aligns on; a leading dot has none of
+     its own, and its box's foot would drop the tag half a line. */
+  align-items: baseline;
   gap: 0.3125rem;
   font-family: var(--term-words);
-  font-size: 0.625rem;
+  font-size: 0.6875rem;
   letter-spacing: calc(0.06em * var(--term-track));
   text-transform: var(--term-case);
   white-space: nowrap;
@@ -272,6 +276,7 @@ button.term-card-title {
   height: 5px;
   border-radius: 50%;
   flex-shrink: 0;
+  align-self: center;
   background: var(--color-term-text-tertiary);
 }
 .term-dot[data-tone='live'],
@@ -342,13 +347,9 @@ button.term-card-title {
 .term-chg[data-dir='up'] { color: var(--color-profit); }
 .term-chg[data-dir='down'] { color: var(--color-loss); }
 .term-chg[data-dir='flat'] { color: var(--color-term-text-tertiary); }
-.term-chg-mark {
-  width: 0.62em;
-  height: 0.54em;
-  flex-shrink: 0;
-  align-self: center;
-  fill: currentColor;
-}
+/* A figure from an older session than the one shown, such as an option not traded today. */
+.term-stale, .term-stale .term-chg[data-dir] { color: var(--color-term-text-tertiary); }
+.term-stale .term-range-at { background: var(--color-term-text-tertiary); }
 
 /* Label ..... value, in up to --term-cols columns, fewer when a column would
    be narrower than a label and a figure need: the grid answers to its own
@@ -507,7 +508,7 @@ button.term-card-title {
 .term-more {
   margin-top: 0.375rem;
   font-family: var(--term-words);
-  font-size: 0.65625rem;
+  font-size: 0.6875rem;
   letter-spacing: calc(0.04em * var(--term-track));
   text-transform: var(--term-case);
   color: var(--color-term-text-tertiary);

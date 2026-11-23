@@ -19,7 +19,7 @@ const focusAt = (seq: number) => ({
 
 const props = (seq: number): FileViewerProps => ({
   path: 'model.xlsx',
-  body: { mode: 'buffer', content: null, mime: 'excel', buffer: new ArrayBuffer(8), truncated: false },
+  body: { mode: 'buffer', content: null, mime: 'excel', buffer: new ArrayBuffer(8), truncated: false, from: { kind: 'live' } },
   loading: false,
   error: null,
   onRetry: () => {},
@@ -35,7 +35,6 @@ const props = (seq: number): FileViewerProps => ({
   onUndoRedoChange: () => {},
   onEditorTextSelect: () => {},
   onAddContext: null,
-  onContentMouseUp: () => {},
   onViewerLink: () => {},
   onAnchorLink: () => {},
 });

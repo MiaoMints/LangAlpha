@@ -45,12 +45,14 @@ function setup({ banner: initialBanner = null, reply = {} }: { banner?: unknown;
     pendingPTCBackfillRef: { current: new Map() },
     subagentHistory: { toolCalls: new Map() },
     setTokenUsage: vi.fn(),
+    setNextSummary: vi.fn(),
+    nextSummaryOwedRef: { current: false },
     setMessageError,
     setFallbackSuggestion: vi.fn(),
     t: (k: string) => k,
   };
   const deps = {
-    clearModelStatus: vi.fn(), armReportBack: vi.fn(), refreshWorkspaces: vi.fn(),
+    clearModelStatus: vi.fn(), armReportBack: vi.fn(), refreshWorkspaces: vi.fn(), refreshClaudeCodePlan: vi.fn(),
     readMessage: (id: string) => messages.find((m) => m.id === id),
   };
   const processor = (bubbleId: string, isReconnect: boolean) => createStreamEventProcessor(

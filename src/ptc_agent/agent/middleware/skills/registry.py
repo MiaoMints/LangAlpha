@@ -95,9 +95,10 @@ def _is_enabled(
 
 
 # Skills no subagent gets: the chart guide covers annotation tools that only
-# the main agent binds, so a subagent's manifest, its preloads and the names a
-# subagent setting may prefer all leave it out.
-SUBAGENT_WITHHELD_SKILLS: frozenset[str] = frozenset({"chart-annotation"})
+# the main agent binds, and the order guide covers brokerage tools that only
+# the main agent binds directly, so a subagent's manifest, its preloads and the
+# names a subagent setting may prefer all leave them out.
+SUBAGENT_WITHHELD_SKILLS: frozenset[str] = frozenset({"chart-annotation", "order-execution"})
 
 # Registry of all available skills
 # Skills are pre-registered at agent creation but tools are hidden until loaded
@@ -124,17 +125,17 @@ SKILL_REGISTRY: dict[str, SkillDefinition] = {
         # frontmatter drives the sandbox skill manifest), so they must not
         # drift.
         description=(
-            "Extra guidance for draw_chart_annotation, which works without "
-            "loading this. Covers choosing between similar variants, aligning "
-            "times to bars, several charts in one turn, and answering a chart "
-            "selection the user sends."
+            "Drawing on the user's chart from Python with chartkit, as one "
+            "chart layer per analysis (levels, lines, zones, indicators, "
+            "channels, fibs, projections, trade setups). Also answering a "
+            "chart selection the user sends."
         ),
-        switched_tools=("draw_chart_annotation", "manage_chart_annotations"),
+        switched_tools=("manage_chart_layers",),
         skill_md_path="skills/chart-annotation/SKILL.md",
-        # Guidance-only: every chat in the app can open the chart a drawing
+        # Guidance-only: every chat in the app can open the chart a layer
         # lands on (MarketView's, or the chart tab a chat card opens), so the
-        # main agent binds both annotation tools without loading this, and
-        # drops them when this skill is switched off.
+        # main agent binds manage_chart_layers without loading this, and
+        # drops it when this skill is switched off.
         # MarketView still injects it each turn, because its per-turn
         # instruction carries the active chart's symbol and timeframe.
         command="chart-annotation",
@@ -342,6 +343,20 @@ SKILL_REGISTRY: dict[str, SkillDefinition] = {
         command="trade-pitch",
         requires=("research-conventions",),
     ),
+    "order-execution": SkillDefinition(
+        name="order-execution",
+        # Keep in sync with the `description:` in
+        # plugins/langalpha_service/skills/order-execution/SKILL.md
+        # frontmatter (locked by a unit test). Guidance only: agent.py drops it
+        # from any build that binds no brokerage order tool.
+        description=(
+            "Read before placing, changing or cancelling an order through a "
+            "brokerage tool. The rules every order follows, the defaults the "
+            "user's own order preferences replace, the wakeups and tools that "
+            "follow an order, and where to save how the user likes orders placed."
+        ),
+        skill_md_path="skills/order-execution/SKILL.md",
+    ),
     "3-statements": SkillDefinition(
         name="3-statements",
         description="Build or repair an integrated three-statement model: linked IS, BS and CF, supporting schedules, scenarios and a Checks sheet. Triggers on three-statement model, build me a model, link the statements, populate this template, make my balance sheet balance.",
@@ -377,8 +392,16 @@ SKILL_REGISTRY: dict[str, SkillDefinition] = {
     ),
     "interactive-dashboard": SkillDefinition(
         name="interactive-dashboard",
-        description="Interactive web dashboards: stock trackers, sector heatmaps, portfolio monitors, served via preview URL",
+        description="Interactive web apps served from the computer via preview URL: dashboards, trackers, screeners, monitors, tools, multi-page or React apps, anything that needs a running server",
         skill_md_path="skills/interactive-dashboard/SKILL.md",
+        command="web-app",
+        # Its apps read the LangAlpha kit from dashboard-page's references.
+        requires=("dashboard-page",),
+    ),
+    "dashboard-page": SkillDefinition(
+        name="dashboard-page",
+        description="The user's own LangAlpha Dashboard: build or change the page they see when they open LangAlpha, with live market data and custom data refreshed on a schedule",
+        skill_md_path="skills/dashboard-page/SKILL.md",
         command="dashboard",
     ),
     "initiating-coverage": SkillDefinition(
@@ -393,6 +416,13 @@ SKILL_REGISTRY: dict[str, SkillDefinition] = {
         description="Web scraping: scrape_page / scrape_pages MCP tools for fetching pages as markdown, HTML, or text (fast HTTP, browser rendering, anti-bot stealth), plus the direct Scrapling Python API for selectors, sessions, and spiders",
         skill_md_path="skills/web-scraping/SKILL.md",
         command="web-scraping",
+    ),
+    "browser": SkillDefinition(
+        name="browser",
+        description="A real Chrome on this computer, driven from Bash with the `agent-browser` command, for pages that only show what you need after clicking, typing or running JavaScript. The person can watch it live and use it with you",
+        skill_md_path="skills/browser/SKILL.md",
+        command="browser",
+        feature="browser",
     ),
     "html-report": SkillDefinition(
         name="html-report",
@@ -478,14 +508,17 @@ def build_effective_skill_registry(
     user_skills: Sequence[Any] = (),
     user_skill_dir: str | None = None,
     workspace_skill_dir: str | None = None,
+    withheld: Iterable[str] = (),
 ) -> dict[str, SkillDefinition]:
     """Assemble the per-build registry every agent surface consumes.
 
     Feature gating, minus the user's builtin disables (as
     ``resolve_disabled_skills`` reads them), plus the user's uploaded
-    skills. The one assembly path shared by the agent build, the subagent
-    compiler and the server's per-turn checks, so a gate applied in one
-    can't be missed in another.
+    skills, minus what the turn's computer does not carry (``withheld``,
+    the config's ``withheld_skills``, which no ``requires`` keeps). The one
+    assembly path shared by the agent build, the subagent compiler and the
+    server's per-turn checks, so a gate applied in one can't be missed in
+    another.
     """
     registry = get_skill_registry(feature_resolver=feature_resolver)
     for name in resolve_disabled_skills(disabled_skills):
@@ -497,6 +530,8 @@ def build_effective_skill_registry(
             workspace_source_dir=workspace_skill_dir,
         )
     )
+    for name in withheld:
+        registry.pop(name, None)
     return registry
 
 

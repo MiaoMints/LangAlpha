@@ -2,6 +2,7 @@ import { useEffect, useEffectEvent, useMemo, useRef, useState, type ReactNode } 
 import { useTranslation } from 'react-i18next';
 import { Newspaper, Search, X } from 'lucide-react';
 import { Loader } from '@/components/ui/loader';
+import { TickerLabel } from '@/components/TickerLogo';
 import { SwapCell } from '@/components/ui/crossfade';
 import { SkeletonBar } from '@/components/ui/skeleton';
 import { useNow } from '@/hooks/useNow';
@@ -105,7 +106,7 @@ function NewsRow({
         </span>
       </td>
       <td className="term-code">
-        {tickers[0] ?? ''}
+        <TickerLabel symbol={tickers[0]} />
         {tickers.length > 1 && <span className="term-t3"> +{tickers.length - 1}</span>}
       </td>
     </tr>
@@ -298,6 +299,7 @@ function NewsFeedWidget({ instance, updateConfig }: WidgetRenderProps<NewsFeedCo
             <Search size={10} aria-hidden="true" />
             <input
               type="text"
+              aria-label={t('dashboard.widgets.newsFeed.tickerPlaceholder')}
               placeholder={t('dashboard.widgets.newsFeed.tickerPlaceholder')}
               value={tickerFilter}
               onChange={(e) => setTickerFilter(e.target.value)}
@@ -319,7 +321,7 @@ function NewsFeedWidget({ instance, updateConfig }: WidgetRenderProps<NewsFeedCo
               <button
                 key={dr.key}
                 type="button"
-                className="dash-range"
+                className="dash-range open-style:control-voice"
                 aria-pressed={dateRange === dr.key}
                 onClick={() => setDateRange(dr.key)}
               >
@@ -364,7 +366,7 @@ function NewsFeedWidget({ instance, updateConfig }: WidgetRenderProps<NewsFeedCo
           {hasFilters ? (
             <button
               type="button"
-              className="dash-range"
+              className="dash-range open-style:control-voice"
               onClick={() => {
                 setTickerFilter('');
                 setDateRange('all');

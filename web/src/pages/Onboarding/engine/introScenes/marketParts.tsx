@@ -1,4 +1,5 @@
 import type { ReactNode } from 'react';
+import { TickerLogo } from '@/components/TickerLogo';
 import { useTranslation } from 'react-i18next';
 import {
   BarChart3,
@@ -14,7 +15,7 @@ import {
 import { useLocale } from '@/hooks/useLocale';
 import { fixed2, signedFixed2 } from '@/lib/format';
 import { cn } from '@/lib/utils';
-import { ClearButton, Intervals, Segmented, SelectionTools, ToolBtn } from './chartTools';
+import { Intervals, Segmented, SelectionTools, ToolBtn } from './chartTools';
 import { InputDock, signColor } from './kit';
 import { NVDA_LAST, NVDA_QUOTE } from './nvdaSeries';
 import { Transcript } from './transcriptParts';
@@ -76,6 +77,7 @@ function StockTop() {
     <div className="flex min-w-0 flex-1 items-center gap-2 px-2">
       <div className="flex min-w-0 flex-1 flex-col gap-[3px]">
         <div className="flex min-w-0 items-center gap-[5px] leading-none">
+          <TickerLogo symbol={q.sym} className="text-[9px]" />
           <span
             className="flex shrink-0 items-center gap-[1px] rounded-[2px] px-[1px] text-[9px] font-semibold"
             style={{ color: 'var(--color-text-primary)' }}
@@ -238,10 +240,10 @@ function Metrics() {
 }
 
 /** The chart's toolbar (`.chart-tools`) as a page-width chart lays it out:
-    intervals and indicators on the left; Clear while the agent's drawing is
-    up, the selection tools, the tools, the menu (the view buttons fold into
-    it at this width) and the Light / Advanced switch on the right. */
-function ChartTools({ armed = false, clear = false }: { armed?: boolean; clear?: boolean }) {
+    intervals and indicators on the left; the selection tools, the tools, the
+    menu (the view buttons fold into it at this width) and the Light /
+    Advanced switch on the right. */
+function ChartTools({ armed = false }: { armed?: boolean }) {
   const { t } = useTranslation();
   return (
     <div
@@ -256,11 +258,6 @@ function ChartTools({ armed = false, clear = false }: { armed?: boolean; clear?:
       <Intervals />
       <ToolBtn icon={SlidersHorizontal} />
       <span className="ml-auto flex items-center" style={{ gap: GAP }}>
-        {clear && (
-          <span className="intro-pop">
-            <ClearButton />
-          </span>
-        )}
         <SelectionTools armed={armed} />
         <ToolBtn icon={Settings2} />
         <ToolBtn icon={Menu} />
@@ -402,7 +399,6 @@ function ChatPanel({
  */
 export function MarketPage({
   armed,
-  clear,
   chart,
   title,
   transcript,
@@ -411,7 +407,6 @@ export function MarketPage({
   sendAt,
 }: {
   armed?: boolean;
-  clear?: boolean;
   chart: ReactNode;
   title?: string;
   transcript?: ReactNode;
@@ -435,7 +430,7 @@ export function MarketPage({
       <div className="flex min-h-0 flex-1">
         <div className="flex min-w-0 flex-col" style={{ width: CHART_W }}>
           <Metrics />
-          <ChartTools armed={armed} clear={clear} />
+          <ChartTools armed={armed} />
           <div className="relative flex-1" style={{ background: 'var(--color-bg-card)' }}>
             {chart}
           </div>

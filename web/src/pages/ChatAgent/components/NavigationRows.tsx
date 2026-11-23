@@ -11,20 +11,21 @@
  */
 import React, { memo, useCallback, useEffect, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
+import { useUser } from '@/hooks/useUser';
 import {
   ChevronRight, Folder, FolderOpen, Pin,
   X, ChevronsDown, MoreHorizontal, SquarePen, Archive,
-  ExternalLink, Pencil, Share2, Link2, Trash2,
+  ExternalLink, Pencil, Share2, Link2, Trash2, Users,
   type LucideIcon,
 } from 'lucide-react';
 import { DropdownMenu, DropdownMenuContent, DropdownMenuTrigger } from '../../../components/ui/dropdown-menu';
 import {
   ContextMenu, ContextMenuContent, ContextMenuItem, ContextMenuSeparator, ContextMenuTrigger,
 } from '../../../components/ui/context-menu';
-import { toast } from '@/components/ui/use-toast';
-import { copyText } from '@/lib/clipboard';
+import { copyWithToast } from '@/lib/clipboard';
 import { isDesktopShell } from '@/lib/desktop';
 import { isImeComposing } from '@/lib/ime';
+import { cn } from '@/lib/utils';
 import { HoverCard, HoverCardContent, HoverCardTrigger } from '../../../components/ui/hover-card';
 import { mediumDate, relativeTime } from '@/lib/format';
 import { Loader } from '@/components/ui/loader';
@@ -45,6 +46,9 @@ import { useNavTree, type DragGate } from './navTreeKit';
 import { computerIdentity } from './ComputerBadge';
 import { FolderCommand, FolderTerminal } from './computerFolderIcons';
 import { useComputer } from '../hooks/useComputers';
+import { colleagueName, threadStanding } from '@/lib/sharedThreads';
+import type { SharedThreadInfo } from '@/types/sharedWorkspaces';
+import { SharedThreadTrailing, SharedWorkspaceMenuItems, type SharedNavRow } from './sharedNavRows';
 
 export interface ThreadEntry {
   thread_id: string;
@@ -54,6 +58,8 @@ export interface ThreadEntry {
   created_at?: string;
   updated_at?: string;
   turn_count?: number;
+  /** On a shared workspace's thread: who started it and who wrote last. */
+  shared?: SharedThreadInfo | null;
   [key: string]: unknown;
 }
 
@@ -134,7 +140,7 @@ function ThreadRowTitle({ tid, title, active, onActivate }: {
         e.preventDefault();
         onActivate();
       }}
-      className={`text-sm truncate${fading ? ' animate-fade-in' : ''}`}
+      className={cn('text-sm truncate', fading && 'animate-fade-in', active && 'rail-prompt')}
       style={{ color: active ? 'var(--color-text-primary)' : 'var(--color-text-secondary)' }}
     >
       {title}
@@ -172,14 +178,22 @@ function ThreadRowGlyph({ tid, isCurrentThread }: { tid: string; isCurrentThread
           }}
         />
       ) : (
-        <span
-          role="img"
-          aria-label={t('nav.threadUnseen')}
-          className="rounded-full"
-          style={{ width: 6, height: 6, background: 'var(--color-accent-primary)' }}
-        />
+        <UnseenMark label={t('nav.threadUnseen')} />
       )}
     </span>
+  );
+}
+
+/** The tree's one unread mark: a thread finished unseen, or a closed shared
+ *  workspace holding one. */
+function UnseenMark({ label }: { label: string }) {
+  return (
+    <span
+      role="img"
+      aria-label={label}
+      className="rounded-full"
+      style={{ width: 6, height: 6, background: 'var(--color-accent-primary)' }}
+    />
   );
 }
 
@@ -399,6 +413,9 @@ function ThreadTreeRowImpl({
   const { t } = useTranslation();
   const { kit } = useNavTree();
   const tid = thread.thread_id;
+  // Only a shared workspace's thread carries `shared`.
+  const colleague = colleagueName(thread.shared, useUser().user?.user_id ?? null, t('sharedWorkspace.someone'));
+  const sharedMark = !!thread.shared?.shared_with_workspace;
   const subagents = agents?.filter((a) => !a.isMainAgent) || [];
   const hasSubagents = isCurrentThread && subagents.length > 0;
   const seedTitle = thread.title || thread.first_query_content?.slice(0, 40) || '';
@@ -459,19 +476,14 @@ function ThreadTreeRowImpl({
   const activateRow = () => {
     // A touch long-press opens the menu; the tap that ends it is not a navigation.
     if (renaming || menuOpen) return;
-    if (isCurrentThread) {
-      // Toggle agents expand for current thread
-      if (hasSubagents) onToggleThread(tid);
-    } else {
-      onNavigateThread(wsId, tid);
-    }
+    // Toggle agents expand for current thread. Without agents to show it is still
+    // a pick, which the mobile drawer closes on.
+    if (hasSubagents) onToggleThread(tid);
+    else onNavigateThread(wsId, tid);
   };
 
   const copyLink = () => {
-    copyText(threadHref(tid)).then(
-      () => toast({ title: t('nav.linkCopied') }),
-      () => toast({ variant: 'destructive', title: t('nav.copyLinkFailed') }),
-    );
+    copyWithToast(threadHref(tid), t('nav.linkCopied'), t('nav.copyLinkFailed'));
   };
 
   return (
@@ -507,6 +519,9 @@ function ThreadTreeRowImpl({
                   />
                 ) : (<>
                   <ThreadRowTitle tid={tid} title={title} active={isCurrentThread} onActivate={activateRow} />
+                  {(colleague || sharedMark) && (
+                    <SharedThreadTrailing tid={tid} isCurrentThread={isCurrentThread} name={colleague} sharedMark={sharedMark} />
+                  )}
                   {/* Expand-agents chevron — immediately right of the thread name,
                       mirroring the workspace row. Only on the current thread when it
                       has subagents. Hover-revealed (always shown on touch); rotates
@@ -532,7 +547,7 @@ function ThreadTreeRowImpl({
                   {isPinned && !isMobile && (
                     <Pin
                       aria-hidden
-                      className="h-3 w-3 ml-auto shrink-0 transition-opacity group-hover:opacity-0"
+                      className={`h-3 w-3 ${colleague || sharedMark ? '' : 'ml-auto '}shrink-0 transition-opacity group-hover:opacity-0`}
                       fill="currentColor"
                       style={{ color: 'var(--color-text-quaternary)' }}
                     />
@@ -647,6 +662,8 @@ export interface WorkspaceTreeRowProps {
   onRenameThread?: (wsId: string, threadId: string, title: string, previousTitle: string) => void;
   onShareThread?: (wsId: string, threadId: string) => void;
   onDeleteThread?: (wsId: string, threadId: string, title: string) => void;
+  /** A shared workspace's row: absent on the person's own. */
+  shared?: SharedNavRow;
 }
 
 function WorkspaceTreeRowImpl({
@@ -675,10 +692,12 @@ function WorkspaceTreeRowImpl({
   onRenameThread,
   onShareThread,
   onDeleteThread,
+  shared,
 }: WorkspaceTreeRowProps) {
   const { t } = useTranslation();
   const label = useWorkspaceLabel();
   const { kit } = useNavTree();
+  const me = useUser().user?.user_id;
   const wsId = ws.workspace_id;
   const isHome = isHomeWorkspace(ws);
   const isPinned = Boolean(ws.is_pinned);
@@ -697,13 +716,35 @@ function WorkspaceTreeRowImpl({
   // Rename starts once the menu has gone, as on the thread row: a pointer
   // crossing a closing menu's items moves focus into it and ends the edit.
   const renameAfterMenuRef = useRef(false);
-  const requestRename = rename.enabled ? () => { renameAfterMenuRef.current = true; } : undefined;
+  // Renamed for everyone, so a shared one only by whoever may manage it; an
+  // edit already open stays open if the role goes, and meets the refusal.
+  const canRename = rename.enabled && (!shared || shared.canManage);
+  const requestRename = canRename ? () => { renameAfterMenuRef.current = true; } : undefined;
   const handleMenuCloseAutoFocus = (event: Event) => {
     if (!renameAfterMenuRef.current) return;
     renameAfterMenuRef.current = false;
     event.preventDefault();
     rename.onStart(wsId, ws.name || '');
   };
+  // A closed shared workspace says it holds something unread; open, its
+  // threads say which.
+  const unreadMark = !!shared?.hasUnread && !isExpanded;
+  const onRenameRow = (menu: 'dropdown' | 'context') => (
+    menu === 'context' ? requestRename : canRename ? () => rename.onStart(wsId, ws.name || '') : undefined
+  );
+  const menuItems = (menu: 'dropdown' | 'context') => (shared ? (
+    <SharedWorkspaceMenuItems menu={menu} onRename={onRenameRow(menu)} onOpenPeople={() => shared.onOpenPeople(wsId)} />
+  ) : (
+    <WorkspaceMenuItems
+      workspace={ws}
+      menu={menu}
+      onTogglePin={onPinWorkspace ? () => onPinWorkspace(wsId, !isPinned) : undefined}
+      onRename={onRenameRow(menu)}
+      onDuplicate={wsActions.openDuplicate}
+      onMove={wsActions.openMove}
+      onDelete={wsActions.openDelete}
+    />
+  ));
 
   // A touch long-press opens the menu; the tap that ends it is not a toggle.
   const handleRowClick = useCallback(() => {
@@ -725,7 +766,9 @@ function WorkspaceTreeRowImpl({
               onClick={handleRowClick}
               {...(isRenaming ? {} : dragHandleProps)}
             >
-              {workspaceGlyph(ws, isExpanded, machine)}
+              {shared
+                ? <Users aria-hidden="true" className="h-4 w-4 shrink-0" style={{ color: 'var(--color-text-tertiary)' }} />
+                : workspaceGlyph(ws, isExpanded, machine)}
               {isRenaming ? (
                 <input
                   data-nav-key="rename"
@@ -752,10 +795,15 @@ function WorkspaceTreeRowImpl({
                   >
                     {label(ws) || t('nav.workspaceFallback')}
                   </span>
+                  {unreadMark && (
+                    <span className="ml-auto flex shrink-0 items-center">
+                      <UnseenMark label={t('nav.workspaceUnread')} />
+                    </span>
+                  )}
                   {/* Chevron + row actions float over the name's tail on hover
                       (as thread rows do), so the name keeps the full row width
                       instead of truncating around controls that are not showing. */}
-                  <div className={isMobile ? 'flex items-center gap-0.5 ml-auto shrink-0' : 'nav-panel-row-actions'}>
+                  <div className={isMobile ? `flex items-center gap-0.5 ${unreadMark ? '' : 'ml-auto '}shrink-0` : 'nav-panel-row-actions'}>
                     <span className="shrink-0 flex items-center">
                       <ChevronRight
                         className={`${CHEVRON_CLASS}${isExpanded ? ' rotate-90' : ''}`}
@@ -799,14 +847,7 @@ function WorkspaceTreeRowImpl({
                                 align=end would grow leftward over the tree since the
                                 trigger hugs the sidebar edge. */}
                             <DropdownMenuContent align="start" sideOffset={4} onClick={(e) => e.stopPropagation()}>
-                              <WorkspaceMenuItems
-                                workspace={ws}
-                                onTogglePin={onPinWorkspace ? () => onPinWorkspace(wsId, !isPinned) : undefined}
-                                onRename={rename.enabled ? () => rename.onStart(wsId, ws.name || '') : undefined}
-                                onDuplicate={wsActions.openDuplicate}
-                                onMove={wsActions.openMove}
-                                onDelete={wsActions.openDelete}
-                              />
+                              {menuItems('dropdown')}
                             </DropdownMenuContent>
                           </DropdownMenu>
                         )}
@@ -827,15 +868,7 @@ function WorkspaceTreeRowImpl({
           </ContextMenuTrigger>
           {showWsMenu && (
             <ContextMenuContent onCloseAutoFocus={handleMenuCloseAutoFocus}>
-              <WorkspaceMenuItems
-                workspace={ws}
-                menu="context"
-                onTogglePin={onPinWorkspace ? () => onPinWorkspace(wsId, !isPinned) : undefined}
-                onRename={requestRename}
-                onDuplicate={wsActions.openDuplicate}
-                onMove={wsActions.openMove}
-                onDelete={wsActions.openDelete}
-              />
+              {menuItems('context')}
             </ContextMenuContent>
           )}
         </ContextMenu>
@@ -872,7 +905,7 @@ function WorkspaceTreeRowImpl({
                   onArchiveThread={onArchiveThread}
                   onRenameThread={onRenameThread}
                   onShareThread={onShareThread}
-                  onDeleteThread={onDeleteThread}
+                  onDeleteThread={threadStanding(thread.shared, me, !!shared?.canManage).canDelete ? onDeleteThread : undefined}
                 />
               </kit.ThreadItem>
             ))}

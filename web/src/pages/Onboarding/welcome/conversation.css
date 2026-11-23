@@ -33,10 +33,36 @@
 .welcome-chat__rise {
   animation: welcome-chat-rise var(--motion-enter) var(--ease-out) backwards;
 }
+/* Setup handing over: the page fades in over the setup's, on the curve that
+   does not pop, and its first line writes itself once it is up. */
+@keyframes welcome-chat-arrive {
+  from {
+    opacity: 0;
+  }
+}
+.welcome-chat--arrive {
+  animation: welcome-chat-arrive var(--motion-reveal) var(--ease-reveal) backwards;
+}
 /* The composer opens on the last turn, where what is written in it goes to
    the agent with the answers. Its edge comes up in the accent, short of the
    full edge focus gives it, so it reads as on offer rather than in use; the
    box's own border transition carries the change. */
 .welcome-chat__composer--cue .chat-input-container:not(:focus-within, .recording) {
   border-color: color-mix(in srgb, var(--color-accent-primary) 70%, var(--color-border-input));
+}
+
+/* Terminal: the agent's lines stay in the reply's face, as replies do
+   everywhere; the controls answering them, and the reader's own answers, take
+   the shell's mono, the answers after a prompt (.rail-prompt). Scoped here
+   rather than set in the shared bubble and option card, which the chat draws
+   otherwise. */
+:root:not([data-card-style]) .welcome-chat :is([data-slot='option-card'], [data-slot='chip-group']) {
+  font-family: var(--font-mono);
+}
+:root:not([data-card-style]) .welcome-chat [data-slot='option-title'] + span {
+  font-size: var(--cs-text-menu);
+}
+:root:not([data-card-style]) .welcome-chat .pf-bubble p {
+  font-family: var(--font-mono);
+  font-size: var(--cs-text-field);
 }

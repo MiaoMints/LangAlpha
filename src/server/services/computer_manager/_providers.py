@@ -7,8 +7,11 @@ import logging
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
+from collections.abc import Mapping
 from typing import Any, Dict, Optional
 
+from ptc_agent.core.sandbox.providers._ssh_transport import Link, Machine
+from ptc_agent.core.sandbox.providers._tiers import container_sizing, resolve_tier
 from ptc_agent.core.sandbox.runtime import (
     HostUnavailablePolicy,
     SandboxGoneError,
@@ -20,6 +23,7 @@ from ptc_agent.core.sandbox.runtime import (
 from src.server.database.computer import (
     DEFAULT_ROOT_DIR,
     clear_computer_host_unavailable,
+    end_moved_host_outage,
     get_computer,
     record_computer_disk,
     stamp_computer_host_unavailable,
@@ -39,7 +43,7 @@ logger = logging.getLogger(__name__)
 
 
 class HostOutageClock(HostUnavailablePolicy):
-    """Rebuild a computer once its sandbox's host has refused starts too long.
+    """Rebuild a computer once its sandbox's host has not started it for too long.
 
     The clock lives on the computer row, so every worker and every restart
     measures the same outage. A handle only calls a sandbox replaced once the
@@ -54,8 +58,12 @@ class HostOutageClock(HostUnavailablePolicy):
         self.threshold = threshold
         self._named = {sandbox_id} if sandbox_id else set()
 
-    async def rebuild_now(self, sandbox_id: str) -> Optional[datetime]:
-        clock = await stamp_computer_host_unavailable(self.computer_id, sandbox_id)
+    async def rebuild_now(
+        self, sandbox_id: str, stuck_in: str | None = None
+    ) -> Optional[datetime]:
+        clock = await stamp_computer_host_unavailable(
+            self.computer_id, sandbox_id, stuck_in
+        )
         if clock is None:
             return None
         self._named.add(sandbox_id)
@@ -63,7 +71,7 @@ class HostOutageClock(HostUnavailablePolicy):
         if unavailable_for < self.threshold:
             return None
         logger.warning(
-            f"Host of sandbox {sandbox_id} has refused starts of computer "
+            f"Host of sandbox {sandbox_id} has not started computer "
             f"{self.computer_id} for {unavailable_for}; rebuilding it from the "
             "backup and keeping the old sandbox for salvage",
             extra={
@@ -73,6 +81,9 @@ class HostOutageClock(HostUnavailablePolicy):
             },
         )
         return since
+
+    async def observed(self, sandbox_id: str, state: str) -> None:
+        await end_moved_host_outage(self.computer_id, sandbox_id, state)
 
     def bound(self, sandbox_id: str) -> None:
         """A sandbox this handle built and published is the row's from then on,
@@ -113,6 +124,32 @@ class ProviderMixin:
                 f"{', '.join(unknown)}"
             )
         return type(base).model_validate({**base.model_dump(), **overrides})
+
+    def tier_size(
+        self, computer: Mapping[str, Any], tier: str | None
+    ) -> tuple[float, float] | None:
+        """The cpus and memory GiB ``computer``'s sandbox gets on ``tier``, as
+        its provider builds it: a Docker container is floored at the operator's
+        own size, any other sandbox gets the tier's preset, and a tier its
+        provider no longer offers runs at a base size no preset names (None)."""
+        settings = self._provider_settings(
+            computer["kind"], computer.get("provider_config")
+        )
+        choice = resolve_tier(
+            tier,
+            default_tier=settings.default_tier,
+            resource_tiers=settings.resource_tiers,
+        )
+        if computer["kind"] == "docker":
+            sizing = container_sizing(
+                choice,
+                floor_cpus=settings.cpu_count,
+                floor_memory_limit=settings.memory_limit,
+            )
+            return sizing.cpus, sizing.memory_bytes / 1024**3
+        if choice.preset is None:
+            return None
+        return float(choice.preset.cpu), float(choice.preset.memory)
 
     def _provider_for(self, binding: Optional[ComputerBinding]):
         """Use the persisted backend so one process can serve multiple providers.
@@ -198,6 +235,26 @@ class ProviderMixin:
             yield await provider.get(sandbox_id)
         finally:
             await provider.close()
+
+    async def machine_link(self, computer: Dict[str, Any]) -> Machine[Link]:
+        """An own computer's machine, for work on the machine itself rather
+        than in the computer (its Claude Code token), dialed once here so one
+        out of reach says so at once. Never started, so the computer's state
+        stays as it is.
+
+        Raises:
+            SandboxTransientError: The machine could not be reached.
+        """
+        from ptc_agent.core.sandbox.providers.ssh import SSHProvider
+
+        binding = self._binding_from_computer("", computer)
+        if binding.kind != "ssh" or not binding.provider_ref:
+            raise SandboxTransientError(f"Computer {binding.computer_id} is not an SSH computer that is set up")
+        provider = self._provider_for(binding)
+        assert isinstance(provider, SSHProvider)
+        machine = provider.machine(binding.provider_ref)
+        await machine.link()
+        return machine
 
     async def keep_sandbox_alive(
         self,

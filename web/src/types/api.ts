@@ -1,6 +1,10 @@
 /** Core API types — User, Workspace, Thread, and response wrappers */
 
 import type { CommandFailureReason, CommandTool } from './commands';
+import type { ArtifactCommentSendFields, ShareAudience } from './artifacts';
+import type { SharedThreadInfo } from './sharedWorkspaces';
+import type { ChartView } from '@/pages/MarketView/types/chartView';
+import type { PublishedLayer } from '@/pages/MarketView/types/chartLayer';
 
 // --- User ---
 
@@ -21,10 +25,60 @@ export interface User {
   personalization_completed?: boolean;
   /** Completed the legacy first-run onboarding flow. */
   onboarding_completed?: boolean;
+  /** The organization the account belongs to; null or absent for none. Only
+   *  `suspended` is set when the server knows the suspension and not yet
+   *  which organization it is. */
+  organization?: AccountOrganization | null;
+  /** What the account may do. Absent from a server that predates rules, which
+   *  restricts nothing; null when the account's rules cannot be read right
+   *  now, which is not "no rules": the server refuses turns until they can. */
+  policy?: AccountPolicy | null;
+  /** Where the user chose to work, asked once by the desktop app's first run; null when never asked. */
+  computer_choice?: ComputerChoice | null;
   created_at?: string;
   updated_at?: string;
   [key: string]: unknown;
 }
+
+export interface AccountOrganization {
+  id: string | null;
+  name: string | null;
+  suspended?: boolean;
+  /** The account's teams in the organization; absent from a server that
+   *  sends none. */
+  teams?: AccountTeam[];
+}
+
+/** A team of the account's organization it is in, with its role there. */
+export interface AccountTeam {
+  id: string;
+  name: string;
+  role: 'admin' | 'member';
+}
+
+/** Who set a rule: the organization the account belongs to, or the
+ *  deployment the app runs on. */
+export type RuleSetter = 'organization' | 'deployment';
+
+export interface AccountPolicy {
+  /** The models a turn may run, in the order the server picks a default
+   *  from; null allows any. */
+  models: { allowed: string[] | null };
+  own_model_access: { api_keys: boolean; subscriptions: boolean };
+  public_links: boolean;
+  trading: boolean;
+  own_machines: boolean;
+  user_connectors: boolean;
+  /** Each restricted rule (`models.allowed`, `own_model_access.api_keys`,
+   *  `public_links`, ...) and who set it. A rule that restricts nothing is
+   *  not listed. */
+  set_by: Record<string, RuleSetter>;
+}
+/**
+ * `own_machine` keeps a cloud computer from being built for a user with no
+ * computer Home can live on; `cloud` keeps the default.
+ */
+export type ComputerChoice = 'own_machine' | 'cloud';
 
 export interface UserPreferences {
   [key: string]: unknown;
@@ -73,12 +127,38 @@ export interface FeatureState {
   key: string;
   label: string;
   description: string;
-  /** Honest cost of opting in to an experimental feature; English-only, null when none. */
-  tradeoffs: string | null;
+  /** The Experiments group it is listed under; the web app names and orders them. */
+  category?: FeatureCategory | null;
+  /** Still changing: behavior and pricing may move under it. */
+  preview?: boolean;
+  /** What Experiments shows a user deciding whether to keep it. */
+  guide?: FeatureGuide | null;
   enabled: boolean;
-  gate: 'none' | 'opt_in' | 'opt_out' | 'plan';
+  gate: 'none' | 'opt_in' | 'opt_out' | 'plan' | 'grant';
   min_tier: number | null;
   user_override: boolean | null;
+  /** Where the user turns it on when not in Experiments: Claude Code's
+   *  opt-in is made by connecting it under Model access. */
+  home?: 'model_access' | null;
+  /** The account's organization decides it, so an override is refused. */
+  set_by_organization?: boolean;
+  /** Features this one depends on: it is off wherever any of them is. */
+  requires?: string[];
+}
+
+export type FeatureCategory = 'chat' | 'tools' | 'autonomy' | 'long_threads' | 'dashboard';
+
+export interface FeatureGuide {
+  /** Finish "Turn it on if" / "Leave it off if" (or "Keep it on if" / "Turn
+   *  it off if" for an opt-out feature), so each starts in lower case. */
+  on_if: string;
+  off_if: string;
+  /** The price at a glance, set beside the default. */
+  cost: string | null;
+  /** What holds whichever way it is set. */
+  good_to_know: string | null;
+  /** What switching it loses, shown on the row beside its switch. */
+  caution: string | null;
 }
 
 // --- Workspace ---
@@ -201,6 +281,8 @@ export interface ComputerSsh {
   tunnel: boolean;
   /** Whether the tunnel is up now; null when the computer has none. */
   tunnel_connected: boolean | null;
+  /** The tunnel is down because its machine paired again, as with another LangAlpha account or server. Reconnecting brings it back. */
+  paired_elsewhere?: boolean;
   /** Answered by LangAlpha's helper (remote control of a Mac) rather than the machine's own sshd. */
   helper: boolean;
   /** The system as `uname -s` names it ("Darwin", "Linux"); null on a computer added before it was kept. */
@@ -235,6 +317,8 @@ export interface Computer {
   /** How many workspaces live on the machine, counted by the server: a list
    *  page a caller happens to hold is not that number. */
   workspace_count?: number;
+  /** Home's turns run here while an own-machine primary is away, so it stays with no workspaces. */
+  stands_in_for_home?: boolean;
   root_dir: string;
   /** The user's own machine, for an `ssh` computer; null for every other kind. */
   ssh: ComputerSsh | null;
@@ -257,6 +341,57 @@ export interface Computer {
   /** Why the last start failed, kept until a start succeeds or a reinstall or
    *  reconnect is accepted. Absent from an older server. */
   start_failure?: ComputerStartFailure | null;
+  /** Make primary, asked with the create (`ComputerCreate.make_primary`);
+   *  null once applied, or when none was asked. */
+  make_primary?: ComputerMakePrimaryIntent | null;
+  /** A remove waiting on Home's move off it (`home_to`), or how one ended
+   *  without the computer going. */
+  removal?: ComputerRemoval | null;
+  /** What its browser is set to. Absent from an older server. */
+  browser?: ComputerBrowser;
+}
+
+/** How sharply the computer's live browser view is drawn. */
+export type BrowserQuality = 'light' | 'standard' | 'sharp' | 'retina';
+
+/** What a computer's browser is set to, as its machine is handed it. */
+export interface ComputerBrowser {
+  /** Null follows the computer's size. */
+  quality: BrowserQuality | null;
+  /** Sites stay signed in between the browser's starts; never on a computer
+   *  holding shared workspaces. */
+  signins: boolean;
+  /** It also shows as a window on the Mac's screen. */
+  window: boolean;
+  /** The computer can show one: a Mac under remote control. */
+  window_available: boolean;
+}
+
+/** Why the server did not carry out what its owner asked of a computer, in its own sentence. */
+export interface ComputerIntentError {
+  /** A move refusal code, or a removal refusal code. */
+  code: string;
+  message: string;
+}
+
+/** `pending` until the first start completes; `dropped` with Make primary's refusal. */
+export interface ComputerMakePrimaryIntent {
+  state: 'pending' | 'dropped';
+  error: ComputerIntentError | null;
+}
+
+/**
+ * `waiting_for_home` while Home's move `move_id` runs; `home_did_not_move`
+ * when it failed or was cancelled, and the computer stays primary;
+ * `not_removed` when Home moved but the remove was then refused; `removed`
+ * once the computer is gone, `removed` saying what it left behind (null when
+ * that was not recorded).
+ */
+export interface ComputerRemoval {
+  state: 'waiting_for_home' | 'home_did_not_move' | 'not_removed' | 'removed';
+  move_id: string;
+  error: ComputerIntentError | null;
+  removed?: ComputerRemoveResponse | null;
 }
 
 /** What fixes a failed start, decided by the server from its code. */
@@ -390,8 +525,13 @@ export interface ComputerRemoveResponse {
   key: ComputerKeyRemoval | null;
   /** What happened to LangAlpha's files on an SSH computer's machine; null unless delete_files was asked. */
   files?: ComputerFilesRemoval | null;
+  /** A Claude Code token left on an SSH computer's machine; null when none is, absent from an older backend. */
+  token?: ComputerTokenRemoval | null;
   /** The named workspaces it deleted, not one moved off it meanwhile; absent from an older backend. */
   workspaces_deleted?: string[];
+  /** On a 202: Home is moving to `home_to` first, and the computer is
+   *  removed once it has. `GET /computers/{id}/removal` says how it ended. */
+  move_id?: string | null;
 }
 
 export interface ComputerFilesRemoval {
@@ -400,6 +540,13 @@ export interface ComputerFilesRemoval {
   root_kept: boolean;
   /** ~/.langalpha stays, since another computer on the login uses it. */
   runtime_kept: boolean;
+}
+
+export interface ComputerTokenRemoval {
+  /** The machine was not reached (unreached), or answered but could not delete it (failed); either way it last held a token file of the computer's. */
+  outcome: 'unreached' | 'failed';
+  /** The token file on the machine, for deleting it by hand. */
+  path: string;
 }
 
 export interface ComputerKeyRemoval {
@@ -512,6 +659,9 @@ export interface ComputerCreate {
   /** Keep a backup of each workspace's files. Omitted means on; the server
    *  refuses off for a machine it runs. */
   files_backup?: boolean;
+  /** Make it primary, moving Home onto it, once its first start completes;
+   *  one the server can't apply shows in the computer's `make_primary`. */
+  make_primary?: boolean;
 }
 
 export interface SshTarget {
@@ -551,6 +701,9 @@ export interface SshProbeResult {
   model?: string;
   /** Answered by LangAlpha's helper (remote control of a Mac) rather than the machine's own sshd. */
   helper: boolean;
+  /** Whether an organization's Claude Code policy is installed there, which
+   *  keeps Claude Code from running. Absent from an older server. */
+  claude_code_blocked?: boolean;
 }
 
 export type SshProbeErrorCode =
@@ -611,8 +764,9 @@ export interface ReorderItem {
 
 // --- Thread ---
 
-/** An agent that hands turns to a workspace's thread. */
-export type DispatchingAgent = 'chief_of_staff';
+/** An agent that hands turns to a workspace's thread. `cli` is a computer's
+ *  agent through the `la` CLI, and `id` the thread whose command sent it. */
+export type DispatchingAgent = 'chief_of_staff' | 'cli';
 
 /**
  * Who initiated a thread, or one turn of it (a query row's metadata carries
@@ -667,10 +821,44 @@ export type ReportSource =
       /** The call it started from, whose tool card the report opens; null
        *  for a command whose call had no id. */
       tool_call_id?: string | null;
+      /** The chart layers the command published after it was handed off,
+       *  which an inline call's result lists as its own. */
+      chart_layers?: PublishedLayer[] | null;
     };
+
+/**
+ * Where a fork cuts its source: `through_turn` keeps the turn and its reply,
+ * `before_turn` stops short of it and hands the turn's message back as
+ * `prefill` for the user to send again.
+ */
+export type ThreadForkCut = 'through_turn' | 'before_turn';
+
+/** `metadata.fork` on a thread copied from another. */
+export interface ThreadForkOrigin {
+  kind: string;
+  /** The source thread. */
+  thread_id: string;
+  cut: ThreadForkCut;
+  turn_index: number;
+  /** The source's checkpoint the copy was cut at. */
+  checkpoint_id: string | null;
+  /** When the copy was made. */
+  at: string;
+  /** The title the fork was made with, which its first message retitles from; not the source's. */
+  title: string | null;
+  /** Finished subagent task runs carried over. */
+  tasks: number;
+  /** Whether the source's scratchpad was copied too. */
+  copy_scratchpad: boolean;
+  /** The user who made the fork. */
+  by: string;
+  /** Set once the fork's first turn carried its scratchpad and notice; absent on older rows. */
+  carried_at?: string | null;
+}
 
 export interface ThreadMetadata {
   origin?: ThreadOrigin;
+  fork?: ThreadForkOrigin;
   [key: string]: unknown;
 }
 
@@ -696,8 +884,13 @@ export interface Thread {
   /** Only on a model change's response: the model the thread was on is
    *  writing out, for the new one, a summary only its provider can read. */
   summary_handoff?: boolean | null;
+  /** Only on a model change's response: the model the thread was on is
+   *  writing a brief of the thread for the Claude Code model it moved to. */
+  brief_handoff?: boolean | null;
   /** Turn count (list responses only). */
   turn_count?: number;
+  /** The first message sent in the thread (list responses only), which names an untitled one. */
+  first_query_content?: string;
   created_at?: string;
   updated_at?: string;
   // Lifecycle enrichment (present on list responses for threads with runs).
@@ -708,6 +901,9 @@ export interface Thread {
   latest_run_id?: string | null;
   last_seen_run_seq?: number;
   run_started_at?: string | null;
+  /** Who started a shared workspace's thread and wrote in it last; absent
+   *  on any other thread. */
+  shared?: SharedThreadInfo;
   [key: string]: unknown;
 }
 
@@ -748,6 +944,8 @@ export interface ThreadSharePermissions {
   allow_files?: boolean;
   allow_download?: boolean;
   root_path?: string;
+  /** Who the link opens to; absent means anyone. */
+  audience?: ShareAudience;
 }
 
 export interface ThreadShareStatus {
@@ -755,6 +953,8 @@ export interface ThreadShareStatus {
   share_token: string;
   share_url: string;
   permissions: ThreadSharePermissions;
+  /** The audiences the owner may choose now. Absent from an older server. */
+  audiences?: ShareAudience[];
 }
 
 // --- Share links (files and apps) ---
@@ -770,8 +970,6 @@ interface ShareLinkBase {
   title: string | null;
   shared: boolean;
   shared_at: string | null;
-  /** The confirmed list while shared, null otherwise. */
-  shared_files: string[] | null;
   created_at: string;
 }
 
@@ -780,6 +978,8 @@ export interface FileShareLink extends ShareLinkBase {
   /** Workspace-relative entry path. */
   path: string;
   port: null;
+  /** The file's artifact record, which this link is the code of. */
+  artifact_id?: string;
 }
 
 export interface AppShareLink extends ShareLinkBase {
@@ -787,6 +987,12 @@ export interface AppShareLink extends ShareLinkBase {
   /** The optional entry path on the served app. */
   path: string | null;
   port: number;
+  artifact_id?: null;
+  /**
+   * 16 hex of the sha256 of the command that starts the app, null when none is
+   * stored; absent from an older server. The app's grants are kept under it.
+   */
+  command_key?: string | null;
 }
 
 /** One item's stable `/a/<code>` link. Private unless `shared`. */
@@ -795,26 +1001,6 @@ export type ShareLink = FileShareLink | AppShareLink;
 export type ShareLinkTarget =
   | { kind: 'file'; path: string }
   | { kind: 'app'; port: number };
-
-export type ShareFileReason = 'entry' | 'page' | 'style' | 'markdown' | 'script';
-
-export interface ShareFileEntry {
-  path: string;
-  size: number;
-  reason: ShareFileReason;
-}
-
-export interface ShareLinkDrift {
-  added: string[];
-  removed: string[];
-}
-
-/** The current file list for a file link, with the drift against what was confirmed. */
-export interface ShareLinkFiles {
-  files: ShareFileEntry[];
-  total_size: number;
-  drift: ShareLinkDrift | null;
-}
 
 export interface SharedLinksResponse {
   links: ShareLink[];
@@ -827,6 +1013,10 @@ export interface FileGrant {
   /** Seconds the grant has left when it is answered. */
   expires_in: number;
 }
+
+// --- Artifacts ---
+
+export type * from './artifacts';
 
 // --- Workspace Files ---
 
@@ -859,7 +1049,15 @@ export interface WriteFileResponse {
   size: number;
 }
 
-export type UnsavedReason = 'too_large' | 'path_too_long' | 'unreadable' | 'changed' | 'failed';
+export type UnsavedReason =
+  | 'too_large'
+  | 'path_too_long'
+  | 'bad_name'
+  | 'unreadable'
+  | 'changed'
+  | 'failed'
+  | 'history_too_large'
+  | 'history_held';
 
 export interface UnsavedFile {
   path: string;
@@ -985,12 +1183,14 @@ export interface SSEEventData {
 
 // --- Chat Message Send Body ---
 
-export interface ChatMessageBody {
+export interface ChatMessageBody extends ArtifactCommentSendFields {
   workspace_id: string;
   messages: Array<{ role: string; content: string }>;
   locale: string;
   timezone: string;
   additional_context?: unknown;
+  /** What the charts beside the composer show, for the agent's snapshots. */
+  chart_views?: ChartView[];
   checkpoint_id?: string;
   fork_from_turn?: number;
   expected_latest_run_id?: string;

@@ -9,15 +9,18 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from ptc_agent.config.agent import CredentialSource
+from src.llms.claude_code import is_claude_code_model
 from src.llms.model_spec import (
     canonical_reasoning_efforts,
     reasoning_block,
     summary_reasoning_effort,
 )
 from src.llms.preferences import resolve_tuning, resolve_turn_tuning
+from src.server.services.policy import OWN_SUBSCRIPTIONS, Policy, raise_model_denied
+from src.server.services.account import require_policy
 
 from . import logger, user_models
 from .availability import (
@@ -26,8 +29,11 @@ from .availability import (
     raise_oauth_reauth_required,
     raise_oauth_refresh_unavailable,
 )
-from .byok import byok_candidates, call_endpoint, walk_byok_candidates
+from .byok import byok_candidates, call_endpoint, stored_key, walk_byok_candidates
 from .user_models import ModelSource
+
+if TYPE_CHECKING:
+    from src.server.services.oauth_providers import SubscriptionProvider
 
 #: Providers that accept a request-time service tier. The rule had no owner:
 #: an ``access_type == "oauth"`` gate, a ``claude-oauth`` exclusion and four
@@ -83,16 +89,6 @@ def is_own_key_turn(config: Any) -> bool:
     )
 
 
-def may_use_platform_key(config: Any, *, users_choice: bool) -> bool:
-    """May a client this turn builds run on the platform's key?
-
-    A turn moves onto the platform's key only for a model the user picked, or
-    when the platform already pays for it, so a refused key or subscription
-    never quietly becomes the same model on credits.
-    """
-    return users_choice or not is_own_key_turn(config)
-
-
 async def _resolve_custom_model_byok(
     user_id: str,
     model_name: str,
@@ -116,30 +112,31 @@ async def _resolve_custom_model_byok(
        Unlike a system model's walk, this one crosses a separate credential
        (``own_api_key``): the client is built against the endpoint of the slug
        that held the key, so the key still goes to the service that issued it.
-    """
-    from src.server.database.api_keys import get_byok_config_for_provider
 
+    Returns the key, its base URL, the entry to build from, and the slug that
+    held the key, whose account the calls bill.
+    """
     provider = custom_config["provider"]
 
     # 1. Model name is itself a custom sub-provider with a key
     cp_by_name = await user_models.get_custom_provider_config(user_id, model_name, _pref_cache=_pref_cache)
     if cp_by_name:
-        byok_config = await get_byok_config_for_provider(user_id, model_name)
+        byok_config = await stored_key(user_id, model_name, _byok_cache=_byok_cache)
         if byok_config:
             parent = cp_by_name["parent_provider"]
             base_url = byok_config.get("base_url") or mc.get_provider_info(parent).get("base_url")
             custom_config = user_models.route_custom_entry(custom_config, cp_by_name, mc)
-            return byok_config, base_url, custom_config
+            return byok_config, base_url, custom_config, model_name
 
     # 2. Provider field is a custom sub-provider
     cp_by_provider = await user_models.get_custom_provider_config(user_id, provider, _pref_cache=_pref_cache)
     if cp_by_provider:
-        byok_config = await get_byok_config_for_provider(user_id, provider)
+        byok_config = await stored_key(user_id, provider, _byok_cache=_byok_cache)
         if byok_config:
             parent = cp_by_provider["parent_provider"]
             base_url = byok_config.get("base_url") or mc.get_provider_info(parent).get("base_url")
             custom_config = user_models.route_custom_entry(custom_config, cp_by_provider, mc)
-            return byok_config, base_url, custom_config
+            return byok_config, base_url, custom_config, provider
 
     # 3. System provider — walk [provider → parent → sibling variants] for a
     #    stored key. The sibling step covers the mirror case where a custom
@@ -157,9 +154,9 @@ async def _resolve_custom_model_byok(
         base_url = byok_config.get("base_url") or mc.get_provider_info(endpoint).get("base_url")
         if endpoint != provider:
             custom_config = {**custom_config, "provider": endpoint}
-        return byok_config, base_url, custom_config
+        return byok_config, base_url, custom_config, holding
 
-    return None, None, custom_config
+    return None, None, custom_config, None
 
 
 async def _custom_provider_model(
@@ -201,6 +198,133 @@ async def _egress_kwargs(model_name: str, base_url: str | None, params: dict | N
     return {"egress_transport": egress.sdk_transport}
 
 
+@dataclass(frozen=True)
+class SubscriptionRoute:
+    """The model runs on the user's sign-in to ``subscription`` or not at all.
+
+    ``model_info`` is the entry the turn reads the plans that include the
+    model from (``oauth_plans``): the user's custom entry, or the manifest's.
+    """
+
+    subscription: SubscriptionProvider
+    model_info: dict
+
+
+@dataclass(frozen=True)
+class OwnKeyRoute:
+    """The user's stored key serves the model.
+
+    ``provider`` is the provider the client is built as; ``custom_config`` the
+    entry a custom (or custom-provider) model is built from, None for a
+    manifest model, which is built by name.
+    """
+
+    key: dict
+    base_url: str | None
+    provider: str
+    custom_config: dict | None = None
+    holding: str | None = None
+
+
+@dataclass(frozen=True)
+class DeploymentRoute:
+    """Nothing of the user's serves this manifest model: a turn runs it on the
+    deployment's key or local server, which a plan gates in platform mode."""
+
+    model_info: dict
+
+    @property
+    def provider(self) -> str | None:
+        return self.model_info.get("provider")
+
+
+@dataclass(frozen=True)
+class ClaudeCodeRoute:
+    """A Claude Code row: the runtime runs it on the setup token the user
+    saved for it, so it bills their Claude plan and never a key."""
+
+    model_info: dict
+
+
+@dataclass(frozen=True)
+class NoRoute:
+    """Nothing serves the model: a custom one with no key, or an unknown name."""
+
+
+Route = SubscriptionRoute | ClaudeCodeRoute | OwnKeyRoute | DeploymentRoute | NoRoute
+
+
+def subscription_route(model_name: str, mc, *, custom_entry: dict | None) -> SubscriptionRoute | None:
+    """The subscription a model runs on, by the provider of the user's custom
+    entry when there is one (it shadows the manifest as everywhere else),
+    else of the manifest's."""
+    from src.server.services.oauth_providers import SUBSCRIPTIONS
+
+    model_info = custom_entry if custom_entry is not None else mc.get_model_config(model_name)
+    if not model_info:
+        return None
+    subscription = SUBSCRIPTIONS.get(model_info["provider"])
+    return SubscriptionRoute(subscription, model_info) if subscription else None
+
+
+def plan_includes(model_info: dict, plan_type: str | None) -> bool:
+    """Whether a subscription on ``plan_type`` may run the model (manifest
+    ``oauth_plans``). A model that lists no plans takes any, and a plan not
+    read (None or empty) passes, since the upstream stays the authority; a
+    plan that was read must be on the list."""
+    allowed = model_info.get("oauth_plans")
+    plan = (plan_type or "").lower()
+    return not (allowed and plan and plan not in {p.lower() for p in allowed})
+
+
+async def byok_key(
+    user_id: str,
+    model_name: str,
+    source: ModelSource,
+    entry: dict,
+    mc,
+    *,
+    _pref_cache: dict | None = None,
+    _byok_cache: dict | None = None,
+) -> OwnKeyRoute | None:
+    """The user's stored key that would serve ``model_name``, and where its
+    calls go, or None when no key does. Whether keys are switched on is the
+    caller's question.
+
+    - System model: walk [provider → parent → sibling variants] for the key
+      (coding-plan variants store it under their own slug), but call the
+      endpoint ``call_endpoint`` picks, never merely the candidate that held it.
+    - Custom model (custom shadows built-in when names collide): walk the
+      custom/provider/variant key chain via ``_resolve_custom_model_byok``.
+    - Unknown name that matches one of the user's ``custom_providers``:
+      a custom model entry synthesized on that provider's key.
+    """
+    if source == ModelSource.UNKNOWN:
+        entry = await _custom_provider_model(user_id, model_name, _pref_cache=_pref_cache)
+        if entry is None:
+            return None
+    if source in (ModelSource.CUSTOM, ModelSource.UNKNOWN):
+        byok_config, base_url, custom_config, holding = await _resolve_custom_model_byok(
+            user_id, model_name, entry, mc,
+            _pref_cache=_pref_cache, _byok_cache=_byok_cache,
+        )
+        if not byok_config:
+            return None
+        return OwnKeyRoute(byok_config, base_url, custom_config["provider"], custom_config, holding=holding)
+
+    provider = entry["provider"]
+    byok_config, holding = await walk_byok_candidates(
+        user_id, provider, mc, _byok_cache=_byok_cache,
+    )
+    if not byok_config:
+        return None
+    # base_url precedence: a user custom base_url on the holding slug wins;
+    # otherwise the endpoint ``call_endpoint`` picks.
+    endpoint = call_endpoint(provider, holding, mc, custom=False)
+    base_url = byok_config.get("base_url") or mc.get_provider_info(endpoint).get("base_url")
+    return OwnKeyRoute(byok_config, base_url, provider, holding=holding)
+
+
 async def resolve_byok_llm_client(
     user_id: str,
     model_name: str,
@@ -212,20 +336,12 @@ async def resolve_byok_llm_client(
     service_tier: str | None = None,
 ):
     """
-    If BYOK is active, build an LLM client for ``model_name``. Returns None
-    if BYOK isn't applicable or no key is configured. ``resolve_llm_config``
-    converts a None result into a user-facing ``byok_key_required``
-    HTTPException for custom models on the main-model path — this function
-    stays at debug log level so the user sees one error, not two.
-
-    - System model: walk [provider → parent → sibling variants] for the BYOK
-      key (coding-plan variants store it under their own slug), but build
-      against the MODEL'S OWN provider endpoint, never the candidate that
-      merely held the key.
-    - Custom model (custom shadows built-in when names collide): walk the
-      custom/provider/variant key chain via ``_resolve_custom_model_byok``.
-    - Unknown name but matches a user's ``custom_providers`` slug:
-      synthesize a custom model entry and route through the user's key.
+    If BYOK is active, build an LLM client for ``model_name`` on the key
+    ``byok_key`` finds. Returns None if BYOK isn't applicable or no key is
+    configured. ``resolve_llm_config`` converts a None result into a
+    user-facing ``byok_key_required`` HTTPException for custom models on the
+    main-model path — this function stays at debug log level so the user sees
+    one error, not two.
 
     ``classify_model`` is O(1) with ``_pref_cache`` populated, so callers
     don't need to pre-classify — pass the cache and this function does its
@@ -242,88 +358,51 @@ async def resolve_byok_llm_client(
     source, config_entry = await user_models.classify_model(
         user_id, model_name, _pref_cache=_pref_cache,
     )
-
-    # Custom model — custom entry wins. If the name also matches a built-in,
-    # we intentionally ignore the system side: the user asked for their
-    # variant's key to handle this name.
-    if source == ModelSource.CUSTOM:
-        byok_config, base_url, custom_config = await _resolve_custom_model_byok(
-            user_id, model_name, config_entry, mc,
-            _pref_cache=_pref_cache, _byok_cache=_byok_cache,
-        )
-        if not byok_config:
+    route = await byok_key(
+        user_id, model_name, source, config_entry, mc,
+        _pref_cache=_pref_cache, _byok_cache=_byok_cache,
+    )
+    if route is None:
+        if source == ModelSource.CUSTOM:
             # ``resolve_llm_config`` converts this None into an HTTPException
             # for the main-model path, and logs its own warning for custom
             # fallback models. Keep this at debug so the chat-level error
             # (with CTA) is the single user-visible signal.
             logger.debug(
                 f"[CHAT] No BYOK key found for custom model={model_name} "
-                f"provider={custom_config['provider']}."
+                f"provider={config_entry['provider']}."
             )
-            return None
-        logger.info(
-            f"[CHAT] Using BYOK key for custom model={model_name} "
-            f"provider={custom_config['provider']} base_url={base_url or 'SDK default'}"
-        )
-        return create_llm_from_custom(
-            custom_config,
-            api_key=byok_config["api_key"],
-            base_url=base_url,
-            cache_key=cache_key,
-            reasoning_effort=reasoning_effort,
-            **_tier_kwargs(service_tier, custom_config["provider"]),
-            **await _egress_kwargs(model_name, base_url, custom_config.get("parameters")),
-        )
-
-    # Unknown name — last-chance check for a custom-provider slug. Covers the
-    # edge case where a user typed their custom provider slug as the model name.
-    if source == ModelSource.UNKNOWN:
-        synthetic_cm = await _custom_provider_model(user_id, model_name, _pref_cache=_pref_cache)
-        if synthetic_cm is None:
-            return None
-        byok_config, base_url, custom_config = await _resolve_custom_model_byok(
-            user_id, model_name, synthetic_cm, mc,
-            _pref_cache=_pref_cache, _byok_cache=_byok_cache,
-        )
-        if not byok_config:
-            return None
-        return create_llm_from_custom(
-            custom_config,
-            api_key=byok_config["api_key"],
-            base_url=base_url,
-            cache_key=cache_key,
-            reasoning_effort=reasoning_effort,
-            **_tier_kwargs(service_tier, custom_config["provider"]),
-            **await _egress_kwargs(model_name, base_url, custom_config.get("parameters")),
-        )
-
-    # System model — the BYOK key may live under the model's own provider
-    # slug (coding-plan variants store it there), its parent, or a sibling
-    # variant that shares its credential. Walk all three; but pin SDK +
-    # base_url to the MODEL'S OWN provider, never the candidate that merely
-    # held the key.
-    provider = config_entry["provider"]
-    byok_config, holding = await walk_byok_candidates(
-        user_id, provider, mc, _byok_cache=_byok_cache,
-    )
-    if not byok_config:
         return None
-    # base_url precedence: a user custom base_url on the holding slug wins;
-    # otherwise the endpoint ``call_endpoint`` picks.
-    endpoint = call_endpoint(provider, holding, mc, custom=False)
-    base_url = byok_config.get("base_url") or mc.get_provider_info(endpoint).get("base_url")
+
+    if route.custom_config is not None:
+        if source == ModelSource.CUSTOM:
+            logger.info(
+                f"[CHAT] Using BYOK key for custom model={model_name} "
+                f"provider={route.provider} base_url={route.base_url or 'SDK default'}"
+            )
+        return create_llm_from_custom(
+            route.custom_config,
+            api_key=route.key["api_key"],
+            base_url=route.base_url,
+            cache_key=cache_key,
+            reasoning_effort=reasoning_effort,
+            **_tier_kwargs(service_tier, route.provider),
+            **await _egress_kwargs(model_name, route.base_url, route.custom_config.get("parameters")),
+        )
+
     logger.debug(
         f"[CHAT] Resolved BYOK client for system model={model_name} "
-        f"provider={provider} key_held_by={holding} base_url={base_url or 'SDK default'}"
+        f"provider={route.provider} key_held_by={route.holding} "
+        f"base_url={route.base_url or 'SDK default'}"
     )
     return create_llm(
         model_name,
-        api_key=byok_config["api_key"],
-        base_url=base_url,
+        api_key=route.key["api_key"],
+        base_url=route.base_url,
         reasoning_effort=reasoning_effort,
         cache_key=cache_key,
-        **_tier_kwargs(service_tier, provider),
-        **await _egress_kwargs(model_name, base_url),
+        **_tier_kwargs(service_tier, route.provider),
+        **await _egress_kwargs(model_name, route.base_url),
     )
 
 
@@ -351,17 +430,13 @@ async def resolve_oauth_llm_client(
         OAuthRefreshUnavailable,
         valid_token,
     )
-    from src.server.services.oauth_providers import SUBSCRIPTIONS
 
     mc = LLMFactory.get_model_config()
-    model_info = custom_entry if custom_entry is not None else mc.get_model_config(model_name)
-    if not model_info:
+    route = subscription_route(model_name, mc, custom_entry=custom_entry)
+    if route is None:
         return None
-
+    subscription, model_info = route.subscription, route.model_info
     provider = model_info["provider"]
-    subscription = SUBSCRIPTIONS.get(provider)
-    if subscription is None:
-        return None
 
     try:
         token = await valid_token(user_id, provider)
@@ -384,9 +459,9 @@ async def resolve_oauth_llm_client(
     # Plan-gated OAuth models (manifest `oauth_plans`): reject early with a
     # clear message instead of an opaque upstream error. Unknown plan_type
     # fails open — the upstream backend remains the authority.
-    allowed_plans = model_info.get("oauth_plans")
-    plan_type = (token.plan_type or "").lower()
-    if allowed_plans and plan_type and plan_type not in {p.lower() for p in allowed_plans}:
+    if not plan_includes(model_info, token.plan_type):
+        allowed_plans = model_info["oauth_plans"]
+        plan_type = token.plan_type.lower()
         raise HTTPException(
             status_code=400,
             detail={
@@ -454,6 +529,7 @@ async def resolve_model_client(
     reasoning_effort=None,
     service_tier=None,
     allow_platform_fallback=False,
+    policy: Policy | None = None,
     _pref_cache=None,
     _byok_cache=None,
 ) -> ResolvedClient:
@@ -466,19 +542,46 @@ async def resolve_model_client(
     are orthogonal. An OAuth-required HTTPException is allowed to propagate.
 
     ``service_tier`` is offered to all three routes; each drops it unless
-    ``supports_service_tier`` says its provider takes one.
+    ``supports_service_tier`` says its provider takes one. ``credential_route``
+    answers which of the three serves a model without building a client; its
+    steps are the ones the builders here ask, so keep the two in this order.
+
+    A Claude Code row resolves to its runtime target, on the user's own
+    credential: the runtime signs in with the setup token kept for it, never a key.
+
+    Own access the ``policy`` denies (looked up when not given) is skipped as
+    if it were not there, and a model that runs only on a denied sign-in is
+    refused.
     """
+    if policy is None:
+        policy = await require_policy(user_id)
     source, entry = await user_models.classify_model(user_id, model_name, _pref_cache=_pref_cache)
+    custom_entry = entry if source == ModelSource.CUSTOM else None
 
-    client = await resolve_oauth_llm_client(
-        user_id, model_name, reasoning_effort,
-        service_tier=service_tier, cache_key=cache_key,
-        custom_entry=entry if source == ModelSource.CUSTOM else None,
-    )
-    if client:
-        return ResolvedClient(client, source, CredentialSource.OAUTH)
+    if source == ModelSource.SYSTEM and is_claude_code_model(model_name):
+        from src.llms.llm import create_llm
 
-    if is_byok:
+        if not policy.allows(OWN_SUBSCRIPTIONS):
+            raise_model_denied(policy, OWN_SUBSCRIPTIONS, model_name)
+        return ResolvedClient(
+            create_llm(model_name, reasoning_effort=reasoning_effort), source, CredentialSource.OAUTH
+        )
+
+    if policy.allows(OWN_SUBSCRIPTIONS):
+        client = await resolve_oauth_llm_client(
+            user_id, model_name, reasoning_effort,
+            service_tier=service_tier, cache_key=cache_key,
+            custom_entry=custom_entry,
+        )
+        if client:
+            return ResolvedClient(client, source, CredentialSource.OAUTH)
+    else:
+        from src.llms.llm import LLM as LLMFactory
+
+        if subscription_route(model_name, LLMFactory.get_model_config(), custom_entry=custom_entry):
+            raise_model_denied(policy, OWN_SUBSCRIPTIONS, model_name)
+
+    if policy.byok(is_byok):
         client = await resolve_byok_llm_client(
             user_id, model_name, is_byok, reasoning_effort,
             _pref_cache=_pref_cache, cache_key=cache_key, _byok_cache=_byok_cache,
@@ -507,6 +610,45 @@ async def resolve_model_client(
         return ResolvedClient(client, source, CredentialSource.PLATFORM)
 
     return ResolvedClient(None, source, CredentialSource.NONE)
+
+
+async def credential_route(
+    user_id: str,
+    model_name: str,
+    *,
+    is_byok: bool,
+    policy: Policy | None = None,
+    _pref_cache: dict | None = None,
+    _byok_cache: dict | None = None,
+) -> Route:
+    """Which credential a turn on ``model_name`` runs on, building no client.
+
+    ``resolve_model_client``'s ladder, asked through the helpers its builders
+    use: a subscription's model runs on that sign-in or not at all (whether
+    the sign-in is there and its plan includes the model is the caller's
+    question, ``plan_includes``); then the user's own key, when keys are on;
+    then, for a manifest model, the deployment. Own access the ``policy``
+    denies is no route.
+    """
+    from src.llms.llm import LLM as LLMFactory
+
+    if policy is None:
+        policy = await require_policy(user_id)
+    mc = LLMFactory.get_model_config()
+    source, entry = await user_models.classify_model(user_id, model_name, _pref_cache=_pref_cache)
+    custom = source == ModelSource.CUSTOM
+    if source == ModelSource.SYSTEM and is_claude_code_model(model_name):
+        return ClaudeCodeRoute(entry) if policy.allows(OWN_SUBSCRIPTIONS) else NoRoute()
+    if route := subscription_route(model_name, mc, custom_entry=entry if custom else None):
+        return route if policy.allows(OWN_SUBSCRIPTIONS) else NoRoute()
+    if policy.byok(is_byok) and (route := await byok_key(
+        user_id, model_name, source, entry, mc,
+        _pref_cache=_pref_cache, _byok_cache=_byok_cache,
+    )):
+        return route
+    if source == ModelSource.SYSTEM:
+        return DeploymentRoute(entry)
+    return NoRoute()
 
 
 # ---------------------------------------------------------------------------
@@ -564,6 +706,9 @@ def role_registry(config, model_pref, turn_model: str | None = None) -> list[LLM
     carries the tuning its own model resolves to, compaction's effort aside
     (see ``LLMRole``). The turn-level override is deliberately not applied: it
     names the model the composer picked, not whichever model a role pins.
+    None on a Claude Code row, which a role cannot call: a summary that
+    falls back to the turn's model is langalpha's compaction, which a Claude
+    Code turn does not run.
     """
     compaction = config.llm.compaction_name
     # A summary written by a model picked for it falls back to the turn's
@@ -587,7 +732,7 @@ def role_registry(config, model_pref, turn_model: str | None = None) -> list[LLM
             reasoning_effort=resolve_tuning(model_pref, config.llm.fetch_name).reasoning_effort,
         ),
     ]
-    return [r for r in roles if r.model]
+    return [r for r in roles if r.model and not is_claude_code_model(r.model)]
 
 
 async def _prefetch_byok_cache(
@@ -657,7 +802,7 @@ def _stamp(config, client, prompt_guidance: str | None) -> None:
 
 async def _resolve_role_clients(
     config, user_id: str, roles: list[LLMRole], model_pref: dict,
-    byok_cache: dict, *, is_byok: bool, cache_key: str | None,
+    byok_cache: dict, *, is_byok: bool, cache_key: str | None, policy: Policy,
     main_model: str | None = None,
 ) -> None:
     """Resolve compaction/fetch/subagent role clients onto ``config`` in place.
@@ -672,9 +817,8 @@ async def _resolve_role_clients(
     gets ``main_model`` at the summary level instead, so a summary keeps its
     level, and a keyless role with a set effort gets it at that effort.
     """
-    # A role is never the user's pick of a stand-in, so it stays on the key
-    # the turn runs on.
-    platform_ok = may_use_platform_key(config, users_choice=False)
+    # A turn on the user's own key or subscription never moves onto credits.
+    platform_ok = not is_own_key_turn(config)
 
     def _needs_own_client(role: LLMRole) -> bool:
         """Whether this role has to be materialized rather than left to its name.
@@ -695,7 +839,7 @@ async def _resolve_role_clients(
             rc = await resolve_model_client(
                 user_id, model, is_byok=is_byok, cache_key=cache_key,
                 allow_platform_fallback=platform_ok,
-                reasoning_effort=effort,
+                reasoning_effort=effort, policy=policy,
                 _pref_cache=model_pref, _byok_cache=byok_cache,
             )
         except Exception:
@@ -713,7 +857,7 @@ async def _resolve_role_clients(
                 user_id, role.model, is_byok=is_byok, cache_key=cache_key,
                 allow_platform_fallback=_needs_own_client(role),
                 service_tier=role.service_tier,
-                reasoning_effort=role.reasoning_effort,
+                reasoning_effort=role.reasoning_effort, policy=policy,
                 _pref_cache=model_pref, _byok_cache=byok_cache,
             )
         except Exception:
@@ -778,7 +922,7 @@ async def _resolve_role_clients(
     # main-client copy is safe. PLATFORM/NONE users store nothing → cheap name
     # path stays (a non-BYOK reasoning user's PLATFORM client is NOT copied).
     # The explicit None check makes the invariant a guard, not an assumption.
-    if is_own_key_turn(config) and config.llm_client is not None:
+    if is_own_key_turn(config) and main_model and config.llm_client is not None:
         for role in roles:
             if role.fallback_to_main and role.key not in config.subsidiary_llm_clients:
                 summary_client = (
@@ -802,33 +946,32 @@ async def _resolve_role_clients(
 
 async def _resolve_fallback_clients(
     config, user_id: str, model_pref: dict, byok_cache: dict,
-    *, is_byok: bool, cache_key: str | None, users_fallbacks: bool,
+    *, is_byok: bool, cache_key: str | None, policy: Policy,
     reasoning_effort: str | None = None, fast_mode: bool | None = None,
 ) -> None:
     """Resolve ``config.llm.fallback`` names into client instances in place.
 
-    A turn never moves onto a payer the user did not choose. Fallbacks the
-    user saved (``users_fallbacks``) are their choice, each running as they
-    picked it, on credits included. The deployment's own list is not: on a
-    turn the user's key or subscription pays for, a default fallback they
-    hold no credential for is skipped rather than built on the platform's
-    key (``may_use_platform_key``). On any other turn a SYSTEM fallback
-    without a user key yields a platform client. Custom/unknown fallbacks
-    without a usable key warn + skip.
+    A fallback never mixes our bill with the user's, whoever saved the list.
+    On a turn the user's key or subscription pays for, a fallback they hold no
+    credential for is skipped rather than built on the platform's key
+    (``is_own_key_turn``). On a platform turn a SYSTEM fallback without a
+    user key yields a platform client; one the user holds a key for is still
+    built on it, for a subagent on their key, and the resilience middleware
+    keeps each call to fallbacks its own payer bills. Custom/unknown
+    fallbacks without a usable key warn + skip.
 
     A fallback takes the turn-level overrides, unlike a role: it stands in for
     the model the request named, so "think harder this turn" still applies.
     Everything under that resolves on the fallback's own name, so the primary's
     speed is not charged to a model whose profile did not ask for it.
     """
-    config.fallback_users_choice = users_fallbacks
     fallback_models = config.llm.fallback or []
     if not fallback_models:
         config.fallback_llm_clients = []
         config.fallback_llm_names = []
         return
 
-    platform_ok = may_use_platform_key(config, users_choice=users_fallbacks)
+    platform_ok = not is_own_key_turn(config)
 
     async def _resolve_one(model_name: str):
         try:
@@ -840,7 +983,7 @@ async def _resolve_fallback_clients(
                 user_id, model_name, is_byok=is_byok, cache_key=cache_key,
                 allow_platform_fallback=platform_ok,
                 service_tier=_tier_for(tuning.fast_mode),
-                reasoning_effort=tuning.reasoning_effort,
+                reasoning_effort=tuning.reasoning_effort, policy=policy,
                 _pref_cache=model_pref, _byok_cache=byok_cache,
             )
         except Exception:
@@ -900,11 +1043,42 @@ async def _resolve_fallback_clients(
         )
 
 
+async def _stamp_credential_payer(
+    config, user_id: str, model_name: str, *, is_byok: bool, model_pref: dict, byok_cache: dict,
+    policy: Policy,
+) -> None:
+    """Record who the main model's credential bills, for a failed turn to name.
+
+    Asked of the same ladder that built the client, from the caches it read,
+    so no lookup repeats, as the picker's badge asks it. On the deployment's
+    credential only a local server answers from the route (a server on the
+    machine is nobody's account, as the badge says); otherwise, or failing
+    that, the source does.
+    """
+    from src.llms.llm import LLM as LLMFactory
+
+    from .payers import route_payer, source_payer  # lazy: payers imports this module
+
+    config.credential_payer = source_payer(config.credential_source)
+    own = config.credential_source in (CredentialSource.OAUTH, CredentialSource.BYOK)
+    try:
+        route = await credential_route(
+            user_id, model_name, is_byok=is_byok, policy=policy,
+            _pref_cache=model_pref, _byok_cache=byok_cache,
+        )
+        named = route_payer(route, LLMFactory.get_model_config())
+        if named is not None and (own or named.payer == "local"):
+            config.credential_payer = named
+    except Exception:
+        # Naming the account is wording only; the turn runs without it.
+        logger.warning("[CHAT] Could not name the credential for %s", model_name, exc_info=True)
+
+
 async def resolve_clients(
     config, user_id: str, effective_model: str, model_pref: dict,
     subagent_roles: list[LLMRole], *, is_byok: bool, thread_id: str | None,
     reasoning_effort: str | None, fast_mode: bool | None, user_defined: bool,
-    users_fallbacks: bool,
+    policy: Policy,
 ) -> None:
     """Build every client this turn can reach, tuned and stamped as it is built.
 
@@ -920,8 +1094,7 @@ async def resolve_clients(
 
     ``subagent_roles`` are the roles of the subagents this build compiles;
     the role list is built here because both things that read it, the BYOK
-    prefetch and the role resolver, are below this line. ``users_fallbacks``
-    says the fallback list is one the user saved (``select_model``).
+    prefetch and the role resolver, are below this line.
     """
     main_tuning = resolve_turn_tuning(
         model_pref, effective_model,
@@ -947,11 +1120,16 @@ async def resolve_clients(
         reasoning_effort=main_tuning.reasoning_effort,
         service_tier=_tier_for(main_tuning.fast_mode),
         allow_platform_fallback=bool(main_tuning.reasoning_effort),
+        policy=policy,
         _pref_cache=model_pref, _byok_cache=byok_cache,
     )
     # Always store credential_source (even NONE) — single source of truth
     # downstream (credit gate, materialization gate, billing signal).
     config.credential_source = main.credential_source
+    await _stamp_credential_payer(
+        config, user_id, effective_model, is_byok=is_byok,
+        model_pref=model_pref, byok_cache=byok_cache, policy=policy,
+    )
     if main.client is not None:
         _stamp(config, main.client, config.prompt_guidance)
         config.llm_client = main.client
@@ -967,15 +1145,17 @@ async def resolve_clients(
     # Subsidiary role clients (compaction / fetch / subagent:*) + BYOK-pure
     # materialization, and fallback models. Both resolve through the primitive
     # and write disjoint config fields (subsidiary_llm_clients vs
-    # fallback_llm_clients), so they run concurrently.
+    # fallback_llm_clients), so they run concurrently. A Claude Code turn's
+    # own model is no client to lend a role: each role keeps the model it names.
     await asyncio.gather(
         _resolve_role_clients(
             config, user_id, roles, model_pref, byok_cache,
-            is_byok=is_byok, cache_key=thread_id, main_model=effective_model,
+            is_byok=is_byok, cache_key=thread_id, policy=policy,
+            main_model=None if is_claude_code_model(effective_model) else effective_model,
         ),
         _resolve_fallback_clients(
             config, user_id, model_pref, byok_cache,
-            is_byok=is_byok, cache_key=thread_id, users_fallbacks=users_fallbacks,
+            is_byok=is_byok, cache_key=thread_id, policy=policy,
             reasoning_effort=reasoning_effort, fast_mode=fast_mode,
         ),
     )

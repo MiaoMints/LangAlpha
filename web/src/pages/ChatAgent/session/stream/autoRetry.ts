@@ -9,8 +9,12 @@
  * reply failed, with Retry on it, once it stops.
  */
 
+import { isOnline, waitForOnline } from '@/lib/network';
+import { holdReload } from '@/lib/reloadHolds';
 import { failAssistantMessage } from './finalizeMessage';
 import { updateMessage } from '../../hooks/utils/messageHelpers';
+import type { ChartView } from '@/pages/MarketView/types/chartView';
+import type { CommentSend } from '@/types/api';
 import type { ChatMessage } from '@/types/chat';
 import type { SSEEvent, SetMessages } from '../types';
 
@@ -33,6 +37,15 @@ export function readRetryNotice(event: SSEEvent): RetryNotice {
   };
 }
 
+/**
+ * A request whose stream dropped before its run's first frame. No run may exist
+ * to resume: a disconnect during setup cancels the turn, and before START leaves
+ * nothing on the server. So it goes again under its key, whose answer says what
+ * did happen: a new run, the copy that started, or a Retry of one the drop
+ * cancelled before it ran.
+ */
+export const DROPPED_BEFORE_RUN: RetryNotice = { autoRetry: true, attempt: null, maxRetries: null, recovery: 'resend' };
+
 /** What a turn sent, kept so a failure can send it again. */
 export interface TurnRequest {
   message: string | null;
@@ -46,28 +59,51 @@ export interface TurnRequest {
   /** The send's subagents pick. A resend may be what creates the thread, so
    * it carries the pick too. */
   subagentsAllowed?: boolean;
+  /** The turn skips the summary a cold thread gets first, and so does
+   * another attempt at it. */
+  keepFullContext?: boolean;
   /** A send the server may never have seen goes again under its first key,
    * so a copy that did arrive is adopted rather than doubled. */
   requestKey?: string;
+  /** The file comments the send carries, which a resend carries again,
+   * and where the person read as they sent them. */
+  artifactComments?: CommentSend;
+  /** What the charts beside the composer showed at the send, which a
+   * resend or a Retry of it carries again. */
+  chartViews?: ChartView[];
 }
+
+/** What a turn carries besides what it sends and where it runs from. */
+type TurnFlags = Pick<TurnRequest, 'keepFullContext'>;
+/** What a send carries that its Retry carries again. */
+type ResentFlags = TurnFlags & Pick<TurnRequest, 'chartViews'>;
 
 export const sendRequest = (
   message: string,
   additionalContext: Record<string, unknown>[] | null,
-  subagentsAllowed?: boolean,
-): TurnRequest => ({ message, additionalContext, checkpointId: null, forkFromTurn: null, retryOf: null, subagentsAllowed });
+  { artifactComments, chartViews, ...flags }: ResentFlags & Pick<TurnRequest, 'subagentsAllowed' | 'artifactComments'> = {},
+): TurnRequest => ({
+  message, additionalContext, checkpointId: null, forkFromTurn: null, retryOf: null, ...flags,
+  ...(artifactComments?.ids.length ? { artifactComments } : {}),
+  ...(chartViews?.length ? { chartViews } : {}),
+});
 
 export const forkRequest = (
   message: string | null,
   checkpointId: string,
   forkFromTurn: number,
-): TurnRequest => ({ message, additionalContext: null, checkpointId, forkFromTurn, retryOf: null });
+  flags: TurnFlags = {},
+): TurnRequest => ({ message, additionalContext: null, checkpointId, forkFromTurn, retryOf: null, ...flags });
 
 /** A Retry of the run `runId`, or of the thread's latest one for null. */
 export const retryRequest = (
   runId: string | null,
   additionalContext: Record<string, unknown>[] | null,
-): TurnRequest => ({ message: null, additionalContext, checkpointId: null, forkFromTurn: null, retryOf: { runId } });
+  { chartViews, ...flags }: ResentFlags = {},
+): TurnRequest => ({
+  message: null, additionalContext, checkpointId: null, forkFromTurn: null, retryOf: { runId }, ...flags,
+  ...(chartViews?.length ? { chartViews } : {}),
+});
 
 /** The Retry a reply gets when nothing better is known: the thread's latest
  * failed run, from where its checkpoint left off. */
@@ -86,7 +122,10 @@ export function recoveryRequest(
   failedRunId: string | null,
 ): TurnRequest | null {
   if (notice.recovery === 'resend') return request;
-  return retryRequest(failedRunId, request?.additionalContext ?? null);
+  return retryRequest(failedRunId, request?.additionalContext ?? null, {
+    keepFullContext: request?.keepFullContext,
+    chartViews: request?.chartViews,
+  });
 }
 
 /** The Retry a failed reply holds, kept for the bubble it would replace. */
@@ -119,6 +158,10 @@ function shouldAutoRetry(notice: RetryNotice, spent: number): boolean {
  * the minute a computer that is still starting can hold an attempt. */
 const autoRetryDelayMs = (spent: number): number => 1000 * 2 ** spent;
 
+/** How long a resend waits for a link, in slices so a stop is noticed within one. */
+const OFFLINE_CEILING_MS = 5 * 60 * 1000;
+const OFFLINE_SLICE_MS = 5 * 1000;
+
 export interface RetrySettlerDeps {
   setMessages: SetMessages;
   getMessages: () => readonly ChatMessage[];
@@ -131,6 +174,8 @@ export interface RetrySettlerDeps {
   resend: (request: TurnRequest, truncateIndex: number, snapshot: readonly ChatMessage[], spent: number) => void;
   /** Hands the reply's Retry what to send, once the client stops on its own. */
   holdRetry: (held: HeldRetry | null) => void;
+  /** The scheduled resend will not go: a stop or another session took the chat while it waited. */
+  abandoned: () => void;
   wasStoppedRef: { readonly current: boolean };
   sessionEpochRef: { readonly current: number };
   threadIdRef: { readonly current: string | null };
@@ -171,20 +216,35 @@ export function settleRetryNotice(
   }
   const epoch = deps.sessionEpochRef.current;
   const tid = deps.threadIdRef.current;
-  setTimeout(() => {
+  const offlineDeadline = Date.now() + OFFLINE_CEILING_MS;
+  // A reload during the wait would lose a message the server may not have.
+  const release = holdReload();
+  const send = () => {
     // A stop during the wait already settled the bubble and the session.
-    if (deps.wasStoppedRef.current) return;
+    if (deps.wasStoppedRef.current) {
+      release();
+      deps.abandoned();
+      return;
+    }
     // A newer turn, another thread or leaving the chat took the session, and
     // that owner manages the loading state; only this bubble is left to settle.
     if (deps.sessionEpochRef.current !== epoch || deps.threadIdRef.current !== tid) {
+      release();
       failReply(deps, bubbleId, deps.failedText);
+      deps.abandoned();
       return;
     }
+    if (!isOnline() && Date.now() < offlineDeadline) {
+      void waitForOnline(OFFLINE_SLICE_MS).then(send);
+      return;
+    }
+    release();
     // The resend replaces the bubble in the same write that adds its own, so
     // the reply never shows as settled between attempts.
     const transcript = deps.getMessages();
     const at = transcript.findIndex((m) => m.id === bubbleId);
     deps.resend(next, at === -1 ? transcript.length : at, transcript, spent + 1);
-  }, autoRetryDelayMs(spent));
+  };
+  setTimeout(send, autoRetryDelayMs(spent));
   return true;
 }

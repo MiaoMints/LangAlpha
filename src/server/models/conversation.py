@@ -5,20 +5,62 @@ This module defines response models for workspace thread endpoints that work wit
 the query-response schema (workspaces, thread, query, response).
 """
 
-from typing import Optional, List, Dict, Any
+from typing import Annotated, Optional, List, Dict, Any, Literal
 from datetime import datetime
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from uuid import UUID
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    field_validator,
+    model_serializer,
+    model_validator,
+)
+
+from src.server.models.report import PlatformStatus, ReportClient, ReportFollowUp
 
 from src.llms.reasoning import ReasoningLevel
+from src.server.utils.thread_stamp import SCANNED_CHARS
 
 
 # ==================== Workspace Thread Response Models ====================
+
+class ThreadSender(BaseModel):
+    user_id: str
+    name: Optional[str] = None
+
+
+class SharedThreadInfo(BaseModel):
+    """Who started a shared workspace's thread and who sent its latest turn,
+    and whether it is shared with the workspace or its starter's alone."""
+
+    created_by: Optional[ThreadSender] = None
+    last_sender: Optional[ThreadSender] = None
+    shared_with_workspace: bool = True
+    #: Someone other than its starter has sent a turn there, so it can no
+    #: longer be made private.
+    others_sent: bool = False
+
+
+class ThreadVisibilityRequest(BaseModel):
+    """Body of PUT /api/v1/threads/{id}/visibility."""
+
+    shared_with_workspace: bool = Field(
+        ...,
+        description="True shares the thread with everyone in its shared "
+        "workspace; False makes it its starter's alone again, refused once "
+        "anyone else has sent a turn in it.",
+    )
+
 
 class WorkspaceThreadListItem(BaseModel):
     """Response model for a thread in list view."""
     thread_id: str = Field(..., description="Thread ID")
     workspace_id: str = Field(..., description="Workspace ID")
-    thread_index: int = Field(..., description="Thread index within workspace")
+    thread_index: Optional[int] = Field(
+        None,
+        description="Thread index within workspace; absent in a shared workspace",
+    )
     current_status: str = Field(..., description="Thread status")
     msg_type: Optional[str] = Field(None, description="Message type")
     title: Optional[str] = Field(None, description="User-editable thread title")
@@ -84,8 +126,29 @@ class WorkspaceThreadListItem(BaseModel):
         "provider can read. Until it is written the new model reads a plain "
         "record of the compacted part.",
     )
+    brief_handoff: Optional[bool] = Field(
+        None,
+        description="Only on the response to a model change: whether the "
+        "model the thread was on is writing a brief of the thread for the "
+        "Claude Code model it moved to, which has seen none of it. The next "
+        "send waits for it.",
+    )
     created_at: datetime = Field(..., description="Creation timestamp")
     updated_at: datetime = Field(..., description="Last update timestamp")
+    shared: Optional["SharedThreadInfo"] = Field(
+        None,
+        description="Only on a thread in a shared workspace (absent elsewhere): "
+        "who started it and who sent its latest turn.",
+    )
+
+    @model_serializer(mode="wrap")
+    def _omit_absent_shared(self, handler):
+        # A personal thread's item keeps exactly its shape from before shared
+        # workspaces, rather than carrying a null for them.
+        data = handler(self)
+        if isinstance(data, dict) and data.get("shared") is None:
+            data.pop("shared", None)
+        return data
 
     # Lifecycle enrichment (thread-lifecycle v6) — derived from the latest
     # attempt on the run ledger. All optional: only the list queries join the
@@ -117,6 +180,14 @@ class WorkspaceThreadListItem(BaseModel):
     )
     run_started_at: Optional[datetime] = Field(
         None, description="Latest attempt's start time (start, not settle)"
+    )
+    latest_run_model: Optional[str] = Field(
+        None,
+        description="The model the latest attempt was set to run on, which "
+        "``llm_model`` does not say when the thread follows the account "
+        "default. The thread's transcript records the model that answered, "
+        "which differs after a fallback mid-turn. Null for an attempt that "
+        "started before attempts recorded it.",
     )
 
     model_config = ConfigDict(json_schema_extra={
@@ -265,10 +336,10 @@ class ThreadCreateRequest(BaseModel):
     @field_validator("first_query")
     @classmethod
     def _clip_first_query(cls, v: str) -> str:
-        # Clients send the full first message; the server consumes at most
-        # 4000 chars of it (title-prompt clip; the title stamp is [:255]).
+        # Clients send the full first message; the server reads only what the
+        # title stamp scans, which has to reach a reply after a long quote.
         # Truncate rather than reject so long pastes don't 422 the fast door.
-        return v[:4000]
+        return v[:SCANNED_CHARS]
     # Same contract as ChatRequest.platform (see models/chat.py for the format
     # rationale) — pre-created MarketView threads must carry their tag since
     # ensure_thread_exists never updates platform on an existing row.
@@ -300,6 +371,12 @@ class ThreadCreateRequest(BaseModel):
         description="The thread's own fast mode; omitted, the thread follows "
         "the user's Settings until a PATCH sets one.",
     )
+    shared_with_workspace: bool = Field(
+        default=False,
+        description="In a shared workspace, start the thread shared with "
+        "everyone in it; omitted, it is the starter's alone until they share "
+        "it. Ignored anywhere else.",
+    )
 
     @model_validator(mode="after")
     def _something_titles_the_thread(self) -> "ThreadCreateRequest":
@@ -308,6 +385,25 @@ class ThreadCreateRequest(BaseModel):
         if self.title is None and not self.first_query:
             raise ValueError("first_query or title is required")
         return self
+
+
+class ThreadForkRequest(BaseModel):
+    """Body of POST /api/v1/threads/{thread_id}/fork: where the copy is cut."""
+
+    cut: Literal["through_turn", "before_turn"] = Field(
+        "through_turn",
+        description="'through_turn' keeps the turn's reply; 'before_turn' keeps "
+        "everything before the turn and answers its message as ``prefill``.",
+    )
+    turn_index: int = Field(..., ge=0, description="The turn the cut is made at.")
+    title: Optional[str] = Field(None, max_length=255, description="The fork's title; the source's when omitted.")
+    # Same contract as ThreadCreateRequest.platform.
+    platform: Optional[str] = Field(
+        default=None,
+        pattern=r"^[a-z_]+(:[A-Z0-9][A-Z0-9.-]*)?$",
+        max_length=50,
+        description="Origin/platform identifier, e.g. 'web', 'market_view:AAPL'.",
+    )
 
 
 class ThreadCreateResponse(BaseModel):
@@ -319,7 +415,7 @@ class ThreadCreateResponse(BaseModel):
     """
     thread_id: str
     workspace_id: str
-    thread_index: int
+    thread_index: Optional[int] = None
     title: Optional[str] = None
     msg_type: str
     subagents_allowed: Optional[bool] = Field(
@@ -442,6 +538,14 @@ class SharePermissions(BaseModel):
             "workspace."
         ),
     )
+    # Absent means anyone, which every token minted so far opens to.
+    audience: Literal["public", "organization"] = Field(
+        "public",
+        description=(
+            "Who the link opens to: anyone with it, or only members of the "
+            "owner's organization, who sign in to open it."
+        ),
+    )
 
     @model_validator(mode="after")
     def download_requires_files(self):
@@ -466,6 +570,10 @@ class ThreadShareResponse(BaseModel):
     permissions: SharePermissions = Field(
         default_factory=SharePermissions, description="Current share permissions"
     )
+    audiences: List[Literal["public", "organization"]] = Field(
+        default_factory=lambda: ["public"],
+        description="The audiences the owner may choose for the link now",
+    )
 
 
 # ==================== Feedback Models ====================
@@ -474,9 +582,16 @@ class FeedbackRequest(BaseModel):
     """Request model for submitting feedback on a response."""
     turn_index: int = Field(..., description="Turn index of the response to rate")
     rating: str = Field(..., pattern=r"^(thumbs_up|thumbs_down)$", description="Rating: thumbs_up or thumbs_down")
-    issue_categories: Optional[List[str]] = Field(None, description="Issue categories for thumbs_down")
-    comment: Optional[str] = Field(None, description="Optional free-text comment")
+    # Bounded as the platform bounds a report's, which refuses a longer one on
+    # every retry.
+    issue_categories: Optional[List[Annotated[str, Field(max_length=64)]]] = Field(
+        None, max_length=20, description="Issue categories for thumbs_down"
+    )
+    comment: Optional[str] = Field(None, max_length=4000, description="Optional free-text comment")
     consent_human_review: bool = Field(False, description="Whether user consents to anonymous human review")
+    client: Optional[ReportClient] = Field(
+        None, description="The app the rating came from, for the report a thumbs-down sends"
+    )
 
 
 class FeedbackResponse(BaseModel):
@@ -489,4 +604,23 @@ class FeedbackResponse(BaseModel):
     consent_human_review: bool = False
     review_status: Optional[str] = None
     created_at: str
+    # The report a thumbs-down sends; null on a thumbs-up, and on a thumbs-down
+    # from before reports, which has none to add to.
+    report_id: Optional[str] = None
+    # When the team got the report this thumbs-down sent; null until it did.
+    reported_at: Optional[str] = None
+    # The notes the user added to that report since.
+    report_follow_ups: List[ReportFollowUp] = Field(default_factory=list)
+    # What became of the report this call sent; null when it sent none.
+    report_status: Optional[PlatformStatus] = None
+
+
+class FeedbackFollowUpRequest(BaseModel):
+    """More for the report a thumbs-down sent: a note, a human review, or both."""
+    turn_index: int
+    note: Optional[str] = Field(None, max_length=4000)
+    # Made by the client for the note and kept across its retries.
+    note_id: Optional[UUID] = None
+    human_review: bool = False
+    client: Optional[ReportClient] = None
 

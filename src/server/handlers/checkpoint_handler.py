@@ -12,81 +12,21 @@ from typing import NamedTuple
 
 from fastapi import HTTPException
 
-from src.server.database.conversation import queries as queries_db
 from src.server.database.conversation import threads_read
-from src.server.services.history.reader import pair_turns, turn_anchors
+from src.server.services.history.branch import branch_turns, stale_fork_detail
 from src.server.utils.checkpoint_helpers import (
     FORK_ROOT_CHECKPOINT_ID,
     build_checkpoint_config,
-    checkpoint_on_branch,
     get_checkpointer,
     turn_base_checkpoint_id,
-    walk_current_branch_boundaries,
 )
 from src.server.utils.pg_sanitize import normalize_uuid
 from src.server.models.chat import ChatRequest
 from src.server.models.workflow import (
-    TurnCheckpointInfo,
     ThreadTurnsResponse,
 )
 
 logger = logging.getLogger(__name__)
-
-
-class _BranchTurns(NamedTuple):
-    turns: list[TurnCheckpointInfo]
-    tip_id: str | None
-    # The last entry of ``turns`` when it stands for turns past the branch's
-    # last boundary, which never reached the graph.
-    unstarted: TurnCheckpointInfo | None
-
-
-async def _branch_turns(
-    thread_id: str, branch_tip_checkpoint_id: str | None
-) -> _BranchTurns:
-    try:
-        boundaries, tip_id = await walk_current_branch_boundaries(
-            get_checkpointer(), thread_id, branch_tip_checkpoint_id
-        )
-        persisted = await queries_db.get_query_turn_indexes(thread_id)
-    except Exception as e:
-        logger.error(f"[CHECKPOINT] Failed to list checkpoints for thread {thread_id}: {e}")
-        raise HTTPException(status_code=500, detail="Failed to retrieve checkpoint history")
-
-    anchors = turn_anchors(boundaries, tip_id) if tip_id else []
-    numbers = pair_turns(anchors, persisted)
-    turns = [
-        TurnCheckpointInfo(
-            turn_index=turn_index,
-            # The thread's first input builds on no saved checkpoint.
-            edit_checkpoint_id=(
-                None
-                if anchor.is_resume
-                else anchor.parent_checkpoint_id or FORK_ROOT_CHECKPOINT_ID
-            ),
-            regenerate_checkpoint_id=anchor.regenerate_checkpoint_id,
-        )
-        for anchor, turn_index in zip(anchors, numbers)
-        if turn_index is not None
-    ]
-    # A run that failed before its first step, an edit's included, leaves its
-    # turn's rows past the branch's last boundary and nothing on the branch.
-    # Its message forks from the tip, the state before it, and so does any
-    # such turn before it, so one entry under the last turn number serves
-    # them all, the way the next checkpointed turn serves one mid-thread. With
-    # no checkpoint at all, the state before them is the empty fork root.
-    last_kept = max((n for n in numbers if n is not None), default=None)
-    past = [n for n in persisted if last_kept is None or n > last_kept]
-    unstarted = None
-    if past:
-        base = tip_id or FORK_ROOT_CHECKPOINT_ID
-        unstarted = TurnCheckpointInfo(
-            turn_index=past[-1],
-            edit_checkpoint_id=base,
-            regenerate_checkpoint_id=base,
-        )
-        turns.append(unstarted)
-    return _BranchTurns(turns, tip_id, unstarted)
 
 
 async def get_thread_turns(
@@ -102,25 +42,12 @@ async def get_thread_turns(
     share one last entry at the tip, or at the empty fork root on a thread
     with no checkpoint, which is also where the first turn's edit forks.
     """
-    listing = await _branch_turns(thread_id, branch_tip_checkpoint_id)
+    listing = await branch_turns(thread_id, branch_tip_checkpoint_id)
     return ThreadTurnsResponse(
         thread_id=thread_id,
         turns=listing.turns,
         retry_checkpoint_id=listing.tip_id,
     )
-
-
-def stale_fork_detail() -> dict:
-    """The 409 detail for a fork whose branch is no longer the thread's.
-
-    One wording for every refusal: the route's, when the checkpoint forks no
-    turn of the current branch or the client's view missed a newer run, and
-    START's, when another worker moved the branch after that check.
-    """
-    return {
-        "code": "stale_fork",
-        "message": "This chat changed since it was loaded. Reload it and try again.",
-    }
 
 
 class ForkPoint(NamedTuple):
@@ -159,7 +86,7 @@ async def resolve_fork_turn(
     """
     branch = await threads_read.get_thread_branch_read(thread_id)
     branch_tip, horizon = branch.checkpoint_id, branch.run_horizon
-    listing = await _branch_turns(thread_id, branch_tip)
+    listing = await branch_turns(thread_id, branch_tip)
     turns = listing.turns
     if (
         regenerate
@@ -187,6 +114,44 @@ async def resolve_fork_turn(
             return ForkPoint(turn.turn_index, branch_tip, horizon, unstarted)
         kept = turn.turn_index if kept is None else max(kept, turn.turn_index)
     raise HTTPException(status_code=409, detail=stale_fork_detail())
+
+
+async def first_turn_dropped(thread_id: str, checkpoint_id: str) -> int | None:
+    """The first turn a run from ``checkpoint_id`` leaves off the thread's
+    branch, or None when the run only adds to it (the branch's tip, or a
+    newer checkpoint built on it, as a failed run leaves).
+
+    On the branch, the turn whose span holds the checkpoint is replaced and
+    every later one with it. Off the branch, or with no branch read, the
+    turns it drops are not known, so every turn counts (0).
+    """
+    from src.server.utils.checkpoint_helpers import checkpoint_on_branch
+
+    tip = (await threads_read.get_thread_branch_read(thread_id)).checkpoint_id
+    if tip is None:
+        return 0
+    if checkpoint_id == tip or await checkpoint_on_branch(thread_id, tip, checkpoint_id):
+        return None
+    if not await checkpoint_on_branch(thread_id, checkpoint_id, tip):
+        return 0
+    dropped = 0
+    # Checkpoint ids are uuid6, ordered by time, the fork root first.
+    for turn in (await branch_turns(thread_id, tip)).turns:
+        start = turn.edit_checkpoint_id
+        if start is not None and start <= checkpoint_id:
+            dropped = max(dropped, turn.turn_index)
+    return dropped
+
+
+async def first_turn_replaced(thread_id: str, request: ChatRequest) -> int | None:
+    """The first turn ``request`` leaves off the thread's branch, or None
+    when it only adds to it. An answer to a paused turn names the checkpoint
+    it resumes, which replaces nothing."""
+    if request.fork_from_turn is not None:
+        return int(request.fork_from_turn)
+    if request.checkpoint_id and not request.hitl_response:
+        return await first_turn_dropped(thread_id, str(request.checkpoint_id))
+    return None
 
 
 def _is_run(run: dict | None, run_id: str) -> bool:
@@ -308,30 +273,31 @@ async def get_retry_checkpoint(thread_id: str, checkpoint_id: str | None = None)
 
 
 async def settle_resume_request(thread_id: str, request: ChatRequest) -> ChatRequest:
-    """The HITL answer ``request``, refused if its pause is on a branch a fork
-    replaced, else stamped with the run horizon START holds it to.
+    """The HITL answer ``request``, refused unless it resumes the pause the
+    thread would resume next, else stamped with the run horizon START holds it
+    to.
 
     A resume that names no checkpoint loads the newest, and after a fork
     whose run failed before its first step that is the replaced branch's
     pause, which no reader shows any more (``turn_base_checkpoint_id``). One
-    that names its checkpoint resumes there, which must be on the branch the
-    thread's pointer names. A fork admitted after this check is caught at
-    START, which refuses the answer if a run started after the horizon; read
-    first, so no fork can fall between the check and the horizon.
+    that names its checkpoint must name that newest one. LangGraph resumes a
+    named checkpoint wherever it sits, so an older pause would resume a card a
+    later run already went past, putting its call through (an order
+    included), and one under a flush or a compaction would run its step's
+    finished calls again and drop what was written on top. A fork admitted
+    after this check is caught at START, which refuses the answer if a run
+    started after the horizon; read first, so no fork can fall between the
+    check and the horizon.
     """
     branch = await threads_read.get_thread_branch_read(thread_id)
     checkpointer = get_checkpointer()
-    if not request.checkpoint_id:
-        replaced = await turn_base_checkpoint_id(checkpointer, thread_id) is not None
-    elif branch.checkpoint_id is None:
-        replaced = False
-    else:
-        replaced = not await checkpoint_on_branch(
-            thread_id,
-            request.checkpoint_id,
-            branch.checkpoint_id,
-            checkpointer=checkpointer,
+    stale = await turn_base_checkpoint_id(checkpointer, thread_id) is not None
+    if not stale and request.checkpoint_id:
+        newest = await checkpointer.aget_tuple(build_checkpoint_config(thread_id))
+        stale = (
+            newest is None
+            or newest.config["configurable"]["checkpoint_id"] != request.checkpoint_id
         )
-    if replaced:
+    if stale:
         raise HTTPException(status_code=409, detail=stale_fork_detail())
     return request.model_copy(update={"resume_run_horizon": branch.run_horizon})

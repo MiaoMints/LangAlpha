@@ -1,0 +1,123 @@
+"""The setup token a user's Claude Code turns sign in with on the backend:
+saving, removing, and whether it works, for Settings and the model picker.
+
+- GET    /api/v1/claude-code/setup           Where the user's Claude Code stands as a whole, opted in or not
+- GET    /api/v1/claude-code/chief-of-staff  Where a Home thread's Claude Code runs, and whether its Default does
+- GET    /api/v1/claude-code/status          Whether the user's Claude Code models can run
+- POST   /api/v1/claude-code/sign-in         Start a sign-in that makes a setup token
+- POST   /api/v1/claude-code/sign-in/code    Finish it with the code Claude's page shows
+- PUT    /api/v1/claude-code/token           Save a setup token the user made themselves
+- DELETE /api/v1/claude-code/token           Remove the saved token
+- POST   /api/v1/claude-code/check           Check now: read the saved token's Claude plan with one minimal request
+- GET    /api/v1/claude-code/custody         How turns on cloud computers run, where the user chooses it
+- PUT    /api/v1/claude-code/custody         Choose it
+
+The flow and the token store are ``services.claude_code`` (``flow``, ``saved``),
+and the choice for cloud computers ``hosted``.
+"""
+
+from fastapi import APIRouter, Response
+
+from src.server.models.claude_code import (
+    ClaudeCodeChiefOfStaff, ClaudeCodeCustody, ClaudeCodeSetup, ClaudeCodeStatus, CodeBody, CustodyBody, TokenBody,
+)
+from src.server.services.claude_code import flow, hosted, saved
+from src.server.services.claude_code.flow import backend_on, pasted_code, pasted_token, require
+from src.server.services.claude_code.saved import SavedHome
+from src.server.services.claude_code.setup_state import chief_of_staff, setup_state
+from src.server.services.oauth_signin import OAuthRefusal
+from src.server.services.policy import OWN_SUBSCRIPTIONS
+from src.server.services.account import require_policy
+from src.server.utils.api import CurrentUserId, require_thread_owner
+
+router = APIRouter(prefix="/api/v1/claude-code", tags=["claude-code"])
+
+
+@router.get("/setup", response_model=ClaudeCodeSetup)
+async def get_setup(x_user_id: CurrentUserId):
+    current = await setup_state(x_user_id)
+    require(current is not None, "This server doesn't offer Claude Code.")
+    return current
+
+
+@router.get("/chief-of-staff", response_model=ClaudeCodeChiefOfStaff)
+async def get_chief_of_staff(thread_id: str, x_user_id: CurrentUserId):
+    """The Chief of Staff's answer in ``setup``, asked for one Home thread by
+    web builds from before every Home thread ran the Claude Code Default
+    alike; the thread no longer changes it."""
+    await require_thread_owner(thread_id, x_user_id)
+    require(await flow.rows_on(x_user_id))
+    return await chief_of_staff(x_user_id)
+
+
+@router.get("/status", response_model=ClaudeCodeStatus)
+async def get_status(x_user_id: CurrentUserId):
+    return await saved.status(x_user_id)
+
+
+@router.post("/sign-in")
+async def start_sign_in(x_user_id: CurrentUserId):
+    require(await backend_on(x_user_id))
+    (await require_policy(x_user_id)).require(OWN_SUBSCRIPTIONS, "Connecting a Claude Code subscription")
+    return await flow.start_sign_in(SavedHome(x_user_id))
+
+
+@router.post("/sign-in/code", response_model=ClaudeCodeStatus)
+async def finish_sign_in(body: CodeBody, x_user_id: CurrentUserId):
+    require(await backend_on(x_user_id))
+    (await require_policy(x_user_id)).require(OWN_SUBSCRIPTIONS, "Connecting a Claude Code subscription")
+    return await flow.finish_sign_in(SavedHome(x_user_id), pasted_code(body))
+
+
+@router.put("/token", response_model=ClaudeCodeStatus)
+async def save_token(body: TokenBody, x_user_id: CurrentUserId):
+    require(await backend_on(x_user_id))
+    (await require_policy(x_user_id)).require(OWN_SUBSCRIPTIONS, "Connecting a Claude Code subscription")
+    token, rejected = pasted_token(body)
+    return await flow.paste(SavedHome(x_user_id), token, rejected)
+
+
+@router.delete("/token", status_code=204)
+async def remove_token(x_user_id: CurrentUserId):
+    await flow.remove(SavedHome(x_user_id))
+    return Response(status_code=204)
+
+
+@router.post("/check", status_code=204)
+async def check_saved(x_user_id: CurrentUserId):
+    await saved.check_now(x_user_id)
+    return Response(status_code=204)
+
+
+_NO_CHOICE = "This server offers no choice of how Claude Code runs on cloud computers."
+
+
+@router.get("/custody", response_model=ClaudeCodeCustody)
+async def get_custody(x_user_id: CurrentUserId):
+    current = await hosted.custody(x_user_id) if await flow.rows_on(x_user_id) else None
+    require(current is not None, _NO_CHOICE)
+    return current
+
+
+#: Why a choice is refused, by the reason ``hosted.choose`` gives.
+_CUSTODY_REFUSED = {
+    "unavailable": (409, "This server doesn't offer that choice right now."),
+    "stored_blocked": (403, "Storing a setup token isn't available for your account."),
+    "disclosure": (400, "Accept the current terms to store your setup token."),
+}
+
+
+@router.put("/custody", response_model=ClaudeCodeCustody)
+async def put_custody(body: CustodyBody, x_user_id: CurrentUserId):
+    # Storing the token keeps a credential; any other choice deletes it.
+    if body.mode == "stored":
+        (await require_policy(x_user_id)).require(OWN_SUBSCRIPTIONS, "Connecting a Claude Code subscription")
+    try:
+        chosen = await hosted.choose(x_user_id, body.mode, body.disclosure) if await flow.rows_on(x_user_id) else None
+    except hosted.CustodyRefused as refused:
+        status, message = _CUSTODY_REFUSED[refused.reason]
+        raise OAuthRefusal(status, refused.reason, message, retryable=False) from None
+    except hosted.TurnsNotStopped:
+        raise flow.turns_running() from None
+    require(chosen is not None, _NO_CHOICE)
+    return chosen

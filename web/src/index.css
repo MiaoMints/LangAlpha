@@ -14,6 +14,7 @@
    Tailwind's rules sitting outside any layer (see the note there). Only the
    theme variables go in a layer; tokens.css declares the values that matter. */
 @import './styles/tokens.css';
+@import './styles/cardStyle.css';
 @import './styles/animations.css';
 @import './styles/chrome.css';
 @import './styles/dotGrid.css';
@@ -31,6 +32,9 @@
 @source './**/*.{js,ts,jsx,tsx}';
 @source not './**/__tests__/**';
 @source not './**/*.test.{js,ts,jsx,tsx}';
+/* The preview harnesses (the *-preview.html pages) are dev-only, so their own
+   layout classes stay out of the production sheet. */
+@source not './**/__preview__/**';
 /* The onboarding scenes generate their own, which load with them
    (introScenes/scenes.css). */
 @source not './pages/Onboarding/engine/introScenes/**';

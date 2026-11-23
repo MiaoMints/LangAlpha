@@ -58,7 +58,6 @@ export function mainHandlersMockModule(
     handleToolCalls: vi.fn(),
     handleToolCallResult: vi.fn(),
     handleToolCallChunks: vi.fn(),
-    handleTodoUpdate: vi.fn(),
     ...overrides,
   };
 }
@@ -109,7 +108,6 @@ export function historyHandlersMockModule(
     handleHistoryTextContent: vi.fn(),
     handleHistoryToolCalls: vi.fn(),
     handleHistoryToolCallResult: vi.fn(),
-    handleHistoryTodoUpdate: vi.fn(),
     handleHistorySteeringDelivered: vi.fn(),
     ...overrides,
   };
@@ -143,6 +141,8 @@ export function threadStatus(over: Record<string, unknown> = {}) {
 export interface MuxConnection {
   threadId: string;
   cursors: string | null;
+  /** Whether the socket asked for the open turn's settled runs. */
+  openTurn: boolean;
   /** Feed raw SSE text (one or more frames, blank-line terminated). */
   push: (sse: string) => void;
   /** Server-side close: resolves the transport promise (client reconnects). */
@@ -160,11 +160,14 @@ export function captureMuxConnections(mockOpen: Mock): MuxConnection[] {
       cursors: string | null,
       onLine: (line: string) => void,
       signal: AbortSignal,
+      _sinceAgeS?: number,
+      openTurn?: boolean,
     ) =>
       new Promise<void>((resolve) => {
         conns.push({
           threadId,
           cursors,
+          openTurn: !!openTurn,
           push: (sse: string) => {
             for (const line of sse.split('\n')) onLine(line);
           },

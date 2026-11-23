@@ -16,7 +16,8 @@ route:
   restarting server) is retried under the outbox backoff. Once that runs
   out, or at once on one that does not (the user's usage limit, a request
   the server turns away), the job is held for the thread's next turn
-  instead of dropped. Held, it waits parked: the next turn takes the notice
+  instead of dropped. One refused for a suspended account asks again each
+  hour instead, so a reinstated account wakes as it would have. Held, it waits parked: the next turn takes the notice
   in, and a turn that ends without doing so has its finalize release it
   for one more look, after which a refusal holds it again. A turn that ends
   while the claim waits out refusals releases nothing for the claimed job,
@@ -151,8 +152,10 @@ async def execute_market_target(job: dict) -> None:
         render_notice,
     )
     from src.server.services.report_back.notify_turn import (
+        SUSPENDED_WAIT_S,
+        TURN_ROOM_WAIT_S,
         earlier_wake,
-        park_while_thread_busy,
+        park_unless_ready,
         post_notification_turn,
         release_if_a_turn_ended,
         run_marker,
@@ -246,7 +249,7 @@ async def execute_market_target(job: dict) -> None:
     # Out of retries: this claim is the one more look a held job's release
     # bought it, or the last of its backoff, so a refusal holds it again
     # rather than starting another round.
-    spent = bool(payload.get("exhausted")) or attempts >= MAX_ATTEMPTS
+    spent = bool(payload.get("exhausted")) or attempts - int(payload.get("waited") or 0) >= MAX_ATTEMPTS
 
     for _ in range(_MAX_ROUNDS):
         if not await _fence():
@@ -255,10 +258,13 @@ async def execute_market_target(job: dict) -> None:
             logger.info(f"{_LOG} {subject} was delivered or settled meanwhile")
             return
 
-        if await park_while_thread_busy(
+        # The user's machine asleep: its notice waits, unread, for the
+        # machine to connect, rather than a wake that fails at its connect.
+        if await park_unless_ready(
             job_id,
             attempts,
             thread_id,
+            workspace_id=str(thread["workspace_id"]),
             log_prefix=_LOG,
             subject=subject,
             parks_at_ceiling=True,
@@ -276,6 +282,8 @@ async def execute_market_target(job: dict) -> None:
             still_due=_still_due,
             busy_fails_fast=True,
             refusal_fails_fast=True,
+            room_fails_fast=True,
+            suspension_waits=True,
         )
         if outcome == "dispatched":
             if run_id is None:
@@ -292,6 +300,12 @@ async def execute_market_target(job: dict) -> None:
             await asyncio.sleep(_BUSY_RETRY_DELAY)
             continue
         if outcome == "lost":
+            return
+        if outcome in ("full", "suspended"):
+            # A suspended account's notice waits by the clock too, still
+            # owed, so a reinstated account wakes as it would have.
+            wait_s = TURN_ROOM_WAIT_S if outcome == "full" else SUSPENDED_WAIT_S
+            await outbox_db.wait_for_room(job_id, attempts=attempts, wait_s=wait_s)
             return
         if outcome == "cap" and not spent:
             logger.warning(

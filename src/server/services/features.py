@@ -6,11 +6,15 @@ sandbox view, so the LLM can never edit a flag. Reads ride the existing
 Redis-cached preferences fetch; writes merge-upsert the sub-dict and
 invalidate that cache. Plan-gated features resolve against the platform
 access tier (Redis-cached, fetched only when a plan-gated feature exists).
+The organization tier comes from ``services.account``, which reads nothing
+unless the deployment enables ``teams``; while it cannot say which
+organization a user is in, every feature resolves off for that user.
 """
 
 import asyncio
 import logging
 from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
 from typing import Any, Literal
 
 from pydantic import BaseModel
@@ -19,15 +23,24 @@ from src.config import settings
 from src.config.features import (
     FEATURES,
     USER_CONTROLLABLE_GATES,
+    FeatureCategory,
+    FeatureGate,
+    FeatureGuide,
     effective_flags,
     has_plan_gated_features,
+    org_value,
     system_flag,
 )
+from src.server.services import account as accounts
+from src.server.services import membership
+from src.server.services.account_contract import Account, Org
+from src.server.services.policy import Policy
 from src.server.database.user import (
     get_user_preferences,
     invalidate_user_prefs_cache,
     upsert_user_preferences,
 )
+from src.server.database.shared_workspaces import is_holder
 
 logger = logging.getLogger(__name__)
 
@@ -42,11 +55,21 @@ class FeatureState(BaseModel):
     key: str
     label: str
     description: str
-    tradeoffs: str | None = None
+    #: How Experiments lists it, and what it shows a user deciding (``FeatureSpec``).
+    category: FeatureCategory | None = None
+    preview: bool = False
+    guide: FeatureGuide | None = None
     enabled: bool
-    gate: Literal["none", "opt_in", "opt_out", "plan"]
+    gate: Literal["none", "opt_in", "opt_out", "plan", "grant"]
     min_tier: int | None = None
     user_override: bool | None = None
+    #: Where the user turns it on, when not in Experiments (``FeatureSpec.home``).
+    home: Literal["model_access"] | None = None
+    #: The user's organization decided this one, so the user cannot change it.
+    set_by_organization: bool = False
+    #: Features this one depends on (``FeatureSpec.requires``): it is off
+    #: wherever any of them is.
+    requires: list[str] = []
 
 
 class UnknownFeatureError(KeyError):
@@ -55,6 +78,15 @@ class UnknownFeatureError(KeyError):
 
 class FeatureNotOverridableError(PermissionError):
     """The feature's gate does not accept per-user overrides."""
+
+
+class FeatureSetByOrganizationError(FeatureNotOverridableError):
+    """The user's organization has turned the feature off."""
+
+
+class FeatureOffFailed(RuntimeError):
+    """What has to end before the feature is off for the user did not, so
+    the override was not saved."""
 
 
 async def _get_overrides(user_id: str) -> dict[str, Any]:
@@ -72,28 +104,123 @@ async def _access_tier(user_id: str) -> int | None:
     """
     if not has_plan_gated_features() or settings.HOST_MODE != "platform":
         return None
-    from src.server.dependencies.usage_limits import get_platform_access_tier
+    if is_holder(user_id):
+        # No plan: a plan-gated feature reads off for a holder.
+        return None
+    tier = await membership.access_tier(user_id)
+    # -1 is no access, which a plan gate reads as no plan at all.
+    return tier if tier is not None and tier >= 0 else None
 
-    return await get_platform_access_tier(user_id)
+
+async def _platform_context(user_id: str) -> tuple[Account | None, int | None]:
+    """The user's account and access tier.
+
+    Asked in turn, not together: on a cold cache the account read fills the
+    membership entry the tier read then finds, so the two never send the auth
+    service two requests for one user.
+    """
+    account = await accounts.account_for(user_id)
+    return account, await _access_tier(user_id)
+
+
+def _resolve(
+    overrides: dict[str, Any], account: Account | None, access_tier: int | None
+) -> dict[str, bool]:
+    """Every feature for one user; all off while the account is unknown, since
+    any of them might be one the organization turned off."""
+    # ``account_for`` is the door, so it alone decides ``teams``, whatever a
+    # deployment sets as its gate. Forced inside the resolution rather than
+    # after it, so a feature that requires ``teams`` follows the door too.
+    return effective_flags(
+        overrides,
+        access_tier=access_tier,
+        org_features=account.features if account is not None else None,
+        account_unknown=account is None,
+        forced={"teams": account is not None and account.org is not None},
+    )
 
 
 async def effective_flags_for_user(
     user_id: str, overrides: dict[str, Any] | None = None
 ) -> dict[str, bool]:
     """Resolved feature map for one user; ``overrides`` skips the prefs read
-    when the caller already holds the user's ``feature_overrides``."""
+    when the caller already holds the user's ``feature_overrides``. Every
+    feature reads off while the user's account is unknown."""
     if overrides is None:
-        overrides, access_tier = await asyncio.gather(
-            _get_overrides(user_id), _access_tier(user_id)
+        overrides, (account, access_tier) = await asyncio.gather(
+            _get_overrides(user_id), _platform_context(user_id)
         )
     else:
-        access_tier = await _access_tier(user_id)
-    return effective_flags(overrides, access_tier=access_tier)
+        account, access_tier = await _platform_context(user_id)
+    return _resolve(overrides, account, access_tier)
+
+
+def granted_override_keys() -> list[str]:
+    """The features on the ``grant`` gate, whose override only the server
+    writes: Reset preferences keeps them, since the user never set them."""
+    return [key for key in FEATURES if system_flag(key).gate is FeatureGate.GRANT]
 
 
 async def user_feature_enabled(user_id: str, key: str) -> bool:
     """Effective flag for one user; unknown keys resolve False."""
     return (await effective_flags_for_user(user_id)).get(key, False)
+
+
+async def user_feature_enabled_or(user_id: str, key: str, *, on_error: bool) -> bool:
+    """:func:`user_feature_enabled` for a caller that has to act either way:
+    a failed read answers ``on_error``, which the caller picks by which
+    mistake costs less, running what the user turned off or skipping what
+    they left on."""
+    try:
+        return await user_feature_enabled(user_id, key)
+    except Exception:
+        logger.warning(
+            "[Features] %s read failed; taking it as %s", key, on_error, exc_info=True
+        )
+        return on_error
+
+
+async def feature_enabled_for_account(
+    user_id: str, key: str, account: Account | None
+) -> bool:
+    """:func:`user_feature_enabled` for an account the caller has already
+    read through ``account_for``, so the membership is not read twice."""
+    overrides = await _get_overrides(user_id)
+    return _resolve(overrides, account, await _access_tier(user_id)).get(key, False)
+
+
+@dataclass(frozen=True)
+class Member:
+    """An active member of an organization, as :func:`org_member` reads one."""
+
+    account: Account
+    org: Org
+    policy: Policy
+
+
+async def org_member(
+    user_id: str, feature: str | None = None, *, recheck: bool = False
+) -> Member | None:
+    """The user as an active member of an organization that allows ``teams``,
+    with ``feature`` on for them when one is named. None for an account in no
+    organization, a suspended one, the feature off, and with the door shut,
+    which reads nothing. Raises the 503 while the account cannot be read.
+    ``recheck`` asks the auth service past the cached entry, for a grant
+    about to be acted on (``read_standing``), and counts only its answer: the
+    last one on record standing in for it raises the 503 too."""
+    if not membership.teams_door_open():
+        return None
+    standing = await accounts.read_standing(user_id, recheck=recheck, answered_only=recheck)
+    account = standing.account
+    if account is None:
+        raise accounts.AccountUnknown()
+    if account.org is None or account.suspended:
+        return None
+    if feature is not None and not await feature_enabled_for_account(
+        user_id, feature, account
+    ):
+        return None
+    return Member(account, account.org, standing.policy)
 
 
 async def list_user_features(user_id: str) -> list[FeatureState]:
@@ -103,10 +230,11 @@ async def list_user_features(user_id: str) -> list[FeatureState]:
     catalog contract is that the kill switch hides every surface, and a listed
     entry would render a Settings toggle that can never turn on.
     """
-    overrides, access_tier = await asyncio.gather(
-        _get_overrides(user_id), _access_tier(user_id)
+    overrides, (account, access_tier) = await asyncio.gather(
+        _get_overrides(user_id), _platform_context(user_id)
     )
-    resolved = effective_flags(overrides, access_tier=access_tier)
+    resolved = _resolve(overrides, account, access_tier)
+    org_features = account.features if account is not None else None
     features = []
     for key, spec in FEATURES.items():
         flag = system_flag(key)
@@ -114,19 +242,27 @@ async def list_user_features(user_id: str) -> list[FeatureState]:
             continue
         override = overrides.get(key)
         user_controllable = flag.gate in USER_CONTROLLABLE_GATES
+        org = org_value(org_features, key)
         features.append(
             FeatureState(
                 key=key,
                 label=spec.label,
                 description=spec.description,
-                tradeoffs=spec.tradeoffs,
+                category=spec.category,
+                preview=spec.preview,
+                guide=spec.guide,
                 enabled=resolved[key],
                 gate=flag.gate.value,
                 min_tier=flag.min_tier,
+                home=spec.home,
+                requires=list(spec.requires),
                 user_override=(
                     override
                     if user_controllable and isinstance(override, bool)
                     else None
+                ),
+                set_by_organization=(
+                    org is False or (org is True and flag.gate is FeatureGate.GRANT)
                 ),
             )
         )
@@ -221,7 +357,8 @@ async def set_feature_override(
 ) -> list[FeatureState]:
     """Set (or clear, with ``None``) a user's override and return the new state.
 
-    Only ``opt_in``/``opt_out`` gates accept overrides. The whole
+    Only ``opt_in``/``opt_out`` gates accept overrides, and not one the
+    user's organization has turned off. The whole
     ``feature_overrides`` sub-dict is rewritten because the JSONB merge in
     ``upsert_user_preferences`` is shallow; an emptied dict deletes the key
     outright (``None`` value = per-key delete in the DB layer).
@@ -230,6 +367,11 @@ async def set_feature_override(
         raise UnknownFeatureError(key)
     if system_flag(key).gate not in USER_CONTROLLABLE_GATES:
         raise FeatureNotOverridableError(key)
+    # An unknown account does not refuse: the setting is the user's to keep,
+    # and the organization's off still wins wherever the flag is resolved.
+    account = await accounts.account_for(user_id)
+    if account is not None and org_value(account.features, key) is False:
+        raise FeatureSetByOrganizationError(key)
 
     # Read-modify-write of the whole feature_overrides bag: concurrent PUTs on
     # different keys can drop each other. Accepted — this is a single user's
@@ -239,6 +381,20 @@ async def set_feature_override(
         overrides.pop(key, None)
     else:
         overrides[key] = enabled
+
+    before = _FEATURE_BEFORE_OFF_HOOKS.get(key, ())
+    if before and not (await effective_flags_for_user(user_id, overrides)).get(key, False):
+        try:
+            for hook in before:
+                await hook(user_id)
+        except Exception as exc:
+            logger.warning(
+                "[Features] off hook for %s failed before save user_id=%s",
+                key,
+                user_id,
+                exc_info=True,
+            )
+            raise FeatureOffFailed(key) from exc
 
     await upsert_user_preferences(
         user_id, other_preference={"feature_overrides": overrides or None}
@@ -255,12 +411,20 @@ async def set_feature_override(
 # setting registers here at startup, as an outbox executor registers its
 # hook type.
 _FEATURE_OFF_HOOKS: dict[str, list[Callable[[str], Awaitable[None]]]] = {}
+# Those whose work nothing later could tell apart from work the setting
+# allows, so the override is saved only once they finish.
+_FEATURE_BEFORE_OFF_HOOKS: dict[str, list[Callable[[str], Awaitable[None]]]] = {}
 
 
-def register_feature_off_hook(key: str, hook: Callable[[str], Awaitable[None]]) -> None:
-    """Run ``hook(user_id)`` each time a user's override leaves ``key`` off.
-    Idempotent for the same function."""
-    hooks = _FEATURE_OFF_HOOKS.setdefault(key, [])
+def register_feature_off_hook(
+    key: str, hook: Callable[[str], Awaitable[None]], *, before_save: bool = False
+) -> None:
+    """Run ``hook(user_id)`` each time a user's override leaves ``key`` off:
+    once it is saved, best effort, or with ``before_save`` before it is,
+    where a failure saves no override (``FeatureOffFailed``). Idempotent for
+    the same function."""
+    registry = _FEATURE_BEFORE_OFF_HOOKS if before_save else _FEATURE_OFF_HOOKS
+    hooks = registry.setdefault(key, [])
     if hook not in hooks:
         hooks.append(hook)
 

@@ -2,12 +2,13 @@
  * Tests for useChatMessages workspace_status SSE event handling.
  *
  * The hook translates SSE `workspace_status` events into the
- * `workspaceStarting` state consumed by ChatView. We need to verify:
+ * `turnStatus.workspaceStarting` state consumed by ChatView. We need to verify:
  * - `starting` with `sandbox_state: "archived"` -> 'archived' (slow restore copy)
  * - `starting` without `sandbox_state`          -> 'starting' (generic copy)
  * - `starting` with an unknown `sandbox_state`  -> 'starting' (graceful fallback)
  * - `ready`                                     -> false (spinner clears)
- * - `turn_held` held/released drive `turnHeld` the same way; a reconnect also clears it
+ * - `turn_held` held/released drive `turnHeld` the same way; a drop before released clears it too
+ * - a `claude_code_queue` wait's line goes with the stream's end and with a stop
  *
  * Note: the hook's `cleanupAfterStreamEnd` resets `workspaceStarting` to
  * false when the stream completes, so we keep the stream open with a
@@ -112,7 +113,7 @@ describe('useChatMessages – workspace_status SSE handling', () => {
     });
 
     await waitFor(() => {
-      expect(result.current.workspaceStarting).toBe('archived');
+      expect(result.current.turnStatus.workspaceStarting).toBe('archived');
     });
 
     resolve();
@@ -130,7 +131,7 @@ describe('useChatMessages – workspace_status SSE handling', () => {
     });
 
     await waitFor(() => {
-      expect(result.current.workspaceStarting).toBe('starting');
+      expect(result.current.turnStatus.workspaceStarting).toBe('starting');
     });
 
     resolve();
@@ -150,7 +151,7 @@ describe('useChatMessages – workspace_status SSE handling', () => {
     });
 
     await waitFor(() => {
-      expect(result.current.workspaceStarting).toBe('starting');
+      expect(result.current.turnStatus.workspaceStarting).toBe('starting');
     });
 
     resolve();
@@ -170,7 +171,7 @@ describe('useChatMessages – workspace_status SSE handling', () => {
     });
 
     await waitFor(() => {
-      expect(result.current.workspaceStarting).toBe(false);
+      expect(result.current.turnStatus.workspaceStarting).toBe(false);
     });
 
     resolve();
@@ -195,7 +196,7 @@ describe('useChatMessages – workspace_status SSE handling', () => {
       await result.current.handleSendMessage('hello');
     });
 
-    expect(result.current.workspaceStarting).toBe(false);
+    expect(result.current.turnStatus.workspaceStarting).toBe(false);
   });
 
   it('stream cleanup clears workspaceStarting regardless of last seen state', async () => {
@@ -224,7 +225,7 @@ describe('useChatMessages – workspace_status SSE handling', () => {
 
     // After cleanupAfterStreamEnd runs, spinner should be cleared.
     await waitFor(() => {
-      expect(result.current.workspaceStarting).toBe(false);
+      expect(result.current.turnStatus.workspaceStarting).toBe(false);
     });
   });
 
@@ -240,7 +241,7 @@ describe('useChatMessages – workspace_status SSE handling', () => {
     });
 
     await waitFor(() => {
-      expect(result.current.turnHeld).toBe('handoff');
+      expect(result.current.turnStatus.turnHeld).toBe('handoff');
     });
 
     resolve();
@@ -270,21 +271,20 @@ describe('useChatMessages – workspace_status SSE handling', () => {
     });
 
     await waitFor(() => {
-      expect(result.current.turnHeld).toBe('compact');
+      expect(result.current.turnStatus.turnHeld).toBe('compact');
     });
 
     act(() => {
       emit({ event: 'turn_held', status: 'released' });
     });
 
-    expect(result.current.turnHeld).toBeNull();
+    expect(result.current.turnStatus.turnHeld).toBeNull();
   });
 
-  it('a reconnect clears turnHeld when the stream dropped before released', async () => {
-    mockStatus.mockResolvedValue(threadStatus({ can_reconnect: true, status: 'running' }));
-    // The resumed run stream stays open, so only the attach can clear the line.
-    mockReconnect.mockImplementation(() => new Promise(() => {}));
-    mockSendStream.mockImplementation(
+  it('a drop before released clears turnHeld and sends the message again', async () => {
+    // A held frame always precedes the run's first frame, so this drop has no
+    // run to resume: the send goes again, and the held line must not wait on it.
+    mockSendStream.mockImplementationOnce(
       async (
         _msg: string,
         _ws: string,
@@ -296,6 +296,8 @@ describe('useChatMessages – workspace_status SSE handling', () => {
         return { disconnected: true };
       },
     );
+    // The second attempt stays open, so only the drop can have cleared the line.
+    mockSendStream.mockImplementation(() => new Promise(() => {}));
 
     const { result } = renderHookWithProviders(() => useChatMessages('ws-test'));
 
@@ -303,8 +305,14 @@ describe('useChatMessages – workspace_status SSE handling', () => {
       void result.current.handleSendMessage('hello');
     });
 
-    await waitFor(() => expect(mockReconnect).toHaveBeenCalled());
-    expect(result.current.turnHeld).toBeNull();
+    await waitFor(() => expect(mockSendStream).toHaveBeenCalledTimes(1));
+    await act(async () => { await new Promise((r) => setTimeout(r, 0)); });
+    expect(result.current.turnStatus.turnHeld).toBeNull();
+    expect(mockSendStream).toHaveBeenCalledTimes(1);
+
+    await waitFor(() => expect(mockSendStream).toHaveBeenCalledTimes(2), { timeout: 3000 });
+    expect(mockReconnect).not.toHaveBeenCalled();
+    expect(result.current.turnStatus.turnHeld).toBeNull();
   });
 
   it('a thread switch clears the held line of the thread it leaves', async () => {
@@ -326,7 +334,7 @@ describe('useChatMessages – workspace_status SSE handling', () => {
     act(() => {
       void result.current.handleSendMessage('hello');
     });
-    await waitFor(() => expect(result.current.turnHeld).toBe('handoff'));
+    await waitFor(() => expect(result.current.turnStatus.turnHeld).toBe('handoff'));
 
     await act(async () => {
       tid = 'thread-B';
@@ -334,7 +342,7 @@ describe('useChatMessages – workspace_status SSE handling', () => {
       await Promise.resolve();
     });
 
-    expect(result.current.turnHeld).toBeNull();
+    expect(result.current.turnStatus.turnHeld).toBeNull();
   });
 
   it('stream cleanup clears turnHeld when released never comes', async () => {
@@ -358,7 +366,55 @@ describe('useChatMessages – workspace_status SSE handling', () => {
     });
 
     await waitFor(() => {
-      expect(result.current.turnHeld).toBeNull();
+      expect(result.current.turnStatus.turnHeld).toBeNull();
     });
+  });
+});
+
+describe('useChatMessages – a Claude Code CLI wait', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  const waiting = {
+    event: 'claude_code_queue', agent: 'main', signal: 'waiting', wait_id: 'w1',
+    computer_id: 'c1', name: 'Mac', running: 2, cap: 2, settable: true, max: 8,
+  };
+
+  it('shows the wait, and stream cleanup clears it when no admitted frame comes', async () => {
+    const { resolve } = mockHangingStream([waiting]);
+    const { result } = renderHookWithProviders(() => useChatMessages('ws-test'));
+
+    let sent: Promise<unknown> = Promise.resolve();
+    act(() => {
+      sent = result.current.handleSendMessage('hello');
+    });
+    await waitFor(() => {
+      expect(result.current.turnStatus.cliQueue).toEqual(expect.objectContaining({ waitId: 'w1', computerId: 'c1' }));
+    });
+
+    await act(async () => {
+      resolve();
+      await sent;
+    });
+    await waitFor(() => {
+      expect(result.current.turnStatus.cliQueue).toBeNull();
+    });
+  });
+
+  it('a stop clears the wait', async () => {
+    mockHangingStream([waiting]);
+    const { result } = renderHookWithProviders(() => useChatMessages('ws-test'));
+
+    act(() => {
+      void result.current.handleSendMessage('hello');
+    });
+    await waitFor(() => expect(result.current.turnStatus.cliQueue).not.toBeNull());
+
+    await act(async () => {
+      await result.current.stopWorkflow();
+    });
+
+    expect(result.current.turnStatus.cliQueue).toBeNull();
   });
 });

@@ -8,6 +8,8 @@ import psycopg
 import pytest
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 
+from ptc_agent.agent.middleware.image_capture import CAPTURED_IMAGES_KEY
+
 from src.server.services.history.reader import TaskHistory
 from src.server.services.history.replay import (
     CheckpointReplayUnavailable,
@@ -808,6 +810,72 @@ async def test_image_map_applied_from_the_rows_replay_facts(monkeypatch):
     assert chunks == ["![old](https://cdn/old.png)", "![new](https://cdn/new.png)"]
 
 
+async def test_image_map_applied_from_what_each_message_recorded(monkeypatch):
+    """The text keeps the path; each message records where its images were
+    captured at model time, so a turn recovery settled, with no map on its
+    row, still shows its own copy of a chart a later turn rewrote."""
+    def captured(url):
+        return {CAPTURED_IMAGES_KEY: {"work/chart.png": url}}
+
+    history = ThreadHistory(
+        thread_id=THREAD,
+        turns=[
+            _turn(0, [AIMessage(
+                content="![v1](work/chart.png)", id="ai-1",
+                response_metadata=captured("https://cdn/v1.png"),
+            )]),
+            _turn(1, [AIMessage(
+                content="![v2](work/chart.png)", id="ai-2",
+                response_metadata=captured("https://cdn/v2.png"),
+            )]),
+        ],
+    )
+    _mock_reader(monkeypatch, history)
+
+    items = await build_checkpoint_replay_items(
+        thread_rows([_query(0), _query(1, content="next")], {0: _response(0), 1: _response(1)}),
+    )
+
+    chunks = [i["data"]["content"] for i in items if i["event"] == "message_chunk"]
+    assert chunks == ["![v1](https://cdn/v1.png)", "![v2](https://cdn/v2.png)"]
+
+
+async def test_each_message_of_a_turn_shows_its_own_capture(monkeypatch):
+    """Regression: the agent showed a chart, rewrote it and showed it again in
+    one turn, and the turn's map (last capture wins) gave both messages the
+    second copy. A link to the file goes to its capture too, so a reply that
+    lists the file beside its picture still shows the picture once."""
+    def captured(url):
+        return {CAPTURED_IMAGES_KEY: {"work/chart.png": url}}
+
+    history = ThreadHistory(
+        thread_id=THREAD,
+        turns=[_turn(0, [
+            AIMessage(
+                content="![v1](work/chart.png)", id="ai-1",
+                response_metadata=captured("https://cdn/v1.png"),
+            ),
+            AIMessage(
+                content="- [chart.png](work/chart.png)\n\n![v2](work/chart.png)", id="ai-2",
+                response_metadata=captured("https://cdn/v2.png"),
+            ),
+        ])],
+    )
+    _mock_reader(monkeypatch, history)
+    row = {
+        **_response(0),
+        "replay_facts": {"images": {"work/chart.png": "https://cdn/v2.png"}},
+    }
+
+    items = await build_checkpoint_replay_items(thread_rows([_query(0)], {0: row}))
+
+    chunks = [i["data"]["content"] for i in items if i["event"] == "message_chunk"]
+    assert chunks == [
+        "![v1](https://cdn/v1.png)",
+        "- [chart.png](https://cdn/v2.png)\n\n![v2](https://cdn/v2.png)",
+    ]
+
+
 async def test_subagent_transcript_projected_once_with_image_map(monkeypatch):
     task_artifact = {"task_id": "tsk1", "action": "init", "description": "d", "prompt": "p"}
     turn_msgs = [
@@ -1604,6 +1672,49 @@ async def test_model_fallback_projected_from_ui_records(monkeypatch):
     assert data["turn_index"] == 0
 
 
+async def test_a_turn_that_opened_on_a_brief_replays_its_mark_ahead_of_the_reply(monkeypatch):
+    from ptc_agent.agent.middleware.compaction.brief import BRIEF_PREFIX, handoff_mark
+
+    brief = {"text": BRIEF_PREFIX + "BRIEF BODY", "through": "other-1", "source": "model", "from_model": "deepseek-flash"}
+    turn = _turn(
+        0,
+        [AIMessage(content="picking up", id="ai-1")],
+        new_ui_records=[handoff_mark(brief, to="claude-sonnet-5-5-code")],
+    )
+    _mock_reader(monkeypatch, ThreadHistory(thread_id=THREAD, turns=[turn]))
+    items = await build_checkpoint_replay_items(thread_rows([_query(0)], {0: _response(0)}))
+    assert [i["event"] for i in items] == ["user_message", "context_window", "message_chunk"]
+    data = items[1]["data"]
+    assert (data["action"], data["from_model"], data["to_model"]) == ("brief", "deepseek-flash", "claude-sonnet-5-5-code")
+    assert data["summary_text"] == "BRIEF BODY" and data["turn_index"] == 0
+
+
+async def test_a_turn_that_waited_for_a_claude_code_cli_replays_each_wait_where_it_happened(monkeypatch):
+    """One at the turn's start follows its hand-off, which came first; one a
+    CLI started mid-turn sits after the message that CLI went on from, as
+    each showed live."""
+    from ptc_agent.agent.middleware.compaction.brief import handoff_mark
+    from src.llms.claude_code import CliWait
+
+    fields = {"computer_id": "c", "name": "Mac", "running": 4, "cap": 4, "settable": True, "max": 8}
+    opening, later = CliWait(**fields, wait_id="w1"), CliWait(**fields, wait_id="w2")
+    brief = {"text": "B", "through": "other-1", "source": "model", "from_model": "deepseek-flash"}
+    turn = _turn(
+        0,
+        [AIMessage(content="first", id="ai-1"), AIMessage(content="done", id="ai-2")],
+        new_ui_records=[handoff_mark(brief, to="claude-opus-5-5-code"), opening.mark(329, "human-0"),
+                        later.mark(12, "ai-1")],
+    )
+    _mock_reader(monkeypatch, ThreadHistory(thread_id=THREAD, turns=[turn]))
+    items = await build_checkpoint_replay_items(thread_rows([_query(0)], {0: _response(0)}))
+    assert [(i["event"], i["data"].get("wait_id")) for i in items] == [
+        ("user_message", None), ("context_window", None), ("claude_code_queue", "w1"),
+        ("message_chunk", None), ("claude_code_queue", "w2"), ("message_chunk", None),
+    ]
+    assert items[2]["data"] == {"thread_id": THREAD, "agent": "main", "signal": "admitted", **fields, "wait_id": "w1",
+                                "waited_s": 329, "turn_index": 0, "response_id": "resp-0"}
+
+
 def _fallback_record(record_id, after=None):
     return {
         "type": "ui",
@@ -1642,6 +1753,21 @@ async def test_model_fallback_a_failed_step_never_saved_replays_from_its_row(
         "error",
     ]
     assert items[2]["data"]["to_model"] == "f"
+
+
+async def test_a_cli_wait_a_failed_step_never_saved_replays_from_its_row_and_a_saved_one_once(monkeypatch):
+    from src.llms.claude_code import CliWait, queue_record
+
+    fields = {"computer_id": "c", "name": "Mac", "running": 4, "cap": 4, "settable": True, "max": 8}
+    unsaved, saved = CliWait(**fields, wait_id="w1"), CliWait(**fields, wait_id="w2")
+    turn = _turn(0, [AIMessage(content="ok", id="ai-1")], new_ui_records=[saved.mark(30, None)])
+    _mock_reader(monkeypatch, ThreadHistory(thread_id=THREAD, turns=[turn]))
+    rows = [queue_record(w.event("admitted", 30)) for w in (unsaved, saved)]
+    items = await build_checkpoint_replay_items(thread_rows([_query(0)], {0: _failed_response(*rows)}))
+    assert [(i["event"], i["data"].get("wait_id")) for i in items] == [
+        ("user_message", None), ("claude_code_queue", "w2"), ("message_chunk", None),
+        ("claude_code_queue", "w1"), ("error", None),
+    ]
 
 
 async def test_model_fallback_saved_and_on_the_row_replays_once(monkeypatch):

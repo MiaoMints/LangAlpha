@@ -38,7 +38,10 @@ from hashlib import sha256
 from pathlib import Path
 from typing import Any
 
+from ptc_agent.config.plugins import skills_needing_own_data
 from src.server.database.account_disables import list_account_disables
+from src.server.database.home_workspace import acting_for
+from src.server.database.shared_workspaces import is_holder
 from src.server.database.user_skills import (
     archive_key_unused_guard,
     get_user_skill_archive_blob,
@@ -363,7 +366,7 @@ async def load_user_skill_bundle(
         # scope is a second query, so it rides alongside the disables read
         # rather than after it.
         ws_disabled, all_ws_rows = await asyncio.gather(
-            list_workspace_skill_disables(workspace_id),
+            list_workspace_skill_disables(acting_for(user_id, workspace_id)),
             list_user_skills(user_id, workspace_id=workspace_id),
         )
         workspace_disabled = frozenset(ws_disabled)
@@ -414,6 +417,20 @@ async def load_user_skill_bundle(
     )
 
 
+def shared_computer_withheld(owner_id: str | None) -> frozenset[str]:
+    """Skills a shared workspace's computer does not carry, since no turn
+    there may use the data they work on (``skills_needing_own_data``) or the
+    built-in servers they teach (``holder_withheld_skills``); a person's
+    computer carries every one. The one place the rule is decided: a turn
+    reads it off its config (``withheld_skills``), the computer's sync from
+    its owner here."""
+    if not is_holder(owner_id):
+        return frozenset()
+    from src.server.services.shared_workspaces.holder import holder_withheld_skills
+
+    return skills_needing_own_data() | holder_withheld_skills()
+
+
 def skills_delivery_signature(
     user_skill_dir: str | None, disabled_skills: frozenset[str] | set[str]
 ) -> str:
@@ -444,8 +461,9 @@ async def sandbox_skill_sync_params(
     # Account-level disables only. A workspace's own disables are applied to
     # its link view by the reconciler; pruning them from the shared directory
     # would take the skill from every sibling workspace on the computer.
-    if bundle.account_disabled_builtins:
-        params["disabled_skills"] = bundle.account_disabled_builtins
+    disabled = bundle.account_disabled_builtins | shared_computer_withheld(user_id)
+    if disabled:
+        params["disabled_skills"] = disabled
     if bundle.dir:
         params["user_skill_dir"] = bundle.dir
     return params

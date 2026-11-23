@@ -1,7 +1,7 @@
 .stock-header {
   padding: 12px 20px;
   background-color: var(--color-bg-card);
-  border-bottom: 1px solid var(--color-border-default);
+  --rule-ink: var(--color-shell-divider, var(--color-border-default));
   flex-shrink: 0;
 }
 
@@ -139,7 +139,7 @@
 /* Data source indicator (Live / Delayed) — inline next to ticker */
 .stock-data-source {
   display: inline-flex;
-  align-items: center;
+  align-items: baseline;
   flex: 0 0 auto;
   gap: 5px;
   font-size: 0.6875rem;
@@ -180,11 +180,19 @@
   }
 }
 
+/* Sits on the baseline, then rises so its centre meets the middle of the
+   capitals, which is also the middle of a CJK label's glyphs. */
 .data-source-dot {
   width: 6px;
   height: 6px;
   border-radius: 50%;
   flex-shrink: 0;
+  transform: translateY(calc(3px - 0.5cap));
+}
+
+/* Browsers without the cap unit take the figure for this face, 0.36em. */
+@supports not (height: 1cap) {
+  .data-source-dot { transform: translateY(calc(3px - 0.36em)); }
 }
 
 .data-source-dot--live {
@@ -235,7 +243,7 @@
   grid-template-columns: repeat(5, 1fr);
   gap: 10px;
   padding-top: 10px;
-  border-top: 1px solid var(--color-border-default);
+  --rule-ink: var(--color-shell-divider, var(--color-border-default));
 }
 
 .metric-item {
@@ -249,11 +257,32 @@
   color: var(--color-text-secondary);
   text-transform: uppercase;
 }
+/* Terminal's in its label ink, tracked wider. */
+:root:not([data-card-style]) .metric-label {
+  font-weight: inherit;
+  letter-spacing: 0.06em;
+  color: var(--color-term-text-tertiary);
+}
 
 .metric-value {
   font-size: 0.875rem;
   color: var(--color-text-primary);
   font-weight: 500;
+}
+
+/* The open card styles set the stats as the data cards do: labels in the
+   words' face, figures in mono. The labels keep their capitals: the copy
+   under them is cased unevenly ("Prev Close", "52 wk high"), which sentence
+   case would show. */
+:where(:root:not([data-card-style='balanced'])) :is(.stock-price, .stock-change, .metric-value) {
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+}
+:where(:root:not([data-card-style='balanced'])) .metric-label {
+  font-family: var(--term-words);
+  font-size: var(--cs-text-label, 0.71875rem);
+  font-weight: 500;
+  letter-spacing: 0.04em;
 }
 
 .metrics-discrepancy-hint {
@@ -331,14 +360,8 @@
   .stock-names { flex: 1 1 0; }
   .stock-data-source--inline { flex: 0 0 100%; }
   .stock-metrics { grid-template-columns: repeat(4, 1fr); gap: 6px; }
-  .metric-label { font-size: 0.625rem; }
+  .metric-label { font-size: 0.6875rem; }
   .metric-value { font-size: 0.75rem; }
-  .metric-item--watchlist {
-    grid-column: 3 / -1;
-    display: flex;
-    align-items: flex-end;
-    justify-content: flex-end;
-  }
 
   .stock-metrics-toggle-row {
     display: flex;

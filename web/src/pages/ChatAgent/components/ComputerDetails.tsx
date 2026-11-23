@@ -13,22 +13,31 @@ import { Button } from '@/components/ui/button';
 import { toast } from '@/components/ui/use-toast';
 import { SwapCell } from '@/components/ui/crossfade';
 import { Loader } from '@/components/ui/loader';
-import { ToggleSwitch } from '@/components/ui/switch';
 import { useLocale } from '@/hooks/useLocale';
 import { formatBytes } from '@/lib/format';
 import { useIsPresent } from '@/lib/framer';
 import { DURATION } from '@/lib/motion';
 import type { Computer } from '@/types/api';
 
+import { useBrowserHere } from '../hooks/useBrowserHere';
 import { useComputerProviders, useComputerStorage } from '../hooks/useComputers';
 import type { ThisMac } from '../hooks/useRemoteControl';
-import { isComputerPreparing, isComputerStatusTransitional, takesWorkspaces } from '../utils/computerStatus';
+import { BrowserQualitySetting } from './BrowserQualitySetting';
+import { BrowserSigninsSetting } from './BrowserSigninsSetting';
+import { BrowserWindowSetting } from './BrowserWindowSetting';
+import {
+  homeEligibility,
+  isComputerPreparing,
+  isComputerStatusTransitional,
+} from '../utils/computerStatus';
 import { DiskBar, DiskUsageText } from './computerDiskUi';
 import { activeSpecChange, effectiveTier } from './specChangeUi';
 import { COMPUTER_NAME_MAX, computerNameTakenMessage } from '../utils/computerName';
 import { MakePrimaryButton } from './MakePrimaryDialog';
-import { providerCanBePrimary, providerManagesSpec } from './providerUi';
+import { providerIsOwnMachine, providerManagesSpec } from './providerUi';
+import { localMachine } from './machineArt/machine';
 import { ComputerFacts } from './computerFacts';
+import { ComputerClaudeCode } from './ComputerClaudeCode';
 import {
   ComputerNotes,
   ComputerSpecRows,
@@ -37,6 +46,7 @@ import {
   PowerButton,
   SpecRow,
   StartFailureAction,
+  ToggleRow,
   type MachineActions,
 } from './computerParts';
 import { railOrdinal } from './computerRailState';
@@ -52,12 +62,15 @@ interface ComputerDetailsProps {
   /** The rail's height on screen when it was left, for the details to take; none opened straight onto them. */
   height?: number | null;
   onBack: () => void;
+  /** The page back returns to, when that is not the rail (Settings, which
+   *  lists the machines itself). No rail behind, the place in it is not shown. */
+  backLabel?: string;
   thisMac: ThisMac | null;
   showProvider: boolean;
   actions: MachineActions;
 }
 
-function ComputerDetails({ computer, index, total, height, onBack, thisMac, showProvider, actions }: ComputerDetailsProps) {
+function ComputerDetails({ computer, index, total, height, onBack, backLabel, thisMac, showProvider, actions }: ComputerDetailsProps) {
   const { t } = useTranslation();
   const prepareHintId = useId();
   const removeHintId = useId();
@@ -66,13 +79,22 @@ function ComputerDetails({ computer, index, total, height, onBack, thisMac, show
   const disk = computer.disk ?? null;
   const specChange = activeSpecChange(computer);
   const managesSpec = providerManagesSpec(computer.kind);
-  // The primary is kept, so it offers no Remove at all. Every other computer
-  // offers it, held while the server would refuse, with the reason under it.
-  // Workspaces on it do not hold it: the confirmation offers to delete them.
-  const removeHeld = computer.is_primary ? null : removeBlock(computer, actions.powerBusy);
+  const browserHere = useBrowserHere(computer);
+  // A hosted primary is kept, so it offers no Remove at all. Every other
+  // computer offers it, held while the server would refuse, with the reason
+  // under it; on a primary the user brings the confirmation asks where Home
+  // goes. Workspaces on it do not hold it: the confirmation offers to delete them.
+  const removable = !computer.is_primary || providerIsOwnMachine(computer.kind);
+  const removeHeld = removable ? removeBlock(computer, actions.powerBusy) : null;
   const removeHint = removeHeld ? removeBlockHint(t, removeHeld) : null;
-  const canBePrimary = !computer.is_primary && providerCanBePrimary(computer.kind);
-  const hasSettings = (managesSpec && computer.is_always_on) || computer.kind === 'ssh';
+  // Backup off is not held here: the confirmation offers to turn it on.
+  const home = homeEligibility(computer);
+  const primaryUnreachable = !computer.is_primary && home.held === 'unreachable';
+  // Make primary asked with the create, which the server could not apply:
+  // said here, beside the button that asks again.
+  const primaryDropped = !computer.is_primary && computer.make_primary?.state === 'dropped' ? computer.make_primary : null;
+  const primaryHintId = useId();
+  const hasSettings = (managesSpec && computer.is_always_on) || !managesSpec;
 
   // The view replaced the button that opened it, so focus starts on the way back.
   useEffect(() => {
@@ -84,11 +106,13 @@ function ComputerDetails({ computer, index, total, height, onBack, thisMac, show
       <div className="computer-details-head">
         <button ref={backRef} type="button" className="computer-details-back" onClick={onBack}>
           <ChevronLeft className="h-3.5 w-3.5" />
-          {t('computer.computers', 'Computers')}
+          {backLabel ?? t('computer.computers', 'Computers')}
         </button>
-        <span className="computer-rail-count">
-          {t('computer.card.position', '{{n}} / {{total}}', { n: railOrdinal(index), total: railOrdinal(total) })}
-        </span>
+        {!backLabel && (
+          <span className="computer-rail-count">
+            {t('computer.card.position', '{{n}} / {{total}}', { n: railOrdinal(index), total: railOrdinal(total) })}
+          </span>
+        )}
       </div>
 
       <div className="computer-details-grid">
@@ -100,31 +124,43 @@ function ComputerDetails({ computer, index, total, height, onBack, thisMac, show
           <div className="computer-details-actions">
             <StartFailureAction computer={computer} actions={actions} />
             <PowerButton computer={computer} actions={actions} />
-            {(canBePrimary || !computer.is_primary) && (
+            {removable && (
               <div className="computer-details-rarer">
-                {canBePrimary && (
+                {!computer.is_primary && (
                   <MakePrimaryButton
                     movingHome={actions.movingHome}
-                    disabled={actions.makePrimaryHeld || !!specChange || !takesWorkspaces(computer)}
+                    disabled={actions.makePrimaryHeld || !!specChange || home.held !== null}
                     onClick={actions.makePrimary}
+                    describedBy={primaryUnreachable && !actions.movingHome ? primaryHintId : undefined}
                   />
                 )}
-                {!computer.is_primary && (
-                  <Button
-                    variant="ghost"
-                    size="sm"
-                    className="ml-auto"
-                    onClick={actions.remove}
-                    disabled={!!removeHeld}
-                    // A preparing computer already says why, in its own hint.
-                    aria-describedby={removeHeld === 'preparing' ? prepareHintId : removeHint ? removeHintId : undefined}
-                  >
-                    {t('computer.remove', 'Remove')}
-                  </Button>
-                )}
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  className="ml-auto"
+                  onClick={actions.remove}
+                  disabled={!!removeHeld}
+                  // A preparing computer already says why, in its own hint.
+                  aria-describedby={removeHeld === 'preparing' ? prepareHintId : removeHint ? removeHintId : undefined}
+                >
+                  {t('computer.remove', 'Remove')}
+                </Button>
               </div>
             )}
             {/* Under the buttons, so its arriving moves none of them. */}
+            {removable && primaryUnreachable && !actions.movingHome && (
+              <p id={primaryHintId} className="computer-details-hint">
+                {t('computer.makePrimary.unreachable', "You can make it primary once it's connected.")}
+              </p>
+            )}
+            {primaryDropped && (
+              <p className="computer-details-hint" data-testid="computer-primary-dropped">
+                {t('computer.makePrimary.dropped', "{{name}} wasn't made primary. {{reason}}", {
+                  name: computer.name,
+                  reason: primaryDropped.error?.message ?? '',
+                }).trim()}
+              </p>
+            )}
             {removeHint && (
               <p id={removeHintId} className="computer-details-hint">
                 {removeHint}
@@ -140,7 +176,7 @@ function ComputerDetails({ computer, index, total, height, onBack, thisMac, show
             <ComputerNotes computer={computer} thisMac={thisMac} prepareHintId={prepareHintId} primaryNote />
             <ComputerSpecRows computer={computer} spec={false}>
               {/* Where its workspaces are, on a machine the user brings. */}
-              {computer.kind === 'ssh' && computer.root_dir && (
+              {!managesSpec && computer.root_dir && (
                 <div>
                   <dt>{t('computer.machine.folder', 'Folder')}</dt>
                   <dd title={computer.root_dir}>
@@ -151,6 +187,8 @@ function ComputerDetails({ computer, index, total, height, onBack, thisMac, show
             </ComputerSpecRows>
           </section>
 
+          <ComputerClaudeCode computerId={computer.computer_id} actions={actions} />
+
           <section className="computer-details-group">
             <h3 className="computer-details-title">{t('computer.card.storage', 'Storage')}</h3>
             <p className="text-[12.5px]" style={{ color: 'var(--color-text-primary)' }}>
@@ -160,38 +198,32 @@ function ComputerDetails({ computer, index, total, height, onBack, thisMac, show
             <StorageBreakdown computer={computer} />
           </section>
 
+          {browserHere && <BrowserQualitySetting computer={computer} />}
+          {browserHere && computer.browser?.window_available && <BrowserWindowSetting computer={computer} />}
+          {browserHere && <BrowserSigninsSetting computer={computer} />}
+
           {hasSettings && (
             <section className="computer-details-group">
               <dl className="computer-card-spec mt-0">
                 {/* Always-on is no longer offered, so the switch is only there to turn it off. */}
                 {managesSpec && computer.is_always_on && (
-                  <div>
-                    <dt>{t('computer.alwaysOn', 'Always-on')}</dt>
-                    <dd>
-                      <ToggleSwitch
-                        checked
-                        onChange={actions.turnOffAlwaysOn}
-                        // Mid start or stop the switch would promise a state the machine
-                        // is about to leave; it opens again once the machine settles.
-                        disabled={actions.alwaysOnBusy || isTransitional || computer.status === 'deleted'}
-                        ariaLabel={t('computer.alwaysOn', 'Always-on')}
-                      />
-                    </dd>
-                  </div>
+                  <ToggleRow
+                    label={t('computer.alwaysOn', 'Always-on')}
+                    checked
+                    onChange={actions.turnOffAlwaysOn}
+                    // Mid start or stop the switch would promise a state the machine
+                    // is about to leave; it opens again once the machine settles.
+                    disabled={actions.alwaysOnBusy || isTransitional || computer.status === 'deleted'}
+                  />
                 )}
                 {/* Only a machine the user brings offers the choice: a hosted one always backs up. */}
-                {computer.kind === 'ssh' && (
-                  <div>
-                    <dt>{t('computer.filesBackup.label', 'Back up files')}</dt>
-                    <dd>
-                      <ToggleSwitch
-                        checked={computer.files_backup !== false}
-                        onChange={() => actions.setFilesBackup(computer.files_backup === false)}
-                        disabled={actions.filesBackupBusy || computer.status === 'deleted'}
-                        ariaLabel={t('computer.filesBackup.label', 'Back up files')}
-                      />
-                    </dd>
-                  </div>
+                {!managesSpec && (
+                  <ToggleRow
+                    label={t('computer.filesBackup.label', 'Back up files')}
+                    checked={computer.files_backup !== false}
+                    onChange={() => actions.setFilesBackup(computer.files_backup === false)}
+                    disabled={actions.filesBackupBusy || computer.status === 'deleted'}
+                  />
                 )}
               </dl>
             </section>
@@ -212,13 +244,14 @@ function ComputerDetails({ computer, index, total, height, onBack, thisMac, show
  */
 function MachineFacts({ computer, onChangeSpec }: { computer: Computer; onChangeSpec: () => void }) {
   const { t } = useTranslation();
-  const { data } = useComputerProviders({ enabled: computer.kind !== 'ssh' });
+  const managesSpec = providerManagesSpec(computer.kind);
+  const { data } = useComputerProviders({ enabled: managesSpec });
   const rows: { key: string; label: string; value: string }[] = [];
   const add = (key: string, label: string, value: string | null | undefined) => {
     if (value) rows.push({ key, label, value });
   };
   const gb = (count: number) => t('computer.machine.gb', '{{count}} GB', { count });
-  const ssh = computer.kind === 'ssh' ? computer.ssh : null;
+  const ssh = computer.kind === 'ssh' ? computer.ssh : computer.kind === 'local' ? localMachine(computer) : null;
   if (ssh) {
     add('system', t('computer.machine.system', 'System'), ssh.distro || systemName(ssh.os));
     add('processor', t('computer.machine.processor', 'Processor'), ssh.cpu || ssh.arch);

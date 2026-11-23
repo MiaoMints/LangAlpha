@@ -13,17 +13,29 @@ from dataclasses import dataclass, replace
 from typing import Literal, Optional
 
 from ptc_agent.agent.middleware.image_capture import CAPTURE_TIMEOUT_SECONDS
+from ptc_agent.core.sandbox.unreachable import unanswered_code
 from src.config.settings import get_checkpoint_flush_timeout
 from src.server.contracts.status import (
+    GATEWAY_OUTAGE_META,
     INTERRUPT_REASON_CREDIT_PAUSE,
+    RESTART_INTERRUPTED_META,
     classify_interrupts,
-    is_user_stop,
+    bills_subagents,
+    is_suspension_stop,
 )
-from src.server.database.runs.hook_jobs import WAKEUP_QUIET_META
-from src.server.database.runs.lifecycle import ProducerRecord, RunOutcome
+from src.server.database.runs.hook_jobs import IDLE_COMPACTION_META, WAKEUP_QUIET_META
+from src.server.database.runs.lifecycle import (
+    ProducerRecord,
+    RunOutcome,
+    get_run_replay_facts,
+)
 from src.server.services.runs.stream_errors import (
+    COMPUTER_UNREACHABLE,
     failure_kind_metadata,
     model_call_failure,
+    plan_stop_metadata,
+    unreachable_failure,
+    upstream_failure,
 )
 from src.server.utils.persistence_utils import (
     calculate_execution_time,
@@ -40,14 +52,17 @@ class FinalizeVerdict:
 
     ``applied`` gates every terminal business effect: only the winner runs
     them, with the status it adopted. A loser carries the survivor's status
-    for its local mark and runs nothing. ``stopped_by_user`` is read off the
+    for its local mark and runs nothing. ``bills_subagents`` is read off the
     winning row, so a stop another worker took counts.
     """
 
     applied: bool
     status: str
     survivor_status: Optional[str] = None
-    stopped_by_user: bool = False
+    bills_subagents: bool = False
+    #: The winning row was cancelled by its account's suspension, which its
+    #: ``run_end`` says so a reader tells it from the user's own stop.
+    stopped_by_suspension: bool = False
 
     @property
     def concluded(self) -> bool:
@@ -128,9 +143,10 @@ async def assemble_finalize_artifacts(
     handler,
     cancelled_by_user: bool,
     workspace_id: Optional[str],
-    user_id: Optional[str],
+    recorded_as: Optional[str],
     stop_events: Optional[list[dict]] = None,
     exc: Optional[BaseException] = None,
+    restart: bool = False,
 ) -> RunOutcome:
     """Build everything the finalize CAS writes: usage records, the persist
     metadata and the producer's record.
@@ -154,17 +170,27 @@ async def assemble_finalize_artifacts(
             persist_metadata[extra] = metadata[extra]
     if status == "cancelled":
         persist_metadata["cancelled_by_user"] = cancelled_by_user
+        if restart:
+            persist_metadata[RESTART_INTERRUPTED_META] = True
     if exc is not None:
-        persist_metadata.update(
-            model_call_failure(
-                exc,
-                getattr(
-                    getattr(handler, "agent_config", None), "credential_source", None
-                ),
-            )
-        )
+        config = getattr(handler, "agent_config", None)
+        persist_metadata.update(model_call_failure(exc, config))
         if status == "error":
-            persist_metadata.update(failure_kind_metadata(exc))
+            kind = failure_kind_metadata(exc)
+            persist_metadata.update(kind)
+            if kind.get("error_kind") == COMPUTER_UNREACHABLE:
+                # Which machine did not answer, as the live frame named it,
+                # so a reload of a run that went mid-turn names it too.
+                persist_metadata.update(
+                    await unreachable_failure(exc, workspace_id=workspace_id)
+                )
+            if unanswered_code(exc) == "gateway_unreachable":
+                persist_metadata[GATEWAY_OUTAGE_META] = True
+            if kind.get("error_kind") == "upstream":
+                # Who pays decides the card, so a reload of a run that sent
+                # no frame words it as the live one would have.
+                persist_metadata["upstream"] = upstream_failure(exc, config)
+            persist_metadata.update(plan_stop_metadata(exc))
     # The pause's own words, which settling the run's automation relays. A
     # pause without words is stamped null, so settling knows there is
     # nothing to relay.
@@ -175,13 +201,18 @@ async def assemble_finalize_artifacts(
     quiet = getattr(handler, "quiet", None)
     if quiet is not None:
         persist_metadata[WAKEUP_QUIET_META] = {"changed": quiet["changed"]}
+    # Whether the completed turn owes the idle compaction job: only for a
+    # user who opted in, so no one else's turn writes or reads anything for it.
+    agent_config = getattr(handler, "agent_config", None)
+    if agent_config is not None and agent_config.feature_enabled("idle_compaction"):
+        persist_metadata[IDLE_COMPACTION_META] = True
     # Steering inputs archive on the owning response (v4 identity model:
     # steering = no run, no turn), from the steer rows this run confirmed
     # delivered.
     steering_inputs = await _delivered_steering_inputs(key)
     if steering_inputs:
         persist_metadata["steering_inputs"] = steering_inputs
-    if not (workspace_id and user_id):
+    if not (workspace_id and recorded_as):
         # Usage rows need both; without them the ledger transition still
         # happens, billing artifacts are simply absent.
         per_call_records = None
@@ -196,7 +227,7 @@ async def assemble_finalize_artifacts(
         per_call_records=per_call_records,
         tool_usage=tool_usage,
         record=await _producer_record(key, handler, stop_events, status),
-        images=await _late_images(key, metadata, handler),
+        images=await _turn_images(key, metadata, handler),
     )
 
 
@@ -216,9 +247,34 @@ async def _delivered_steering_inputs(key: tuple) -> list[str]:
     return [row["content"] for row in rows if row.get("content")]
 
 
+async def _turn_images(key: tuple, metadata: dict, handler) -> dict[str, str]:
+    """The URL of every sandbox image the run's saved text names: those the
+    model-time capture caught, and those it missed, captured now. The text
+    keeps the paths, so the live view (through run_end) and a replay show
+    these in their place."""
+    return {
+        **(handler.captured_images if handler is not None else {}),
+        **await _late_images(key, metadata, handler),
+    }
+
+
+async def settled_images(run_id: str) -> dict[str, str]:
+    """The image URLs the finalize recorded on the run's row, for its
+    ``run_end``. Empty on a failed read, which costs the live view its
+    pinned images rather than the frame they ride on."""
+    from src.server.services.history.replay.facts import images_of
+
+    try:
+        facts = await get_run_replay_facts(run_id)
+    except Exception:
+        logger.warning(f"[Finalize] images of run {run_id} unreadable", exc_info=True)
+        return {}
+    return images_of(facts)
+
+
 async def _late_images(key: tuple, metadata: dict, handler) -> dict[str, str]:
-    """The URLs of the sandbox images the run's saved text still names,
-    which the model-time capture left as paths. Captured on every ending,
+    """The URLs of the sandbox images the run's saved text names that the
+    model-time capture missed. Captured on every ending,
     since a stopped, failed or paused run kept its earlier steps' text, and
     bounded like that capture: a run whose sandbox died must still settle."""
     artifact_hook = metadata.get("artifact_hook")
@@ -321,7 +377,10 @@ async def drive_finalize_cas(
                 )
                 status = final_status
             return FinalizeVerdict(
-                applied=True, status=status, stopped_by_user=is_user_stop(run)
+                applied=True,
+                status=status,
+                bills_subagents=bills_subagents(run),
+                stopped_by_suspension=is_suspension_stop(run),
             )
         survivor_status = run.get("status")
         logger.warning(
@@ -332,7 +391,10 @@ async def drive_finalize_cas(
         return FinalizeVerdict(
             applied=False, status=status, survivor_status=survivor_status
         )
-    except Exception:
+    except Exception as e:
+        from src.observability.sentry import capture_finalize_failure
+
+        capture_finalize_failure(e, thread_id=key[0], run_id=key[1])
         logger.critical(
             f"[Finalize] FINALIZE FAILED for {key}: run row "
             f"remains in_progress for recovery",

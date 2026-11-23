@@ -11,11 +11,14 @@ import { cn } from '@/lib/utils';
  * than a page of differently drawn boxes.
  */
 export function SettingsGroup({
+  id,
   title,
   description,
   action,
   children,
 }: {
+  /** The search's anchor, for a group whose rows come and go. */
+  id?: string;
   title?: string;
   description?: ReactNode;
   /** A control for the whole group, level with its title. */
@@ -24,11 +27,11 @@ export function SettingsGroup({
 }) {
   const titleId = useId();
   return (
-    <section className="settings-group" aria-labelledby={title ? titleId : undefined}>
+    <section id={id} className="settings-group" aria-labelledby={title ? titleId : undefined}>
       {(title || description || action) && (
         <div className="settings-group-head">
           <div className="min-w-0 flex-[1_1_220px]">
-            {title && <h2 id={titleId} className="settings-group-title">{title}</h2>}
+            {title && <h2 id={titleId} className="settings-group-title open-style:label-voice">{title}</h2>}
             {description && <p className="settings-group-desc">{description}</p>}
           </div>
           {action}
@@ -41,6 +44,7 @@ export function SettingsGroup({
 
 export function SettingRow({
   id,
+  className,
   label,
   description,
   labelId,
@@ -51,6 +55,8 @@ export function SettingRow({
 }: {
   /** The anchor the settings search jumps to. */
   id?: string;
+  /** For what the row's place in its list asks of it, such as an indent. */
+  className?: string;
   label: ReactNode;
   description?: ReactNode;
   /** Names the control by the row's label, for a group or switch. */
@@ -64,7 +70,7 @@ export function SettingRow({
   children?: ReactNode;
 }) {
   return (
-    <div id={id} className={cn('settings-row', wide && 'is-wide', inline && 'is-inline')}>
+    <div id={id} className={cn('settings-row', wide && 'is-wide', inline && 'is-inline', className)}>
       <div className="settings-row-text">
         {htmlFor ? (
           <label htmlFor={htmlFor} id={labelId} className="settings-row-label">{label}</label>

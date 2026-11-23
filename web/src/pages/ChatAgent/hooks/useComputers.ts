@@ -12,7 +12,7 @@ import { QueryClient, queryOptions, useQuery, useQueryClient } from '@tanstack/r
 
 import { registerAuthReset } from '@/lib/authResets';
 import { queryKeys } from '@/lib/queryKeys';
-import type { Computer, ComputerStorage, ComputersResponse, SshPairingStatus } from '@/types/api';
+import type { Computer, ComputerProvidersResponse, ComputerStorage, ComputersResponse, SshPairingStatus } from '@/types/api';
 
 import {
   createSshPairing,
@@ -59,15 +59,19 @@ function sleep(ms: number, signal: AbortSignal): Promise<void> {
   });
 }
 
-/** The machine's status as the list cache holds it right now. */
-function cachedComputerStatus(queryClient: QueryClient, computerId: string): string | undefined {
+/**
+ * The computer as the lists already read hold it, or null: for a decision
+ * made outside render, which reads what the app believes now without a fetch.
+ */
+export function cachedComputer(queryClient: QueryClient, computerId: string | null | undefined): Computer | null {
+  if (!computerId) return null;
   for (const [, data] of queryClient.getQueriesData<ComputersResponse | undefined>({
     queryKey: queryKeys.computers.lists(),
   })) {
     const row = data?.computers?.find((c) => c.computer_id === computerId);
-    if (row) return row.status;
+    if (row) return row;
   }
-  return undefined;
+  return null;
 }
 
 /**
@@ -80,7 +84,7 @@ function cachedComputerStatus(queryClient: QueryClient, computerId: string): str
 function computersList() {
   return queryOptions({
     queryKey: queryKeys.computers.lists(),
-    queryFn: getComputers,
+    queryFn: () => getComputers(),
     staleTime: 30_000,
     refetchInterval: (query) =>
       query.state.data?.computers.some((c) => activeSpecChange(c)) ? SPEC_CHANGE_POLL_MS : false,
@@ -115,6 +119,10 @@ export function useComputer(computerId: string | null) {
 export function fetchComputerList(queryClient: QueryClient): Promise<ComputersResponse> {
   return queryClient.fetchQuery({ ...computersList(), staleTime: 0 });
 }
+
+/** Home's computer: the primary on the list, unless it is being removed. */
+export const primaryComputer = (computers: readonly Computer[] | undefined): Computer | null =>
+  computers?.find((c) => c.is_primary && c.status !== 'deleted') ?? null;
 
 /** Names the create, so a decision that needs a new row on the list can wait for it to land. */
 export const CREATE_COMPUTER_MUTATION_KEY = ['computers', 'create'] as const;
@@ -157,6 +165,11 @@ const providersQuery = queryOptions({
  */
 export function useComputerProviders(options: { enabled: boolean }) {
   return useQuery({ ...providersQuery, enabled: options.enabled });
+}
+
+/** The providers, read now unless fresh in the cache. */
+export function fetchComputerProviders(queryClient: QueryClient): Promise<ComputerProvidersResponse> {
+  return queryClient.fetchQuery(providersQuery);
 }
 
 /** Read the providers ahead of the New computer form, which waits on them. */
@@ -220,12 +233,18 @@ export function patchComputerRow(
  * the storage breakdown sits under that prefix too, and refetching it runs
  * `du` over the whole machine, which a rename or an always-on toggle has no
  * reason to pay for. A change that does move bytes calls
- * {@link invalidateMachineStorage} alongside.
+ * {@link invalidateMachineStorage} alongside. Claude Code's list of the
+ * user's own computers names each one and is not polled when empty, so a
+ * machine added, renamed or removed is read there again too, as is where
+ * Claude Code stands as a whole and each cloud computer it names too small
+ * for Claude Code.
  */
 export function invalidateMachine(queryClient: QueryClient) {
   void queryClient.invalidateQueries({ queryKey: queryKeys.computers.lists() });
   void queryClient.invalidateQueries({ queryKey: queryKeys.workspaces.all });
   void queryClient.invalidateQueries({ queryKey: queryKeys.workspaces.quota() });
+  void queryClient.invalidateQueries({ queryKey: queryKeys.features.claudeCodeComputers() });
+  void queryClient.invalidateQueries({ queryKey: queryKeys.features.claudeCodeSetup() });
 }
 
 /** Re-read the per-folder breakdown, if anyone is looking at it. */
@@ -421,8 +440,14 @@ export function useComputerStatusFanout(): void {
               // even if the re-read below is slow or fails.
               if (frame.start_failure) patchComputerRow(queryClient, computerId, { start_failure: frame.start_failure });
               patchComputerStatusInCaches(queryClient, computerId, status);
-              // A breakdown read while the machine was down only says to start it.
-              if (status === 'running') invalidateMachineStorage(queryClient, computerId);
+              // A breakdown read while the machine was down only says to start
+              // it, and Claude Code's list, which reads a computer's token only
+              // while it runs, still says it is offline.
+              if (status === 'running') {
+                invalidateMachineStorage(queryClient, computerId);
+                void queryClient.invalidateQueries({ queryKey: queryKeys.features.claudeCodeComputers() });
+                void queryClient.invalidateQueries({ queryKey: queryKeys.features.claudeCodeSetup() });
+              }
               // A failed start still needs the row: the server keeps why on
               // it (`start_failure`) before it sends 'error', or 'stopped' for
               // a start that reverted. Asked here, not after the close: either
@@ -440,7 +465,7 @@ export function useComputerStatusFanout(): void {
           if (isComputerStatusTerminal(lastStatus)) return;
           await reconcile();
           if (controller.signal.aborted) return;
-          if (!isComputerStatusTransitional(cachedComputerStatus(queryClient, computerId))) return;
+          if (!isComputerStatusTransitional(cachedComputer(queryClient, computerId)?.status)) return;
           if (attempt >= STATUS_RECONNECT.maxAttempts) return;
           await sleep(
             Math.min(STATUS_RECONNECT.baseMs * 2 ** attempt, STATUS_RECONNECT.capMs),

@@ -5,7 +5,7 @@ import { scrollMemory } from '@/lib/scrollMemory';
 import { ANCHORED_TOGGLE_EVENT } from '../../utils/anchoredToggle';
 import { useLatestRef } from '@/hooks/useLatestRef';
 import { TRANSCRIPT_STATUS_SELECTOR } from './TranscriptStatus';
-import { INTENT_EVENTS, type StreamFollowControls, type TurnStart } from './streamFollow';
+import { INTENT_EVENTS, towardStart, type StreamFollowControls, type TurnStart } from './streamFollow';
 import { blockSize, createTranscriptFollow, type PinTarget, type TabPlace, type TranscriptFollow } from './transcriptFollow';
 import { createTurnPin, type TurnPin } from './turnPin';
 
@@ -33,6 +33,58 @@ function readPlace(c: HTMLElement, orFirst = false): { id: string; delta: number
   }
   if (!hit?.dataset.messageId) return null;
   return { id: hit.dataset.messageId, delta: top - hit.getBoundingClientRect().top };
+}
+
+/** The row a width change holds a reader mid-thread on, found as the browser's
+ *  scroll anchoring finds its anchor: from the bubble at the view's top down
+ *  through each block its top edge cuts, to the first that starts in view or
+ *  the innermost the edge cuts. A bubble is too coarse: a long reply
+ *  rewrapping above the line the reader is on would push that line down. */
+function rowAtTop(c: HTMLElement): HTMLElement | null {
+  const top = c.getBoundingClientRect().top;
+  const bubbles = c.querySelectorAll<HTMLElement>('[data-message-id]');
+  let lo = 0;
+  for (let hi = bubbles.length; lo < hi; ) {
+    const mid = (lo + hi) >> 1;
+    if (bubbles[mid].getBoundingClientRect().bottom <= top) lo = mid + 1;
+    else hi = mid;
+  }
+  let el: Element | undefined = bubbles[lo];
+  while (el && el.getBoundingClientRect().top < top) {
+    const next: Element | undefined = Array.from(el.children).find((k) => {
+      const r = k.getBoundingClientRect();
+      return r.height > 0 && r.bottom > top;
+    });
+    if (!next) break;
+    el = next;
+  }
+  return el instanceof HTMLElement ? el : null;
+}
+
+/** Whether a face's unicode-range reaches basic Latin, as the body font's
+ *  does. A subset that does not (a CJK slice Google serves on first use of a
+ *  character) loads mid-stream and rewraps only the text that needed it. */
+function coversLatin(face: FontFace): boolean {
+  return face.unicodeRange.split(',').some((part) => {
+    const range = part.trim().replace(/^u\+/i, '');
+    const [lo, hi = lo] = range.includes('?')
+      ? [range.replace(/\?/g, '0'), range.replace(/\?/g, 'F')]
+      : range.split('-');
+    return parseInt(lo, 16) <= 0x41 && 0x41 <= parseInt(hi, 16);
+  });
+}
+
+/** How many body-font faces have loaded. One more than at the last resize is
+ *  the body font swapping in, which rewraps every line as a width change does.
+ *  It can land long after a thread's entry has settled: text first draws in a
+ *  fallback, and the font comes over the network. Counted on each face, since
+ *  the set as a whole may still be loading others when the swap lays out. */
+function loadedFonts(): number {
+  let n = 0;
+  document.fonts?.forEach((face) => {
+    if (face.status === 'loaded' && coversLatin(face)) n += 1;
+  });
+  return n;
 }
 
 /** Where the reader was, for a thread: on a bubble, or at the end. */
@@ -118,12 +170,18 @@ export function useChatScroll({
   const pinTargetRef = useRef<PinTarget | null>(null);
   const followRef = useRef<TranscriptFollow | null>(null);
   const turnPinRef = useRef<TurnPin | null>(null);
+  // A disclosure toggle holds the toggled row at the viewport position it had
+  // when clicked, for as long as its animation resizes the transcript.
+  const toggleHoldRef = useRef<{ el: HTMLElement; top: number; until: number; toggled: boolean } | null>(null);
   // Made on first use, not in render. A placement decides the pill: shown
-  // unless it left the reader at the end.
+  // unless it left the reader at the end. It ends a toggle's hold as well, or
+  // the hold would end later and decide both again from wherever a glide to
+  // that place had got to.
   const getFollow = useCallback(() => (followRef.current ??= createTranscriptFollow({
     following: isNearBottomRef,
     pin: pinTargetRef,
     placed: (atEnd) => {
+      toggleHoldRef.current = null;
       pillBaselineLenRef.current = messagesLenRef.current;
       setPillState({ visible: !atEnd, hasNew: false, newCount: 0 });
     },
@@ -132,9 +190,6 @@ export function useChatScroll({
   /** The wrapper ChatView puts between the scroller and the padded transcript,
    *  which carries the pinned turn's floor. */
   const transcriptFloorRef = useCallback((el: HTMLDivElement | null) => getTurnPin().setFloor(el), [getTurnPin]);
-  // A disclosure toggle holds the toggled row at the viewport position it had
-  // when clicked, for as long as its animation resizes the transcript.
-  const toggleHoldRef = useRef<{ el: HTMLElement; top: number; until: number } | null>(null);
 
   useLayoutEffect(() => {
     getFollow().setLive(isStreaming);
@@ -333,13 +388,53 @@ export function useChatScroll({
     if (!c) return;
     const follow = getFollow();
     const turnPin = getTurnPin();
-    const detach = follow.attach(c);
+    // The pinned turn's floor is measured from the view's height, so a keyboard
+    // closing on a send would otherwise leave the bottom short of the pin.
+    const detach = follow.attach(c, {
+      settle: (own) => {
+        if (turnPin.active) turnPin.settle(c, own);
+      },
+      ready: entryRestoreSettled,
+    });
     const engine = follow.engine;
     if (!engine) return detach;
     const saved = takeTabPlace('main');
     if (saved != null) follow.restore(saved);
 
+    // Whether the view sat at the very end when it last moved or the
+    // transcript last resized. A rewrap is judged by this, not by where its
+    // own layout left the view: that layout has already rewrapped the whole
+    // transcript, and the browser's scroll anchoring has moved the view with
+    // it. Nor by a scroll at a size the observer has yet to report: a layout
+    // forced ahead of the frame sends anchoring's scroll event before the
+    // observer runs, and judged there the reader at the end had already left
+    // it by the growth below them. The observer judges once it has run. The
+    // size compared is the observed box's, not the scroller's: the turn pin's
+    // floor sits outside that box and moves the scroll height with no
+    // observer callback, and a scroll after it must still be judged.
+    const content = resolveScrollContent(c);
+    const padded = content.parentElement ?? content;
+    const observedHeight = () => padded.getBoundingClientRect().height;
+    const endNow = () => isNearBottom({ scrollTop: c.scrollTop, scrollHeight: c.scrollHeight, clientHeight: c.clientHeight }, AT_BOTTOM_PX);
+    let atEnd = endNow();
+    let judgedHeight = observedHeight();
+    const judgeEnd = () => {
+      atEnd = endNow();
+      judgedHeight = observedHeight();
+    };
+
+    // The jump pill, for a reader the end has got away from.
+    const offerJump = (away: boolean) => setJumpPill((prev) => {
+      if (!away) {
+        return prev.visible || prev.hasNew ? { visible: false, hasNew: false, newCount: 0 } : prev;
+      }
+      if (prev.visible) return prev; // keep hasNew/newCount once shown
+      pillBaselineLenRef.current = messagesLenRef.current;
+      return { visible: true, hasNew: false, newCount: 0 };
+    });
+
     const handleScroll = () => {
+      if (observedHeight() === judgedHeight) judgeEnd();
       const byReader = follow.scrolled();
       // Record every settle (user scrolls AND pins/follows) so the cross-unmount
       // store always reflects where the transcript actually is: a bottom pin
@@ -368,15 +463,7 @@ export function useChatScroll({
       // The reader's own scroll has taken the view from any held place, and
       // takes it from the pinned turn's floor.
       turnPin.yieldFloor(c);
-      const atBottom = isNearBottomRef.current;
-      setJumpPill((prev) => {
-        if (atBottom) {
-          return prev.visible || prev.hasNew ? { visible: false, hasNew: false, newCount: 0 } : prev;
-        }
-        if (prev.visible) return prev; // keep hasNew/newCount once shown
-        pillBaselineLenRef.current = messagesLenRef.current;
-        return { visible: true, hasNew: false, newCount: 0 };
-      });
+      offerJump(!isNearBottomRef.current);
     };
     c.addEventListener('scroll', handleScroll, { passive: true });
 
@@ -386,6 +473,10 @@ export function useChatScroll({
     // arrives.
     const handleUserIntent = (e: Event) => {
       follow.intent(e);
+      // A reader heading up has left the end, though the scroll this makes may
+      // come at a size the observer has yet to judge: a rewrap reported after
+      // it must not carry them back down.
+      if (towardStart(e)) atEnd = false;
       toggleHoldRef.current = null;
       if (entryRestoreRafRef.current != null) {
         cancelAnimationFrame(entryRestoreRafRef.current);
@@ -393,6 +484,43 @@ export function useChatScroll({
       }
     };
     for (const type of INTENT_EVENTS) c.addEventListener(type, handleUserIntent, { passive: true });
+
+    // A hold ends by asking where it left the reader. An unfold grows below
+    // the held row, so holding it never scrolls and the band is never asked
+    // again: the reader who opened a row to read it still counted as
+    // following and was carried to the bottom on the next growth. The pill
+    // says so as well: what the row opened can have pushed the end out of
+    // view with no scroll of the reader's to raise it, and a reply then ran
+    // on under the composer with nothing to bring them back. Only for a row
+    // they toggled: a rewrap's hold is none of their doing, and its end
+    // leaves the pill as it was.
+    const endHold = (atEndNow: boolean) => {
+      const toggled = toggleHoldRef.current?.toggled;
+      toggleHoldRef.current = null;
+      isNearBottomRef.current = atEndNow;
+      if (toggled) offerJump(!atEndNow);
+    };
+    // The view is held on `el` where it stands. A toggle's hold ends on its
+    // own clock, not only at the next resize: nothing may grow again once
+    // what the row opened has landed, and the reader would be left as the
+    // hold found them.
+    let holdEnd = 0;
+    const holdRow = (el: HTMLElement, toggled: boolean) => {
+      const hold = { el, top: el.getBoundingClientRect().top, until: performance.now() + TOGGLE_HOLD_MS, toggled };
+      toggleHoldRef.current = hold;
+      window.clearTimeout(holdEnd);
+      if (!toggled) return;
+      const wait = () => {
+        holdEnd = window.setTimeout(() => {
+          // A hidden view measures nothing; its hold ends at its next resize.
+          if (toggleHoldRef.current !== hold || c.clientHeight === 0) return;
+          // Held on for as long as a width change went on.
+          if (performance.now() < hold.until) return wait();
+          endHold(endNow());
+        }, Math.max(0, hold.until - performance.now()));
+      };
+      wait();
+    };
 
     // A disclosure toggle: the reader has just chosen a place, the toggled row.
     // The pinned turn's floor stays as it is, but the pin no longer places the
@@ -402,7 +530,7 @@ export function useChatScroll({
       if (!el) return;
       follow.intent(e);
       turnPin.drop();
-      toggleHoldRef.current = { el, top: el.getBoundingClientRect().top, until: performance.now() + TOGGLE_HOLD_MS };
+      holdRow(el, true);
     };
     c.addEventListener(ANCHORED_TOGGLE_EVENT, handleAnchoredToggle);
 
@@ -412,13 +540,13 @@ export function useChatScroll({
     // followed: the observer also fires once on attach and on every shrink,
     // and a follow there would move a reader whose position a tab return has
     // just restored, or whom a fold just left exactly where they were.
-    const content = resolveScrollContent(c);
-    const padded = content.parentElement ?? content;
     const status = content.querySelector<HTMLElement>(TRANSCRIPT_STATUS_SELECTOR);
     let lastHeight = -1;
     let lastPad = -1;
+    let lastWidth = -1;
     let lastStatusHeight = -1;
-    const ro = new ResizeObserver((entries) => {
+    let lastFonts = loadedFonts();
+    const onResize = (entries: ResizeObserverEntry[]) => {
       // A cached view is display:none and measures 0. Coming back from that
       // is not growth: the composer and the status lines would read as grown
       // and carry a reader near the end to it. A hidden view keeps the sizes
@@ -450,6 +578,14 @@ export function useChatScroll({
       const pad = height - (entry.contentBoxSize?.[0]?.blockSize ?? entry.contentRect.height);
       const composerGrew = lastPad >= 0 && pad > lastPad;
       lastPad = pad;
+      // The wrapper is as wide as the scroller, so a change in its width is
+      // the file panel opening or closing beside the chat, or the window
+      // resizing: every line rewraps at once. So does a font swapping in.
+      const width = entry.borderBoxSize?.[0]?.inlineSize ?? entry.contentRect.width;
+      const fonts = loadedFonts();
+      const relaid = (lastWidth >= 0 && Math.abs(width - lastWidth) >= 1) || fonts !== lastFonts;
+      lastWidth = width;
+      lastFonts = fonts;
       const atEndBefore = () => isNearBottom(
         { scrollTop: c.scrollTop, scrollHeight: c.scrollHeight - growth, clientHeight: c.clientHeight },
         AT_BOTTOM_PX,
@@ -463,29 +599,47 @@ export function useChatScroll({
       }
       const hold = toggleHoldRef.current;
       if (hold && performance.now() <= hold.until && c.contains(hold.el)) {
+        // Held for as long as a width change goes on, however long the
+        // window takes to resize.
+        if (relaid) hold.until = performance.now() + TOGGLE_HOLD_MS;
         const delta = hold.el.getBoundingClientRect().top - hold.top;
         if (Math.abs(delta) >= 1) engine.jump(c.scrollTop + delta);
         return;
       }
-      if (hold) {
-        toggleHoldRef.current = null;
-        // An unfold grows below the held row, so holding it never scrolls and
-        // the band is never asked again: the reader who opened a row to read
-        // it still counted as following and was carried to the bottom on the
-        // next growth. Ask where the hold actually left them, before the
-        // growth this callback is reporting, or a reader at the end is read as
-        // that growth short of it.
-        isNearBottomRef.current = atEndBefore();
+      // Where the hold left them before the growth this callback is
+      // reporting, or a reader at the end is read as that growth short of it.
+      if (hold) endHold(atEndBefore());
+      // A rewrap is a relayout, not news. A reader at the very end, or
+      // one the follow is carrying, stays at the end through every frame of
+      // it, by a jump: a glide would trail the rewrap and leave the last lines
+      // under the composer. A reader mid-thread is held on the row at the top
+      // of the view, as a toggle holds its row. A landing re-reads its target
+      // every frame, so it carries on to where the rewrap moved it.
+      if (relaid && !engine.landing && entryRestoreSettled()) {
+        if (atEnd || follow.carrying) {
+          engine.jump(c.scrollHeight - c.clientHeight);
+          return;
+        }
+        const row = rowAtTop(c);
+        if (row) {
+          holdRow(row, false);
+          return;
+        }
       }
       // The composer carries only a reader at the very end, measured before
       // the growth as for the toggle above: one in the band short of the end
       // is reading there. A status line arriving under the last reply is the
       // thread's news.
       if (growth > 0 && entryRestoreSettled()) follow.grew(statusGrew || (composerGrew && atEndBefore()));
+    };
+    const ro = new ResizeObserver((entries) => {
+      onResize(entries);
+      // A hidden view measures nothing, and keeps what it last showed.
+      if (c.clientHeight > 0) judgeEnd();
     });
     // The padded wrapper's border box, not the content's: its bottom padding
     // is the floating composer's height, and a taller composer (the tray
-    // unfolding, a todo tab arriving, the input wrapping) must re-pin and
+    // unfolding, a notice arriving, the input wrapping) must re-pin and
     // follow like content, or the last line ends up under it. The status
     // lines are watched on their own so their growth can be told from the
     // reader's.
@@ -519,6 +673,7 @@ export function useChatScroll({
       for (const type of INTENT_EVENTS) c.removeEventListener(type, handleUserIntent);
       c.removeEventListener(ANCHORED_TOGGLE_EVENT, handleAnchoredToggle);
       document.removeEventListener('visibilitychange', handleVisibility);
+      window.clearTimeout(holdEnd);
       if (visibilityRafRef.current != null) {
         cancelAnimationFrame(visibilityRafRef.current);
         visibilityRafRef.current = null;

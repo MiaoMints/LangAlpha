@@ -20,7 +20,7 @@ from src.llms.reasoning import REASONING_LEVELS, apply_reasoning_effort
 #: this table so a change to one side fails the other's suite instead of quietly
 #: making the UI name a level the server does not run.
 _CLAMP_CONTRACT = json.loads(
-    (Path(__file__).parents[3] / "tests/fixtures/reasoning_clamp.json").read_text()
+    (Path(__file__).parents[3] / "web/src/lib/__tests__/__fixtures__/reasoning_clamp.json").read_text()
 )
 
 
@@ -86,12 +86,12 @@ class TestUnhonoredLevelsDegrade:
 
     def test_above_the_ceiling_steps_down_one(self, config):
         """max on a low/medium/high model runs high, not that model's middle."""
-        assert config.get_reasoning_efforts("gemini-4-argon") == [
+        assert config.get_reasoning_efforts("gemini-4-carbon") == [
             "low",
             "medium",
             "high",
         ]
-        assert config.resolve_reasoning_effort("gemini-4-argon", "max") == "high"
+        assert config.resolve_reasoning_effort("gemini-4-carbon", "max") == "high"
 
     def test_below_the_floor_takes_the_lowest(self, config):
         """Nothing at or under the request — the model's minimum is as close as it gets."""
@@ -216,11 +216,11 @@ class TestWhoWinsWhenTwoThingsNameTheLevel:
     """
 
     def test_an_override_beats_the_manifest_default(self):
-        client = LLM("gpt-6.1-sol", reasoning={"effort": "high"})
+        client = LLM("gpt-6.2-sol", reasoning={"effort": "high"})
         assert client.parameters["reasoning"]["effort"] == "high"
 
     def test_a_requested_level_beats_an_override(self):
-        client = LLM("gpt-6.1-sol", reasoning_effort="low", reasoning={"effort": "high"})
+        client = LLM("gpt-6.2-sol", reasoning_effort="low", reasoning={"effort": "high"})
         assert client.parameters["reasoning"]["effort"] == "low"
         assert client.resolved_reasoning_effort == "low"
 

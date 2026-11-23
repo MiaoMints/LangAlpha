@@ -33,6 +33,7 @@ export function useToolbarItems({
   menuDirection = 'up',
   menuContainer = null,
   draftRef,
+  subagentsRef,
 }: {
   /** Null while the thread's value is not read, which hides the toggle. */
   subagentsAllowed: boolean | null;
@@ -51,6 +52,8 @@ export function useToolbarItems({
   menuContainer?: HTMLElement | null;
   /** The composer's text field, where a pick made with the pointer leaves focus. */
   draftRef?: RefObject<HTMLTextAreaElement | null>;
+  /** The subagents toggle, which its default offer is anchored to. */
+  subagentsRef?: RefObject<HTMLButtonElement | null>;
 }): ToolbarItem[] {
   const { t } = useTranslation();
 
@@ -163,6 +166,7 @@ export function useToolbarItems({
           label={t('chat.pills.subagents')}
           tooltip={t(subagentsOn ? 'chat.pills.subagentsOn' : 'chat.pills.subagentsOff')}
           measureOnly={measureOnly}
+          buttonRef={measureOnly ? undefined : subagentsRef}
         >
           <SubagentsGlyph on={subagentsOn} />
         </IconToggle>
@@ -224,6 +228,6 @@ export function useToolbarItems({
     watchMode, setWatchMode, marketWatchEnabled, showWorkspaceMenu,
     workspaces, selectedWorkspaceId, t,
     hasScopePicker, allSelected, scopeLabel, noWorkspacesHint, hasSecondSection,
-    pickAll, pickWorkspace, menuDirection, menuContainer, draftRef,
+    pickAll, pickWorkspace, menuDirection, menuContainer, draftRef, subagentsRef,
   ]);
 }

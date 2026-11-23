@@ -1,5 +1,6 @@
 import {
   Fragment,
+  useCallback,
   useEffect,
   useEffectEvent,
   useId,
@@ -8,7 +9,7 @@ import {
   type Dispatch,
   type SetStateAction,
 } from 'react';
-import { useNavigate, useSearchParams } from 'react-router';
+import { useLocation, useNavigate, useSearchParams } from 'react-router';
 import { useTranslation } from 'react-i18next';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { preloadRouteChunk } from '@/components/Main/Main';
@@ -31,6 +32,7 @@ import { queryKeys } from '@/lib/queryKeys';
 import { scrollMotion } from '@/lib/reducedMotion';
 import { warmWorkspace } from '@/pages/ChatAgent/utils/warmWorkspace';
 import { getPreferences } from '@/pages/Dashboard/utils/api';
+import { discardAttachment } from '@/pages/ChatAgent/utils/attachmentUpload';
 import { useOnboarding } from '../OnboardingProvider';
 import { AgentPending, AgentTurn, ConversationShell, TurnCard, UserTurn } from './conversation';
 import {
@@ -45,6 +47,7 @@ import { kickoffSend } from './kickoff';
 import { marketBriefQuery } from './marketBrief';
 import {
   WELCOME_EDIT_PARAM,
+  cameFromSetup,
   WELCOME_STEP_PARAM,
   isWelcomeStep,
   openingStep,
@@ -53,7 +56,7 @@ import {
   type WelcomeStepId,
 } from './paths';
 import { answered, profilePatch, readProfile, resumeAnswers, unlistedSectors, type InvestingProfile } from './profile';
-import { screenshotAttachment } from './screenshots';
+import { ScreenshotStaging, screenshotAttachment } from './screenshots';
 import { brokerageNames, brokerageSummary, elsewhereSummary, questionSummary } from './summary';
 import { useBrokers } from './useBrokers';
 import { AgentStep } from './steps/AgentStep';
@@ -87,6 +90,7 @@ const PLACEHOLDER_NAME = 'Local User';
 export default function Welcome() {
   useSyncUserLocale();
   const [searchParams] = useSearchParams();
+  const location = useLocation();
   const { user } = useUser();
   // Read again on every visit rather than taken from the cache: the agent
   // writes the same profile and the save sends what differs from this row,
@@ -98,13 +102,16 @@ export default function Welcome() {
     retry: false,
   });
   const { skipWelcome } = useOnboarding();
-  if (!row.isFetchedAfterMount) return <PageLoading />;
+  const mode: WelcomeMode = searchParams.get(WELCOME_EDIT_PARAM) === '1' ? 'edit' : 'new';
+  const arriving = mode === 'new' && cameFromSetup(location.state);
+  // From setup, the page it left is the one this fades in over, so the wait
+  // is that page's ground rather than the loading wall.
+  if (!row.isFetchedAfterMount) return arriving ? <div className="fixed inset-0 bg-(--color-bg-page)" /> : <PageLoading />;
   // Not opened on a blank profile: a save is measured against the row read
   // here, so it would replace what the server holds with the few answers
   // changed on top of nothing.
   if (row.isError) return <LoadFailed retrying={row.isFetching} onRetry={() => void row.refetch()} />;
 
-  const mode: WelcomeMode = searchParams.get(WELCOME_EDIT_PARAM) === '1' ? 'edit' : 'new';
   const steps = welcomeSteps(mode);
   const userId = user?.user_id ?? null;
   const saved = readProfile(row.data);
@@ -128,6 +135,7 @@ export default function Welcome() {
       userId={userId}
       userName={user?.name ?? null}
       onSkip={skipWelcome}
+      arriving={arriving}
     />
   );
 }
@@ -171,6 +179,9 @@ interface WelcomeFlowProps {
   onSkip: () => void;
   /** The brokerage step's own answers, from a draft being resumed. */
   resumedElsewhere?: WelcomeDraft['elsewhere'];
+  /** Opened by setup finishing: the page fades in and its first turn writes
+   *  itself, as one just arrived at does. */
+  arriving?: boolean;
 }
 
 /** A turn of the conversation: a step, or the brokerage step's second half
@@ -215,6 +226,7 @@ export function WelcomeFlow({
   userName = null,
   onSkip,
   resumedElsewhere,
+  arriving = false,
 }: WelcomeFlowProps) {
   const { t, i18n } = useTranslation();
   const locale = useLocale();
@@ -253,10 +265,26 @@ export function WelcomeFlow({
   // once its waits are over: a screenshot read during them is in here before
   // a render shows it.
   const elsewhereRef = useRef(elsewhere);
-  const setElsewhere: Dispatch<SetStateAction<ElsewhereAnswers>> = (update) => {
+  const setElsewhere: Dispatch<SetStateAction<ElsewhereAnswers>> = useCallback((update) => {
     elsewhereRef.current = typeof update === 'function' ? update(elsewhereRef.current) : update;
     setElsewhereState(elsewhereRef.current);
-  };
+  }, []);
+  // The screenshots stay staged while the flow is open, however long that is.
+  const stagingRef = useRef<ScreenshotStaging | null>(null);
+  useEffect(() => {
+    const staging = new ScreenshotStaging(
+      () => elsewhereRef.current.shots,
+      (id, attachmentId, readyAt) =>
+        setElsewhere((e) => ({ ...e, shots: e.shots.map((s) => (s.id === id ? { ...s, attachmentId, readyAt } : s)) })),
+    );
+    stagingRef.current = staging;
+    return () => {
+      staging.close();
+      stagingRef.current = null;
+    };
+  }, [setElsewhere]);
+  const { shots: stagedShots } = elsewhere;
+  useEffect(() => stagingRef.current?.track(stagedShots), [stagedShots]);
   // Each screenshot add, settled once its files are in the answers; each
   // holding or watchlist row written or removed by search, settled once the
   // write is done; and each trading level picked beside a connected broker,
@@ -269,7 +297,17 @@ export function WelcomeFlow({
   const [handoff, setHandoff] = useState<Handoff>(null);
   // The turn just arrived at, which writes itself in. One opened on, or gone
   // back to, is there at once.
-  const [fresh, setFresh] = useState<TurnId | null>(null);
+  const [fresh, setFresh] = useState<TurnId | null>(arriving ? initialStep : null);
+  // Kept for the visit: the arrival is spent once the page is up, so a reload
+  // opens on the flow standing.
+  const [arrived] = useState(arriving);
+  const location = useLocation();
+  const spendArrival = useEffectEvent(() => {
+    navigate({ pathname: location.pathname, search: location.search }, { replace: true, state: null });
+  });
+  useEffect(() => {
+    if (arrived) spendArrival();
+  }, [arrived]);
   // The hand-off's waits, called off when the flow is left. A ref rather than
   // part of `handoff`: leaving unmounts the flow, and the cleanup that calls
   // them off then needs the one running, not the one of the render it was
@@ -314,7 +352,7 @@ export function WelcomeFlow({
     preloadRouteChunk('/chat/t/__default__');
     let live = true;
     void queryClient.ensureQueryData(homeWorkspaceQuery(queryClient)).then(
-      (home) => (live ? warmWorkspace(home.workspace_id, queryClient) : undefined),
+      (home) => (live ? warmWorkspace(home.workspace_id, queryClient, 'onboarding') : undefined),
       () => {},
     );
     return () => {
@@ -446,9 +484,16 @@ export function WelcomeFlow({
     // that fails has said so in its toast, and the turn goes on the level the
     // server kept.
     await Promise.allSettled(preparing.current);
+    // A screenshot whose id the server may have dropped (a tab asleep for a
+    // day) is staged again and waited for, rather than sent missing.
     // A brief read by now wins the race even when the deadline is past too:
     // of two settled promises, the first listed is taken.
-    const [workspaceId, marketBrief] = await Promise.all([home, Promise.race([briefRead, briefDeadline]), shown]);
+    const [workspaceId, marketBrief, , shotsKept = true] = await Promise.all([
+      home,
+      Promise.race([briefRead, briefDeadline]),
+      shown,
+      stagingRef.current?.freshen(),
+    ]);
     if (controller.signal.aborted) return;
     if (!workspaceId) {
       standDown();
@@ -464,6 +509,19 @@ export function WelcomeFlow({
     // way showing them, and ahead of the composer's files.
     const answers = elsewhereRef.current;
     const shots = !connected && answers.method === 'screenshot' ? answers.shots : [];
+    // One the server let go that could not be staged again stops the start
+    // here, kept to be tried again, rather than reach the chat not received.
+    if (shots.length > 0 && !shotsKept) {
+      standDown();
+      toast({
+        variant: 'destructive',
+        title: t('common.error'),
+        description: t('onboarding.welcome.start.failed'),
+      });
+      return;
+    }
+    // Staged for a way no longer taken, they go with nothing; the server forgets them.
+    if (shots !== answers.shots) for (const shot of answers.shots) discardAttachment(shot.attachmentId);
     const send = kickoffSend(
       {
         task: written.task,
@@ -527,10 +585,15 @@ export function WelcomeFlow({
       // written there and not sent is not dropped for the suggestions.
       if (mode === 'new') {
         const input = composerRef.current;
-        if (!input?.send()) {
-          const options = input?.getModelOptions() ?? { model: null, reasoningEffort: null, fastMode: false };
-          void handOff({ task: '', attachments: [], options });
+        if (input?.send()) return;
+        // Files still uploading or failed hold the task; starting without
+        // them would drop them, so the composer and its hint wait instead.
+        if (input?.holdsSend()) {
+          input.focus();
+          return;
         }
+        const options = input?.getModelOptions() ?? { model: null, reasoningEffort: null, fastMode: false };
+        void handOff({ task: '', attachments: [], options });
       } else if (await save()) finish(SETTINGS_RETURN);
       return;
     }
@@ -685,12 +748,14 @@ export function WelcomeFlow({
     mode === 'new' ? (
       <ChatInput
         ref={composerRef}
+        // Its first message opens a Chief of Staff thread in Home.
+        inHome
         disabled={!composerOpen}
         placeholder={t(
           composerOpen ? 'onboarding.welcome.chat.composer.start' : 'onboarding.welcome.chat.composer.waiting',
         )}
-        onSend={(message, attachments, _commands, options) => {
-          if (composerOpen) void handOff({ task: message.trim(), attachments, options });
+        onSend={({ message, files, modelOptions }) => {
+          if (composerOpen) void handOff({ task: message.trim(), attachments: files, options: modelOptions });
         }}
       />
     ) : null;
@@ -698,6 +763,7 @@ export function WelcomeFlow({
   return (
     <ConversationShell
       testId="welcome-flow"
+      arriving={arrived}
       exit={
         <WizardExit
           label={mode === 'edit' ? t('onboarding.welcome.cancel') : t('onboarding.welcome.skip')}

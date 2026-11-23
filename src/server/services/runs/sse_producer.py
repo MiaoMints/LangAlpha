@@ -16,7 +16,10 @@ import json_repair
 from langchain_core.messages import AIMessage, AIMessageChunk, BaseMessage, ToolMessage
 from langgraph.types import Overwrite
 
-from ptc_agent.agent.middleware.image_capture import collect_sandbox_paths
+from ptc_agent.agent.middleware.image_capture import (
+    collect_sandbox_paths,
+    recorded_images,
+)
 
 from ptc_agent.agent.middleware.runtime_context.turn import (
     TURN_DEADLINE_KEY,
@@ -28,12 +31,17 @@ from src.server.utils.content_normalizer import (
     is_thinking_status_signal,
 )
 from src.server.utils.pg_sanitize import finite_json_dumps
+from src.llms.claude_code import QUEUE_FIELDS, QUEUE_EVENT_TYPE, queue_record
 from src.server.contracts.status import classify_interrupts
 from src.server.database.provenance import MAIN_PROVENANCE_LANE
 from src.server.database.runs.lifecycle import ProducerRecord
 from src.server.services.runs.credit_usage import build_credit_usage_data
 from src.server.services.runs.reasoning_facts import ReasoningDurations
-from src.server.services.runs.stream_errors import error_event_data
+from src.server.services.runs.stream_errors import (
+    COMPUTER_UNREACHABLE,
+    error_event_data,
+    unreachable_failure,
+)
 from src.tools.wakeups.models import WakeupArtifact
 from src.tools.wakeups.quiet import quiet_result
 from src.server.utils.text_phase import TextPhaseTracker
@@ -44,7 +52,7 @@ from src.utils.stream_coalescing import (
     StreamFrame,
     delta_piece,
 )
-from src.llms.content_utils import extract_reasoning_summary_index
+from src.llms.content_utils import ReasoningSpacer
 from src.config.settings import (
     get_workflow_timeout,
     is_sse_event_log_enabled,
@@ -56,6 +64,12 @@ from src.server.utils.error_sanitization import (
 )
 
 logger = logging.getLogger(__name__)
+
+#: Claude Code's own custom events, by the fields each passes on.
+_CLAUDE_CODE_EVENTS: dict[str, tuple[str, ...]] = {
+    "claude_code_plan": ("reason", "window", "until"),
+    QUEUE_EVENT_TYPE: QUEUE_FIELDS,
+}
 
 # Dedicated logger for SSE events (can be configured independently)
 sse_logger = logging.getLogger("sse_events")
@@ -150,6 +164,23 @@ def _fallback_record(record: Dict[str, Any]) -> Dict[str, Any]:
         "props": props,
         "metadata": {"after_message_id": after} if after else {},
     }
+
+
+def kept_notice(event_type: str, data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """The ui record a notice frame names, as the producer keeps it for a
+    step that may never commit its own: a main-lane model fallback, or a
+    main-lane CLI wait long enough to note. Recovery reads a dead run's
+    notices back through it, in the order they streamed."""
+    if event_type == "model_fallback":
+        return fallback_from_frame(data)
+    if (
+        event_type == QUEUE_EVENT_TYPE
+        and data.get("agent") == "main"
+        and data.get("signal") == "admitted"
+        and data.get("wait_id")
+    ):
+        return queue_record(data)
+    return None
 
 
 def fallback_from_frame(data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
@@ -251,21 +282,21 @@ class RunSSEProducer:
         # The main agent's provenance records as emitted, for the finalize to
         # write.
         self.provenance_events: List[Dict[str, Any]] = []
-        # The main agent's model_fallback ui records as emitted: a step that
-        # fails or is stopped after one never commits it.
-        self._model_fallbacks: List[Dict[str, Any]] = []
+        # The main lane's notice ui records as streamed (model fallbacks,
+        # Claude Code CLI waits), which a stopped or failed run's row keeps
+        # for those its last step never committed.
+        self._notices: List[Dict[str, Any]] = []
         # The last error frame the main agent's stream sent, for the finalize
         # of a failed run to keep.
         self._error_frame: Optional[Dict[str, Any]] = None
-        # The sandbox image paths each message the main graph saved still
-        # names, by message id: a later write of the message replaces its
-        # entry.
-        self._saved_image_paths: Dict[str, Set[str]] = {}
+        # The sandbox image paths each message the main graph saved names,
+        # by message id, each with the URL its model-time capture went to, or
+        # None where that capture missed it: a later write of the message
+        # replaces its entry.
+        self._saved_images: Dict[str, Dict[str, Optional[str]]] = {}
 
-        # Track reasoning block index per agent to detect block transitions
-        # When index changes (e.g., 0→1), a separator (\n\n) is needed between blocks
-        self._reasoning_block_index: dict[str, int] = {}
-        self._reasoning_separator_pending: Set[str] = set()
+        # Each agent's open reasoning, spaced into its sections.
+        self._reasoning_spacers: dict[str, ReasoningSpacer] = {}
         # Whitespace-only reasoning deltas seen before an agent's reasoning
         # section opened, held with their message id until visible reasoning
         # follows.
@@ -568,7 +599,8 @@ class RunSSEProducer:
                                         "original_message_count", "source",
                                         "summary_tokens", "truncated_count", "error",
                                         "kind", "offloaded_args", "offloaded_reads",
-                                        "threshold"):
+                                        "threshold", "cached_tokens",
+                                        "context_limit", "from_model", "to_model"):
                                 if key in event_data:
                                     cw_data[key] = event_data[key]
                             if event_data.get("action") == "token_usage":
@@ -615,6 +647,27 @@ class RunSSEProducer:
                             yield self._build_sse_event("provenance", prov_data)
                             continue
 
+                        # Claude Code's own notices, passed on with the fields
+                        # each carries: a reply the Claude plan ran out during,
+                        # billed to usage credits (replay shows it from the
+                        # reply's stamp, ``PLAN_NOTICE_KEY``), and a turn's wait
+                        # for one of its computer's CLIs (replay shows it from
+                        # the turn's ``ui`` record, ``QUEUE_EVENT_TYPE``).
+                        if (passed := _CLAUDE_CODE_EVENTS.get(event_type)) is not None:
+                            if (
+                                event_type == QUEUE_EVENT_TYPE
+                                and event_data.get("signal") == "admitted"
+                                and not agent_from_stream
+                            ):
+                                self._notices.append(queue_record(event_data))
+                            yield self._build_sse_event(event_type, {
+                                "thread_id": self.thread_id,
+                                "agent": self._extract_agent_name(agent_from_stream, event_data)
+                                if agent_from_stream else "main",
+                                **{k: event_data[k] for k in passed if k in event_data},
+                            })
+                            continue
+
                         # Handle steering delivery signal
                         if event_type == "steering_delivered":
                             yield self._build_sse_event("steering_delivered", {
@@ -636,7 +689,7 @@ class RunSSEProducer:
                         ):
                             if not agent_from_stream:
                                 kept = _fallback_record(event_data)
-                                self._model_fallbacks.append(kept)
+                                self._notices.append(kept)
                                 # Names the record, so recovery can keep a
                                 # notice whose step died with the worker.
                                 fallback_ref = {
@@ -835,7 +888,7 @@ class RunSSEProducer:
                         f"thread_id={self.thread_id} run_id={self.run_id} — "
                         f"suppressing interrupt SSE; turn will finalize failed"
                     )
-                    yield self._build_error_event(
+                    yield await self._build_error_event(
                         "The assistant paused for input but the pause could not be "
                         "saved. Please retry this message.",
                     )
@@ -906,7 +959,7 @@ class RunSSEProducer:
             _stream_span.record_exception(e)
             _stream_span.set_status(Status(StatusCode.ERROR))
             if not isinstance(e, TurnTimeLimitError):
-                yield self._build_error_event(str(e), exc=e)
+                yield await self._build_error_event(str(e), exc=e)
             raise  # Re-raise so the run executor finalizes as failed
         finally:
             # Safety net: if the stream ends (timeout / error / CancelledError /
@@ -1124,8 +1177,7 @@ class RunSSEProducer:
                     if agent_name in self.reasoning_active:
                         yield self._build_reasoning_signal(agent_name, message_id, "complete", is_compaction=is_compaction)
                         self.reasoning_active.discard(agent_name)
-                    self._reasoning_block_index.pop(agent_name, None)
-                    self._reasoning_separator_pending.discard(agent_name)
+                    self._reasoning_spacers.pop(agent_name, None)
                 else:
                     # Reasoning started - emit start signal
                     if agent_name not in self.reasoning_active:
@@ -1148,8 +1200,7 @@ class RunSSEProducer:
                         if agent_name in self.reasoning_active:
                             yield self._build_reasoning_signal(agent_name, message_id, "complete", is_compaction=is_compaction)
                             self.reasoning_active.discard(agent_name)
-                        self._reasoning_block_index.pop(agent_name, None)
-                        self._reasoning_separator_pending.discard(agent_name)
+                        self._reasoning_spacers.pop(agent_name, None)
                     else:
                         # Reasoning started - emit start signal
                         if agent_name not in self.reasoning_active:
@@ -1282,15 +1333,6 @@ class RunSSEProducer:
                         yield self._build_sse_event("tool_call_chunks", event_stream_message)
                         return  # Don't process input_json_delta as regular content
 
-        # Detect reasoning summary_text index transitions before normalization
-        # When the summary_text index changes (e.g., 0→1), a new reasoning thought started
-        reasoning_idx = self._extract_reasoning_summary_index(message_chunk.content)
-        if reasoning_idx is not None:
-            prev_idx = self._reasoning_block_index.get(agent_name)
-            self._reasoning_block_index[agent_name] = reasoning_idx
-            if prev_idx is not None and reasoning_idx != prev_idx:
-                self._reasoning_separator_pending.add(agent_name)
-
         # Resolve before normalization: the frame that announces the phase has
         # empty text and is dropped below, so the table must be filled first.
         text_phase = self._text_phase.resolve(agent_name, message_id, message_chunk.content)
@@ -1327,11 +1369,6 @@ class RunSSEProducer:
                     self._reasoning_whitespace_held[agent_name] = (message_id, text_content)
                     text_content = None
 
-        # Prepend separator when transitioning between reasoning blocks
-        if text_content and content_type == "reasoning" and agent_name in self._reasoning_separator_pending:
-            text_content = "\n\n" + text_content
-            self._reasoning_separator_pending.discard(agent_name)
-
         event_stream_message: dict[str, Any] = {
             "thread_id": self.thread_id,
             "agent": agent_name,
@@ -1353,8 +1390,11 @@ class RunSSEProducer:
                 # Reasoning completed, emit completion signal before this content
                 yield self._build_reasoning_signal(agent_name, message_id, "complete", is_compaction=is_compaction)
                 self.reasoning_active.discard(agent_name)
-                self._reasoning_block_index.pop(agent_name, None)
-                self._reasoning_separator_pending.discard(agent_name)
+                self._reasoning_spacers.pop(agent_name, None)
+
+            if content_type == "reasoning":
+                spacer = self._reasoning_spacers.setdefault(agent_name, ReasoningSpacer())
+                text_content = spacer.space(message_chunk.content, text_content)
 
             event_stream_message["content"] = text_content
             event_stream_message["content_type"] = content_type  # "text" or "reasoning"
@@ -1445,8 +1485,7 @@ class RunSSEProducer:
             if agent_name in self.reasoning_active:
                 yield self._build_reasoning_signal(agent_name, message_id, "complete", is_compaction=is_compaction)
                 self.reasoning_active.discard(agent_name)
-                self._reasoning_block_index.pop(agent_name, None)
-                self._reasoning_separator_pending.discard(agent_name)
+                self._reasoning_spacers.pop(agent_name, None)
 
             # Unified tool call completion handler for all providers
             # After normalization, both Response API "completed" and Anthropic "tool_use"
@@ -1648,16 +1687,6 @@ class RunSSEProducer:
 
         return filtered_tool_calls
 
-    @staticmethod
-    def _extract_reasoning_summary_index(content: Any) -> Optional[int]:
-        """Extract the summary_text item index from reasoning content.
-
-        Thin delegate to ``content_utils.extract_reasoning_summary_index`` —
-        the shared implementation is reused by the subagent token forwarder so
-        both streaming paths separate reasoning sections identically.
-        """
-        return extract_reasoning_summary_index(content)
-
     def _build_reasoning_signal(
         self,
         agent_name: str,
@@ -1701,15 +1730,33 @@ class RunSSEProducer:
                 messages = [messages]
             for message in messages:
                 if isinstance(message, AIMessage) and message.id:
-                    self._saved_image_paths[message.id] = collect_sandbox_paths(
-                        [message]
-                    )
+                    captured = recorded_images(message)
+                    self._saved_images[message.id] = {
+                        path: captured.get(path)
+                        for path in collect_sandbox_paths([message])
+                    }
 
     @property
     def saved_image_paths(self) -> Set[str]:
-        """The sandbox images the main agent's saved messages name, which
-        the model-time capture left as paths."""
-        return set().union(*self._saved_image_paths.values())
+        """The sandbox images the main agent's saved messages name that the
+        model-time capture did not capture."""
+        return {
+            path
+            for images in self._saved_images.values()
+            for path, url in images.items()
+            if url is None
+        }
+
+    @property
+    def captured_images(self) -> Dict[str, str]:
+        """The URL each sandbox image the main agent's saved messages name
+        was captured to at model time."""
+        return {
+            path: url
+            for images in self._saved_images.values()
+            for path, url in images.items()
+            if url is not None
+        }
 
     def record(self, stop_events: Optional[List[Dict[str, Any]]] = None) -> ProducerRecord:
         """What the finalize stores beside the status that the checkpoint
@@ -1723,7 +1770,7 @@ class RunSSEProducer:
                 if isinstance(e, dict) and e.get("event") == "provenance"
             ],
             reasoning_ms=self._reasoning.as_facts(),
-            model_fallbacks=list(self._model_fallbacks),
+            model_fallbacks=list(self._notices),
             error_frame=self._error_frame,
         )
 
@@ -1770,23 +1817,22 @@ class RunSSEProducer:
 
         return result
 
-    def _build_error_event(
-        self,
-        error_message: str,
-        *,
-        exc: Optional[BaseException] = None,
+    async def _build_error_event(
+        self, error_message: str, *, exc: Optional[BaseException] = None
     ) -> StreamFrame:
         """Build an error frame; ``exc`` enables the classification
-        ``error_event_data`` describes."""
-        frame = self._build_sse_event(
-            "error",
-            error_event_data(
-                self.thread_id,
-                error_message,
-                exc=exc,
-                credential_source=getattr(self.agent_config, "credential_source", None),
-            ),
+        ``error_event_data`` describes, and names a machine that did not
+        answer (``unreachable_failure``)."""
+        data = error_event_data(
+            self.thread_id,
+            error_message,
+            exc=exc,
+            model=getattr(getattr(self.agent_config, "llm", None), "name", None),
+            config=self.agent_config,
         )
+        if exc is not None and data.get("error_kind") == COMPUTER_UNREACHABLE:
+            data.update(await unreachable_failure(exc))
+        frame = self._build_sse_event("error", data)
         self._error_frame = kept_error_frame(frame.data)
         return frame
 

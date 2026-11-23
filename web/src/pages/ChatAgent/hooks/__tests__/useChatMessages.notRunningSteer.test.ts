@@ -190,6 +190,42 @@ describe('useChatMessages: a steer the server refuses as not_running', () => {
     expect(textContentCalls.at(-1)?.assistantMessageId).toBe(resentAssistant.id);
   });
 
+  it.each([true, false])('the send it goes out as keeps keepFullContext=%s', async (skip) => {
+    const firstHang = deferred<{ disconnected: boolean }>();
+    mockSendStream.mockImplementation(
+      async (_msg: string, _ws: string, _tid: string | null, { onEvent }: { onEvent: OnEvent }) => {
+        const call = mockSendStream.mock.calls.length;
+        if (call === 1) {
+          onEvent({ event: 'thread_id', thread_id: 'thread-nr-skip' });
+          return firstHang.promise;
+        }
+        if (call === 2) throw notRunning();
+        return new Promise(() => {});
+      },
+    );
+
+    const { result } = renderHookWithProviders(() => useChatMessages('ws-nr'));
+    let firstSend: Promise<unknown> = Promise.resolve();
+    await act(async () => {
+      firstSend = result.current.handleSendMessage('first turn');
+      await Promise.resolve();
+    });
+    await waitFor(() => expect(result.current.isLoading).toBe(true));
+
+    await act(async () => {
+      await result.current.handleSendMessage('follow-up steering', null, null, { keepFullContext: skip });
+    });
+    firstHang.resolve({ disconnected: false });
+    await act(async () => {
+      await firstSend.catch(() => undefined);
+    });
+
+    await waitFor(() => expect(mockSendStream).toHaveBeenCalledTimes(3));
+    const resendOpts = mockSendStream.mock.calls[2][3] as { steerOnly?: boolean; keepFullContext?: boolean };
+    expect(resendOpts.steerOnly).toBeFalsy();
+    expect(resendOpts.keepFullContext).toBe(skip);
+  });
+
   it('a resend the server failed to start outlives a reload, and its Retry sends it again under its key', async () => {
     const firstHang = deferred<{ disconnected: boolean }>();
     const steerAnswer = deferred<void>();
@@ -664,5 +700,74 @@ describe('useChatMessages: refused steers belong to their view, not to a thread 
     expect(posts.slice(3).map((p) => p.message)).toEqual(['refused before the switch', 'refused after the switch']);
     expect(posts[3].opts.requestKey).not.toBe(posts[2].opts.requestKey);
     expect(posts[4].opts.requestKey).not.toBe(posts[1].opts.requestKey);
+  });
+});
+
+describe('useChatMessages: a send naming staged files while a turn runs', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockCancel.mockResolvedValue({ cancelled: true, message: 'ok' });
+  });
+
+  const csv = new File(['a,b\n'], 'a.csv', { type: 'text/csv' });
+  const FILES = [{ type: 'file', attachment_id: 'att-1', description: 'a.csv' }];
+  const META = [{ name: 'a.csv', type: 'text/csv', size: 4, file: csv }];
+
+  async function sendFiles(hook: Hook, message: string) {
+    await settle(() => hook.result.current.handleSendMessage(message, FILES, META));
+  }
+
+  it('is held rather than steered, and opens the next turn with its files, ahead of what was typed after it', async () => {
+    const { hook, posts } = await startTurn();
+    await sendFiles(hook, 'read this');
+    // A steer would reach the turn as its text alone.
+    expect(posts).toHaveLength(1);
+    expect(userBubbles(hook, 'read this')).toMatchObject([{ steering: true }]);
+    const waitingId = userBubbles(hook, 'read this')[0].id;
+
+    // What comes after waits behind it rather than steering past it.
+    await settle(() => hook.result.current.handleSendMessage('and then this'));
+    expect(posts).toHaveLength(1);
+
+    await settle(() => posts[0].end());
+    await waitFor(() => expect(posts).toHaveLength(2));
+    expect(posts[1].message).toBe('read this');
+    expect(posts[1].opts.steerOnly).toBeFalsy();
+    expect((posts[1].opts as SendOpts & { additionalContext?: unknown }).additionalContext).toEqual(FILES);
+    expect(userBubbles(hook, 'read this')).toMatchObject([{ id: waitingId }]);
+
+    await settle(() => posts[1].end());
+    await waitFor(() => expect(posts).toHaveLength(3));
+    expect(posts[2].message).toBe('and then this');
+  });
+
+  it('goes back to the composer with its files on a stop', async () => {
+    const { hook, posts } = await startTurn();
+    await sendFiles(hook, 'read this');
+    await settle(() => hook.result.current.stopWorkflow());
+
+    expect(hook.result.current.returnedSteering).toBe('read this');
+    expect(hook.result.current.returnedDraft?.files).toEqual([{ file: csv, type: 'text/csv', attachmentId: 'att-1' }]);
+    expect(userBubbles(hook, 'read this')).toEqual([]);
+    await settle(() => {});
+    expect(posts).toHaveLength(1);
+  });
+
+  it('keeps its files on the Retry when the server refuses it as running', async () => {
+    const { hook, posts } = await startTurn();
+    await sendFiles(hook, 'read this');
+    mockSendStream.mockImplementationOnce(async () => {
+      throw refusal('running');
+    });
+    await settle(() => posts[0].end());
+    await waitFor(() => expect(mockSendStream).toHaveBeenCalledTimes(2));
+    await waitFor(() => expect(hook.result.current.isLoading).toBe(false));
+    expect(hook.result.current.messages.at(-1)).toMatchObject({ error: true, unadmitted: true });
+
+    // The resend's stream stays open, so it is not awaited.
+    await settle(() => { void hook.result.current.handleRetry(); });
+    await waitFor(() => expect(mockSendStream).toHaveBeenCalledTimes(3));
+    expect(mockSendStream.mock.lastCall?.[0]).toBe('read this');
+    expect(mockSendStream.mock.lastCall?.[3]).toMatchObject({ additionalContext: FILES });
   });
 });

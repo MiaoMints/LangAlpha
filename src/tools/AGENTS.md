@@ -21,6 +21,11 @@ call this tool rather than another one, what to pass, or what to do with the res
 A sentence that changes none of the three is prompt cost with no return, paid on
 every turn of every conversation.
 
+Tool text has one version for every model. The guidance level
+(`src/ptc_agent/agent/prompts/templates/AGENTS.md`) reaches only the prompt
+templates, never a docstring, an argument description, a result or an error, so
+review tool text for sentences no bound model needs, not for a missing lean copy.
+
 ## Three sections, three jobs
 
 ```
@@ -54,8 +59,7 @@ Which copy to keep depends on the decorator, so check it before deleting either.
 Most tools here do not set `parse_docstring=True`, so their `Args:` block does not
 reach the JSON schema: it is prose the model reads alongside a schema carrying only
 names, types and defaults, and the `Annotated`/`Field` text is the copy that ships.
-`TodoWrite` (`ptc_agent/agent/tools/todo/tool.py`) and `think_tool`
-(`ptc_agent/agent/tools/think.py`) **do** set it, so there the `Args:` block *is* the
+`think_tool` (`ptc_agent/agent/tools/think.py`) **does** set it, so there the `Args:` block *is* the
 published description and the `Field`/`Annotated` copy is the one to drop. Deleting
 the wrong half silently changes what the model is told a parameter means.
 
@@ -103,8 +107,8 @@ Returns:
     File paths only, not contents; newest first.        # Glob: tells you a Read is coming
 
 Returns:
-    A long markdown report with the filing's official   # get_sec_filing: the cost signal
-    source URLs. Expect it to consume real context.     # is the reason to prefer a cheaper tool
+    ... The items' text is not in the result: it is     # get_sec_filing: what is not in it,
+    written to files in your workspace.                 # so the model knows a Read is coming
 ```
 
 **MCP tools: the full machine shape.** Agent-written Python indexes `resp["data"]`

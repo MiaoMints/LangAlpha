@@ -405,7 +405,7 @@ def test_scan_oversized_reported_not_emitted(tmp_path):
     _write(tmp_path, "ok.bin", b"z" * 100)
     out = _scan(tmp_path)
     assert [e["path"] for e in out["entries"]] == ["ok.bin"]
-    assert out["oversized"] == [{"path": "big.bin", "size": 101}]
+    assert [(o["path"], o["size"]) for o in out["oversized"]] == [("big.bin", 101)]
     assert out["hashed"] == 1
 
 
@@ -1648,6 +1648,20 @@ def test_pack_writes_chunks_at_the_computer_root_when_pack_root_is_given(tmp_pat
     assert os.path.isabs(chunk["path"])
     assert chunk["path"].startswith(str(computer / "_internal" / "packs") + os.sep)
     assert not (work / "_internal").exists()
+    assert open(chunk["path"], "rb").read() == b"aaa"
+
+
+def test_pack_names_a_chunk_absolute_when_the_walk_root_holds_the_computer(tmp_path):
+    """A copy walks any folder, one above the computer root among them; the
+    chunk is still named where the push resolves it, under the pack root."""
+    computer = tmp_path / "langalpha"
+    computer.mkdir()
+    members = _members(tmp_path, {"a.txt": b"aaa"})
+    out = rt.pack(
+        {"root": str(tmp_path), "pack_root": str(computer), "max_bytes": 1024, "members": members}
+    )
+    chunk = out["chunks"][0]
+    assert chunk["path"].startswith(str(computer / "_internal" / "packs") + os.sep)
     assert open(chunk["path"], "rb").read() == b"aaa"
 
 

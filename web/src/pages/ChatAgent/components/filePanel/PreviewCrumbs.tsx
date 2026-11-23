@@ -4,15 +4,20 @@ import { useTranslation } from 'react-i18next';
 import { Loader } from '@/components/ui/loader';
 import { toast } from '@/components/ui/use-toast';
 import { useCopyShareLink } from '@/hooks/useCopyShareLink';
+import { usePinAppAsDashboard } from '@/lib/dashboards';
 import { useShareLink } from '@/hooks/useShareLink';
 import { shareLinkHref } from '../../utils/api/shareLinks';
+import { PinDashboardButton } from './PinDashboardButton';
 import type { PreviewEntry } from './usePreviews';
+import './portChip.css';
 
 interface PreviewCrumbsProps {
   entry: PreviewEntry;
   onRefresh: () => void;
   /** The workspace the app runs in, whose `/a/` link opens it in a tab. */
   workspaceId?: string | null;
+  /** The thread the panel is beside, which set as the dashboard is where an edit goes. */
+  threadId?: string | null;
   /** A read-only panel opens the app's link but offers no copy of it. */
   readOnly?: boolean;
 }
@@ -23,7 +28,7 @@ interface PreviewCrumbsProps {
  * carries no chrome of its own — the tab's X is its close, and this row is
  * where everything else lives, so the panel keeps one header shape.
  */
-export function PreviewCrumbs({ entry, onRefresh, workspaceId = null, readOnly = false }: PreviewCrumbsProps): React.ReactElement {
+export function PreviewCrumbs({ entry, onRefresh, workspaceId = null, threadId = null, readOnly = false }: PreviewCrumbsProps): React.ReactElement {
   const { t } = useTranslation();
   const name = entry.title || t('filePanel.previewTab');
 
@@ -32,6 +37,7 @@ export function PreviewCrumbs({ entry, onRefresh, workspaceId = null, readOnly =
   const { data: link } = useShareLink(workspaceId, { kind: 'app', port: entry.port });
   const { copy, copiedCode } = useCopyShareLink();
   const copied = !!link && copiedCode === link.code;
+  const { pinned, pinIt } = usePinAppAsDashboard(link, name, entry.path, { workspaceId, threadId });
 
   // The check confirms the copy; the toast says who the link opens for.
   const copyLink = async () => {
@@ -39,7 +45,7 @@ export function PreviewCrumbs({ entry, onRefresh, workspaceId = null, readOnly =
   };
 
   return (
-    <div className="file-panel-crumbs">
+    <div className="file-panel-crumbs rule-b">
       <LayoutDashboard className="h-3.5 w-3.5 shrink-0" style={{ color: 'var(--color-icon-muted)' }} />
       <span className="file-panel-crumb is-file">{name}</span>
       <span className="file-panel-port-chip">:{entry.port}</span>
@@ -47,7 +53,7 @@ export function PreviewCrumbs({ entry, onRefresh, workspaceId = null, readOnly =
       {/* The path gives way before the buttons do: it shrinks to an
           ellipsis, and they keep their size at any length of it. */}
       {entry.path && (
-        <span className="file-panel-crumb-meta file-panel-crumb-path font-mono" title={entry.path}>
+        <span className="file-panel-crumb-meta open-style:control-voice file-panel-crumb-path font-mono" title={entry.path}>
           {entry.path}
         </span>
       )}
@@ -65,6 +71,7 @@ export function PreviewCrumbs({ entry, onRefresh, workspaceId = null, readOnly =
             : <Link2 className="h-3.5 w-3.5" />}
         </button>
       )}
+      {workspaceId && !readOnly && <PinDashboardButton pinned={pinned} onClick={pinIt} disabled={!link} />}
       <button
         type="button"
         onClick={onRefresh}

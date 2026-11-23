@@ -10,6 +10,7 @@ out of the root entirely, and one pointing at the root's reserved ``_internal``.
 from __future__ import annotations
 
 import base64
+import hashlib
 import math
 import os
 import re
@@ -22,7 +23,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from fastapi import HTTPException
 
-from src.server.app.share_access import ShareScope, shared_path_visible
+from src.server.services.served_paths import ShareScope, shared_path_visible
 from src.server.app.share_files import (
     download_shared_file,
     list_shared_files,
@@ -43,13 +44,13 @@ from src.server.services.workspace_file_containment import (
     resolve_in_sandbox,
     serving_roots,
 )
+from src.server.app.workspace_files._shared import RANGE_MAX_BYTES
 from src.server.app.workspace_files.crud import (
-    RANGE_MAX_BYTES,
     download_workspace_file,
     read_workspace_file,
 )
 from src.server.utils.http_headers import content_disposition
-from src.server.app.workspace_files.serve import serve_workspace_file
+from src.server.app.workspace_files.serve import _owner_visible, serve_workspace_file
 from ptc_agent.core.sandbox.providers.ssh_runtime import SSHRuntime
 from ptc_agent.core.sandbox.runtime import SandboxTransientError
 
@@ -62,9 +63,9 @@ SIBLING_SECRET = b"a file the share token does not cover"
 CHART_PNG = b"\x89PNG\r\n\x1a\n\x01\x02"
 
 _SERVE_DBWS = "src.server.app.workspace_files.serve.db_get_workspace"
-_SERVE_FP = "src.server.app.workspace_files.serve.FilePersistenceService"
+_SERVE_FP = "src.server.services.warm_files.FilePersistenceService"
 _SERVE_WD = "src.server.app.workspace_files.serve.work_dir_for"
-_SERVE_WSMGR = "src.server.app.workspace_files.serve.WorkspaceManager"
+_SERVE_WSMGR = "src.server.services.warm_files.WorkspaceManager"
 _SERVE_VAULT = "src.server.app.workspace_files.serve.get_vault_secrets_for_redaction"
 _SHARE_WD = "src.server.app.share_access.work_dir_for"
 _SHARE_THREAD = "src.server.app.share_access.get_thread_by_share_token"
@@ -72,11 +73,11 @@ _SHARE_DBWS = "src.server.app.share_access.db_get_workspace"
 _SHARE_SERVE = "src.server.app.share_files.serve_workspace_file"
 _SHARE_FP = "src.server.app.share_files.FilePersistenceService"
 _SHARE_VAULT = "src.server.app.share_files.get_vault_secrets_for_redaction"
-_SHARE_WSMGR = "src.server.app.workspace_files.serve.WorkspaceManager"
+_SHARE_WSMGR = "src.server.services.warm_files.WorkspaceManager"
 _CRUD_DBWS = "src.server.app.workspace_files.crud.db_get_workspace"
-_CRUD_OWNER = "src.server.app.workspace_files.crud.require_workspace_owner"
+_CRUD_OWNER = "src.server.app.workspace_files.crud.workspace_access"
 _CRUD_ACQUIRE_TO_CHANGE = "src.server.app.workspace_files.crud.acquire_sandbox_to_change"
-_CRUD_WD = "src.server.app.workspace_files.crud.owner_work_dir"
+_CRUD_WD = "src.server.app.workspace_files._shared.owner_work_dir"
 # The row a URL-only route re-reads after a live read, to prove the folder the
 # read went to was still this workspace's.
 _RECHECK = "src.server.app.workspace_files._shared.db_get_workspace"
@@ -217,6 +218,7 @@ def _shared_thread(perms: dict | None = None) -> dict:
         "conversation_thread_id": "thread-containment-1",
         "workspace_id": WS_ID,
         "share_permissions": perms or {"allow_files": True, "allow_download": True},
+        "owner_id": "owner-1",
     }
 
 
@@ -441,7 +443,7 @@ async def test_serve_falls_back_to_the_mirror_when_the_probe_cannot_run(tree) ->
         _warm(mgr, tree.sandbox)
         fp.get_file_content = AsyncMock(return_value=record)
         response = await serve_workspace_file(
-            WS_ID, "work/report.html", inject_theme=False
+            WS_ID, "work/report.html", visible=_owner_visible
         )
     assert response.status_code == 200
     assert response.body == b"mirrored"
@@ -476,7 +478,7 @@ async def test_serve_denies_a_symlink_out_of_the_serve_root(tree) -> None:
         fp.get_file_content = AsyncMock(return_value=None)
         with pytest.raises(HTTPException) as exc:
             await serve_workspace_file(
-                WS_ID, "work/escape/secret.txt", inject_theme=False
+                WS_ID, "work/escape/secret.txt", visible=_owner_visible
             )
     assert exc.value.status_code == 404
     assert tree.sandbox.reads == []
@@ -496,7 +498,7 @@ async def test_serve_denies_a_symlink_into_the_reserved_runtime_dir(tree) -> Non
         fp.get_file_content = AsyncMock(return_value=None)
         with pytest.raises(HTTPException) as exc:
             await serve_workspace_file(
-                WS_ID, "work/reserved/secret.txt", inject_theme=False
+                WS_ID, "work/reserved/secret.txt", visible=_owner_visible
             )
     assert exc.value.status_code == 404
     assert tree.sandbox.reads == []
@@ -515,7 +517,7 @@ async def test_serve_returns_a_contained_file(tree) -> None:
         _warm(mgr, tree.sandbox)
         fp.get_file_content = AsyncMock(return_value=None)
         response = await serve_workspace_file(
-            WS_ID, "work/report.html", inject_theme=False
+            WS_ID, "work/report.html", visible=_owner_visible
         )
     assert response.status_code == 200
     assert response.body == REPORT_HTML
@@ -533,7 +535,7 @@ async def test_serve_denies_a_traversal_path_without_touching_the_sandbox(tree) 
         _warm(mgr, tree.sandbox)
         with pytest.raises(HTTPException) as exc:
             await serve_workspace_file(
-                WS_ID, "../outside/secret.txt", inject_theme=False
+                WS_ID, "../outside/secret.txt", visible=_owner_visible
             )
     assert exc.value.status_code == 404
     assert tree.sandbox.runtime.commands == []
@@ -839,7 +841,7 @@ async def test_workspace_download_denies_a_symlink_out_of_the_root(tree) -> None
     with (
         patch(_CRUD_DBWS, AsyncMock(return_value=_workspace())),
         patch(_OWNED_DBWS, AsyncMock(return_value=_workspace())),
-        patch(_CRUD_OWNER, MagicMock()),
+        patch(_CRUD_OWNER, AsyncMock()),
         patch(_CRUD_WD, return_value=tree.root),
         patch(_CRUD_ACQUIRE_TO_CHANGE, _acquired(tree.sandbox, _workspace())),
     ):
@@ -882,7 +884,7 @@ async def test_workspace_download_past_the_exec_limit_uses_the_provider(
     with (
         patch(_CRUD_DBWS, AsyncMock(return_value=_workspace())),
         patch(_OWNED_DBWS, AsyncMock(return_value=_workspace())),
-        patch(_CRUD_OWNER, MagicMock()),
+        patch(_CRUD_OWNER, AsyncMock()),
         patch(_CRUD_WD, return_value=tree.root),
         patch(_CRUD_ACQUIRE_TO_CHANGE, _acquired(tree.sandbox, _workspace())),
         patch(_EXEC_CAP, 4),
@@ -911,7 +913,7 @@ async def test_a_whole_read_fits_in_what_the_runtime_keeps_of_its_output(tree) -
     with (
         patch(_CRUD_DBWS, AsyncMock(return_value=_workspace())),
         patch(_OWNED_DBWS, AsyncMock(return_value=_workspace())),
-        patch(_CRUD_OWNER, MagicMock()),
+        patch(_CRUD_OWNER, AsyncMock()),
         patch(_CRUD_WD, return_value=tree.root),
         patch(_CRUD_ACQUIRE_TO_CHANGE, _acquired(tree.sandbox, _workspace())),
         patch(_CRUD_STORAGE, return_value=False),
@@ -932,7 +934,7 @@ async def test_a_streamed_download_holds_the_folder_until_the_response_is_sent(t
     with (
         patch(_CRUD_DBWS, AsyncMock(return_value=_workspace())),
         patch(_OWNED_DBWS, AsyncMock(return_value=_workspace())),
-        patch(_CRUD_OWNER, MagicMock()),
+        patch(_CRUD_OWNER, AsyncMock()),
         patch(_CRUD_WD, return_value=tree.root),
         patch(_CRUD_ACQUIRE_TO_CHANGE, _acquired(tree.sandbox, _workspace(), events)),
         patch(_EXEC_CAP, 4),
@@ -964,7 +966,7 @@ async def test_workspace_download_fails_the_send_when_the_file_grows(tree) -> No
     with (
         patch(_CRUD_DBWS, AsyncMock(return_value=_workspace())),
         patch(_OWNED_DBWS, AsyncMock(return_value=_workspace())),
-        patch(_CRUD_OWNER, MagicMock()),
+        patch(_CRUD_OWNER, AsyncMock()),
         patch(_CRUD_WD, return_value=tree.root),
         patch(_CRUD_ACQUIRE_TO_CHANGE, _acquired(tree.sandbox, _workspace())),
         patch(_EXEC_CAP, 4),
@@ -984,7 +986,7 @@ async def test_workspace_download_past_the_exec_limit_still_denies_an_escape(
     with (
         patch(_CRUD_DBWS, AsyncMock(return_value=_workspace())),
         patch(_OWNED_DBWS, AsyncMock(return_value=_workspace())),
-        patch(_CRUD_OWNER, MagicMock()),
+        patch(_CRUD_OWNER, AsyncMock()),
         patch(_CRUD_WD, return_value=tree.root),
         patch(_CRUD_ACQUIRE_TO_CHANGE, _acquired(tree.sandbox, _workspace())),
         patch(_EXEC_CAP, 1),
@@ -1003,7 +1005,7 @@ async def test_workspace_read_denies_a_symlink_out_of_the_root(tree) -> None:
     with (
         patch(_CRUD_DBWS, AsyncMock(return_value=_workspace())),
         patch(_OWNED_DBWS, AsyncMock(return_value=_workspace())),
-        patch(_CRUD_OWNER, MagicMock()),
+        patch(_CRUD_OWNER, AsyncMock()),
         patch(_CRUD_WD, return_value=tree.root),
         patch(_CRUD_ACQUIRE_TO_CHANGE, _acquired(tree.sandbox, _workspace())),
     ):
@@ -1020,7 +1022,7 @@ async def test_workspace_download_returns_a_contained_file(tree) -> None:
     with (
         patch(_CRUD_DBWS, AsyncMock(return_value=_workspace())),
         patch(_OWNED_DBWS, AsyncMock(return_value=_workspace())),
-        patch(_CRUD_OWNER, MagicMock()),
+        patch(_CRUD_OWNER, AsyncMock()),
         patch(_CRUD_WD, return_value=tree.root),
         patch(_CRUD_ACQUIRE_TO_CHANGE, _acquired(tree.sandbox, _workspace())),
     ):
@@ -1035,13 +1037,13 @@ async def test_workspace_download_returns_a_contained_file(tree) -> None:
 
 _CRUD_VAULT = "src.server.app.workspace_files.crud.get_vault_secrets_for_redaction"
 _CRUD_READ_RANGE = "src.server.app.workspace_files.crud.read_contained_sandbox_range"
-_RANGE_MAX = "src.server.app.workspace_files.crud.RANGE_MAX_BYTES"
+_RANGE_MAX = "src.server.app.workspace_files._shared.RANGE_MAX_BYTES"
 _CRUD_WARM = "src.server.app.workspace_files.crud.warm_sandbox"
 VAULT_SECRET = "vault-secret-value-1234"
 # A version line as stat prints it (size, mtime, ctime, inode), and the clock.
 STAMPED = "10 1700000000.5 1700000000.5 42"
 CLOCK = "1700000100"
-_VERSION_MIN_AGE = "src.server.services.workspace_file_containment._VERSION_MIN_AGE_S"
+_VERSION_MIN_AGE = "ptc_agent.core.sandbox.file_version._SETTLED_AFTER_S"
 
 
 @pytest.fixture
@@ -1085,16 +1087,19 @@ async def _ranged_download(
     warm=None,
     folder_now=None,
     events=None,
+    if_none_match=None,
 ):
     """The owner route's answer. ``warm`` is the sandbox of a session this
     worker already holds, ``folder_now`` the row the recheck after a warm read
     finds, and ``events`` notes an acquisition."""
     request = MagicMock()
     request.headers = {"range": range_header} if range_header else {}
+    if if_none_match:
+        request.headers["if-none-match"] = if_none_match
     with (
         patch(_CRUD_DBWS, AsyncMock(return_value=_workspace())),
         patch(_OWNED_DBWS, AsyncMock(return_value=_workspace())),
-        patch(_CRUD_OWNER, MagicMock()),
+        patch(_CRUD_OWNER, AsyncMock()),
         patch(_CRUD_WD, return_value=tree.root),
         patch(_CRUD_ACQUIRE_TO_CHANGE, _acquired(tree.sandbox, _workspace(), events)),
         patch(_CRUD_VAULT, AsyncMock(return_value={"API_KEY": VAULT_SECRET})),
@@ -1108,6 +1113,57 @@ async def _ranged_download(
 
 @pytest.mark.usefixtures("settled")
 @pytest.mark.asyncio
+async def test_an_image_asked_for_again_at_its_version_is_not_read(tree) -> None:
+    """Every chat image asks again each time it shows, so a file still at the
+    version the browser holds is answered 304 by the sandbox, with nothing
+    read; a rewrite moves the version and goes out whole."""
+    first = await _ranged_download(tree, None)
+    etag = first.headers["etag"]
+    assert first.status_code == 200
+    assert re.fullmatch(r'"\d+-[\d.]+-[\d.]+-\d+"', etag)
+
+    again = await _ranged_download(tree, None, if_none_match=etag)
+    assert again.status_code == 304
+    assert again.headers["etag"] == etag
+    assert not again.body
+
+    # Any tag of a list matches, and a comma inside a quoted tag is its own.
+    decoy = f'"other,{etag.strip(chr(34))}"'
+    assert (await _ranged_download(tree, None, if_none_match=decoy)).status_code == 200
+    listed = await _ranged_download(tree, None, if_none_match=f'"abc", {etag}')
+    assert listed.status_code == 304
+
+    # Another size, so the version moves even where both writes share a tick.
+    Path(tree.root, "work/chart.png").write_bytes(b"\x89PNG\r\n\x1a\n\x00\x01\x02")
+    rewritten = await _ranged_download(tree, None, if_none_match=etag)
+    assert rewritten.status_code == 200
+    assert rewritten.body == b"\x89PNG\r\n\x1a\n\x00\x01\x02"
+    assert rewritten.headers["etag"] != etag
+
+
+@pytest.mark.asyncio
+async def test_a_file_too_fresh_for_a_version_is_told_by_its_bytes(tree) -> None:
+    """Two writes within one clock step share every stamp, so a file written
+    just now goes out under a validator of its bytes."""
+    # Fresh however long the run takes to get here.
+    with patch(_VERSION_MIN_AGE, math.inf):
+        response = await _ranged_download(tree, None)
+    assert response.headers["etag"].strip('"') == hashlib.md5(
+        b"\x89PNG\r\n\x1a\n\xff\xfe"
+    ).hexdigest()
+
+
+@pytest.mark.usefixtures("settled")
+@pytest.mark.asyncio
+async def test_redacted_text_is_not_sent_under_the_files_version(tree) -> None:
+    Path(tree.root, "work/settings.bin").write_text(f"key={VAULT_SECRET}\n")
+    response = await _ranged_download(tree, None, path="work/settings.bin")
+    assert VAULT_SECRET.encode() not in response.body
+    assert response.headers["etag"].strip('"') == hashlib.md5(response.body).hexdigest()
+
+
+@pytest.mark.usefixtures("settled")
+@pytest.mark.asyncio
 async def test_a_ranged_read_returns_the_slice_and_the_file_it_was_cut_from(
     tree,
 ) -> None:
@@ -1115,8 +1171,9 @@ async def test_a_ranged_read_returns_the_slice_and_the_file_it_was_cut_from(
     sliced = await _read_range(tree, "work/chart.png", 2, 4)
     assert sliced.canonical == f"{tree.root}/work/chart.png"
     assert (sliced.size, sliced.content, sliced.head) == (10, chart[2:6], chart)
-    # mtime, ctime and inode from GNU or BSD stat, with the fraction both give.
-    assert re.fullmatch(r"\d+\.\d+-\d+\.\d+-\d+", sliced.version)
+    # Size, mtime, ctime and inode from GNU or BSD stat, with the fraction
+    # both give.
+    assert re.fullmatch(r"10-\d+\.\d+-\d+\.\d+-\d+", sliced.version)
 
 
 @pytest.mark.usefixtures("settled")
@@ -1271,7 +1328,7 @@ async def test_a_ctime_counts_once_the_clock_is_two_seconds_past_it(
         _b64(canonical.encode()), line, clock, _b64(b"head"), _b64(b"abcd"), line
     )
     sliced = await _read_range(tree, "work/chart.png", 0, 4)
-    assert sliced.version == (f"1700000000.5-{ctime}-42" if versioned else None)
+    assert sliced.version == (f"10-1700000000.5-{ctime}-42" if versioned else None)
 
 
 @pytest.mark.usefixtures("settled")
@@ -1420,6 +1477,39 @@ async def test_a_file_without_a_version_goes_whole(tree) -> None:
 
 
 @pytest.mark.asyncio
+async def test_a_range_the_live_read_gave_up_on_still_reaches_the_backup(tree) -> None:
+    """The warm read found no version and sent the live read for the whole
+    file; when that read failed over, the backup served the whole file to a
+    request for a slice."""
+    from fastapi.responses import Response
+
+    from src.server.services.workspace_files import FromBackup
+
+    async def live_then_backup(_ws_id, _workspace, live, backup, *, away_ok):
+        try:
+            return await live()
+        except SandboxTransientError:
+            return await backup(FromBackup())
+
+    from_backup = AsyncMock(return_value=Response(status_code=206))
+    crud = "src.server.app.workspace_files.crud"
+    with (
+        patch(f"{crud}._warm_range_response", AsyncMock(return_value=(True, None))),
+        patch(
+            f"{crud}._download_live",
+            AsyncMock(side_effect=SandboxTransientError("machine away")),
+        ) as whole,
+        patch(f"{crud}.files_from", live_then_backup),
+        patch(f"{crud}.download_from_backup", from_backup),
+    ):
+        response = await _ranged_download(tree, "bytes=0-3")
+
+    assert response.status_code == 206
+    assert whole.await_args.args[5] is None
+    assert from_backup.await_args.args[5] == (0, 3)
+
+
+@pytest.mark.asyncio
 async def test_a_file_that_changed_mid_read_is_a_503_to_retry(tree) -> None:
     """Not the sandbox-unreachable answer: the sandbox is fine, the file moved."""
     changed = AsyncMock(side_effect=FileChangedWhileRead("work/chart.png"))
@@ -1439,7 +1529,8 @@ async def test_a_file_that_changed_mid_read_is_a_503_to_retry(tree) -> None:
 
 
 def _ranged_commands(sandbox) -> list[str]:
-    return [c for c in sandbox.runtime.commands if "date +%s" in c]
+    # A whole read prints the version too; only a range reads from an offset.
+    return [c for c in sandbox.runtime.commands if "tail -c +" in c]
 
 
 @pytest.mark.usefixtures("settled")

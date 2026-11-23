@@ -2,6 +2,8 @@
  * Shared types for stream and history event handlers.
  */
 
+import type { PreviewFailure } from '../../utils/api/sandbox';
+
 /** A loosely-typed message record used throughout the chat state. */
 export type MessageRecord = Record<string, unknown>;
 
@@ -25,16 +27,6 @@ export interface ToolCallResultRecord {
   [key: string]: unknown;
 }
 
-/** Shape of the todo update payload. */
-export interface TodoPayload {
-  todos?: unknown[];
-  total?: number;
-  completed?: number;
-  in_progress?: number;
-  pending?: number;
-  [key: string]: unknown;
-}
-
 /** Data for an inline HTML widget. */
 export interface HtmlWidgetData {
   html: string;
@@ -52,7 +44,8 @@ export interface PreviewData {
   /** URL path suffix (e.g. "/timeline.html") appended to the resolved signed URL. */
   path?: string;
   loading?: boolean;
-  error?: boolean;
+  /** Set when the app could not be shown, saying why. */
+  error?: PreviewFailure;
   /** Monotonic counter — incremented on user clicks to force iframe reload even when URL is unchanged. */
   reloadToken?: number;
   /** The workspace the app runs in, when not the view's own: an `/a/` link from a sibling. */

@@ -87,6 +87,47 @@ def _no_user_subagents(monkeypatch):
     monkeypatch.setattr(plugin_subagents, "subagents_snapshot", _no_snapshot)
 
 
+@pytest.fixture(autouse=True)
+def _no_host_claude_code_managed(monkeypatch, tmp_path_factory):
+    """Point Claude Code's managed-settings paths at folders that do not exist.
+
+    The check runs the real script, so on a machine with an organization's
+    managed settings installed (``/etc/claude-code``) every computer the
+    tests stand up, the backend's own included, would read as policy-blocked.
+    Tests *about* the check set these paths themselves.
+    """
+    from ptc_agent.core import claude_code_managed
+
+    empty = tmp_path_factory.getbasetemp() / "no-claude-code-managed"
+    for name in ("CLAUDE_CODE_MANAGED_DIR_LINUX", "CLAUDE_CODE_MANAGED_DIR_MAC", "MAC_MANAGED_PREFERENCES_DIR"):
+        monkeypatch.setattr(claude_code_managed, name, str(empty / name))
+
+
+@pytest.fixture(autouse=True)
+def _no_claude_plan_rows(monkeypatch):
+    """Stub the Claude plan's rows (``claude_code_plan``) to none for unit tests.
+
+    Settings, admission, every token save and removal, and a Claude Code
+    run's reports read or write them, and unit tests have no pool. A test
+    about the plan state installs its own store over this one.
+    """
+    from src.server.database import claude_code_plan
+
+    async def _none(*_args, **_kwargs):
+        return None
+
+    async def _kept(*_args, **_kwargs):
+        return True
+
+    async def _no_rows(user_id, credentials=None):
+        return {}
+
+    monkeypatch.setattr(claude_code_plan, "forget_plan", _none)
+    monkeypatch.setattr(claude_code_plan, "drop_plan", _none)
+    monkeypatch.setattr(claude_code_plan, "update_plan", _kept)
+    monkeypatch.setattr(claude_code_plan, "get_plans", _no_rows)
+
+
 @pytest.fixture(scope="session")
 def shipped_skill_md():
     """Locate a shipped skill's SKILL.md on disk, by name.

@@ -43,6 +43,7 @@ if __name__ == "__main__":
     )
 
     args = parser.parse_args()
+    args.workers = max(1, args.workers)
 
     # Configure SSE event logger independently
     # This allows viewing ONLY SSE events by setting SSE_EVENT_LOG_LEVEL=info
@@ -74,6 +75,17 @@ if __name__ == "__main__":
     # or deleted as of v4 Phase 2 (accepted residual: same-pair dispatch
     # lifecycle overlap across processes, gen-CAS-bounded last-writer-wins).
     os.environ["LANGALPHA_WORKERS"] = str(args.workers)
+    # Prompt templates are re-read on change only where the code reloads too:
+    # checking each one's mtime on every render costs a stat per template
+    # per turn on the event loop.
+    os.environ["LANGALPHA_RELOAD"] = "1" if reload else "0"
+    # edgartools rate-limits SEC requests per process at 9/s, under SEC's 10/s
+    # per client, so N workers share that budget rather than multiply it. Its
+    # rate is a whole number per second, so past 9 workers the floor of 1/s
+    # each adds up to more than SEC allows.
+    os.environ.setdefault("EDGAR_RATE_LIMIT_PER_SEC", str(max(1, 9 // args.workers)))
+    if args.workers > 9 and os.environ["EDGAR_RATE_LIMIT_PER_SEC"] == "1":
+        logger.warning(f"{args.workers} workers at 1 SEC request/s each exceed SEC's 10/s per client")
 
     try:
         logger.info(f"Starting server on {args.host}:{args.port}")
@@ -85,7 +97,11 @@ if __name__ == "__main__":
             workers=args.workers,
             log_level=args.log_level,
             timeout_keep_alive=300,  # 5 minutes - for long-running workflows
-            timeout_graceful_shutdown=60,  # 60 seconds for graceful shutdown
+            # How long open streams may hold shutdown. The lifespan's shutdown
+            # runs only after, so whoever kills this process must wait longer.
+            timeout_graceful_shutdown=int(
+                os.environ.get("LANGALPHA_GRACEFUL_SHUTDOWN_SECONDS", "60")
+            ),
         )
     except Exception as e:
         logger.error(f"Failed to start server: {str(e)}")

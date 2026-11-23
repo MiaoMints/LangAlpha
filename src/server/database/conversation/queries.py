@@ -60,6 +60,29 @@ async def get_query_turn_indexes(conversation_thread_id: str) -> List[int]:
             return [row["turn_index"] for row in await cur.fetchall()]
 
 
+async def recent_turn_models(conversation_thread_id: str, limit: int = 50) -> List[str]:
+    """The models the thread's newest turns ran, newest first, as each
+    turn's query recorded it (``metadata.llm_model``). A failed read is
+    empty: the caller falls back to another model."""
+    try:
+        async with pool.get_db_connection() as conn:
+            async with conn.cursor(row_factory=dict_row) as cur:
+                await cur.execute(
+                    """
+                    SELECT metadata->>'llm_model' AS llm_model
+                    FROM conversation_queries
+                    WHERE conversation_thread_id = %s AND metadata ? 'llm_model'
+                    ORDER BY turn_index DESC, created_at DESC
+                    LIMIT %s
+                """,
+                    (conversation_thread_id, limit),
+                )
+                return [row["llm_model"] for row in await cur.fetchall() if row["llm_model"]]
+    except Exception:
+        logger.warning(f"Reading the models of thread {conversation_thread_id}'s turns failed", exc_info=True)
+        return []
+
+
 async def get_query_at_turn(
     conversation_thread_id: str, turn_index: int
 ) -> Optional[Dict[str, Any]]:
@@ -197,6 +220,51 @@ async def create_query(
     except Exception as e:
         logger.error(f"Error creating query: {e}")
         raise
+
+
+async def set_run_query_metadata(
+    conn, run_id: str, key: str, value: Any, *, keep_null: bool = False
+) -> None:
+    """Set one key of the metadata on the query row of ``run_id``'s turn, on
+    ``conn``, so a START transaction can correct what it inserted; None
+    removes the key, or with ``keep_null`` stores a JSON null, which says the
+    key was cleared rather than never set."""
+    if value is None and not keep_null:
+        update, params = "COALESCE(q.metadata, '{}'::jsonb) - %s", (key,)
+    else:
+        update = "jsonb_set(COALESCE(q.metadata, '{}'::jsonb), ARRAY[%s], %s::jsonb)"
+        params = (key, SafeJson(value))
+    async with conn.cursor() as cur:
+        await cur.execute(
+            f"""
+            UPDATE conversation_queries q
+            SET metadata = {update}
+            FROM conversation_responses r
+            WHERE r.conversation_response_id::text = %s
+              AND q.conversation_thread_id = r.conversation_thread_id
+              AND q.turn_index = r.turn_index
+            """,
+            (*params, run_id),
+        )
+
+
+async def get_run_query_metadata(run_id: str, key: str) -> Tuple[bool, Any]:
+    """Whether the metadata on the query row of ``run_id``'s turn holds
+    ``key``, and its value: ``(True, None)`` is a JSON null."""
+    async with pool.get_db_connection() as conn, conn.cursor() as cur:
+        await cur.execute(
+            """
+            SELECT COALESCE(q.metadata ? %s, false), q.metadata -> %s
+            FROM conversation_queries q
+            JOIN conversation_responses r
+              ON q.conversation_thread_id = r.conversation_thread_id
+             AND q.turn_index = r.turn_index
+            WHERE r.conversation_response_id::text = %s
+            """,
+            (key, key, run_id),
+        )
+        row = await cur.fetchone()
+    return (bool(row[0]), row[1]) if row else (False, None)
 
 
 async def get_queries_for_thread(

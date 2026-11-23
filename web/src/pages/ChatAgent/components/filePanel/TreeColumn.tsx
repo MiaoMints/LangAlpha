@@ -1,6 +1,6 @@
 import React, { useRef } from 'react';
 import {
-  ArrowUpDown, BookMarked, CandlestickChart, CheckSquare, HardDrive, LayoutDashboard, RefreshCw, ScrollText, Search, Settings, Trash2, Upload, X,
+  ArrowUpDown, CheckSquare, HardDrive, LayoutDashboard, RefreshCw, Search, Settings, Trash2, Upload, X,
 } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
 import { motion } from '@/lib/framer';
@@ -8,7 +8,8 @@ import { TWEEN } from '@/lib/motion';
 import { cn } from '@/lib/utils';
 import { Loader } from '@/components/ui/loader';
 import type { MemoEntry } from '../../utils/api';
-import type { ContextMenuData, ContextPayload } from './types';
+import type { ContextPayload } from '@/components/ui/chat-input.types';
+import type { ContextMenuData } from './types';
 import { SORT_OPTIONS } from './fileMeta';
 import { DirectoryNode } from './DirectoryNode';
 import { useTreeKeyboard } from './useTreeKeyboard';
@@ -16,7 +17,9 @@ import type { TreeFilter } from './useTreeFilter';
 import type { FileSelection } from './useFileSelection';
 import type { FileBackup } from './useFileBackup';
 import type { PreviewEntry } from './usePreviews';
+import type { PanelLauncher } from './panelLaunchers';
 import './TreeColumn.css';
+import './portChip.css';
 
 export interface TreeColumnProps {
   /** The three models the column is a view of. */
@@ -49,11 +52,8 @@ export interface TreeColumnProps {
   /** Dev servers the agent started in this workspace, in port order. */
   previews: PreviewEntry[];
   onOpenPreview: (port: number) => void;
-  /** The reader's memory and memo stores, pinned above the listing; null where the reader has none here. */
-  onOpenMemory: (() => void) | null;
-  onOpenMemo: (() => void) | null;
-  /** A live chart, pinned with the stores; null where charts have no place (a share). */
-  onOpenChart: (() => void) | null;
+  /** The reader's stores and the live views, pinned above the listing; only those with a place here. */
+  pinned: PanelLauncher[];
 
   readOnly: boolean;
   uploadDisabled: boolean;
@@ -96,7 +96,10 @@ export function TreeColumn(props: TreeColumnProps): React.ReactElement {
   // Docked, the column folds on its width so the viewer reflows with it;
   // floating, it slides in from the edge it hangs off. Exits are shorter.
   // Full, it arrives with its tab as any tab's body does, and a file opened
-  // from it narrows it to the column on the same width the fold uses.
+  // from it narrows it to the column on the same width the fold uses. Full
+  // and going (a page or a result opened over the empty tab), it is a tab
+  // body leaving and fades as one: folding its width wiped it across the tab
+  // that replaced it.
   const enter = TWEEN.fold;
   const overlay = props.overlay && !props.full;
   const columnMotion = overlay
@@ -104,7 +107,7 @@ export function TreeColumn(props: TreeColumnProps): React.ReactElement {
     : {
       initial: props.full ? false as const : { width: 0 },
       animate: { width: props.full ? '100%' : TREE_WIDTH, transition: enter },
-      exit: { width: 0, transition: TWEEN.exit },
+      exit: props.full ? { opacity: 0, transition: TWEEN.exit } : { width: 0, transition: TWEEN.exit },
     };
 
   return (
@@ -130,7 +133,7 @@ export function TreeColumn(props: TreeColumnProps): React.ReactElement {
           {selection.selectMode ? (
             <>
               <span className="file-panel-tree-count">{selection.selectedPaths.size}</span>
-              <button className="file-panel-chip" onClick={selection.toggleSelectAll}>
+              <button data-bracket="chip" className="file-panel-chip open-style:control-voice" onClick={selection.toggleSelectAll}>
                 {selection.selectedPaths.size === filter.filteredSortedFiles.length
                   ? t('filePanel.deselectAll')
                   : t('filePanel.selectAllVisible')}
@@ -238,7 +241,8 @@ export function TreeColumn(props: TreeColumnProps): React.ReactElement {
               <span className="file-panel-crumb-spacer" />
               {props.onToggleSystemFiles && (
                 <button
-                  className={`file-panel-chip ${props.showSystemFiles ? 'active' : ''}`}
+                  data-bracket="chip"
+                  className={`file-panel-chip open-style:control-voice ${props.showSystemFiles ? 'active' : ''}`}
                   onClick={props.onToggleSystemFiles}
                   title={t('filePanel.systemDirsHint')}
                 >
@@ -264,8 +268,8 @@ export function TreeColumn(props: TreeColumnProps): React.ReactElement {
             live in tokens.css. */}
         <div className="file-panel-tree-filter">
           <div
-            className="rings-within owns-its-edge flex items-center gap-1.5 h-8 px-2 rounded-md border"
-            style={{ backgroundColor: 'var(--color-bg-input)', borderColor: 'var(--color-border-muted)' }}
+            className="file-panel-tree-search rings-within owns-its-edge flex items-center gap-1.5 h-8 px-2 rounded-[var(--cs-radius-control,var(--radius-md))] border"
+            style={{ backgroundColor: 'var(--color-shell-fill, var(--color-bg-input))', borderColor: 'var(--color-shell-edge, var(--color-border-muted))' }}
           >
             <Search className="h-3.5 w-3.5 shrink-0" style={{ color: 'var(--color-text-tertiary)' }} />
             <input
@@ -328,13 +332,14 @@ export function TreeColumn(props: TreeColumnProps): React.ReactElement {
 
         {filter.availableTypes.length > 1 && !selection.selectMode && (
           <div className="file-panel-tree-chips">
-            <button className={`file-panel-chip ${filter.filterType === 'All' ? 'active' : ''}`} onClick={() => filter.setFilterType('All')}>
+            <button data-bracket="chip" className={`file-panel-chip open-style:control-voice ${filter.filterType === 'All' ? 'active' : ''}`} onClick={() => filter.setFilterType('All')}>
               {t('filePanel.filterAll')}
             </button>
             {filter.availableTypes.map((type) => (
               <button
                 key={type}
-                className={`file-panel-chip ${filter.filterType === type ? 'active' : ''}`}
+                data-bracket="chip"
+                className={`file-panel-chip open-style:control-voice ${filter.filterType === type ? 'active' : ''}`}
                 onClick={() => filter.setFilterType(filter.filterType === type ? 'All' : type)}
               >
                 {type}
@@ -343,35 +348,19 @@ export function TreeColumn(props: TreeColumnProps): React.ReactElement {
           </div>
         )}
 
-        {/* The stores and the chart are pinned above the listing, and outside
+        {/* The stores and the live views are pinned above the listing, and outside
             the tree for the same reason the running apps are: they are not
             files, and a `role="tree"` cannot hold rows that are not treeitems. */}
-        {(props.onOpenMemory || props.onOpenMemo || props.onOpenChart) && (
-          <div className="file-panel-store-group">
-            {props.onOpenMemory && (
-              <button type="button" className="file-panel-item file-panel-store-row" onClick={props.onOpenMemory}>
-                <BookMarked className="h-3.5 w-3.5 shrink-0" style={{ color: 'var(--color-text-tertiary)' }} />
+        {props.pinned.length > 0 && (
+          <div className="file-panel-store-group rule-b">
+            {props.pinned.map(({ key, label, icon: Icon, open }) => (
+              <button key={key} type="button" className="file-panel-item file-panel-store-row" onClick={open}>
+                <Icon className="h-3.5 w-3.5 shrink-0" style={{ color: 'var(--color-text-tertiary)' }} />
                 <span className="flex-1 min-w-0 truncate text-xs" style={{ color: 'var(--color-text-primary)' }}>
-                  {t('filePanel.tabs.memory')}
+                  {label}
                 </span>
               </button>
-            )}
-            {props.onOpenMemo && (
-              <button type="button" className="file-panel-item file-panel-store-row" onClick={props.onOpenMemo}>
-                <ScrollText className="h-3.5 w-3.5 shrink-0" style={{ color: 'var(--color-text-tertiary)' }} />
-                <span className="flex-1 min-w-0 truncate text-xs" style={{ color: 'var(--color-text-primary)' }}>
-                  {t('filePanel.tabs.memo')}
-                </span>
-              </button>
-            )}
-            {props.onOpenChart && (
-              <button type="button" className="file-panel-item file-panel-store-row" onClick={props.onOpenChart}>
-                <CandlestickChart className="h-3.5 w-3.5 shrink-0" style={{ color: 'var(--color-text-tertiary)' }} />
-                <span className="flex-1 min-w-0 truncate text-xs" style={{ color: 'var(--color-text-primary)' }}>
-                  {t('filePanel.chartTab')}
-                </span>
-              </button>
-            )}
+            ))}
           </div>
         )}
 
@@ -379,7 +368,7 @@ export function TreeColumn(props: TreeColumnProps): React.ReactElement {
             files, and a `role="tree"` cannot hold rows that are not treeitems.
             Staying out of the scroller also keeps them reachable from a long list. */}
         {props.previews.length > 0 && (
-          <div className="file-panel-preview-group">
+          <div className="file-panel-preview-group rule-b">
             <div className="file-panel-preview-group-header">
               <LayoutDashboard className="h-3.5 w-3.5 shrink-0" style={{ color: 'var(--color-text-tertiary)' }} />
               <span className="text-xs font-medium truncate" style={{ color: 'var(--color-text-tertiary)' }}>
@@ -430,11 +419,11 @@ export function TreeColumn(props: TreeColumnProps): React.ReactElement {
               </div>
             ))
           ) : props.filesError ? (
-            <p className="px-3 py-6 text-center text-xs" style={{ color: 'var(--color-text-tertiary)' }}>{props.filesError}</p>
+            <p className="file-panel-empty-note px-3 py-6 text-center text-xs" style={{ color: 'var(--color-text-tertiary)' }}>{props.filesError}</p>
           ) : filter.listedFiles.length === 0 && !trimmed ? (
-            <p className="px-3 py-6 text-center text-xs" style={{ color: 'var(--color-text-tertiary)' }}>{t('filePanel.noFilesYet')}</p>
+            <p className="file-panel-empty-note px-3 py-6 text-center text-xs" style={{ color: 'var(--color-text-tertiary)' }}>{t('filePanel.noFilesYet')}</p>
           ) : showList && filter.filteredSortedFiles.length === 0 ? (
-            <p className="px-3 py-6 text-center text-xs" style={{ color: 'var(--color-text-tertiary)' }}>
+            <p className="file-panel-empty-note px-3 py-6 text-center text-xs" style={{ color: 'var(--color-text-tertiary)' }}>
               {trimmed ? t('filePanel.noSearchMatches') : t('filePanel.noTypeMatches', { type: filter.filterType.toLowerCase() })}
             </p>
           ) : (

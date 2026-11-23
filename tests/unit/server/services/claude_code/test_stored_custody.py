@@ -1,0 +1,547 @@
+"""Storing a user's setup token for Claude Code on cloud computers: the
+choice behind its operator's switch and the consent text, turns on the
+stored token, leaving the choice (the token goes with it, and the turns that
+may hold it stop), the operator's block, and the turns nobody starts, which
+never run on it.
+"""
+
+from contextlib import asynccontextmanager
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, call, patch
+
+import pytest
+from fastapi import HTTPException
+
+from ptc_agent.agent.claude_code.launcher import Credential
+from src.server.database.claude_code_hosted import CLAUDE_CODE_TURN, STORED_TURN, CLOUD_TURN
+from src.server.services.claude_code import hosted as hosted_module
+from src.server.services.claude_code.flow import backend_on
+from src.server.services.claude_code.hosted import DISCLOSURE, Hosted, drop_stored, opted_out
+from src.server.services.claude_code.launchers import HostedCredential
+from src.server.services.claude_code.machine import ComputerToken
+from src.server.services.claude_code.saved import SavedHome, token_check_key
+from src.llms.claude_code import ClaudeTurnFailed
+from src.server.services.llm.claude_code import (
+    CLAUDE_CODE_OFF,
+    claude_code_refusal,
+    require_runnable,
+    run_stamp,
+)
+from src.server.services.oauth_signin import OAuthRefusal
+from tests.unit.server.services.claude_code.fakes import Cache, serving
+from tests.unit.server.services.claude_code.test_hosted import (
+    CLOUD,
+    CODE,
+    HOSTED,
+    LAUNCHERS,
+    OWN,
+    SERVICE,
+    SMALL,
+    TOO_SMALL,
+    _admit,
+    platform,
+)
+from tests.unit.server.services.claude_code.test_hosted import client as _client
+
+client = _client
+
+TOKEN = "sk-ant-oat01-" + "t" * 40
+ROWS_ON = "src.server.services.claude_code.flow.rows_on"
+#: The token store's verdict as a cloud computer's placement reads it.
+SAVED_REFUSAL = "src.server.services.claude_code.saved.saved_refusal"
+
+
+# -- The choice --
+
+
+@pytest.fixture(autouse=True)
+def no_stored_task_runs():
+    """No subagent run on the stored token unless a test says otherwise."""
+    with patch(f"{HOSTED}.live_stored_task_runs", AsyncMock(return_value=[])) as runs:
+        yield runs
+
+
+@pytest.mark.asyncio
+async def test_with_its_switch_on_storing_is_the_one_choice_offered(client):
+    with platform(stored=True), patch(ROWS_ON, AsyncMock(return_value=True)):
+        got = await client.get("/api/v1/claude-code/custody")
+    assert got.json() == {
+        "mode": "local", "offered": ["stored"], "blocked": False, "runs_on": None,
+        "refusal": "hosted_off",
+    }
+
+
+@pytest.mark.asyncio
+async def test_storing_the_token_needs_the_current_consent_text_and_records_it(client):
+    saved = AsyncMock()
+    with (
+        platform(stored=True), patch(ROWS_ON, AsyncMock(return_value=True)), patch(f"{HOSTED}.write_custody", saved),
+    ):
+        unread = await client.put("/api/v1/claude-code/custody", json={"mode": "stored"})
+        older = await client.put("/api/v1/claude-code/custody", json={"mode": "stored", "disclosure": "2026-01-v0"})
+        accepted = await client.put("/api/v1/claude-code/custody", json={"mode": "stored", "disclosure": DISCLOSURE})
+    assert (unread.status_code, older.status_code, accepted.status_code) == (400, 400, 200)
+    saved.assert_awaited_once_with("test-user-123", "stored", disclosure=DISCLOSURE)
+
+
+@pytest.mark.asyncio
+async def test_a_blocked_user_is_not_offered_storing_and_cannot_choose_it(client):
+    with platform(stored=True, blocked=True), patch(ROWS_ON, AsyncMock(return_value=True)):
+        got = await client.get("/api/v1/claude-code/custody")
+        stored = await client.put("/api/v1/claude-code/custody", json={"mode": "stored", "disclosure": DISCLOSURE})
+    assert got.json() == {
+        "mode": "local", "offered": [], "blocked": True, "runs_on": None,
+        "refusal": "stored_blocked",
+    }
+    assert stored.status_code == 403
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("given", "expected"),
+    [
+        ({"stored": True, "mode": "stored"}, Hosted("stored_token")),
+        ({"stored": False, "mode": "stored"}, None),
+        ({"stored": True, "mode": "local", "blocked": True}, Hosted(refusal="stored_blocked")),
+        ({"stored": True, "mode": "stored", "blocked": True}, Hosted(refusal="stored_blocked")),
+        ({"stored": True, "mode": "local"}, Hosted(refusal="hosted_off")),
+    ],
+)
+async def test_where_a_turn_on_a_cloud_computer_runs_by_the_choice_and_its_switch(given, expected):
+    with platform(**given):
+        assert await hosted_module.hosted("user-1") == expected
+
+
+# -- Turns on the stored token --
+
+
+@pytest.mark.asyncio
+async def test_a_turn_on_the_stored_token_runs_while_it_is_usable_up_to_the_users_cap():
+    with platform(stored=True, mode="stored"), patch(SAVED_REFUSAL, AsyncMock(return_value=None)):
+        assert await _admit() is None
+    with platform(stored=True, mode="stored"), patch(SAVED_REFUSAL, AsyncMock(return_value="token_refused")):
+        assert (await _admit())["reason"] == "token_refused"
+    with platform(stored=True, mode="stored", live=3), patch(SAVED_REFUSAL, AsyncMock(return_value=None)):
+        assert (await _admit())["reason"] == "too_many_turns"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("given", "reason"),
+    [({"stored": False, "mode": "stored"}, "no_own_computer"), ({"stored": True, "blocked": True}, "no_own_computer")],
+)
+async def test_a_choice_switched_off_or_blocked_runs_the_cli_on_an_own_computer_or_says_none_is_there(given, reason):
+    with platform(**given):
+        assert await _admit() == {
+            "message": CLAUDE_CODE_OFF[reason], "type": "claude_code_off", "model": CODE, "reason": reason,
+        }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("given", "reason"),
+    [({"stored": False, "mode": "stored"}, "choice_changed"), ({"stored": True, "blocked": True}, "choice_changed")],
+)
+async def test_a_run_switched_off_or_blocked_since_admission_never_starts_and_says_why(given, reason):
+    with platform(**given), pytest.raises(ClaudeTurnFailed) as refused:
+        await HostedCredential("user-1", "stored_token", "c-2").read()
+    assert claude_code_refusal(refused.value, CODE)["reason"] == reason
+
+
+@pytest.mark.asyncio
+async def test_the_run_reads_the_stored_token_as_it_starts_for_the_token_descriptor():
+    row = {"access_token": TOKEN, "updated_at": "saved-at"}
+    with platform(stored=True, mode="stored"), patch(f"{LAUNCHERS}.stored_row", AsyncMock(return_value=row)):
+        assert await HostedCredential("user-1", "stored_token", "c-2").read() == Credential(TOKEN)
+
+
+@pytest.mark.asyncio
+async def test_a_run_admitted_on_one_credential_never_starts_on_another_its_row_was_not_stamped_for():
+    with platform(stored=True, mode="stored"), pytest.raises(ClaudeTurnFailed) as refused:
+        await HostedCredential("user-1", "saved_token", "c-2").read()
+    assert claude_code_refusal(refused.value, CODE) == {
+        "message": "How Claude Code runs on cloud computers changed as this turn started. Send your message again.",
+        "type": "claude_code_off", "model": CODE, "reason": "choice_changed",
+    }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("given", "computer", "answer", "stamp"),
+    [
+        ({"stored": True, "mode": "stored"}, CLOUD, None, {**CLOUD_TURN, **STORED_TURN}),
+        ({"stored": True, "mode": "stored"}, OWN, None, STORED_TURN),
+        ({"stored": True, "mode": "stored"}, OWN, SimpleNamespace(relays=True, fresh=False, expired=False), STORED_TURN),
+        ({"stored": True, "mode": "stored"}, OWN, SimpleNamespace(relays=False, fresh=False, expired=False), {}),
+        ({"stored": True, "mode": "local"}, OWN, None, {}),
+        ({"stored": False}, OWN, None, {}),
+    ],
+)
+async def test_a_run_that_may_hold_the_stored_token_is_marked_so_it_can_be_stopped(given, computer, answer, stamp):
+    with (
+        platform(computer=computer, **given), patch(f"{SERVICE}.read_answer", AsyncMock(return_value=answer)),
+        patch(f"{SERVICE}.saved_refusal", AsyncMock(return_value=None)), patch(SAVED_REFUSAL, AsyncMock(return_value=None)),
+    ):
+        assert await _stamp() == stamp
+
+
+async def _stamp() -> dict:
+    """The stamp a turn's row gets from what admission let it run on, past
+    the one every Claude Code turn gets."""
+    admitted = await require_runnable(
+        SimpleNamespace(feature_enabled=lambda _: True), CODE, user_id="user-1", workspace_id="ws-1",
+    )
+    stamp = run_stamp(SimpleNamespace(claude_code=True, claude_code_admitted=admitted))
+    return {k: v for k, v in stamp.items() if k not in CLAUDE_CODE_TURN}
+
+
+# -- Automations on the stored token --
+
+
+@pytest.mark.asyncio
+async def test_an_automation_on_the_stored_token_is_saved():
+    from src.server.services.automations.lifecycle import check_claude_code_hosted
+
+    with platform(stored=True, mode="stored"):
+        await check_claude_code_hosted("user-1", CODE, "ws-1")
+
+
+@pytest.mark.asyncio
+async def test_an_automation_naming_no_model_is_judged_on_the_default_its_firing_runs():
+    from src.server.services.automations.lifecycle import AutomationRefusal, check_claude_code_hosted
+
+    with platform(stored=True, mode="stored", computer=SMALL), pytest.raises(AutomationRefusal) as refused:
+        await check_claude_code_hosted("user-1", None, "ws-1", pref={"preferred_model": CODE})
+    assert str(refused.value) == TOO_SMALL
+    with platform(stored=True, mode="stored", computer=SMALL):
+        await check_claude_code_hosted("user-1", None, "ws-1", pref={"preferred_model": "gpt-5"})
+        with patch("src.server.services.automations.lifecycle.is_home_id", lambda *_: True):
+            await check_claude_code_hosted("user-1", None, "ws-1", pref={"preferred_model": CODE})
+
+
+@pytest.mark.asyncio
+async def test_an_automation_on_an_own_computer_relayed_the_stored_token_is_saved():
+    from src.server.services.automations.lifecycle import check_claude_code_hosted
+    from src.server.services.claude_code.machine import MachineAnswer
+
+    for answer in (None, MachineAnswer("none"), MachineAnswer("works")):
+        with (
+            platform(computer=OWN, stored=True, mode="stored"),
+            patch("src.server.services.claude_code.machine.read_answer", AsyncMock(return_value=answer)),
+        ):
+            await check_claude_code_hosted("user-1", CODE, "ws-1")
+
+
+# -- Own computers and the token sheet --
+
+
+@pytest.mark.asyncio
+async def test_an_own_computer_without_a_token_is_relayed_the_stored_one_only_while_it_is_stored():
+    row = AsyncMock(return_value={"access_token": TOKEN, "updated_at": "saved-at"})
+    with (
+        patch("src.server.services.claude_code.machine.stored_row", row),
+        patch("src.server.services.claude_code.machine.usable", AsyncMock(return_value=True)),
+    ):
+        with platform(stored=True, mode="stored"):
+            assert hosted_module.relay_offered()
+            assert await ComputerToken("user-1", "c-1").read() == Credential(TOKEN)
+        with platform(stored=True, mode="local"):
+            assert await ComputerToken("user-1", "c-1").read() is None
+    assert row.await_count == 1
+    with platform(stored=False):
+        assert not hosted_module.relay_offered()
+
+
+@pytest.mark.asyncio
+async def test_a_token_is_pasted_on_the_platform_only_while_the_user_stores_it():
+    enabled = AsyncMock(return_value=True)
+    with platform(stored=True, mode="stored"), patch("src.server.services.claude_code.flow.user_feature_enabled", enabled):
+        assert await backend_on("user-1")
+    with platform(stored=True, mode="local"), patch("src.server.services.claude_code.flow.user_feature_enabled", enabled):
+        assert not await backend_on("user-1")
+
+
+@pytest.mark.asyncio
+async def test_a_token_checked_while_the_user_stopped_storing_is_not_saved():
+    @asynccontextmanager
+    async def locked(*_):
+        yield object()
+
+    upsert = AsyncMock()
+    with (
+        serving(Cache()),
+        platform(stored=True, mode="local"),
+        patch("src.server.services.claude_code.saved.stored_row", AsyncMock(return_value=None)),
+        patch("src.server.services.claude_code.saved.keep_check", AsyncMock()),
+        patch("src.server.services.claude_code.saved.connection_change", locked),
+        patch("src.server.services.claude_code.saved.upsert_oauth_tokens", upsert),
+        pytest.raises(OAuthRefusal) as refused,
+    ):
+        await SavedHome("user-1").keep(
+            TOKEN, held=AsyncMock(return_value=True), email=None, expires_at=None, token_uuid="",
+        )
+    assert refused.value.status_code == 409
+    upsert.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_a_checked_token_is_saved_reading_the_choice_on_the_writers_own_connection():
+    conn = object()
+
+    @asynccontextmanager
+    async def locked(*_):
+        yield conn
+
+    upsert = AsyncMock()
+    with (
+        serving(Cache()),
+        platform(stored=True, mode="stored") as reads,
+        patch("src.server.services.claude_code.saved.stored_row", AsyncMock(return_value=None)),
+        patch("src.server.services.claude_code.saved.keep_check", AsyncMock()),
+        patch("src.server.services.claude_code.saved.connection_change", locked),
+        patch("src.server.services.claude_code.saved.upsert_oauth_tokens", upsert),
+    ):
+        await SavedHome("user-1").keep(
+            TOKEN, held=AsyncMock(return_value=True), email=None, expires_at=None, token_uuid="",
+        )
+    reads.mode.assert_awaited_once_with("user-1", conn=conn)
+    assert upsert.await_args.kwargs["conn"] is conn
+
+
+# -- Leaving the choice --
+
+
+@pytest.mark.asyncio
+async def test_any_choice_but_storing_takes_the_token_with_it():
+    drop, saved = AsyncMock(return_value=0), AsyncMock()
+    with (
+        platform(stored=True, mode="stored"), patch(f"{HOSTED}.drop_stored", drop),
+        patch(f"{HOSTED}.write_custody", saved),
+    ):
+        await hosted_module.choose("user-1", "local")
+        await hosted_module.choose("user-1", "stored", DISCLOSURE)
+    assert drop.await_args_list == [call("user-1", "local")]
+    saved.assert_awaited_once_with("user-1", "stored", disclosure=DISCLOSURE)
+
+
+@pytest.mark.asyncio
+async def test_dropping_the_stored_token_forgets_its_check_and_stops_each_turn_and_subagent_run_that_may_hold_it(
+    no_stored_task_runs,
+):
+    """A subagent run on it can outlive the turn that launched it."""
+    cache = SimpleNamespace(delete=AsyncMock())
+    no_stored_task_runs.return_value = [("t-3", "k1", "tr-3")]
+    with (
+        patch("src.config.settings.HOST_MODE", "platform"),
+        patch(f"{HOSTED}.write_custody", AsyncMock(return_value=TOKEN)) as leave,
+        patch(f"{HOSTED}.live_stored_turns", AsyncMock(return_value=[("t-1", "r-1"), ("t-2", "r-2")])),
+        patch("src.server.services.cancel_dispatch.cancel_workflow", AsyncMock()) as cancel,
+        patch("src.server.services.cancel_dispatch.cancel_subagent_task", AsyncMock()) as cancel_task,
+        patch("src.utils.cache.redis_cache.get_cache_client", return_value=cache),
+    ):
+        stopped = await drop_stored("user-1", block_reason="terms")
+    leave.assert_awaited_once_with("user-1", "local", block_reason="terms")
+    cache.delete.assert_awaited_once_with(token_check_key(TOKEN))
+    assert cancel.await_args_list == [call("t-1", "r-1", by="agent"), call("t-2", "r-2", by="agent")]
+    # By its run: a stop reaching the task after that run ended stops nothing.
+    cancel_task.assert_awaited_once_with("t-3", "k1", task_run_id="tr-3")
+    no_stored_task_runs.assert_awaited_once_with("user-1")
+    assert stopped == 3
+
+
+@pytest.mark.asyncio
+async def test_a_turn_that_fails_to_stop_leaves_none_of_the_others_on_the_stored_token_running():
+    failed = HTTPException(status_code=500, detail="Failed to cancel the turn.")
+    with (
+        patch("src.config.settings.HOST_MODE", "platform"),
+        patch(f"{HOSTED}.live_stored_turns", AsyncMock(return_value=[("t-1", "r-1"), ("t-2", "r-2")])),
+        patch("src.server.services.cancel_dispatch.cancel_workflow", AsyncMock(side_effect=[failed, None])) as cancel,
+        pytest.raises(hosted_module.TurnsNotStopped) as raised,
+    ):
+        await hosted_module.stop_stored_turns("user-1")
+    assert raised.value.count == 1 and raised.value.__cause__ is failed
+    assert cancel.await_args_list == [call("t-1", "r-1", by="agent"), call("t-2", "r-2", by="agent")]
+
+
+@pytest.mark.asyncio
+async def test_turning_claude_code_off_on_the_platform_drops_the_stored_token():
+    with platform(stored=True, mode="stored"), patch(f"{HOSTED}.drop_stored", AsyncMock()) as drop:
+        await opted_out("user-1")
+    drop.assert_awaited_once_with("user-1")
+    with (
+        platform(stored=True, mode="local"), patch(f"{HOSTED}.drop_stored", AsyncMock()) as drop,
+        patch(f"{HOSTED}.stop_stored_turns", AsyncMock(return_value=0)) as stop,
+    ):
+        await opted_out("user-1")
+    drop.assert_not_awaited()
+    stop.assert_awaited_once_with("user-1")
+    with (
+        platform(stored=True, mode="stored"), patch("src.config.settings.HOST_MODE", "oss"),
+        patch(f"{HOSTED}.drop_stored", AsyncMock()) as drop,
+    ):
+        await opted_out("user-1")
+    drop.assert_not_awaited()
+
+
+def test_claude_code_resolving_off_runs_the_opt_out_however_the_override_got_there():
+    from src.server.services import features
+
+    with (
+        patch.dict(features._FEATURE_BEFORE_OFF_HOOKS, {}, clear=True),
+        patch.dict(features._FEATURE_OFF_HOOKS, {}, clear=True),
+    ):
+        hosted_module.register_opt_out()
+        hosted_module.register_opt_out()
+        assert features._FEATURE_BEFORE_OFF_HOOKS["claude_code_runtime"] == [opted_out]
+        assert "claude_code_runtime" not in features._FEATURE_OFF_HOOKS
+
+
+@pytest.mark.asyncio
+async def test_turning_claude_code_off_saves_nothing_while_the_stored_token_cannot_be_dropped():
+    from httpx import ASGITransport, AsyncClient
+
+    from src.config.features import FeatureGate, SystemFlag
+    from src.server.app.features import router
+    from src.server.services import features
+    from tests.conftest import create_test_app
+
+    prefs = {"other_preference": {"feature_overrides": {"claude_code_runtime": True}}}
+    leave, upsert = AsyncMock(side_effect=OSError("connection lost")), AsyncMock()
+    turns, cache = AsyncMock(return_value=[]), SimpleNamespace(delete=AsyncMock())
+    with (
+        patch.dict(features._FEATURE_BEFORE_OFF_HOOKS, {}, clear=True),
+        platform(stored=True, mode="stored"),
+        patch("src.server.services.features.system_flag", lambda _: SystemFlag(True, FeatureGate.OPT_IN, None)),
+        patch("src.config.features.system_flag", lambda _: SystemFlag(True, FeatureGate.OPT_IN, None)),
+        patch("src.server.services.features.get_user_preferences", AsyncMock(return_value=prefs)),
+        patch("src.server.services.features.upsert_user_preferences", upsert),
+        patch("src.server.services.features.invalidate_user_prefs_cache", AsyncMock()),
+        patch(f"{HOSTED}.write_custody", leave),
+        patch(f"{HOSTED}.live_stored_turns", turns),
+        patch("src.utils.cache.redis_cache.get_cache_client", return_value=cache),
+    ):
+        hosted_module.register_opt_out()
+        async with AsyncClient(transport=ASGITransport(app=create_test_app(router)), base_url="http://test") as c:
+            got = await c.put("/api/v1/features/claude_code_runtime", json={"enabled": False})
+    assert got.status_code == 500
+    assert got.json()["detail"] == "Could not turn off feature: claude_code_runtime"
+    leave.assert_awaited_once_with("test-user-123", "local", block_reason=None)
+    upsert.assert_not_awaited()
+    turns.assert_not_awaited()
+    cache.delete.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_turning_claude_code_off_whose_drop_left_a_turn_running_saves_no_override_and_turns_off_on_retry():
+    from httpx import ASGITransport, AsyncClient
+
+    from src.config.features import FeatureGate, SystemFlag
+    from src.server.app.features import router
+    from src.server.database.claude_code_hosted import Custody
+    from src.server.services import features
+    from tests.conftest import create_test_app
+
+    prefs = {"other_preference": {"feature_overrides": {"claude_code_runtime": True}}}
+    leave, upsert = AsyncMock(return_value=TOKEN), AsyncMock()
+    cancel = AsyncMock(side_effect=[HTTPException(status_code=500, detail="Failed to cancel the turn."), None])
+    with (
+        patch.dict(features._FEATURE_BEFORE_OFF_HOOKS, {}, clear=True),
+        platform(stored=True, mode="stored") as reads,
+        patch("src.server.services.features.system_flag", lambda _: SystemFlag(True, FeatureGate.OPT_IN, None)),
+        patch("src.config.features.system_flag", lambda _: SystemFlag(True, FeatureGate.OPT_IN, None)),
+        patch("src.server.services.features.get_user_preferences", AsyncMock(return_value=prefs)),
+        patch("src.server.services.features.upsert_user_preferences", upsert),
+        patch("src.server.services.features.invalidate_user_prefs_cache", AsyncMock()),
+        patch(f"{HOSTED}.write_custody", leave),
+        patch(f"{HOSTED}.live_stored_turns", AsyncMock(return_value=[("t-1", "r-1")])),
+        patch("src.server.services.cancel_dispatch.cancel_workflow", cancel),
+        patch("src.utils.cache.redis_cache.get_cache_client", return_value=SimpleNamespace(delete=AsyncMock())),
+    ):
+        hosted_module.register_opt_out()
+        async with AsyncClient(transport=ASGITransport(app=create_test_app(router)), base_url="http://test") as c:
+            got = await c.put("/api/v1/features/claude_code_runtime", json={"enabled": False})
+            assert got.status_code == 500
+            assert got.json()["detail"] == "Could not turn off feature: claude_code_runtime"
+            upsert.assert_not_awaited()
+            reads.mode.return_value = Custody("local")
+            again = await c.put("/api/v1/features/claude_code_runtime", json={"enabled": False})
+    assert again.status_code == 200
+    leave.assert_awaited_once()
+    upsert.assert_awaited_once()
+    assert cancel.await_args_list == [call("t-1", "r-1", by="agent")] * 2
+
+
+@pytest.mark.asyncio
+async def test_leaving_the_stored_token_whose_turns_did_not_all_stop_says_so_not_that_it_is_still_stored(client):
+    with (
+        platform(stored=True, mode="stored"), patch(ROWS_ON, AsyncMock(return_value=True)),
+        patch(f"{HOSTED}.drop_stored", AsyncMock(side_effect=hosted_module.TurnsNotStopped(1))),
+    ):
+        got = await client.put("/api/v1/claude-code/custody", json={"mode": "local"})
+    assert got.status_code == 500
+    assert got.json()["error"]["code"] == "turns_running"
+
+
+@pytest.mark.asyncio
+async def test_storing_raced_by_an_operators_block_is_refused_as_blocked(client):
+    from src.server.database.claude_code_hosted import StoringBlocked
+
+    with (
+        platform(stored=True), patch(ROWS_ON, AsyncMock(return_value=True)),
+        patch(f"{HOSTED}.write_custody", AsyncMock(side_effect=StoringBlocked("user-1"))),
+    ):
+        got = await client.put("/api/v1/claude-code/custody", json={"mode": "stored", "disclosure": DISCLOSURE})
+    assert got.status_code == 403
+
+
+@pytest.mark.asyncio
+async def test_removing_the_token_stops_the_turns_on_it():
+    @asynccontextmanager
+    async def locked(*_):
+        yield object()
+
+    with (
+        serving(Cache()),
+        patch("src.config.settings.HOST_MODE", "platform"),
+        patch("src.server.services.claude_code.saved.stored_token", AsyncMock(return_value=TOKEN)),
+        patch("src.server.services.claude_code.saved.connection_change", locked),
+        patch("src.server.services.claude_code.saved.delete_oauth_tokens", AsyncMock()),
+        patch(f"{HOSTED}.live_stored_turns", AsyncMock(return_value=[("t-1", "r-1")])),
+        patch("src.server.services.cancel_dispatch.cancel_workflow", AsyncMock()) as cancel,
+    ):
+        await SavedHome("user-1").remove(held=AsyncMock(return_value=True))
+    assert cancel.await_args_list == [call("t-1", "r-1", by="agent")]
+
+
+@pytest.mark.asyncio
+async def test_removing_the_token_whose_turn_did_not_stop_says_so_not_that_removing_failed():
+    @asynccontextmanager
+    async def locked(*_):
+        yield object()
+
+    delete = AsyncMock()
+    with (
+        serving(Cache()),
+        patch("src.config.settings.HOST_MODE", "platform"),
+        patch("src.server.services.claude_code.saved.stored_token", AsyncMock(return_value=TOKEN)),
+        patch("src.server.services.claude_code.saved.connection_change", locked),
+        patch("src.server.services.claude_code.saved.delete_oauth_tokens", delete),
+        patch(f"{HOSTED}.live_stored_turns", AsyncMock(return_value=[("t-1", "r-1")])),
+        patch("src.server.services.cancel_dispatch.cancel_workflow", AsyncMock(side_effect=HTTPException(status_code=500))),
+        pytest.raises(OAuthRefusal) as refused,
+    ):
+        await SavedHome("user-1").remove(held=AsyncMock(return_value=True))
+    delete.assert_awaited_once()
+    assert (refused.value.status_code, refused.value.error["code"]) == (500, "turns_running")
+
+
+# -- The deploy bar --
+
+
+@pytest.mark.asyncio
+async def test_with_the_switch_off_no_choice_is_read_anywhere():
+    with platform(stored=False, computer=OWN) as reads:
+        assert not await hosted_module.saved_token_runs("user-1")
+        assert not hosted_module.relay_offered()
+        assert await _stamp() == {}
+    reads.mode.assert_not_awaited()

@@ -15,7 +15,9 @@ import pytest
 import pytest_asyncio
 from httpx import ASGITransport, AsyncClient
 
-from tests.conftest import create_test_app
+from tests.conftest import create_test_app, pin_chat_limit
+
+from tests.unit.server.access_stub import as_owner  # noqa: E402
 
 THREADS_MOD = "src.server.app.threads.messaging"
 AUTH_MOD = "src.server.utils.api"
@@ -41,14 +43,11 @@ async def threads_client():
     gate in ``_handle_send_message``.
     """
     from src.server.app.threads import router
-    from src.server.dependencies.usage_limits import (
-        ChatAuthResult,
-        enforce_chat_limit,
-    )
+    from src.server.dependencies.usage_limits import ChatAuthResult
 
     app = create_test_app(router)
-    app.dependency_overrides[enforce_chat_limit] = lambda: ChatAuthResult(
-        user_id="test-user-123", access_tier=0
+    pin_chat_limit(
+        app, ChatAuthResult(user_id="test-user-123", access_tier=0)
     )
     async with AsyncClient(
         transport=ASGITransport(app=app), base_url="http://test"
@@ -164,7 +163,7 @@ class TestReconnectWiring:
             if False:
                 yield ""
 
-        with patch(f"{AUTH_MOD}.require_thread_owner", new=AsyncMock()), \
+        with as_owner(THREADS_MOD), \
              patch("src.server.handlers.chat.reconnect_admission.classify_reconnect", new=_fake_classify), \
              patch("src.server.handlers.chat.reconnect_to_workflow_stream", new=_fake_reconnect):
             resp = await threads_client.get(
@@ -193,7 +192,7 @@ class TestReconnectWiring:
             if False:
                 yield ""
 
-        with patch(f"{AUTH_MOD}.require_thread_owner", new=AsyncMock()), \
+        with as_owner(THREADS_MOD), \
              patch("src.server.handlers.chat.reconnect_admission.classify_reconnect", new=_fake_classify), \
              patch("src.server.handlers.chat.reconnect_to_workflow_stream", new=_fake_reconnect):
             resp = await threads_client.get(

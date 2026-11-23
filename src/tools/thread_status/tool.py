@@ -20,7 +20,7 @@ import inspect
 import logging
 import re
 import uuid
-from collections.abc import Mapping, Sequence
+from collections.abc import Collection, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any, ClassVar, NamedTuple, Protocol
@@ -44,6 +44,7 @@ from src.tools.thread_status.listing import (
     ItemStatus,
     ItemType,
 )
+from src.tools.turn_tool import input_schema
 
 if TYPE_CHECKING:
     from ptc_agent.agent.middleware.background_subagent.registry import (
@@ -105,16 +106,7 @@ def build_thread_status_tool(
         )
         if stop:
             return reader.answer(*await reader.stop(stop.strip()))
-        # In the order an id is looked for: a bare task id can also be a
-        # wakeup's short id or a file name, so tasks come first, and any id
-        # can be an automation's file name, so automations come last.
-        sources: list[Source] = [
-            _Commands(reader),
-            _Tasks(reader),
-            _Wakeups(reader),
-            *([_Analysts(reader)] if analysts else []),
-            _Automations(reader),
-        ]
+        sources = _sources(reader, analysts)
         if id:
             return reader.answer(*await reader.detail(sources, id.strip()))
         return reader.answer(*await reader.listing(sources, type, status))
@@ -122,9 +114,70 @@ def build_thread_status_tool(
     return StructuredTool.from_function(
         coroutine=thread_status,
         name=TOOL_NAME,
+        args_schema=input_schema(TOOL_NAME, thread_status),
         description=inspect.cleandoc(THREAD_STATUS_DOC),
         response_format="content_and_artifact",
     )
+
+
+def _sources(reader: _Reader, analysts: bool) -> list[Source]:
+    """Every type of item, in the order an id is looked for: a bare task id
+    can also be a wakeup's short id or a file name, so tasks come first, and
+    any id can be an automation's file name, so automations come last."""
+    return [
+        _Commands(reader),
+        _Tasks(reader),
+        _Wakeups(reader),
+        *([_Analysts(reader)] if analysts else []),
+        _Automations(reader),
+    ]
+
+
+async def pending_work(
+    thread_id: str,
+    user_id: str | None,
+    *,
+    analysts: bool,
+    before: datetime | None = None,
+    kinds: Collection[ItemType] = TYPES,
+    since: datetime | None = None,
+    ended_since: datetime | None = None,
+) -> ItemType | None:
+    """The first type of item set to report back to the thread, as
+    ThreadStatus lists it, that is running or comes due by ``before`` (at any
+    time when None), or, given ``ended_since``, that ended since then with
+    its report still to come; among ``kinds`` only, and given ``since``, only
+    those set since then (an item whose rows say not when counts). None when
+    there is none. A type that cannot be read counts as one: the thread may
+    be coming back on its own."""
+    reader = _Reader(thread_id=thread_id, user_id=user_id, user_tz="UTC", registry=None)
+    for source in _sources(reader, analysts):
+        if source.type not in kinds:
+            continue
+        try:
+            items = await source.items()
+        except Exception:
+            logger.warning("[ThreadStatus] %s read failed thread_id=%s", source.type, thread_id, exc_info=True)
+            return source.type
+        if any(_reports_back(item, before, since, ended_since) for item in items):
+            return source.type
+    return None
+
+
+def _reports_back(
+    item: Item, before: datetime | None, since: datetime | None, ended_since: datetime | None
+) -> bool:
+    if since is not None and item.set_at is not None and _utc(item.set_at) < since:
+        return False
+    if item.status == "running":
+        return True
+    if item.status == "pending":
+        return before is None or _utc(item.at) <= before
+    return item.owed and ended_since is not None and _utc(item.at) >= ended_since
+
+
+def _utc(at: datetime) -> datetime:
+    return at if at.tzinfo is not None else at.replace(tzinfo=timezone.utc)
 
 
 class Shown(NamedTuple):
@@ -273,18 +326,32 @@ class _Reader:
             ), None
         # Named on the result as a hand-off names its command, so a view whose
         # stream never saw this call (one reconnected since) still re-reads
-        # the thread's commands.
-        return await self._stop(command_id), {"command_id": command_id}
+        # the thread's commands. The chart layers the command published ride
+        # it, for their card, only where nothing else shows them: this stop's
+        # own settle stored them, or this look is the first to show the end
+        # (a notice that got there first brought the card with it).
+        text, row, outcome = await self._stop(command_id)
+        artifact: dict[str, Any] = {"command_id": command_id}
+        layers = row.get("outbox_layers")
+        if layers and (outcome == "stopped" or command_id in self.stamped):
+            artifact["chart_layers"] = layers
+        return text, artifact
 
-    async def _stop(self, command_id: str) -> str:
+    async def _stop(self, command_id: str) -> tuple[str, Mapping[str, Any], str | None]:
         try:
             result = await control.stop_thread_command(self.thread_id, command_id, by="agent")
         except Exception as e:
             logger.warning("[ThreadStatus] stop of %s failed", command_id, exc_info=True)
-            return f"ERROR: Could not stop {command_id}, so it may still be running: {e}"
+            return f"ERROR: Could not stop {command_id}, so it may still be running: {e}", {}, None
         row = result.row or {}
+        return await self._stopped(command_id, result.outcome, row), row, result.outcome
+
+    async def _stopped(self, command_id: str, outcome: str, row: Mapping[str, Any]) -> str:
         wrote = f"What it wrote is in {row.get('log_path')}."
-        match result.outcome:
+        # The stop's settle published the job's outbox; no notice carries it.
+        if published := row.get("outbox_report"):
+            wrote += f"\n\n{published}"
+        match outcome:
             case "not_found":
                 return _unknown(command_id)
             case "stopped":
@@ -476,4 +543,4 @@ def _unknown(item_id: str) -> str:
     return f"No {item_id} in this conversation. ThreadStatus lists the ids."
 
 
-__all__ = ["THREAD_STATUS_DOC", "TOOL_NAME", "build_thread_status_tool"]
+__all__ = ["THREAD_STATUS_DOC", "TOOL_NAME", "build_thread_status_tool", "pending_work"]

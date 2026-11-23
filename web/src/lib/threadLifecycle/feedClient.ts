@@ -21,18 +21,34 @@
  * would be worse than a lib→pages import.
  */
 import type { QueryClient } from '@tanstack/react-query';
+import { markThreadArchived } from '@/lib/deletedThreads';
 import { isCacheOnlyMeta, queryKeys } from '@/lib/queryKeys';
+import { PING_STREAM_BEAT_MS } from '@/lib/streamSilence';
+import { ALL, refreshArtifactComments, refreshArtifactRecord, refreshArtifactThreads, refreshEveryArtifact } from '@/lib/artifactCache';
 import { threadFieldMutationKey } from '@/lib/threadFieldMutations';
-import { patchThreadTitle } from '@/lib/threadListCache';
+import { createEmitter } from '@/lib/emitter';
+import { dropThreadFromViews, patchThreadTitle, threadRowsOf } from '@/lib/threadListCache';
 import { isArchivedThreadsKey, patchThreadRows } from '@/lib/threadRowActions';
+import {
+  applySharedWorkspaceEvent,
+  isCachedSharedWorkspace,
+  isSharedWorkspaceEvent,
+  refreshSharedFiles,
+  resyncSharedWorkspaces,
+  tellSharedThreadDeleted,
+  type SharedWorkspaceEvent,
+} from '@/lib/sharedWorkspaceFeed';
 import {
   getAuthHeaders,
   streamFetch,
 } from '@/pages/ChatAgent/utils/api/transport';
-import type { Thread } from '@/types/api';
+import type { ArtifactCommentEvent, ArtifactRecordEvent, Thread } from '@/types/api';
+import { reconcilePendingApprovals, refreshPendingApprovals } from '@/lib/cliApprovals/reconcile';
+import { reconcilePendingVendorTerms, refreshPendingVendorTerms } from '@/lib/vendorTerms/reconcile';
 import {
   getLifecycleQueryClient,
-  markThreadSeen,
+  listenForSeenElsewhere,
+  markWatchedThreadSeen,
   setLifecycleQueryClient,
 } from './seen';
 import {
@@ -67,6 +83,9 @@ interface ClientState {
   pendingFullInvalidate: boolean;
   /** An automation joined or left a thread's line since the last flush. */
   pendingAutomations: boolean;
+  /** A turn ended in a shared workspace since the last flush: the shared
+   *  list says per workspace whether one is unread, so it is read again. */
+  pendingSharedUnread: boolean;
   invalidateTimer: ReturnType<typeof setTimeout> | null;
   unsubscribeCache: (() => void) | null;
   detachWindow: (() => void) | null;
@@ -90,6 +109,7 @@ const client: ClientState =
     resyncOnSnapshot: false,
     pendingFullInvalidate: false,
     pendingAutomations: false,
+    pendingSharedUnread: false,
     invalidateTimer: null,
     unsubscribeCache: null,
     detachWindow: null,
@@ -144,6 +164,10 @@ function scheduleInvalidate(workspaceId?: string | null): void {
     client.pendingFullInvalidate = false;
     const automations = client.pendingAutomations;
     client.pendingAutomations = false;
+    if (client.pendingSharedUnread) {
+      client.pendingSharedUnread = false;
+      void qc.invalidateQueries({ queryKey: queryKeys.sharedWorkspaces.list() });
+    }
     const workspaces = [...client.pendingWorkspaces];
     client.pendingWorkspaces.clear();
     if (full) {
@@ -153,6 +177,7 @@ function scheduleInvalidate(workspaceId?: string | null): void {
       // The automation announcements have no replay either, and a wait that
       // started while detached would otherwise stay unseen until its poll.
       void qc.invalidateQueries({ queryKey: queryKeys.automations.all });
+      refreshEveryArtifact(qc);
       return;
     }
     for (const ws of workspaces) {
@@ -170,15 +195,39 @@ function scheduleInvalidate(workspaceId?: string | null): void {
   }, INVALIDATE_DEBOUNCE_MS);
 }
 
+const notifications = createEmitter<Record<string, unknown>>();
+
+/**
+ * Hear the payloads that may carry a notification: every `run_started` (a
+ * background one holds its start) and every `notification`. An event to act
+ * on once, not state: a reconnect replays none, losing only that alert.
+ */
+export const subscribeFeedNotifications = notifications.subscribe;
+
+function tellNotification(raw: Record<string, unknown>): void {
+  try {
+    notifications.emit(raw);
+  } catch {
+    // A surface failing must not drop the feed.
+  }
+}
+
 function onFeedEvent(raw: Record<string, unknown>): void {
   const eventName = raw.event as string | undefined;
   if (eventName === 'snapshot') {
     const snap = raw as unknown as SnapshotFrame;
     applySnapshot(snap);
+    const qc = getLifecycleQueryClient();
+    if (qc) {
+      reconcilePendingApprovals(qc, snap.pending_approvals, client.resyncOnSnapshot);
+      reconcilePendingVendorTerms(qc, snap.pending_vendor_terms, client.resyncOnSnapshot);
+    }
     if (client.resyncOnSnapshot) {
       client.resyncOnSnapshot = false;
       client.pendingFullInvalidate = true;
       scheduleInvalidate();
+      const qc = getLifecycleQueryClient();
+      if (qc) void resyncSharedWorkspaces(qc);
       return;
     }
     // Scope the refetch to the workspaces the frame actually touches — a
@@ -196,6 +245,11 @@ function onFeedEvent(raw: Record<string, unknown>): void {
     return;
   }
   if (eventName !== 'thread_lifecycle') return; // 'timeout' → loop re-attaches
+  if (isSharedWorkspaceEvent(raw.type as string | undefined)) {
+    const qc = getLifecycleQueryClient();
+    if (qc) applySharedWorkspaceEvent(qc, raw as SharedWorkspaceEvent);
+    return;
+  }
 
   const evt = raw as {
     type?: string;
@@ -222,10 +276,23 @@ function onFeedEvent(raw: Record<string, unknown>): void {
         evt.run_id &&
         evt.thread_id === getActiveThreadId()
       ) {
-        markThreadSeen(evt.thread_id, evt.run_id);
+        markWatchedThreadSeen(evt.thread_id, evt.run_id);
       }
+      if (evt.type === 'run_settled') {
+        const qc = getLifecycleQueryClient();
+        if (qc) refreshSharedFiles(qc, evt.workspace_id);
+        if (qc && isCachedSharedWorkspace(qc, evt.workspace_id)) client.pendingSharedUnread = true;
+      }
+      // A background run's start carries its notification. After the store
+      // has the run, so a listener reading it sees the run it is told about.
+      if (evt.type === 'run_started') tellNotification(raw);
       return;
     }
+    // A run's end the server decided to tell the user about. The store needs
+    // nothing from it: the run_settled before it already moved the thread.
+    case 'notification':
+      tellNotification(raw);
+      return;
     case 'thread_title': {
       const qc = getLifecycleQueryClient();
       // An empty title is a real payload — clearing a title publishes "" —
@@ -307,22 +374,20 @@ function onFeedEvent(raw: Record<string, unknown>): void {
     case 'thread_deleted':
     case 'thread_archived': {
       const qc = getLifecycleQueryClient();
-      if (qc && evt.thread_id) {
-        const tid = evt.thread_id;
-        // Drop the row from the cached lists + the nav tree's Show-more store
-        // directly: the invalidate below only reaches enabled observers, and
-        // the sidebar's page-0 observers are cache-only — without this, a
-        // thread archived in another tab lingers in the tree until reload.
-        // Archived rows keep their archived-view entries (that list gains the
-        // row via the invalidate instead).
-        patchThreadRows<Thread>(
-          qc,
-          evt.workspace_id ? queryKeys.threads.byWorkspace(evt.workspace_id) : queryKeys.threads.all,
-          (rows) => (rows.some((t) => t.thread_id === tid) ? rows.filter((t) => t.thread_id !== tid) : rows),
-          evt.type === 'thread_archived' ? { skipKey: isArchivedThreadsKey } : {},
-        );
+      const tid = evt.thread_id;
+      const archived = evt.type === 'thread_archived';
+      if (tid) {
+        // Marked before the rows leave, for the nav tree's reveal to read as
+        // they do, as a local archive does.
+        if (archived) markThreadArchived(tid, true);
+        // The debounced invalidate below brings the archived view its row.
+        if (qc) {
+          dropThreadFromViews(qc, tid, evt.workspace_id, { keepArchived: archived });
+          if (!archived) tellSharedThreadDeleted(qc, tid, evt.workspace_id);
+        } else {
+          pruneThread(tid);
+        }
       }
-      if (evt.thread_id) pruneThread(evt.thread_id);
       scheduleInvalidate(evt.workspace_id);
       return;
     }
@@ -330,6 +395,7 @@ function onFeedEvent(raw: Record<string, unknown>): void {
     // lists regain it via the invalidate refetch (which also re-seeds its
     // lifecycle fields — they were pruned when the archive event landed).
     case 'thread_unarchived': {
+      if (evt.thread_id) markThreadArchived(evt.thread_id, false);
       const qc = getLifecycleQueryClient();
       if (qc && evt.thread_id) {
         const tid = evt.thread_id;
@@ -339,6 +405,7 @@ function onFeedEvent(raw: Record<string, unknown>): void {
           (rows) => (rows.some((t) => t.thread_id === tid) ? rows.filter((t) => t.thread_id !== tid) : rows),
           { skipKey: (key) => !isArchivedThreadsKey(key) },
         );
+        refreshArtifactThreads(qc);
       }
       scheduleInvalidate(evt.workspace_id);
       return;
@@ -353,24 +420,66 @@ function onFeedEvent(raw: Record<string, unknown>): void {
       scheduleInvalidate();
       return;
     }
+    case 'cli_approval': {
+      const qc = getLifecycleQueryClient();
+      if (qc) refreshPendingApprovals(qc);
+      return;
+    }
+    // A vendor's terms became pending or were answered, here or elsewhere.
+    case 'vendor_terms': {
+      const qc = getLifecycleQueryClient();
+      if (qc) void refreshPendingVendorTerms(qc);
+      return;
+    }
+    case 'artifact_comment':
+    case 'artifact': {
+      const qc = getLifecycleQueryClient();
+      const event = readArtifactEvent(raw);
+      if (!qc || !event) return;
+      const ref = { artifactId: event.artifact_id, workspaceId: event.workspace_id || null };
+      // A file's comments changed: a send took them, an answer arrived, or
+      // another tab edited or read one. Its comment layer, its counts and the
+      // destination thread's deck read them again, or every deck when the
+      // event names no thread: Mark all read can touch any of them.
+      if (event.type === 'artifact_comment') refreshArtifactComments(qc, [ref], event.thread_id ?? ALL);
+      // A file's record changed: published, updated, unshared, rebound.
+      else refreshArtifactRecord(qc, ref);
+      return;
+    }
     default:
       return; // forward-compatible: unknown types are ignored
   }
+}
+
+/**
+ * An artifact event, or null for one that names no artifact. Read loosely
+ * past the id, so an event missing a field still reads the file again.
+ */
+function readArtifactEvent(raw: Record<string, unknown>): ArtifactCommentEvent | ArtifactRecordEvent | null {
+  const { type, artifact_id: artifactId } = raw;
+  if (typeof artifactId !== 'string' || !artifactId) return null;
+  const str = (value: unknown) => (typeof value === 'string' ? value : '');
+  const common = { v: 1 as const, artifact_id: artifactId, workspace_id: str(raw.workspace_id), path: str(raw.path) };
+  if (type === 'artifact_comment') {
+    return {
+      ...common,
+      type,
+      thread_id: str(raw.thread_id) || null,
+      comment_ids: Array.isArray(raw.comment_ids) ? raw.comment_ids.filter((id): id is string => typeof id === 'string') : [],
+    };
+  }
+  if (type === 'artifact') {
+    return { ...common, type, shared: raw.shared === true, latest_seq: typeof raw.latest_seq === 'number' ? raw.latest_seq : 0 };
+  }
+  return null;
 }
 
 /** Seed the store from every thread-list response (rows carry lifecycle
  * fields) — cold caches first, then each future success via subscription. */
 function attachCacheSeeding(qc: QueryClient): void {
   const seedFromData = (data: unknown): void => {
-    // Two cache shapes live under the 'threads' prefix: plain lists
-    // ({threads}) and the gallery's infinite query ({pages: [{threads}]}).
-    const shaped = data as
-      | { threads?: Thread[]; pages?: Array<{ threads?: Thread[] }> }
-      | undefined;
-    const rows = Array.isArray(shaped?.pages)
-      ? shaped.pages.flatMap((p) => p?.threads ?? [])
-      : shaped?.threads;
-    if (Array.isArray(rows) && rows.length) seedFromListRows(rows);
+    const rows = threadRowsOf(data);
+    if (rows.length) seedFromListRows(rows);
   };
   for (const [, data] of qc.getQueriesData({ queryKey: queryKeys.threads.all })) {
     seedFromData(data);
@@ -401,7 +510,9 @@ function attachWindowHandlers(): void {
   window.addEventListener('freeze', suspend);
   window.addEventListener('pageshow', resume);
   document.addEventListener('visibilitychange', onVisibility);
+  const detachSeen = listenForSeenElsewhere();
   client.detachWindow = () => {
+    detachSeen();
     window.removeEventListener('pagehide', suspend);
     window.removeEventListener('freeze', suspend);
     window.removeEventListener('pageshow', resume);
@@ -445,6 +556,8 @@ async function runLoop(gen: number): Promise<void> {
             signal: controller.signal,
           },
           onFeedEvent,
+          undefined,
+          { beatMs: PING_STREAM_BEAT_MS },
         );
       } catch {
         // Non-2xx (auth churn, backend restart) → backoff below.
@@ -497,5 +610,6 @@ export function stopThreadLifecycleFeed(): void {
   client.pendingWorkspaces.clear();
   client.resyncOnSnapshot = false;
   client.pendingFullInvalidate = false;
+  client.pendingSharedUnread = false;
   client.backoffMs = BACKOFF_START_MS;
 }

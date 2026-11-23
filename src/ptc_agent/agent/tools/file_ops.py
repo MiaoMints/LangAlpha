@@ -7,7 +7,6 @@ from pathlib import Path
 from typing import Any, Callable
 
 import structlog
-from langchain_core.tools import tool
 
 from ptc_agent.agent.backends import (
     FilesystemBackend,
@@ -23,10 +22,11 @@ from ptc_agent.agent.backends.read_window import (
     format_cat_n,
 )
 from ptc_agent.agent.tools.context_file_policy import (
+    AGENT_MD,
+    Admission,
     CappedFile,
+    admit,
     capped_file,
-    fill_note,
-    over_cap_refusal,
 )
 from ptc_agent.agent.tools.utils import mark_sandbox_raised, stamp_sandbox_served
 from ptc_agent.core.paths import MEMO_USER_DIR, logged_path
@@ -34,6 +34,7 @@ from ptc_agent.agent.backends.db_json_route import UserDataValidationError
 from ptc_agent.agent.transcript.reading import READ_CHARS as TRANSCRIPT_READ_CHARS
 from ptc_agent.agent.transcript.reading import cut_window, is_segment
 from src.observability.private_errors import failure
+from src.tools.turn_tool import turn_tool
 
 logger = structlog.get_logger(__name__)
 
@@ -77,29 +78,131 @@ def is_memo_text_path(file_path: str) -> bool:
 # Type alias for operation callback
 OperationCallback = Callable[[dict[str, Any]], None]
 
+_ARTIFACT_SUFFIXES = (".html", ".htm")
+
+
+async def _record_creator(workspace_dir: str, normalized_path: str) -> None:
+    """Name the turn's thread the creator of an HTML file it wrote in its own
+    workspace folder, where comments on the file go by default.
+
+    Never raises: the write already happened, and a file with no creator only
+    falls through to the next destination.
+    """
+    if not normalized_path.lower().endswith(_ARTIFACT_SUFFIXES):
+        return
+    folder = workspace_dir.rstrip("/") + "/"
+    if not normalized_path.startswith(folder):
+        return
+    path = normalized_path[len(folder):]
+    # Scratch and other hidden folders hold nothing the user opens.
+    if any(part.startswith(".") for part in path.split("/")[:-1]):
+        return
+    try:
+        from src.server.services.served_paths import (
+            is_always_hidden_path,
+            may_be_artifact,
+        )
+
+        # A dependency unpacked under vendor/ or node_modules/ may go out with a
+        # page that loads it, but it is not a file the agent made for anyone.
+        if is_always_hidden_path(path) or not may_be_artifact(path):
+            return
+        from langgraph.config import get_config
+
+        configurable = get_config().get("configurable") or {}
+        workspace_id = configurable.get("workspace_id")
+        thread_id = configurable.get("thread_id")
+        if not workspace_id or not thread_id:
+            return
+        from src.server.database.artifacts import record_creator
+
+        await record_creator(
+            workspace_id=str(workspace_id), path=path, thread_id=str(thread_id)
+        )
+    except Exception as e:
+        logger.debug("Recording the file's creator failed", error=str(e))
+
+
+def _edited(text: str | None, old_string: str, new_string: str, replace_all: bool) -> str | None:
+    """``text`` after the edit, or None where the backend will refuse it
+    (no file, or a match that is missing or not unique)."""
+    if text is None or not old_string:
+        return None
+    if not replace_all and text.count(old_string) != 1:
+        return None
+    return text.replace(old_string, new_string, -1 if replace_all else 1)
+
+
+def _with_note(message: str, admission: Admission | None) -> str:
+    note = admission.text if admission is not None else None
+    return f"{message}\n\n{note}" if note else message
+
+
+def read_clipped_marker(cap: int, first: int, next_line: int, file_path: str, max_lines: int) -> str:
+    """What a Read cut short at whole lines ends with: the lines it showed
+    (``first``..``next_line``) and the call that reads on."""
+    return (
+        f"{READ_CLIPPED_NOTE} at {cap} characters to protect the context window. "
+        f"You saw lines {first}..{next_line}. "
+        f"Call Read(file_path='{file_path}', offset={next_line}, limit={max_lines}) "
+        "to continue, or pass a smaller limit to keep each chunk shorter.]"
+    )
+
+
 def create_filesystem_tools(
     backend: FilesystemBackend,
     operation_callback: OperationCallback | None = None,
     *,
-    refuse_over_cap: bool = False,
+    record_creators: bool = False,
+    agent_md: CappedFile = AGENT_MD,
 ) -> tuple:
     """Create the Read, Write, and Edit tools bound to ``backend``.
 
     ``backend`` is either a plain ``SandboxBackend`` or a
     ``CompositeFilesystemBackend`` that adds store-backed memory/memo routing;
-    the tools see a uniform interface either way. ``refuse_over_cap`` turns the
-    fill note on the capped context files into a hard refusal for a Write that
-    would land past the cap.
+    the tools see a uniform interface either way. ``record_creators`` is for
+    tools on the turn's own computer, whose workspace folder is the turn's.
+    ``agent_md`` is the notebook this agent keeps (``agent_md_for``).
     """
 
-    def _capped(normalized_path: str) -> CappedFile | None:
-        return capped_file(
+    async def _admit(
+        normalized_path: str, file_path: str, apply: Callable[[str | None], str | None]
+    ) -> Admission | None:
+        """The admission of a write to a capped file, or None when the file is
+        uncapped or the edit cannot be measured.
+
+        ``apply`` makes the file's text after the write from its text before.
+        A capped file is small, so it is read whole and the write applied here:
+        the backend's edit leaves no way to take one back.
+        """
+        capped = capped_file(
             normalized_path,
             workspace_dir=backend.workspace_dir,
             computer_root=backend.computer_root,
+            agent_md=agent_md,
         )
+        if capped is None:
+            return None
+        try:
+            before = await backend.aread_text(normalized_path)
+        except Exception:  # noqa: BLE001 - the write itself says what is wrong
+            # Left unmeasured: taken as a new file, a rewrite that shrinks a
+            # file already past the limit would be refused on a passing fault.
+            logger.warning("Capped file read failed before a write", file_path=logged_path(file_path))
+            return None
+        after = apply(before)
+        if after is None:
+            return None
+        admission = admit(capped, after, before)
+        if admission.refused:
+            logger.info(
+                "Write refused past its context limit",
+                file_path=logged_path(file_path),
+                limit=capped.limit,
+            )
+        return admission
 
-    @tool("Read")
+    @turn_tool("Read")
     async def read_file(file_path: str, offset: int | None = None, limit: int | None = None) -> str:
         """Read a file. Also supports images (PNG, JPG, GIF, WebP), PDFs and URLs.
 
@@ -192,6 +295,9 @@ def create_filesystem_tools(
             # field and stops sooner, and a single line comes whole.
             segment = is_segment(normalized_path)
             cap = MAX_READ_CHARS
+            # A route may show less of a file at once (``read_cap``).
+            if (route_cap := getattr(backend, "read_cap", None)) is not None:
+                cap = min(cap, route_cap(normalized_path) or cap)
             if segment and max_lines > 1:
                 lines = await cut_window(lines, start_offset)
                 cap = TRANSCRIPT_READ_CHARS
@@ -256,12 +362,7 @@ def create_filesystem_tools(
                             f"`sed -n '{start_offset + 1}p' '{file_path}' | head -c {slice_budget}`.]"
                         )
                 else:
-                    marker = (
-                        f"{READ_CLIPPED_NOTE} at {cap} characters to protect the context window. "
-                        f"You saw lines {start_offset + 1}..{next_line}. "
-                        f"Call Read(file_path='{file_path}', offset={next_line}, limit={max_lines}) "
-                        "to continue, or pass a smaller limit to keep each chunk shorter.]"
-                    )
+                    marker = read_clipped_marker(cap, start_offset + 1, next_line, file_path, max_lines)
                 formatted = clipped + marker
             elif len(lines) == max_lines:
                 # The backend returns at most ``max_lines``, so a full window
@@ -274,6 +375,9 @@ def create_filesystem_tools(
 
             return formatted
 
+        except IsADirectoryError:
+            logger.info("Read of a directory", file_path=logged_path(file_path))
+            return f"ERROR: {file_path} is a directory. Use Glob or `ls` to list it, then Read a file in it."
         except Exception as e:
             mark_sandbox_raised(e)
             error_msg = f"Failed to read file: {e!s}"
@@ -281,7 +385,7 @@ def create_filesystem_tools(
             logger.error("Failed to read file", file_path=logged_path(file_path), exc_info=trace, **fields)
             return f"ERROR: {error_msg}"
 
-    @tool("Write")
+    @turn_tool("Write")
     async def write_file(file_path: str, content: str) -> str:
         """Write content to a file. Overwrites existing.
 
@@ -304,17 +408,9 @@ def create_filesystem_tools(
                 logger.error("Access denied: path outside the allowed directories", file_path=logged_path(file_path))
                 return f"ERROR: {error_msg}"
 
-            capped = _capped(normalized_path)
-            if capped is not None and refuse_over_cap:
-                refusal = over_cap_refusal(capped.name, len(content), capped.cap)
-                if refusal is not None:
-                    logger.info(
-                        "Write refused past its context cap",
-                        file_path=logged_path(file_path),
-                        size=len(content),
-                        cap=capped.cap,
-                    )
-                    return refusal
+            admission = await _admit(normalized_path, file_path, lambda _before: content)
+            if admission is not None and admission.refused:
+                return admission.text
 
             stamp_sandbox_served(backend, normalized_path)
             try:
@@ -343,6 +439,8 @@ def create_filesystem_tools(
                 return f"ERROR: {exc}"
             if not result:
                 return "ERROR: Write operation failed"
+            if record_creators:
+                await _record_creator(backend.workspace_dir, normalized_path)
 
             if operation_callback:
                 try:
@@ -362,8 +460,7 @@ def create_filesystem_tools(
                 bytes_written = len(content.encode("utf-8"))
                 virtual_path = backend.virtualize_path(normalized_path)
                 message = f"Wrote {bytes_written} bytes to {virtual_path}"
-            note = fill_note(capped.name, len(content), capped.cap) if capped else None
-            return f"{message}\n\n{note}" if note else message
+            return _with_note(message, admission)
 
         except Exception as e:
             mark_sandbox_raised(e)
@@ -372,13 +469,14 @@ def create_filesystem_tools(
             logger.error("Failed to write file", file_path=logged_path(file_path), exc_info=trace, **fields)
             return f"ERROR: {error_msg}"
 
-    @tool("Edit")
+    @turn_tool("Edit")
     async def edit_file(file_path: str, old_string: str, new_string: str, replace_all: bool = False) -> str:
         """Replace exact string in a file. Must Read file first.
 
         Args:
             file_path: Path to the file.
-            old_string: Text to replace. Must match the file exactly, including
+            old_string: Text to replace, never empty (to create or overwrite a
+                whole file, use Write). Must match the file exactly, including
                 indentation, and must be unique unless replace_all is set.
             new_string: Replacement text.
             replace_all: Replace every occurrence instead of requiring a unique
@@ -399,11 +497,27 @@ def create_filesystem_tools(
                 logger.error("Access denied: path outside the allowed directories", file_path=logged_path(file_path))
                 return f"ERROR: {error_msg}"
 
+            # An empty string occurs between every character, so the backends
+            # would count it as a match: with replace_all the file came back
+            # with the new text spliced between each pair of characters.
+            if not old_string:
+                return "ERROR: old_string is empty. To create a file or replace all of it, use Write."
+
+            admission = await _admit(
+                normalized_path,
+                file_path,
+                lambda before: _edited(before, old_string, new_string, replace_all),
+            )
+            if admission is not None and admission.refused:
+                return admission.text
+
             stamp_sandbox_served(backend, normalized_path)
             result = await backend.aedit_text(normalized_path, old_string, new_string, replace_all=replace_all)
             if not result.get("success", False):
                 error_msg = result.get("error", "Edit operation failed")
                 return f"ERROR: {error_msg}"
+            if record_creators:
+                await _record_creator(backend.workspace_dir, normalized_path)
 
             if operation_callback:
                 try:
@@ -421,14 +535,7 @@ def create_filesystem_tools(
                 except Exception as cb_err:
                     logger.warning("Operation callback failed", error=str(cb_err))
 
-            message = str(result.get("message", "File edited successfully"))
-            capped = _capped(normalized_path)
-            size = result.get("size")
-            if capped is not None and isinstance(size, int):
-                note = fill_note(capped.name, size, capped.cap)
-                if note is not None:
-                    return f"{message}\n\n{note}"
-            return message
+            return _with_note(str(result.get("message", "File edited successfully")), admission)
 
         except Exception as e:
             mark_sandbox_raised(e)

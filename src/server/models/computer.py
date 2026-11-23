@@ -11,10 +11,11 @@ import posixpath
 import re
 from datetime import datetime
 from enum import StrEnum
-from typing import Any, Dict, List, Literal, Optional
+from typing import Annotated, Any, Dict, List, Literal, Optional
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+from ptc_agent.core.sandbox.browser_runtime.protocol import BringRefusal, StreamQualityName
 from ptc_agent.core.sandbox.providers.ssh_errors import MACHINE_ID_PATTERN
 
 from src.server.services.persistence.sync_result import UnsavedReason
@@ -45,7 +46,7 @@ class ComputerStatus(StrEnum):
 CLAIMABLE_FOR_START = (ComputerStatus.STOPPED, ComputerStatus.CREATING)
 
 
-ComputerKind = Literal["daytona", "docker", "e2b", "ssh"]
+ComputerKind = Literal["daytona", "docker", "e2b", "local", "ssh"]
 
 # Spec presets a request may name. Shown as Small, Medium, Large and Extra
 # Large; the ids predate those names and are persisted on computer rows. Each
@@ -338,6 +339,14 @@ class ComputerCreate(BaseModel):
             "without them"
         ),
     )
+    make_primary: bool = Field(
+        False,
+        description=(
+            "Make it primary, moving Home onto it, once its first start "
+            "completes, as Make primary would. Kept on the computer until then; "
+            "one that can't apply is dropped and shown in ``make_primary``"
+        ),
+    )
 
     @field_validator("name", mode="before")
     @classmethod
@@ -403,6 +412,10 @@ class ComputerSSHProbeResponse(BaseModel):
         False,
         description="LangAlpha's helper answers for the machine rather than an sshd",
     )
+    claude_code_blocked: bool = Field(
+        False,
+        description="Whether an organization's managed Claude Code settings on the machine keep Claude Code from running there",
+    )
     suggested_root_dir: str = Field(
         description=(
             "The folder a computer created without root_dir would work in: "
@@ -463,8 +476,10 @@ class ComputerSSHPairingTarget(BaseModel):
 class ComputerSSHPairingError(BaseModel):
     code: str = Field(
         description=(
-            "unreachable, timeout, auth_failed, host_key_mismatch (something "
-            "else answered there), private_address, not_connected (the "
+            "unreachable, refused (the machine's tunnel is up but its SSH "
+            "server turned the connection away), timeout, auth_failed, "
+            "host_key_mismatch (something else answered there), "
+            "private_address, not_connected (the "
             "machine's tunnel did not come up), gateway_unreachable (the "
             "tunnel gateway did not answer), no_host_key (the machine named "
             "no SSH host keys, so it was not dialed) or script_failed (the "
@@ -561,6 +576,14 @@ class ComputerSSHInfo(BaseModel):
         None,
         description="Whether the tunnel is up now; null when there is none or it is not known",
     )
+    paired_elsewhere: bool = Field(
+        False,
+        description=(
+            "The tunnel is down because its machine paired again, as with another "
+            "LangAlpha account or server, and let it go; reconnecting the machine "
+            "brings it back"
+        ),
+    )
     helper: bool = Field(
         False,
         description=(
@@ -646,6 +669,41 @@ class ComputerSpecRequest(BaseModel):
     )
 
 
+class HomePlanSizeResponse(BaseModel):
+    """Home's computer beside the size the user's plan gives it now."""
+
+    computer_id: Optional[str] = Field(
+        None, description="Home's computer; null before the user has one"
+    )
+    resource_tier: Optional[ResourceTierId] = Field(
+        None, description="Its size now; null before the user has one"
+    )
+    plan_tier: ResourceTierId = Field(
+        description=(
+            "The largest size the plan gives it on its provider, or its own when "
+            "the plan cannot be read"
+        )
+    )
+    largest_tier: Optional[ResourceTierId] = Field(
+        None, description="The largest size its cloud provider builds"
+    )
+    follows_plan: bool = Field(
+        description=(
+            "True while it is still to take plan_tier at its first build: a cloud "
+            "computer not built yet whose owner did not choose its size"
+        )
+    )
+    can_resize: bool = Field(
+        description=(
+            "True when Home's computer is the user's primary, a cloud computer "
+            "already built whose owner did not choose its size, and plan_tier is "
+            "bigger than its size: the computer the app's resize opens. False "
+            "while Home is on a machine of the user's own, a cloud stand-in "
+            "included"
+        )
+    )
+
+
 class ComputerAlwaysOnRequest(BaseModel):
     """Request model for toggling a computer's always-on flag."""
 
@@ -661,6 +719,126 @@ class ComputerFilesBackupRequest(BaseModel):
             "the last backup as it is"
         )
     )
+
+
+class ComputerBrowserQualityRequest(BaseModel):
+    """Request model for how sharply a computer's live browser view is drawn,
+    as the route before ``PATCH /browser`` took it."""
+
+    quality: Optional[StreamQualityName] = Field(
+        description=(
+            "The live view's quality; null follows the computer's size. It "
+            "applies the next time the browser opens"
+        )
+    )
+
+
+class BrowserChoicesUpdate(BaseModel):
+    """What a computer's owner changes about its browser: only the fields sent,
+    saved together. Each applies the next time the browser opens."""
+
+    quality: Optional[StreamQualityName] = Field(
+        None, description="The live view's quality; null follows the computer's size"
+    )
+    window: Optional[bool] = Field(
+        None,
+        description=(
+            "Whether the browser also opens as a window on the Mac's screen, "
+            "beside the Browser tab. Only a Mac under remote control can show one"
+        ),
+    )
+    signins: Optional[bool] = Field(
+        None,
+        description=(
+            "Whether sites stay signed in between the browser's starts. Every "
+            "save signs the browser out of every site, closing it if it is open "
+            "on what it kept, so sending it as it is signs out"
+        ),
+    )
+
+    @field_validator("window", "signins")
+    @classmethod
+    def _yes_or_no(cls, value: Optional[bool]) -> bool:
+        # Only quality has a null meaning; a default is not validated.
+        if value is None:
+            raise ValueError("must be true or false")
+        return value
+
+    @model_validator(mode="after")
+    def _changes_something(self) -> "BrowserChoicesUpdate":
+        if not self.model_fields_set:
+            raise ValueError("name at least one of quality, window or signins")
+        return self
+
+
+class ComputerBrowser(BaseModel):
+    """What a computer's browser is set to, as its machine is handed it."""
+
+    quality: Optional[StreamQualityName] = Field(
+        None, description="The live view's quality; null follows the computer's size"
+    )
+    signins: bool = Field(
+        description=(
+            "Whether sites stay signed in between the browser's starts; never "
+            "on a computer holding shared workspaces"
+        )
+    )
+    window: bool = Field(description="Whether the browser also shows as a window on the Mac's screen")
+    window_available: bool = Field(
+        description="Whether this computer can show one: a Mac under remote control"
+    )
+
+
+class BrowserChoicesSaved(BaseModel):
+    browser: ComputerBrowser
+    applied: bool = Field(
+        description=(
+            "Whether its machine has the choices, or is not running and takes them before "
+            "its next browser. False when a running machine did not answer: it takes "
+            "them at its next acquire, and a browser open meanwhile keeps what it had."
+        )
+    )
+
+
+#: Why no everyday browser's sign-ins were listed or brought: the machine's own
+#: reasons, or the server's, a computer that is not a machine of the person's
+#: own or does not keep sign-ins (``unavailable``), or one not running.
+BrowserSigninRefusal = Literal[BringRefusal, "unavailable", "not_running"]
+
+# A browser's id from the machine's list, and a profile folder as Chromium names
+# them ("Default", "Profile 3"). A source outside these is not listed, since a
+# bring would refuse it.
+BrowserId = Annotated[str, Field(pattern=r"^[a-z]{1,32}$", description="The browser's id")]
+BrowserProfile = Annotated[
+    str, Field(pattern=r"^[A-Za-z0-9 _.-]{1,128}$", description="The profile's folder")
+]
+
+
+class BrowserSigninSource(BaseModel):
+    browser: BrowserId
+    name: str = Field(description="The browser's name, as the person knows it")
+    profile: BrowserProfile
+    profile_name: str = Field(description="The name the person gave the profile")
+
+
+class BrowserSigninSourcesResponse(BaseModel):
+    sources: List[BrowserSigninSource] = Field(default_factory=list)
+    # Why none are listed.
+    reason: Optional[BrowserSigninRefusal] = None
+
+
+class BrowserSigninBringRequest(BaseModel):
+    browser: BrowserId
+    profile: BrowserProfile
+
+
+class BrowserSigninBringResponse(BaseModel):
+    done: bool
+    # Cookies set in the computer's browser.
+    count: int = 0
+    # Cookies the person's browser holds that could not be brought.
+    skipped: int = 0
+    reason: Optional[BrowserSigninRefusal] = None
 
 
 class ComputerRenameRequest(BaseModel):
@@ -787,8 +965,8 @@ class StartFailure(BaseModel):
     code: str = Field(
         description=(
             "folder_marked (another computer's mark is on the root), an SSH "
-            "connect code (root_dir, not_connected, auth_failed, "
-            "host_key_mismatch, unreachable, timeout, gateway_unreachable, "
+            "connect code (root_dir, not_connected, paired_elsewhere, auth_failed, "
+            "host_key_mismatch, unreachable, refused, timeout, gateway_unreachable, "
             "unsupported, private_address, host_key_invalid), or start_failed "
             "for anything else"
         )
@@ -805,6 +983,42 @@ class StartFailure(BaseModel):
         )
     )
     at: datetime = Field(description="When the start failed")
+
+
+class ComputerIntentError(BaseModel):
+    code: str = Field(description="A move refusal code, or a removal refusal code")
+    message: str = Field(description="A sentence the user can be shown as is")
+
+
+class ComputerMakePrimaryIntent(BaseModel):
+    """Make primary, asked with the create, applied once the first start completes."""
+
+    state: Literal["pending", "dropped"]
+    error: Optional[ComputerIntentError] = Field(
+        None, description="Why it was dropped, as Make primary would have refused"
+    )
+
+
+class ComputerRemovalIntent(BaseModel):
+    """A remove that moves Home off this computer first (``home_to``)."""
+
+    state: Literal["waiting_for_home", "home_did_not_move", "not_removed", "removed"] = Field(
+        description=(
+            "waiting_for_home until Home's move ends; home_did_not_move when it "
+            "failed or was cancelled, and the computer stays primary; "
+            "not_removed when Home moved but the remove was then refused; "
+            "removed once the computer is gone"
+        )
+    )
+    move_id: str = Field(description="Home's move, read at GET /workspaces/{home}/move")
+    error: Optional[ComputerIntentError] = None
+    removed: Optional["ComputerRemoveResponse"] = Field(
+        None,
+        description=(
+            "What the removal left behind, as a removal answering at once "
+            "would have said. Null on a computer gone without it recorded"
+        ),
+    )
 
 
 class ComputerResponse(BaseModel):
@@ -846,6 +1060,14 @@ class ComputerResponse(BaseModel):
     workspace_count: int = Field(
         0,
         description="Live projects on this computer, which its stop takes down together",
+    )
+    stands_in_for_home: bool = Field(
+        False,
+        description=(
+            "Home's turns run here while the primary, a machine of the user's "
+            "own, can't be reached, so the computer is kept even with no "
+            "workspaces; its owner can still remove it"
+        ),
     )
     layout_version: Optional[int] = Field(
         None,
@@ -889,6 +1111,12 @@ class ComputerResponse(BaseModel):
     ssh: Optional[ComputerSSHInfo] = Field(
         None, description="The machine an ssh computer runs on; null for other kinds"
     )
+    make_primary: Optional[ComputerMakePrimaryIntent] = Field(
+        None, description="A make primary asked with the create; null when none"
+    )
+    removal: Optional[ComputerRemovalIntent] = Field(
+        None, description="A remove waiting on Home's move off it, or how one ended"
+    )
     start_failure: Optional[StartFailure] = Field(
         None,
         description=(
@@ -896,6 +1124,7 @@ class ComputerResponse(BaseModel):
             "reinstall or reconnect is accepted"
         ),
     )
+    browser: ComputerBrowser = Field(description="What its browser is set to")
 
     model_config = ConfigDict(from_attributes=True)
 
@@ -1006,6 +1235,25 @@ class ComputerFilesRemoval(BaseModel):
     )
 
 
+class ComputerTokenRemoval(BaseModel):
+    """A Claude Code setup token left on a removed ssh computer's machine,
+    which signs in as its owner until it is deleted there."""
+
+    outcome: Literal["unreached", "failed"] = Field(
+        description=(
+            "unreached: the machine did not answer; failed: it answered but could "
+            "not delete it. Either way it last held a token file of the computer's"
+        )
+    )
+    path: str = Field(
+        description=(
+            "The token file on the machine, with ~ for the login's home, in the folder "
+            "it was last found in; in the default config home's (~/.config) when that "
+            "was never said"
+        )
+    )
+
+
 class ComputerRemoveRequest(BaseModel):
     """Request body for removing a computer.
 
@@ -1032,6 +1280,10 @@ class ComputerRemoveResponse(BaseModel):
     files: Optional[ComputerFilesRemoval] = Field(
         None, description="Null unless the removal was asked to delete the machine's files"
     )
+    token: Optional[ComputerTokenRemoval] = Field(
+        None,
+        description="Set only when a Claude Code token of the computer's is left on its machine",
+    )
     workspaces_deleted: List[str] = Field(
         default_factory=list,
         description=(
@@ -1039,6 +1291,18 @@ class ComputerRemoveResponse(BaseModel):
             "or deleted by another request, meanwhile is not among them"
         ),
     )
+    move_id: Optional[str] = Field(
+        None,
+        description=(
+            "Set on a 202: Home is moving to ``home_to`` first, and the computer "
+            "is removed once that move commits. Follow it at GET "
+            "/workspaces/{home}/move, then GET /computers/{id}/removal for how "
+            "it ended"
+        ),
+    )
+
+
+ComputerRemovalIntent.model_rebuild()
 
 
 class ComputerSessionResponse(BaseModel):

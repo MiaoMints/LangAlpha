@@ -1,11 +1,13 @@
 import React, { Suspense } from 'react';
 import { useTranslation } from 'react-i18next';
 import type { OpenFileHandler } from '../../utils/fileLocation';
-import type { MarketWatchState } from '../../session/marketWatchEvents';
 import { SandboxSettingsContent } from '../SandboxSettingsPanel';
 import type { SubagentInfo } from '../ToolCallDetailView';
-import type { ApiAdapter, ChartTabSpec, ContextPayload, PanelTarget } from './types';
+import type { ContextPayload } from '@/components/ui/chat-input.types';
+import type { ApiAdapter, ChartTabSpec, PanelTarget } from './types';
+import type { BrowserViewSession } from './browserStream';
 import type { FileTab, FileTabsApi } from './useFileTabs';
+import { BrowserViewer } from '../viewers/BrowserViewer';
 import { ChartTab } from './ChartTab';
 import { StoreTab } from './StoreTab';
 import { FileViewer, type FileViewerProps } from './FileViewer';
@@ -25,9 +27,6 @@ interface ActiveTabBodyProps {
   target: PanelTarget | null;
   onTargetMemoryHandled?: (seq?: number) => void;
   onTargetMemoHandled?: (seq?: number) => void;
-  marketWatch: MarketWatchState | null;
-  threadId: string | null;
-  isActive: boolean;
   onOpenFile: OpenFileHandler | null;
   onOpenSubagentTask: ((info: SubagentInfo) => void) | null;
   transcript: TranscriptReader | null;
@@ -38,17 +37,21 @@ interface ActiveTabBodyProps {
   onPageCount: (path: string, pages: number) => void;
   /** Whether the empty tab invites a drop. */
   canUpload: boolean;
+  /** Null where the panel has no browser to show, as a share's does not. */
+  browser: BrowserViewSession | null;
 }
 
-/** What fills the viewer slot for the active tab. Preview panes are rendered beside this, always mounted. */
+/** What fills the viewer slot for the active tab. Preview panes are rendered beside this, kept mounted. */
 export function ActiveTabBody({
-  activeTab, tabs, workspaceId, apiAdapter, target, onTargetMemoryHandled, onTargetMemoHandled, marketWatch,
-  threadId, isActive, onOpenFile, onOpenSubagentTask, transcript, onAddContext,
-  onOpenInMarketView, file, onPageCount, canUpload,
+  activeTab, tabs, workspaceId, apiAdapter, target, onTargetMemoryHandled, onTargetMemoHandled,
+  onOpenFile, onOpenSubagentTask, transcript, onAddContext,
+  onOpenInMarketView, file, onPageCount, canUpload, browser,
 }: ActiveTabBodyProps): React.ReactNode {
   switch (activeTab.kind) {
     case 'preview':
       return null;
+    case 'browser':
+      return browser && <BrowserViewer view={browser} />;
     case 'chart':
       return (
         <ChartTab
@@ -85,9 +88,6 @@ export function ActiveTabBody({
           onTargetMemoryHandled={onTargetMemoryHandled}
           onTargetMemoHandled={onTargetMemoHandled}
           onOpenFile={onOpenFile}
-          marketWatch={marketWatch}
-          threadId={threadId}
-          isActive={isActive}
         />
       );
     case 'sources':

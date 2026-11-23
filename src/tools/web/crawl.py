@@ -16,11 +16,11 @@ import re
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlparse
 
-from langchain_core.tools import tool
 
 from src.config.tool_settings import get_crawl_provider
 from src.observability import TOOL_PROVIDER, stamp_run, stamp_tool_provider
 from src.tools.decorators import create_logged_tool, get_tool_tracker
+from src.tools.turn_tool import turn_tool
 from src.tools.web.providers._shared import mark_web_outcome
 from src.tools.web.manifest import (
     CAPABILITY_CRAWL,
@@ -36,6 +36,7 @@ from src.tools.web.types import (
     WebError,
     WebErrorType,
     WebToolError,
+    billed_units,
 )
 
 logger = logging.getLogger(__name__)
@@ -149,7 +150,7 @@ def create_crawl_tools(filesystem_backend: Any) -> List[Any]:
     crawl_tracking = cap.tracking_key(level)
     map_cap = get_capability(provider, CAPABILITY_MAP)
 
-    @tool("WebCrawl", response_format="content_and_artifact")
+    @turn_tool("WebCrawl", response_format="content_and_artifact")
     async def web_crawl(
         url: str,
         limit: int = 25,
@@ -252,11 +253,12 @@ def create_crawl_tools(filesystem_backend: Any) -> List[Any]:
                 # Meter the pages Firecrawl delivered (and billed us for) as they
                 # arrive, so a cancelled crawl still bills exactly what was
                 # delivered — and a failed local write never yields a free page.
-                delivered_ok = sum(1 for p in status.pages if p.ok)
-                if delivered_ok:
+                # A 404 or empty page is billed too, though it is not kept.
+                billed = billed_units(status.pages)
+                if billed:
                     tracker = get_tool_tracker()
                     if tracker:
-                        tracker.record_usage(crawl_tracking, count=delivered_ok)
+                        tracker.record_usage(crawl_tracking, count=billed)
 
                 if status.state.terminal:
                     state = status.state
@@ -319,7 +321,7 @@ def create_crawl_tools(filesystem_backend: Any) -> List[Any]:
         }
         return "\n".join(lines), artifact
 
-    @tool("WebMapImpl", response_format="content_and_artifact")
+    @turn_tool("WebMapImpl", response_format="content_and_artifact")
     async def web_map(url: str, query: Optional[str] = None, limit: int = 100) -> Tuple[str, Dict[str, Any]]:
         """Discover the URLs of a website without crawling it.
 

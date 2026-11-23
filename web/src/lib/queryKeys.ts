@@ -1,4 +1,5 @@
 import type { QueryMeta } from '@tanstack/react-query';
+import type { SearchKind } from '@/api/search';
 
 /**
  * Hierarchical query key factory for React Query, plus the query `meta`
@@ -16,16 +17,30 @@ export const queryKeys = {
     me:          () => [...queryKeys.user.all, 'me'],
     preferences: () => [...queryKeys.user.all, 'preferences'],
     apiKeys:     () => [...queryKeys.user.all, 'api-keys'],
+    claudeCodeCustody: () => [...queryKeys.user.all, 'claude-code-custody'],
     // Its own entry, not part of preferences: the server keeps it apart so the
     // agent, which can write preferences, cannot raise it.
     tradingPermission: () => [...queryKeys.user.all, 'trading-permission'],
+    onboarding: () => [...queryKeys.user.all, 'onboarding'],
   },
   models: {
     all: ['models'],
   },
+  reports: {
+    config: ['reports', 'config'],
+  },
   features: {
     all:  ['features'],
     list: () => [...queryKeys.features.all, 'list'],
+    /** What a read keyed under one flag is keyed by: toggling the flag rereads it. */
+    of: (key: string) => [...queryKeys.features.all, key],
+    /** Every Claude Code read: a token change can move any of them. */
+    claudeCode: () => queryKeys.features.of('claude_code_runtime'),
+    claudeCodeStatus: () => [...queryKeys.features.claudeCode(), 'status'],
+    claudeCodeComputers: () => [...queryKeys.features.claudeCode(), 'computers'],
+    claudeCodeSetup: () => [...queryKeys.features.claudeCode(), 'setup'],
+    // Check now's mutations, each carrying its credential as variables.
+    claudeCodePlanCheck: () => [...queryKeys.features.claudeCode(), 'plan-check'],
   },
   platform: {
     all:    ['platform'],
@@ -54,6 +69,14 @@ export const queryKeys = {
     details: () => [...queryKeys.workspaces.all, 'detail'],
     detail: (id: string) => [...queryKeys.workspaces.details(), id],
     home:   () => [...queryKeys.workspaces.all, 'home'],
+    // Where Home lives, and the cloud computer its turns use while that
+    // machine can't be reached, with what came back from it.
+    homePlacement: () => [...queryKeys.workspaces.all, 'home', 'placement'],
+    // Where each hand-back put the files Home's cloud turns wrote, for their cards.
+    homeHandbacks: (since?: string) =>
+      since === undefined
+        ? [...queryKeys.workspaces.all, 'home', 'handbacks']
+        : [...queryKeys.workspaces.all, 'home', 'handbacks', since],
     quota:  () => [...queryKeys.workspaces.all, 'quota'],
   },
   // A workspace's latest move to another computer, polled while it runs. Its
@@ -70,25 +93,76 @@ export const queryKeys = {
   fileGrants: {
     all:       ['fileGrants'],
     workspace: (wsId: string) => [...queryKeys.fileGrants.all, wsId],
+    // Apart from `workspace`, so renewing the shared grant mints none of these.
+    own:       (wsId: string, mount: number) => [...queryKeys.fileGrants.all, 'own', wsId, mount],
   },
-  // Stable `/a/<code>` links for files and apps, grouped by workspace. A share
-  // or stop rewrites the cached entries holding that code under `links`, then
-  // re-reads the link's file list and the workspace's shared list.
+  // A workspace file's record, its versions and comments. The `artifact_comment`
+  // user event and a turn's end read the comments, the record (its `unread` and
+  // `open_comments`) and the destination thread's queue again; the `artifact`
+  // event reads the record, versions and status again. Never invalidate `all`
+  // in one go: the grant sits under it, and a new grant reloads open frames.
+  artifacts: {
+    all:         ['artifacts'],
+    // The record a file tab reads, by path, before it knows the id (null for a
+    // file never recorded). Events carry workspace and path, so they reach it.
+    allByPath:   ['artifacts', 'path'],
+    // Every path read in a workspace: an event's path is canonical, while a
+    // tab may have asked by another spelling of it.
+    pathsIn:     (wsId: string) => [...queryKeys.artifacts.allByPath, wsId],
+    byPath:      (wsId: string, path: string) => [...queryKeys.artifacts.pathsIn(wsId), path],
+    // The owner's get-or-create of a file's record. Beside the reads by path,
+    // not under them, so an event that reads those again never makes one.
+    ensured:     (wsId: string, path: string) => [...queryKeys.artifacts.all, 'ensured', wsId, path],
+    allDetails:  ['artifacts', 'detail'],
+    detail:      (artifactId: string) => [...queryKeys.artifacts.allDetails, artifactId],
+    versions:    (artifactId: string) => [...queryKeys.artifacts.all, 'versions', artifactId],
+    // Reads the computer, so it is fetched on demand (crumb, Publish dialog)
+    // rather than on every record change.
+    status:      (artifactId: string) => [...queryKeys.artifacts.all, 'status', artifactId],
+    leftOut:     (artifactId: string) => [...queryKeys.artifacts.all, 'left-out', artifactId],
+    // The answer under one report of what the page loaded, beneath `status`, so
+    // anything that reads a file's status again reads this too.
+    statusWith:  (artifactId: string, loaded: readonly string[], earlier: readonly string[]) =>
+      [...queryKeys.artifacts.status(artifactId), loaded, earlier],
+    // The owner's comment destination setting changes every file's answer.
+    allDestinations: ['artifacts', 'destinations'],
+    // A bind or unbind changes the answer for every thread beside.
+    destinationsOf: (artifactId: string) => [...queryKeys.artifacts.allDestinations, artifactId],
+    destinations: (artifactId: string, besideThreadId: string | null) =>
+      [...queryKeys.artifacts.destinationsOf(artifactId), besideThreadId ?? ''],
+    grant:       (artifactId: string) => [...queryKeys.artifacts.all, 'grant', artifactId],
+    allComments: ['artifacts', 'comments'],
+    comments:    (artifactId: string) => [...queryKeys.artifacts.allComments, artifactId],
+    allQueued:   ['artifacts', 'queued'],
+    queued:      (threadId: string) => [...queryKeys.artifacts.allQueued, threadId],
+  },
+  // Stable `/a/<code>` links for files and apps, grouped by workspace. A stop
+  // rewrites the cached entries holding that code under `links`, then re-reads
+  // the workspace's shared list.
   shareLinks: {
     all:         ['shareLinks'],
     byWorkspace: (wsId: string) => [...queryKeys.shareLinks.all, wsId],
     links:       (wsId: string) => [...queryKeys.shareLinks.byWorkspace(wsId), 'link'],
     // `key` is the normalized entry path for a file, the port for an app.
     link:        (wsId: string, kind: string, key: string) => [...queryKeys.shareLinks.links(wsId), kind, key],
-    files:       (wsId: string, code: string) => [...queryKeys.shareLinks.byWorkspace(wsId), 'files', code],
     shared:      (wsId: string) => [...queryKeys.shareLinks.byWorkspace(wsId), 'shared'],
+    // One of the owner's links read by its code, where the workspace is not at hand.
+    byCode:      (code: string) => [...queryKeys.shareLinks.all, 'code', code],
   },
   // What an `/s/` or `/a/` page resolves to. The visitor flag is part of the
   // question: the owner gets a different answer for the same code.
   share: {
     all:      ['share'],
+    // Every answer for one code, whoever asked and at whatever page.
+    metadataOf: (code: string) => [...queryKeys.share.all, 'metadata', code],
     metadata: (code: string, viewer: string | null, asVisitor: boolean, path: string | null) =>
-      [...queryKeys.share.all, 'metadata', code, viewer, asVisitor, path],
+      [...queryKeys.share.metadataOf(code), viewer, asVisitor, path],
+  },
+  // What a framed app read through the bridge, by its checked arguments;
+  // shared by every app on the page. Quotes are the page's own quote rows.
+  appBridge: {
+    all:    ['appBridge'],
+    method: (method: string, args: unknown) => [...queryKeys.appBridge.all, method, args],
   },
   // One projection of a machine: the list. A detail entry would be a second
   // place for a status to disagree with itself, and every surface that shows a
@@ -102,6 +176,13 @@ export const queryKeys = {
     // What a new machine can run on, per user: the plan decides `allowed`.
     providers: () => [...queryKeys.computers.all, 'providers'],
     sshKey: () => [...queryKeys.computers.all, 'ssh-key'],
+    // The browsers on a machine of the person's own, read from the machine.
+    signinSources: (computerId: string) => [...queryKeys.computers.all, 'signin-sources', computerId],
+  },
+  // What a self-hosted server has been set up with; hosted servers have none.
+  setup: {
+    all:    ['setup'],
+    status: () => [...queryKeys.setup.all, 'status'],
   },
   // A pairing is minted by a POST and then polled; the mint is cached so a
   // render never mints twice, and each token's status keys apart from it.
@@ -136,6 +217,15 @@ export const queryKeys = {
     recentAll:   () => [...queryKeys.threads.all, 'recent'],
     recent:      (limit: number) => [...queryKeys.threads.recentAll(), limit],
     status:      (threadId: string) => [...queryKeys.threads.all, 'status', threadId],
+    // The search across every thread (the command palette). Under the prefix,
+    // so a rename, archive or delete rereads the results already on screen.
+    searchAll:   () => [...queryKeys.threads.all, 'search'],
+    // `workspaceId` / `threadId` narrow it to one workspace or one thread.
+    search:      (params: { q: string; kinds?: SearchKind | readonly SearchKind[]; limit: number; paged?: boolean; workspaceId?: string; threadId?: string }) =>
+      [...queryKeys.threads.searchAll(), params],
+    // One turn as the palette's preview shows it; null is the newest turn.
+    searchPreview: (threadId: string, turnIndex: number | null) =>
+      [...queryKeys.threads.searchAll(), 'preview', threadId, turnIndex],
     // The thread's public link: whether it is shared, its URL, what visitors
     // may open. The chat header and every share panel read this one entry.
     share:       (threadId: string) => [...queryKeys.threads.all, 'share', threadId],
@@ -145,6 +235,9 @@ export const queryKeys = {
     // The commands that outlasted their tool's wait and ran on in the
     // background. Under the prefix for the same reason as the wakeups.
     commands:    (threadId: string) => [...queryKeys.threads.all, 'commands', threadId],
+    // What the thread's next call sends ahead of its messages, part by part,
+    // read when the context panel opens.
+    context:     (threadId: string) => [...queryKeys.threads.all, 'context', threadId],
     // Batched dispatch-liveness read for a turn's PTC cards: their threads,
     // the hand-offs' own runs, and the steers of those steered into a run
     // already going. The base key targets every id-set variant for
@@ -190,6 +283,8 @@ export const queryKeys = {
     all:       ['mcp'],
     // The account's servers (not workspace-scoped).
     catalog:   () => [...queryKeys.mcp.all, 'catalog'],
+    // The account's organization's connectors, as this member sees them.
+    orgConnectors: () => [...queryKeys.mcp.all, 'orgConnectors'],
     // Process-global builtins with the user's account-wide toggles.
     builtins:  () => [...queryKeys.mcp.all, 'builtins'],
     // Effective per-workspace server list (builtins + account servers).
@@ -218,6 +313,13 @@ export const queryKeys = {
       url,
       headers,
     ],
+  },
+  // The layers an agent published on charts, one entry per (workspace,
+  // symbol) holding every timeframe, so switching the interval reads the same
+  // entry. `symbol` is the display spelling (`chartKeyParts`).
+  chartLayers: {
+    all:      ['chartLayers'],
+    bySymbol: (workspaceId: string, symbol: string) => [...queryKeys.chartLayers.all, workspaceId, symbol],
   },
   // The brokerage connectors this build ships. Deliberately its own family
   // rather than a child of `mcp`: it is static and user-independent, so the
@@ -275,6 +377,20 @@ export const queryKeys = {
   // The user's order attempts. The list is paged by the server on a keyset
   // cursor, so a filter set is its own list rather than a client-side view of
   // one: the key carries the filters, and changing one starts a new page 1.
+  // The organization library. A publish or removal anywhere changes every
+  // list and the share dialogs' lookups, so all of them sit under `all`.
+  orgLibrary: {
+    all:       ['orgLibrary'],
+    lists:     () => [...queryKeys.orgLibrary.all, 'list'],
+    list:      (kind: string) => [...queryKeys.orgLibrary.lists(), kind],
+    published: (target: string) => [...queryKeys.orgLibrary.all, 'published', target],
+  },
+  sharedWorkspaces: {
+    all:     ['sharedWorkspaces'],
+    list:    () => [...queryKeys.sharedWorkspaces.all, 'list'],
+    members: (wsId: string) => [...queryKeys.sharedWorkspaces.all, 'members', wsId],
+    team:    (wsId: string) => [...queryKeys.sharedWorkspaces.all, 'team', wsId],
+  },
   orders: {
     all:    ['orders'],
     lists:  () => [...queryKeys.orders.all, 'list'],
@@ -300,6 +416,18 @@ export const queryKeys = {
     all:     ['automationDelivery'],
     options: (workspaceId: string | null) => [...queryKeys.automationDelivery.all, 'options', workspaceId],
   },
+  // Actions the agent asked to take from a command that wait on the user. The
+  // user feed invalidates the pending list when one arrives or is answered.
+  cliApprovals: {
+    all:     ['cliApprovals'],
+    pending: () => [...queryKeys.cliApprovals.all, 'pending'],
+  },
+  // Vendor Terms of Service waiting on the user. The user feed invalidates the
+  // pending list whenever it changes.
+  vendorTerms: {
+    all:     ['vendorTerms'],
+    pending: () => [...queryKeys.vendorTerms.all, 'pending'],
+  },
   // Per-symbol quote cache — the unified snapshot layer (see lib/quotes/).
   // Key = uppercase legacy symbol spelling (indexes stripped of a leading '^').
   // Interim keying until Phase 4 re-keys on the canonical instrument_key.
@@ -307,11 +435,28 @@ export const queryKeys = {
     all:    ['quote'],
     detail: (symbol: string) => [...queryKeys.quote.all, symbol],
   },
+  // A ticker's latest trading session as a line (lib/bars/sessionQuery).
+  // Key = display spelling.
+  intradaySession: {
+    all:    ['intradaySession'],
+    detail: (symbol: string) => [...queryKeys.intradaySession.all, symbol],
+  },
   insights: {
     all:         ['insights'],
     // Today's market-wide brief, as markdown for the agent.
     marketBrief: () => [...queryKeys.insights.all, 'market-brief'],
   },
+  // The user's watchlists themselves (id, name), for picking one. What is on
+  // the default list is read under `['watchlistData']` (hooks/membershipQueries).
+  watchlists: {
+    all:   ['watchlists'],
+    list:  () => [...queryKeys.watchlists.all, 'list'],
+    // One list's entries by id, for a list other than the default one.
+    items: (id: string) => [...queryKeys.watchlists.all, 'items', id],
+  },
+  // The US session (open, pre, after, closed), which every quote row's
+  // extended-hours split reads.
+  marketStatus: () => ['marketStatus'],
 };
 
 /**

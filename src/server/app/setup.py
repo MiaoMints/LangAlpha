@@ -27,6 +27,7 @@ if sys.platform == "win32":
 import importlib
 import logging
 import os
+import re
 import certifi
 
 os.environ["SSL_CERT_FILE"] = certifi.where()
@@ -36,6 +37,7 @@ from contextlib import asynccontextmanager
 from uuid import uuid4
 
 from fastapi import FastAPI, Request
+from fastapi.exception_handlers import http_exception_handler
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from starlette.middleware.gzip import GZipMiddleware
@@ -43,7 +45,9 @@ from starlette.middleware.gzip import GZipMiddleware
 from ptc_agent.core.sandbox.livefs_runtime.protocol import PREFIX as LIVEFS_PREFIX
 from ptc_agent.core.sandbox.platform_secrets import PlatformSecretError
 from ptc_agent.core.sandbox.providers.ssh_errors import SSHConnectError
+from src.server.services.computer_errors import NeedsComputer
 from ptc_agent.core.sandbox.runtime import SandboxGoneError, SandboxTransientError
+from src.server.app.logos import LOGOS_PREFIX, router as logos_router
 from src.server.preview_proxy import install_preview_proxy
 from src.config.logging_config import configure_logging
 from src.config.settings import (
@@ -53,7 +57,13 @@ from src.config.settings import (
 from src.observability import init_otel, init_otel_runtime, shutdown_otel_runtime
 from src.observability.private_query import drop_span_query
 from src.server.services.runs.executor import LocalRunExecutor
+from src.server.services import activity
+from src.server.services.policy import PolicyDenied
+from src.server.services.cli_calls import CliCallRecorder
+from src.server.services.membership import MembershipReadScope
+from src.server.utils.request_client import RequestClientMiddleware
 from src.server.services.background_registry_store import BackgroundRegistryStore
+from src.server.utils.api import caller_of
 from src.server.utils.api import find_malformed_route_ids  # TEMP (malformed-id-diag)
 from src.server.services.preview_base import (
     PreviewProxyConfigurationError,
@@ -61,6 +71,7 @@ from src.server.services.preview_base import (
     preview_proxy_requirements,
 )
 from src.server.utils.error_sanitization import (
+    COMPUTER_UNREACHABLE_HEADER,
     sandbox_failure_http,
     single_line,
 )
@@ -94,7 +105,6 @@ bundle_owners = None
 workspace_manager = None  # Workspace manager instance
 checkpointer = None  # PTC Agent LangGraph checkpointer for state persistence
 store = None  # LangGraph Store for cross-turn metadata persistence
-graph = None  # Most recently used LangGraph (for persistence snapshots)
 llm_service = None  # Generic one-shot LLM call wrapper (BYOK/OAuth-aware)
 
 # PID 1 process names that correctly reap orphaned subprocesses.
@@ -132,12 +142,21 @@ _REDIS_BACKGROUND_SINGLETONS: tuple[tuple[str, str], ...] = (
     # Keeps running sandboxes' market-data tokens fresh between turns; a
     # claim on each computer's row in Postgres dedups it across workers.
     ("DataTokenSweeper", "src.server.services.data_token_sweep"),
+    # The same for the token the `la` CLI calls the API with, on every
+    # deployment.
+    ("CliTokenSweeper", "src.server.services.cli_token_sweep"),
     # Takes tunnels no computer uses off their machines; a claim on each
     # tunnel's row in Postgres dedups it across workers.
     ("TunnelSweeper", "src.server.services.ssh_tunnel_sweep"),
+    # Deletes sandboxes a create gave up on once their provider lets it; a
+    # claim on each row in Postgres dedups it across workers.
+    ("AbandonedSandboxSweeper", "src.server.services.abandoned_sandbox_sweep"),
     # Ends uploads their browser abandoned and takes over pulls whose worker
     # died; a claim on each upload's row in Postgres dedups it across workers.
     ("UploadSweeper", "src.server.services.workspace_upload_pull"),
+    # Ends chat attachments their composer abandoned and drops the bytes of
+    # ones past use; a claim on each row in Postgres dedups it across workers.
+    ("AttachmentSweeper", "src.server.services.chat_attachments"),
     # Follows handed-off background commands to their end and keeps their
     # computers up while covered; claims on each command's row in Postgres
     # dedup it across workers.
@@ -145,6 +164,12 @@ _REDIS_BACKGROUND_SINGLETONS: tuple[tuple[str, str], ...] = (
     # Has a model describe MCP servers; a claim on each job's row under its
     # scope's advisory lock dedups it across workers.
     ("McpDescriptionWorker", "src.server.services.mcp_descriptions.worker"),
+    # Indexes for conversation search the turns their settle missed, and
+    # backfills older ones; an advisory lock keeps it to one worker a pass.
+    ("ThreadSearchSweeper", "src.server.services.search.sweep"),
+    # Copies what Home's stand-in wrote into Home once Home's computer is
+    # back; a per-user advisory lock and a guarded watermark dedup it.
+    ("HomeHandbackSweeper", "src.server.services.home_handback"),
 )
 
 
@@ -209,6 +234,14 @@ async def lifespan(app: FastAPI):
     # threads are owned by the worker process, not a dead pre-fork parent.
     init_otel_runtime()
 
+    from src.observability.sentry import init_sentry
+
+    init_sentry()
+
+    from src.observability.langsmith_tracer import configure_trace_payloads
+
+    configure_trace_payloads()
+
     # Container hardening diagnostics: confirm tini is PID 1 and log cgroup PID limit.
     # If PID 1 is python (not tini), `init: true` in compose silently failed and
     # orphaned browser subprocesses will accumulate until cgroup exhausts.
@@ -227,7 +260,7 @@ async def lifespan(app: FastAPI):
         logger.warning(
             "BYOK_ENCRYPTION_KEY is set to the default value from the repository. "
             "User API keys are encrypted with a publicly known key. "
-            "Run `make config` or set a unique BYOK_ENCRYPTION_KEY."
+            "Set a unique BYOK_ENCRYPTION_KEY (openssl rand -hex 32)."
         )
 
     # Initialize and open conversation database pool
@@ -332,12 +365,22 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.warning(f"Pre-built workflow warmup failed: {e}")
 
+    # Keys and the sandbox choice saved in the setup step read like any other
+    # environment value, so they have to be there before config is loaded.
+    from src.server.services import setup_settings
+
+    config_reading = await setup_settings.boot()
+
     # Initialize PTC Agent configuration and session service
     try:
         from ptc_agent.config import load_from_files, ConfigContext
 
         logger.info("Loading PTC Agent configuration...")
-        agent_config = await load_from_files(context=ConfigContext.SDK)
+        agent_config = await load_from_files(
+            context=ConfigContext.SDK,
+            autodetect=config_reading.autodetect,
+            in_reach=config_reading.in_reach,
+        )
 
         from src.config.env import PUBLIC_APP_URL, SERVER_BASE_URL
 
@@ -355,6 +398,16 @@ async def lifespan(app: FastAPI):
         )
 
         await reconcile_platform_secrets_at_boot(agent_config)
+
+        from src.server.services.firecrawl_accounts import warn_if_discovery_keyless
+
+        warn_if_discovery_keyless(agent_config)
+
+        from src.server.services.egress.platform_accounts import (
+            disable_unreachable_platform_servers,
+        )
+
+        disable_unreachable_platform_servers(agent_config)
         logger.info("PTC Agent configuration loaded successfully")
 
         # Connect once, freeze, install as the process-global registry so every
@@ -414,6 +467,14 @@ async def lifespan(app: FastAPI):
         await workspace_manager.start_cleanup_task()
         logger.info("Workspace Manager initialized")
 
+        # What each sandbox was in before a start, and the provider's own
+        # start time, reach the computer events from here.
+        from src.server.services.computer_usage.events import (
+            install_runtime_start_listener,
+        )
+
+        install_runtime_start_listener()
+
         # An ssh computer logs in with its owner's key, which the provider
         # reads through this loader; any worker may start one. A machine that
         # connects out is reached through the gateway the second loader names.
@@ -422,6 +483,14 @@ async def lifespan(app: FastAPI):
 
         install_client_key_loader()
         install_gateway_loader()
+
+        # A create that fails may still leave a sandbox running; the provider
+        # records it for the sweep, in whichever worker the create ran.
+        from src.server.services.abandoned_sandbox_sweep import (
+            install_abandoned_sink,
+        )
+
+        install_abandoned_sink()
 
         # Platform-secret migration sweep: converges running sandboxes left
         # behind the fleet generation (always-on sandboxes never re-init, so
@@ -519,6 +588,16 @@ async def lifespan(app: FastAPI):
         logger.warning(f"Failed to initialize PTC Agent: {e}")
         logger.warning("PTC Agent endpoints may not work correctly")
 
+    # A gate of the same kind, outside the catch-all: with the CLI inside
+    # cloud computers' sandboxes, a kind with no Medium tier would refuse every
+    # one of its computers as too small.
+    if agent_config is not None:
+        from src.server.services.claude_code.hosted import check_sandbox_tiers
+
+        check_sandbox_tiers(agent_config.sandbox)
+
+    setup_settings.start()
+
     # Multi-worker hard gate (top level — must not be swallowed by the PTC
     # init catch-all): without the fence, two workers could both write one
     # thread's checkpoints. Refuse to boot rather than corrupt.
@@ -544,25 +623,38 @@ async def lifespan(app: FastAPI):
     # permanently off behind one WARN line (report-backs undelivered, burst
     # slots leaking).
     from src.server.services.report_back import command as command_report
+    from src.server.services.report_back import restart as restart_resume
+    from src.server.services import automation_executor
     from src.server.services.report_back import steer_executor, subagent
     from src.server.services.report_back.handoff import core as handoff_core
-    from src.server.services import automation_settlement, thread_lifecycle_feed
+    from src.server.services import automation_settlement, idle_compaction, notices, thread_lifecycle_feed
     from src.server.services.features import register_feature_off_hook
     from src.server.services.hook_outbox import HookOutboxDrainer
     from src.server.services.market_targets import delivery as market_target_delivery
+    from src.server.services.push import notify as push_notify
     from src.server.services.wakeups import cancel as wakeups_cancel
     from src.server.services.wakeups import delivery as wakeup_delivery
 
     handoff_core.register_outbox_executors()
     subagent.register_outbox_executors()
     command_report.register_outbox_executors()
+    restart_resume.register_outbox_executors()
+    automation_executor.register_outbox_executors()
     steer_executor.register_outbox_executors()
     thread_lifecycle_feed.register_outbox_executors()
     automation_settlement.register_outbox_executors()
     market_target_delivery.register_outbox_executors()
+    notices.register_outbox_executors()
+    # Registered with push off too: its rows then ack as no-ops.
+    push_notify.register_outbox_executors()
+    idle_compaction.register_outbox_executors()
     wakeup_delivery.register_wakeup_executors()
     # Turning wakeups off ends what the agent set, on every thread.
     register_feature_off_hook("wakeups", wakeups_cancel.setting_off)
+    # Turning Claude Code off deletes a setup token stored for the user.
+    from src.server.services.claude_code.hosted import register_opt_out
+
+    register_opt_out()
     try:
         HookOutboxDrainer.get_instance().start()
         logger.info("HookOutboxDrainer started")
@@ -584,6 +676,12 @@ async def lifespan(app: FastAPI):
         scanner.start()
     except Exception as e:
         logger.warning(f"Recovery scanner startup failed: {e}")
+
+    # Graceful restart: drain on request or on SIGTERM, leaving this worker's
+    # running work for the next process to resume.
+    from src.server.services.runs import restart_drain
+
+    restart_drain.start(asyncio.get_running_loop())
 
     # Turn-cancel nudge listener (v4 Phase 2.4e): a /cancel landing on
     # another worker signals this one's executor via pub/sub.
@@ -647,6 +745,19 @@ async def lifespan(app: FastAPI):
         logger.info("WakeupSweeper started")
     except Exception as e:
         logger.warning(f"Failed to start WakeupSweeper: {e}")
+
+    # Start IdleCompactionSweeper (summarizes idle threads while their prompt
+    # cache is warm). Every worker runs one: a claim deletes its row.
+    try:
+        from src.server.handlers.idle_compaction import fire as fire_idle_compaction
+        from src.server.services.idle_compaction import start_sweeper
+
+        if await start_sweeper(fire_idle_compaction):
+            logger.info("IdleCompactionSweeper started")
+        else:
+            logger.info("IdleCompactionSweeper not started: the idle_compaction feature is off")
+    except Exception as e:
+        logger.warning(f"Failed to start IdleCompactionSweeper: {e}")
 
     # Start MarketInsightService (schedule-based market news gathering)
     try:
@@ -765,11 +876,23 @@ async def lifespan(app: FastAPI):
     gc.collect()
     gc.freeze()
     logger.info(f"Froze {gc.get_freeze_count()} startup objects out of the GC")
+    # And what the first turns load for good, once the worker is idle.
+    from src.server.services import heap_settle
+
+    settle = asyncio.create_task(heap_settle.run(), name="heap-settle")
 
     yield  # Server is running
 
     # Shutdown
     logger.info("Application shutdown started...")
+    # Before anything stops: running turns and subagents are cancelled and
+    # recorded for the next process to resume, while every pool is open.
+    try:
+        from src.server.services.runs import restart_drain
+
+        await restart_drain.stop()
+    except Exception as e:
+        logger.warning(f"Error draining for restart: {e}")
     # Awaited, so a warm-up stopped midway releases its lock while Redis is
     # still open; a lock left to expire skips the warm-up of a quick restart.
     # The refreshes go after it, since the warm-up can start them.
@@ -781,6 +904,8 @@ async def lifespan(app: FastAPI):
     if mcp_reconnect is not None:
         mcp_reconnect.cancel()
         await asyncio.gather(mcp_reconnect, return_exceptions=True)
+    settle.cancel()
+    await asyncio.gather(settle, return_exceptions=True)
     from src.server.services.brand_icons import stop_refreshes
 
     await stop_refreshes()
@@ -810,6 +935,13 @@ async def lifespan(app: FastAPI):
         await close_relay_client()
     except Exception as e:
         logger.warning(f"Error closing egress relay client: {e}")
+
+    try:
+        from src.server.services.firecrawl_accounts import close_partner_client
+
+        await close_partner_client()
+    except Exception as e:
+        logger.warning(f"Error closing Firecrawl partner client: {e}")
 
     # 0.0b. Stop the turn-cancel nudge listener.
     try:
@@ -841,6 +973,14 @@ async def lifespan(app: FastAPI):
         await WorkspaceFileGCService.get_instance().stop()
     except Exception as e:
         logger.warning(f"Error shutting down WorkspaceFileGCService: {e}")
+
+    # 0.1b. Stop following the saved setup settings
+    try:
+        from src.server.services import setup_settings
+
+        await setup_settings.stop()
+    except Exception as e:
+        logger.warning(f"Error stopping the setup settings follower: {e}")
 
     # 0.2. Shutdown NewsRefreshService
     try:
@@ -882,6 +1022,13 @@ async def lifespan(app: FastAPI):
         await WakeupSweeper.get_instance().stop()
     except Exception as e:
         logger.warning(f"Error shutting down WakeupSweeper: {e}")
+
+    try:
+        from src.server.services.idle_compaction import IdleCompactionSweeper
+
+        await IdleCompactionSweeper.get_instance().stop()
+    except Exception as e:
+        logger.warning(f"Error shutting down IdleCompactionSweeper: {e}")
 
     # 1. Shutdown AutomationScheduler
     try:
@@ -962,6 +1109,15 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.error(f"Error during LocalRunExecutor shutdown: {e}")
 
+    # 6a. In the desktop app, its computer goes with its server: after the runs
+    # on it have settled, while the pools are still open.
+    try:
+        from src.server.services.desktop_app import stop_this_computer
+
+        await stop_this_computer()
+    except Exception as e:
+        logger.warning(f"Error stopping this computer: {e}")
+
     # 6b. Stop the hook-outbox drainer AFTER BTM shutdown so jobs enqueued by
     # those final finalizes still execute; anything unclaimed survives
     # durably for the next startup's reclaim.
@@ -982,6 +1138,13 @@ async def lifespan(app: FastAPI):
         await drain_tails()
     except Exception as e:
         logger.warning(f"Error draining automation settlements: {e}")
+
+    # Then the activity log's pending writes, briefly, while the pools, Redis
+    # and the auth service's client they use are still open.
+    try:
+        await activity.drain(timeout=activity.SHUTDOWN_DRAIN_S)
+    except Exception as e:
+        logger.warning(f"Error draining activity writes: {e}")
 
     # 6c. Close the writer-guard pool AFTER BTM shutdown: the final
     # finalizes run on pinned guard sessions checked out of this pool.
@@ -1056,12 +1219,26 @@ async def lifespan(app: FastAPI):
 
     # 9. Close usage-limits HTTP client
     try:
-        from src.server.dependencies.usage_limits import close_http_client
+        from src.server.utils.http_client import close_http_client
 
         await close_http_client()
         logger.info("Usage limits HTTP client closed")
     except Exception as e:
         logger.warning(f"Error closing usage limits HTTP client: {e}")
+
+    try:
+        from src.server.services.push.apns import close_apns_client
+
+        await close_apns_client()
+    except Exception as e:
+        logger.warning(f"Error closing APNs client: {e}")
+
+    try:
+        from src.data_client.ginlix_data.logos import close_logo_client
+
+        await close_logo_client()
+    except Exception as e:
+        logger.warning(f"Error closing logo HTTP client: {e}")
 
     # 9.1. Close the messaging gateway HTTP client
     try:
@@ -1132,6 +1309,7 @@ class RequestIDMiddleware:
 
         trace_id = str(uuid4())
         scope["state"] = {"trace_id": trace_id}
+        activity.bind_request(scope)
 
         async def send_wrapper(message):
             if message["type"] == "http.response.start":
@@ -1203,8 +1381,15 @@ def _gzip_exempt(path: str) -> bool:
     next save is checked against. A CDN in front of the server (Cloudflare
     for one) asks for gzip whatever its client asked, and decompressing for
     the daemon, which asks for no encoding, weakens or drops that tag.
+
+    A ticker logo is an already compressed image whose ETag a browser sends
+    back to revalidate it, for the same reason.
     """
-    return path.endswith("/files/download") or path.startswith(f"{LIVEFS_PREFIX}/")
+    return (
+        path.endswith("/files/download")
+        or path.startswith(f"{LIVEFS_PREFIX}/")
+        or path.startswith(f"{LOGOS_PREFIX}/")
+    )
 
 
 class _SelectiveGZip(GZipMiddleware):
@@ -1228,6 +1413,16 @@ app.add_middleware(_SelectiveGZip, minimum_size=1000)
 # `malformed-id-diag` — `grep -rn malformed-id-diag src tests` lists them all.
 app.add_middleware(MalformedIdDiagnosticMiddleware)
 
+# Records every request a computer's `la` makes, with the thread whose command
+# made it (src/server/services/cli_calls.py).
+app.add_middleware(CliCallRecorder)
+
+# One shared membership read per request (services/membership.py).
+app.add_middleware(MembershipReadScope)
+# Which of our apps sent each request, for computer start telemetry
+# (src/server/utils/request_client.py).
+app.add_middleware(RequestClientMiddleware)
+
 # Register request ID middleware (will be executed after CORS)
 # Note: In FastAPI, middleware is executed in reverse order (last added = first executed)
 # So we add RequestIDMiddleware first, then CORS, so CORS executes first
@@ -1240,8 +1435,31 @@ allowed_origins = get_allowed_origins()
 
 logger.info(f"Allowed origins: {allowed_origins}")
 
+# Routes whose URL is the whole credential (a grant or share code in the path).
+# Their documents run on an opaque origin, so their own reads arrive as
+# Origin: null; any origin may read them, and never with credentials, which
+# the app's CORS below would add by echoing that origin back.
+_URL_CREDENTIAL_ROUTES = re.compile(
+    r"/api/v1/(?:wsfiles/g/|artifacts/g/|public/shared/[^/]+/files/serve/)"
+)
+
+
+class _CORSMiddleware(CORSMiddleware):
+    def __init__(self, app, **options):
+        super().__init__(app, **options)
+        self._url_credential = CORSMiddleware(
+            app, allow_origins=["*"], allow_methods=["GET", "HEAD"]
+        )
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] == "http" and _URL_CREDENTIAL_ROUTES.match(scope["path"]):
+            await self._url_credential(scope, receive, send)
+            return
+        await super().__call__(scope, receive, send)
+
+
 app.add_middleware(
-    CORSMiddleware,
+    _CORSMiddleware,
     allow_origins=allowed_origins,  # Restrict to specific origins
     allow_credentials=True,
     allow_methods=[
@@ -1254,9 +1472,34 @@ app.add_middleware(
     ],  # Use the configured list of methods
     allow_headers=["*"],  # Now allow all headers, but can be restricted further
     # A ranged file download is read by script, which sees only these past the
-    # safelisted few when the app is served from another origin.
-    expose_headers=["Content-Range", "Accept-Ranges", "ETag"],
+    # safelisted few when the app is served from another origin; the file panel
+    # words an unreachable computer's 503 from the last.
+    expose_headers=[
+        "Content-Range",
+        "Accept-Ranges",
+        "ETag",
+        COMPUTER_UNREACHABLE_HEADER,
+    ],
 )
+
+
+def _install_loopback_guard() -> None:
+    """Ahead of CORS, whose configured list may allow every origin."""
+    from ptc_agent.core.sandbox.providers.local import local_computer_allowed
+
+    if not local_computer_allowed():
+        return
+    from src.config.env import PUBLIC_APP_URL, SERVER_BASE_URL
+    from src.server.app.loopback_guard import LoopbackOriginGuard
+
+    app.add_middleware(
+        LoopbackOriginGuard,
+        app_origins=(SERVER_BASE_URL, PUBLIC_APP_URL),
+        opaque_origin_routes=_URL_CREDENTIAL_ROUTES,
+    )
+
+
+_install_loopback_guard()
 
 # Previews of private sandboxes, picked out by Host before any middleware
 # above sees the request. Installed last, around the stack the tracing wraps.
@@ -1285,14 +1528,36 @@ async def _sandbox_failure_handler(request: Request, exc: Exception) -> JSONResp
         f"Sandbox unreachable for {single_line(request.url.path)}: {single_line(str(exc))}"
     )
     answer = sandbox_failure_http(exc)
-    return JSONResponse(status_code=answer.status_code, content={"detail": answer.detail})
+    return JSONResponse(
+        status_code=answer.status_code,
+        content={"detail": answer.detail},
+        headers=answer.headers,
+    )
 
 
+async def _policy_denied_handler(request: Request, exc: PolicyDenied):
+    """Answer a refusal by policy exactly as any ``HTTPException`` is answered,
+    recording it first in the organization's activity log: every route's
+    refusal passes here, so no route records its own."""
+    caller = caller_of(request.scope)
+    activity.record_refusal(exc, caller.user_id if caller is not None else None)
+    return await http_exception_handler(request, exc)
+
+
+app.add_exception_handler(PolicyDenied, _policy_denied_handler)
 app.add_exception_handler(SandboxGoneError, _sandbox_failure_handler)
 app.add_exception_handler(SandboxTransientError, _sandbox_failure_handler)
 # A refusal a caller let through unwrapped, which would otherwise answer 500.
 app.add_exception_handler(SSHConnectError, _sandbox_failure_handler)
 
+
+async def _needs_computer_handler(request: Request, exc: NeedsComputer) -> JSONResponse:
+    """The one answer to a user with no computer Home can live on: every
+    route lets the refusal through to here, and the client offers a way out."""
+    return JSONResponse(status_code=409, content={"detail": exc.detail})
+
+
+app.add_exception_handler(NeedsComputer, _needs_computer_handler)
 
 
 # ============================================================================
@@ -1304,18 +1569,31 @@ from src.server.app.sessions import router as sessions_router
 from src.server.app.utilities import health_router
 from src.server.app.computers import router as computers_router
 from src.server.app.computers_ssh import router as computers_ssh_router
+from src.server.app.computers_browser import router as computers_browser_router
 from src.server.app.workspaces import router as workspaces_router
+from src.server.app.home import router as home_router
 from src.server.app.workspace_files import router as workspace_files_router
 from src.server.app.workspace_files import wsfiles_router
+from src.server.app.attachments import router as attachments_router
 from src.server.app.workspace_sandbox import router as workspace_sandbox_router
+from src.server.app.workspace_browser import router as workspace_browser_router
 from src.server.app.chart_annotations import router as chart_annotations_router
+from src.server.app.artifact_frames import frame_router as artifact_frame_router
+from src.server.app.artifacts import router as artifacts_router
+from src.server.app.artifacts import workspace_router as artifact_records_router
 from src.server.app.workspace_sandbox import preview_redirect_router
 from src.server.app.market_data import router as market_data_router
 from src.server.app.bars import router as bars_router
 from src.server.app.user_events import router as user_events_router
+from src.server.app.cli_approvals import router as cli_approvals_router
+from src.server.app.vendor_terms import router as vendor_terms_router
 from src.server.app.users import router as users_router
+from src.server.app.reports import router as reports_router
 from src.server.app.trading_permission import router as trading_permission_router
+from src.server.app.push_devices import router as push_devices_router
 from src.server.app.features import router as features_router
+from src.server.app.claude_code import router as claude_code_router
+from src.server.app.claude_code_computers import router as claude_code_computers_router
 from src.server.app.watchlist import router as watchlist_router
 from src.server.app.portfolio import router as portfolio_router
 from src.server.app.robat_bridge import router as robat_bridge_router
@@ -1327,6 +1605,9 @@ from src.server.app.automations import router as automations_router
 from src.server.app.insights import router as insights_router
 from src.server.app.oauth import OAuthRefusal, router as oauth_router
 from src.server.app.orders import router as orders_router
+from src.server.app.activity import router as activity_router
+from src.server.app.org_library import router as org_library_router
+from src.server.app.shared_workspaces import router as shared_workspaces_router
 from src.server.app.public import router as public_router
 from src.server.app.share_links import (
     owner_router as share_link_owner_router,
@@ -1343,12 +1624,15 @@ from src.server.app.livefs import router as livefs_router
 from src.server.app.mcp_catalog import router as mcp_catalog_router
 from src.server.app.mcp_brokerages import router as mcp_brokerages_router
 from src.server.app.mcp_builtin import router as mcp_builtin_router
+from src.server.app.mcp_org_connectors import router as mcp_org_connectors_router
 from src.server.app.mcp_icons import router as mcp_icons_router
 from src.server.app.mcp_oauth import router as mcp_oauth_router
 from src.server.app.plugins import router as plugins_router
 from src.server.app.marketplace import router as marketplace_router
 from src.server.app.user_vault import router as user_vault_router
 from src.server.app.mcp_servers import router as mcp_servers_router
+from src.server.app.search import router as search_router
+from src.server.app.web_dist import serve_web_dist
 
 # Conditionally import ginlix-data WS proxy (only when GINLIX_DATA_WS_URL is set)
 from src.config.settings import GINLIX_DATA_ENABLED
@@ -1370,9 +1654,21 @@ else:
 
     logger.info("ginlix-data WS proxy disabled (GINLIX_DATA_URL not set)")
 
+# The setup step exists only where the owner sets the server up in the app.
+from src.server.services.setup_settings import self_hosted
+
+if self_hosted():
+    from src.server.app.deployment_setup import router as deployment_setup_router
+
+    app.include_router(
+        deployment_setup_router
+    )  # /api/v1/setup/* - Self-hosted setup step: vendor keys, where agent code runs
+
 # Include all routers
 app.include_router(threads_router)  # /api/v1/threads/* - Thread CRUD, messages, control
+app.include_router(search_router)  # /api/v1/search - Conversation search (command palette)
 app.include_router(sessions_router)  # /api/v1/sessions - Active session stats
+app.include_router(home_router)  # /api/v1/workspaces/home* - Home and its stand-in
 app.include_router(workspaces_router)  # /api/v1/workspaces/* - Workspace CRUD
 app.include_router(
     computers_ssh_router
@@ -1381,26 +1677,50 @@ app.include_router(
     computers_router
 )  # /api/v1/computers/* - Computer lifecycle (the workspace routes alias these)
 app.include_router(
+    computers_browser_router
+)  # /api/v1/computers/{id}/browser* - Browser choices, and bringing in an everyday browser's sign-ins
+app.include_router(
     workspace_files_router
 )  # /api/v1/workspaces/{id}/files/* - Live file access
+app.include_router(
+    attachments_router
+)  # /api/v1/attachments/* - Chat composer attachments, uploaded before the message
 app.include_router(
     workspace_sandbox_router
 )  # /api/v1/workspaces/{id}/sandbox/* - Sandbox stats & packages
 app.include_router(
+    workspace_browser_router
+)  # /api/v1/workspaces/{id}/sandbox/browser-* - The computer's browser
+app.include_router(
     chart_annotations_router
 )  # /api/v1/workspaces/{id}/chart-annotations - Agent-drawn chart annotations
+app.include_router(
+    artifact_records_router
+)  # /api/v1/workspaces/{id}/artifacts - A workspace file's artifact record (owner)
+app.include_router(
+    artifacts_router
+)  # /api/v1/artifacts/{id}/* - Versions, publishing and comments (owner)
 app.include_router(market_data_router)  # /api/v1/market-data/* - Market data proxy
+app.include_router(logos_router)  # /api/v1/market-data/logos/{symbol} - Public logo relay
 app.include_router(
     bars_router
 )  # /api/v1/market-data/bars/* - Protocol-native progressive bars
 app.include_router(users_router)  # /api/v1/users/* - User management
+app.include_router(cli_approvals_router)  # /api/v1/cli/approvals - What la asks the user
+app.include_router(vendor_terms_router)  # /api/v1/vendor-terms - Terms the user accepts
+app.include_router(reports_router)  # /api/v1/reports - Reports forwarded to the platform
 app.include_router(
     trading_permission_router
 )  # /api/v1/users/me/trading-permission - Order approval level
 app.include_router(
     user_events_router
 )  # /api/v1/users/me/thread-events - Thread lifecycle SSE feed
+app.include_router(
+    push_devices_router
+)  # /api/v1/users/me/push-devices - Phones for push notifications
 app.include_router(features_router)  # /api/v1/features/* - Feature flags (per-user resolved)
+app.include_router(claude_code_router)  # /api/v1/claude-code/* - Claude Code setup token and readiness
+app.include_router(claude_code_computers_router)  # /api/v1/claude-code/computers/* - Claude Code on own computers
 app.include_router(
     watchlist_router
 )  # /api/v1/users/me/watchlist/* - Watchlist management
@@ -1438,6 +1758,15 @@ app.include_router(
     orders_router
 )  # /api/v1/orders/* - Order attempt ledger (read-only, user-scoped)
 app.include_router(
+    activity_router
+)  # /api/v1/activity - An organization's activity log (service token, no user)
+app.include_router(
+    org_library_router
+)  # /api/v1/org-library - The organization library (flag org_library)
+app.include_router(
+    shared_workspaces_router
+)  # /api/v1/shared-workspaces, /api/v1/workspaces/{id}/members (flag shared_workspaces)
+app.include_router(
     public_router
 )  # /api/v1/public/* - Public shared thread access (no auth)
 app.include_router(
@@ -1464,6 +1793,9 @@ app.include_router(
 app.include_router(
     mcp_builtin_router
 )  # /api/v1/mcp/builtin-servers - This build's own MCP servers, per-user toggle
+app.include_router(
+    mcp_org_connectors_router
+)  # /api/v1/mcp/org-connectors - The organization's connectors, as a member sees them
 app.include_router(
     mcp_brokerages_router
 )  # /api/v1/mcp/brokerages - Shipped brokerage connectors
@@ -1498,7 +1830,13 @@ app.include_router(
 app.include_router(
     wsfiles_router
 )  # /api/v1/wsfiles/g/{grant}/{path} - Grant-gated path-style file serving
+app.include_router(
+    artifact_frame_router
+)  # /api/v1/artifacts/g/{grant}/v/{seq}/{path} - A version's files, without a preview base
 
 app.include_router(
     market_data_ws_router
 )  # /ws/v1/market-data/* - Real-time WS proxy (or just status endpoint when disabled)
+
+# Last, and only ever reached by a request no route above matched.
+serve_web_dist(app)

@@ -8,18 +8,19 @@ import type { Mock } from 'vitest';
 import { QueryClient } from '@tanstack/react-query';
 import { queryKeys } from '@/lib/queryKeys';
 
-vi.mock('@/lib/quotes/snapshotApi', () => ({
-  getSnapshotStocks: vi.fn(),
-  getSnapshotIndexes: vi.fn(),
+const { mockGetSnapshotStocks, mockGetSnapshotIndexes } = vi.hoisted(() => ({
+  mockGetSnapshotStocks: vi.fn() as Mock,
+  mockGetSnapshotIndexes: vi.fn() as Mock,
 }));
 
-import { getSnapshotStocks, getSnapshotIndexes } from '@/lib/quotes/snapshotApi';
+vi.mock('@/lib/quotes/snapshotApi', () => ({
+  fetchSnapshotBatch: (kind: 'stocks' | 'indexes', symbols: string[]) =>
+    (kind === 'stocks' ? mockGetSnapshotStocks : mockGetSnapshotIndexes)(symbols),
+}));
+
 import { getQuoteBatcher, QuoteBatcher } from '../quoteBatcher';
 import { snapshotToStockPrice } from '../quoteAdapters';
 import { writeQuoteFromWs } from '../quoteWriteThrough';
-
-const mockGetSnapshotStocks = getSnapshotStocks as Mock;
-const mockGetSnapshotIndexes = getSnapshotIndexes as Mock;
 
 describe('QuoteBatcher', () => {
   let client: QueryClient;
@@ -108,9 +109,24 @@ describe('QuoteBatcher', () => {
     expect(a).toBe(b);
   });
 
-  it('resolves every pending symbol to null when the batch call throws', async () => {
-    mockGetSnapshotStocks.mockRejectedValue(new Error('network'));
-    await expect(batcher.request('AAPL')).resolves.toBeNull();
+  it('keeps a known row and its age when a refresh drops the symbol or fails', async () => {
+    mockGetSnapshotStocks.mockResolvedValueOnce({ snapshots: [{ symbol: 'AAPL', price: 100 }] });
+    await batcher.request('AAPL');
+    const updatedAt = client.getQueryState(queryKeys.quote.detail('AAPL'))?.dataUpdatedAt;
+    mockGetSnapshotStocks.mockResolvedValueOnce({ snapshots: [] });
+    await expect(batcher.request('AAPL')).rejects.toThrow('No quote for AAPL');
+    mockGetSnapshotStocks.mockRejectedValueOnce(new Error('network'));
+    await expect(batcher.request('AAPL')).rejects.toThrow('network');
+    expect(client.getQueryData(queryKeys.quote.detail('AAPL'))).toMatchObject({ price: 100 });
+    expect(client.getQueryState(queryKeys.quote.detail('AAPL'))?.dataUpdatedAt).toBe(updatedAt);
+  });
+
+  it('rejects every pending symbol when the batch call throws, and asks again next time', async () => {
+    mockGetSnapshotStocks.mockRejectedValueOnce(new Error('network'));
+    await expect(batcher.request('AAPL')).rejects.toThrow('network');
+    expect(client.getQueryData(queryKeys.quote.detail('AAPL'))).toBeUndefined();
+    mockGetSnapshotStocks.mockResolvedValueOnce({ snapshots: [{ symbol: 'AAPL', price: 101 }] });
+    await expect(batcher.request('AAPL')).resolves.toMatchObject({ price: 101 });
   });
 
   it('binds one batcher per QueryClient', () => {
@@ -152,7 +168,7 @@ describe('writeQuoteFromWs', () => {
 });
 
 describe('snapshotToStockPrice', () => {
-  it('rounds and maps an available quote', () => {
+  it('maps an available quote at the precision it was quoted', () => {
     expect(
       snapshotToStockPrice('AAPL', {
         symbol: 'AAPL', price: 100.456, change: -1.234, change_percent: -1.216,
@@ -160,21 +176,43 @@ describe('snapshotToStockPrice', () => {
       }),
     ).toMatchObject({
       symbol: 'AAPL',
-      price: 100.46,
-      change: -1.23,
-      changePercent: -1.22,
+      price: 100.456,
+      change: -1.234,
+      changePercent: -1.216,
       isPositive: false,
       quoteAvailable: true,
-      previousClose: 101.69,
+      session: { previousClose: 101.69 },
     });
   });
 
-  it('keeps a CN fund price at its 3-decimal tick and a stock at cents', () => {
+  it('quotes a row with no close yet at the previous close, keeping its pre-market move', () => {
+    // A new day's snapshot before the regular session prints: what every
+    // US stock looks like from 4:00 ET until its first tick lands.
+    expect(
+      snapshotToStockPrice('AAPL', {
+        symbol: 'AAPL', price: null, change: 1.36, previous_close: 354.88,
+        last_minute_close: 356.23, early_trading_change: 1.36, early_trading_change_percent: 0.38,
+      }),
+    ).toMatchObject({
+      price: 354.88,
+      change: 0,
+      changePercent: 0,
+      quoteAvailable: true,
+      session: { previousClose: 354.88, lastMinuteClose: 356.23, earlyTradingChangePercent: 0.38 },
+    });
+    expect(snapshotToStockPrice('AAPL', { symbol: 'AAPL', price: null }).quoteAvailable).toBe(false);
+    expect(snapshotToStockPrice('AAPL', { symbol: 'AAPL', price: null, previous_close: 0 }).quoteAvailable).toBe(false);
+  });
+
+  it('keeps a sub-cent tick and a CN fund price unrounded', () => {
+    expect(
+      snapshotToStockPrice('XXII', { symbol: 'XXII', price: 0.0483, change: -0.0258 }),
+    ).toMatchObject({ price: 0.0483, change: -0.0258 });
     expect(
       snapshotToStockPrice('510300.SH', {
         symbol: '510300.SH', price: 3.912, change: 0.0123, asset_class: 'fund', currency: 'CNY',
       }),
-    ).toMatchObject({ price: 3.912, change: 0.012 });
+    ).toMatchObject({ price: 3.912, change: 0.0123 });
     expect(
       snapshotToStockPrice('600519.SH', {
         symbol: '600519.SH', price: 1500.5, asset_class: 'equity', currency: 'CNY',
@@ -185,7 +223,7 @@ describe('snapshotToStockPrice', () => {
   it('marks a missing quote unavailable with zeroed display fields', () => {
     expect(snapshotToStockPrice('MSFT', null)).toEqual({
       symbol: 'MSFT', price: 0, change: 0, changePercent: 0,
-      isPositive: true, quoteAvailable: false,
+      isPositive: true, quoteAvailable: false, places: 2,
     });
   });
 });

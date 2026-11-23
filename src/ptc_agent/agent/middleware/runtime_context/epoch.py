@@ -42,6 +42,7 @@ from ptc_agent.agent.middleware.runtime_context.restate import (
 )
 from ptc_agent.agent.middleware.runtime_context.state import as_dict
 from ptc_agent.agent.roles import AgentRole
+from ptc_agent.agent.tools.context_file_policy import visible
 
 # Rendered in a fixed order so the block is byte-identical for equal inputs.
 MEMORY_TIERS: tuple[str, ...] = ("user", "workspace")
@@ -497,10 +498,10 @@ class Observations:
     # Whether this turn's agent has ``schedule_wakeup``. None for a build
     # whose block says nothing about it.
     wakeups_enabled: bool | None = None
-    # Whether Claude's thinking is in what the next call sends. Such a block
-    # stays valid only while the system prompt in front of it is sent as it
-    # was, so while one is in view the block is never rebuilt: what a rebuild
-    # would have said goes into rows instead.
+    # Whether reasoning bound to its prefix (``thinking_binding``) is in what
+    # the next call sends. It stays valid only while the system prompt in
+    # front of it is sent as it was, so while any is in view the block is
+    # never rebuilt: what a rebuild would have said goes into rows instead.
     thinking_bound: bool = False
     # What the newest summary leaves for the turns after it to read, carried
     # by the row filed once that summary is seen. None when it leaves nothing.
@@ -575,9 +576,9 @@ def _plan(epoch: BaselineEpoch, obs: Observations) -> tuple[Plan, str | None]:
     """How this turn advances the epoch, and the rebuild reason behind it.
 
     ``observe`` files a row for each source that moved, and ``rebuild``
-    freezes a new block. A block Claude's thinking is bound to stands even
-    when a rebuild is due, since rebuilding it would invalidate every thinking
-    block after it, so what the rebuild would have said goes into rows
+    freezes a new block. A block that bound reasoning was produced on stands
+    even when a rebuild is due, since rebuilding it would invalidate all the
+    reasoning after it, so what the rebuild would have said goes into rows
     instead: ``restate`` after a summary, and otherwise ``state_sources``,
     which observes as well.
     """
@@ -882,18 +883,29 @@ def _file_row(
     if observed.get(read.kind) == current_sha:
         return None
     observed[read.kind] = current_sha
-    if entry.sha256 == current_sha:
+    harness = harness_block_for(read.update_kind)
+    if harness is not None and harness.value_intro:
+        # A value block's row states the value outright, a return to the
+        # frozen copy included.
+        text = read.content
+    elif entry.sha256 == current_sha:
         # Back to what the baseline block already says. Still a row: it
         # supersedes an earlier "changed" notice that is now wrong.
         text = f"{read.path} matches its frozen copy again."
     else:
-        # A harness block has no file behind it for the model to open.
-        text = render_diff(
-            entry.text,
-            read.content,
-            read.path,
-            readable=harness_block_for(read.update_kind) is None,
-        )
+        # Diffed as the model would see it, cut as the frozen copy was, so the
+        # part the cut hides never arrives through a change row.
+        current = read.content if read.cap is None else visible(read.cap, read.content)
+        if current == entry.text:
+            text = f"{read.path} changed past the part shown in its frozen copy; Read it for the rest."
+        else:
+            # A harness block has no file behind it for the model to open.
+            text = render_diff(
+                entry.text,
+                current,
+                read.path,
+                readable=harness is None,
+            )
     return DurableUpdate(
         kind=read.update_kind,
         schema_version=UPDATE_SCHEMA_VERSION,
@@ -1046,21 +1058,10 @@ def _entry(read: SourceRead, previous: FileEntry | None) -> FileEntry | None:
     raw = read.content
     return FileEntry(
         path=read.path,
-        text=_truncate(raw, read.cap),
+        text=raw if read.cap is None else visible(read.cap, raw),
         sha256=sha256_text(raw),
         exists=read.text is not None,
     )
-
-
-def _truncate(content: str, cap: int | None) -> str:
-    if cap is None or len(content) <= cap:
-        return content
-    # Cut at a newline so the slice never lands mid-fence and tempts the model
-    # to "repair" content it did not write.
-    cut = content.rfind("\n", 0, cap)
-    if cut <= 0:
-        cut = cap
-    return content[:cut] + "\n\n[... truncated ...]"
 
 
 def _memo_display(count: int | None) -> str | None:

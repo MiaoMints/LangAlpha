@@ -29,13 +29,14 @@ from ptc_agent.core.paths import (
 )
 from ptc_agent.core.sandbox import livefs_mount
 from ptc_agent.core.sandbox.execution import JobExecFailed
-from ptc_agent.core.sandbox.jobs import Ended, Failed, JobOutcome
+from ptc_agent.core.sandbox.jobs import Ended, Failed, JobContext, JobOutcome
 from src.observability import (
     TOOL_CHANNEL,
     TOOL_PROVIDER,
     mark_tool_failed,
     stamp_resource_tier,
 )
+from src.tools.turn_tool import input_schema
 
 logger = structlog.get_logger(__name__)
 
@@ -68,6 +69,19 @@ _FILE_TOOLS_ONLY_ERROR = (
     "Read tool and pass the content in if your code needs it; change them with Edit "
     "and Write."
 )
+
+#: A shared workspace member's memory, which Read and Glob alone reach and
+#: nothing writes. What a Read of it returns is kept from the other members,
+#: and code they all see is no place for it.
+_MEMBER_MEMORY_ERROR = (
+    "ERROR: {dir}/ is reachable only through Read and Glob, and is read-only. Read "
+    "the file you need there, and keep what it says out of your code: every member "
+    "of the workspace sees the code you run."
+)
+
+#: The refusal of a command naming a folder only the file tools reach, where
+#: it is not ``_FILE_TOOLS_ONLY_ERROR``.
+_FILE_TOOLS_ONLY_ERRORS = {WorkspaceLayout.MEMBERS_DIR: _MEMBER_MEMORY_ERROR}
 
 
 _CODE_DOC = """\
@@ -163,6 +177,7 @@ def create_execute_code_tool(
             files_error=_FILES_ROUTE_ERROR,
             file_tools_only=file_tools_only,
             file_tools_error=_FILE_TOOLS_ONLY_ERROR,
+            file_tools_errors=_FILE_TOOLS_ONLY_ERRORS,
             blocked_event="Blocked execute_code referencing a store-backed path",
             code_length=len(code),
         )
@@ -187,9 +202,12 @@ def create_execute_code_tool(
             return await backend.start_code_job(
                 call.command,
                 wait_s=wait_s,
-                thread_id=thread_id or None,
-                call_id=call_id,
-                allowed_servers=allowed_servers,
+                context=JobContext(
+                    thread_id=thread_id or None,
+                    call_id=call_id,
+                    allowed_servers=allowed_servers,
+                    env=command_handoff.turn_job_env(call.config),
+                ),
             )
 
         try:
@@ -225,9 +243,11 @@ def create_execute_code_tool(
         mark_tool_failed(e.cause if isinstance(e, JobExecFailed) else e)
         return f"ERROR: {e!s}", {"mcp_trace": []}
 
+    run = execute_code if hand_off is not None else subagent_execute_code
     tool = StructuredTool.from_function(
-        coroutine=execute_code if hand_off is not None else subagent_execute_code,
+        coroutine=run,
         name="ExecuteCode",
+        args_schema=input_schema("ExecuteCode", run),
         description=code_description(hand_off),
         response_format="content_and_artifact",
     )

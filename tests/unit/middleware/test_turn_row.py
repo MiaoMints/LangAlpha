@@ -10,6 +10,7 @@ anywhere in it costs the row, never the turn.
 """
 
 import re
+from dataclasses import replace
 from datetime import UTC, date, datetime, timedelta
 
 import pytest
@@ -21,6 +22,7 @@ from ptc_agent.agent.middleware.runtime_context import (
     RUNTIME_UPDATE_SOURCE,
     TURN_ROW_KIND,
     TURN_SCHEMA_VERSION,
+    HomeAway,
     TurnContextMiddleware,
     render_update_row,
     runtime_update_from_message,
@@ -545,18 +547,18 @@ class TestTheDeliveryRulesRideWhenTheyAreNews:
 
         assert _provenance(message)["rules_key"] == "web+automation"
         assert "Surface web: full markdown, no length cap" in message.content
-        assert "This thread was started by an automation." in message.content
+        assert "An automation, not a message from the user, starts the turns here" in message.content
 
     @pytest.mark.asyncio
     async def test_a_manual_follow_up_takes_the_thread_back_from_the_automation(self):
-        """The automation row says nobody is waiting; the person's turn has to say otherwise, once."""
+        """The automation row says the user may not be watching; the person's turn has to say otherwise, once."""
         auto = await _row(platform="web", origin="automation")
         manual = await _row(platform="web", state=_state([auto]))
 
         assert _provenance(manual)["rules_key"] == "web"
         assert "A person sent this turn and is waiting for the reply." in manual.content
         assert "Surface web: full markdown" in manual.content
-        assert "started by an automation" not in manual.content
+        assert "starts the turns here" not in manual.content
 
         again = await _row(platform="web", state=_state([auto, manual]))
         assert "waiting for the reply" not in again.content
@@ -582,6 +584,111 @@ class TestTheDeliveryRulesRideWhenTheyAreNews:
         again = await _row(state=_state([auto, manual]))
         assert "rules_key" not in _provenance(again)
         assert "waiting for the reply" not in again.content
+
+    @pytest.mark.asyncio
+    async def test_a_follow_up_after_an_automation_takes_back_the_channel_too(self):
+        """A channel's turn, then an automation's run, then the person writes
+        from the app: the handoff takes back only the automation's paragraph,
+        so the channel's would stay the last word on the surface and the model
+        would keep answering through send_message."""
+        channel = await _row(platform="slack", surface_rules=SLACK_RULES)
+        auto = await _row(origin="automation", state=_state([channel]))
+        manual = await _row(state=_state([channel, auto]))
+
+        assert _provenance(manual)["rules_key"] == "default"
+        assert "no delivery rules of its own" in manual.content
+        assert "send_message" in manual.content
+        assert "A person sent this turn and is waiting for the reply." in manual.content
+
+        again = await _row(state=_state([channel, auto, manual]))
+        assert "rules_key" in _provenance(again)
+        assert "delivery rules" not in again.content
+        assert "waiting for the reply" not in again.content
+
+    @pytest.mark.asyncio
+    async def test_a_thread_left_on_a_bare_handoff_takes_the_channel_back_on_its_next_turn(self):
+        """A thread whose follow-up stated only the handoff, as earlier builds
+        did, still has the channel's paragraph standing behind it."""
+        channel = await _row(platform="slack", surface_rules=SLACK_RULES)
+        auto = await _row(origin="automation", state=_state([channel]))
+        bare_handoff = await _row(state=_state([auto]))
+        assert _provenance(bare_handoff)["rules_key"] == "attended"
+
+        manual = await _row(state=_state([channel, auto, bare_handoff]))
+        assert _provenance(manual)["rules_key"] == "default"
+        assert "no delivery rules of its own" in manual.content
+        assert "waiting for the reply" not in manual.content
+
+    @pytest.mark.asyncio
+    async def test_an_automation_on_a_bare_channel_leaves_the_channel_standing(self):
+        """An automation that names the channel but states no rules for it
+        does not reset, so the channel's paragraph stands behind it and the
+        person's next turn takes it back."""
+        channel = await _row(platform="slack", surface_rules=SLACK_RULES)
+        auto = await _row(
+            platform="slack", origin="automation", state=_state([channel])
+        )
+        assert _provenance(auto)["rules_key"] == "slack+automation"
+
+        manual = await _row(state=_state([channel, auto]))
+        assert "no delivery rules of its own" in manual.content
+        assert "waiting for the reply" in manual.content
+
+    @pytest.mark.asyncio
+    async def test_an_automation_after_a_channel_keeps_the_channel_paragraph(self):
+        """An automation's own run does not take the channel back: what it
+        delivers where is its own business."""
+        channel = await _row(platform="slack", surface_rules=SLACK_RULES)
+        auto = await _row(origin="automation", state=_state([channel]))
+
+        assert "no delivery rules of its own" not in auto.content
+        assert "starts the turns here" in auto.content
+
+    @pytest.mark.asyncio
+    async def test_the_web_line_takes_back_a_channel_it_replaces(self):
+        """The web sends its surface on every turn, so it never reaches the
+        reset; its own line has to say the channel's rules are gone."""
+        channel = await _row(platform="slack", surface_rules=SLACK_RULES)
+        web = await _row(platform="web", state=_state([channel]))
+
+        assert "Surface web: full markdown" in web.content
+        assert "including any to reply with send_message" in web.content
+
+        again = await _row(platform="web", state=_state([channel, web]))
+        assert "delivery rules" not in again.content
+
+    @pytest.mark.asyncio
+    async def test_the_web_line_takes_back_a_channel_behind_an_automation(self):
+        channel = await _row(platform="slack", surface_rules=SLACK_RULES)
+        auto = await _row(origin="automation", state=_state([channel]))
+        web = await _row(platform="web", state=_state([channel, auto]))
+
+        assert "including any to reply with send_message" in web.content
+        assert "Your final answer is what the user reads.\n\nA person sent this turn" in web.content
+
+    @pytest.mark.asyncio
+    async def test_caller_rules_for_the_web_take_back_a_channel_they_replace(self):
+        """A client's own rules for the web replace the channel's paragraph as
+        the built-in line does, and say nothing of send_message either."""
+        channel = await _row(platform="slack", surface_rules=SLACK_RULES)
+        web = await _row(
+            platform="web",
+            surface_rules="Surface web: keep it to a page.",
+            state=_state([channel]),
+        )
+
+        assert (
+            "Surface web: keep it to a page.\n\nThe delivery rules stated earlier"
+            in web.content
+        )
+
+    @pytest.mark.asyncio
+    async def test_a_web_thread_without_a_channel_states_no_take_back(self):
+        web = await _row(platform="web")
+        market = await _row(platform="market_view:AAPL", state=_state([web]))
+
+        assert "send_message" not in web.content
+        assert "send_message" not in market.content
 
     @pytest.mark.asyncio
     async def test_a_turn_with_no_rules_after_a_channel_states_the_return_to_the_default(self):
@@ -821,6 +928,88 @@ class TestTheLowDiskLineIsTakenBack:
 
         assert self.RECOVERED not in sub.content
         assert "disk_low" not in _provenance(sub)
+
+
+class TestWhereAHomeTurnRuns:
+    """A Home turn in its stand-in on a cloud computer says so, and the first
+    turn back on Home's own computer takes it back, as the disk line does."""
+
+    AWAY = HomeAway(
+        workspace_id="stand-in",
+        computer_id="mac-1",
+        computer_name="MacBook Pro",
+        cloud_computer_id="cloud-1",
+        cloud_name="Cloud computer",
+    )
+    BACK = {"computer_name": "MacBook Pro", "folder": "From the cloud/2026-11-15", "files": 3}
+
+    @pytest.mark.asyncio
+    async def test_a_turn_in_the_stand_in_says_where_it_runs_and_what_it_holds(self):
+        away = await _row(home_away=self.AWAY)
+
+        assert "Home lives on MacBook Pro, which couldn't be reached" in away.content
+        assert "a separate Home folder on Cloud computer." in away.content
+        assert "holds only what turns run there wrote" in away.content
+        assert _provenance(away)["home_away"] is True
+
+    @pytest.mark.asyncio
+    async def test_a_report_on_a_command_there_says_why_it_runs_there(self):
+        report = await _row(home_away=replace(self.AWAY, reason="command"))
+
+        assert "where the command it reports on ran" in report.content
+        assert "Home lives on" not in report.content
+
+    @pytest.mark.asyncio
+    async def test_the_first_turn_back_says_where_the_files_went_once(self):
+        away = await _row(home_away=self.AWAY)
+
+        back = await _row(home_back=self.BACK, state=_state([away]))
+        again = await _row(home_back=self.BACK, state=_state([away, back]))
+
+        assert "MacBook Pro is back" in back.content
+        assert "`From the cloud/2026-11-15` in Home (3 files)" in back.content
+        assert "nothing was overwritten" in back.content
+        assert "is back" not in again.content
+
+    @pytest.mark.asyncio
+    async def test_a_copy_still_running_on_the_way_back_is_named_once_it_is_done(self):
+        away = await _row(home_away=self.AWAY)
+        pending = {"computer_name": "MacBook Pro", "pending": True}
+
+        back = await _row(home_back=pending, state=_state([away]))
+        still = await _row(home_back=pending, state=_state([away, back]))
+        done = await _row(home_back=self.BACK, state=_state([away, back, still]))
+        after = await _row(home_back=self.BACK, state=_state([away, back, still, done]))
+
+        assert "was still being copied" in back.content
+        assert _provenance(back)["home_away"] == "pending"
+        assert "copied" not in still.content
+        assert "has since been copied into `From the cloud/2026-11-15` in Home (3 files)" in done.content
+        assert "is back" not in done.content
+        assert _provenance(done)["home_away"] is False
+        assert "copied" not in after.content
+
+    @pytest.mark.asyncio
+    async def test_a_copy_that_carried_nothing_is_not_announced(self):
+        away = await _row(home_away=self.AWAY)
+        back = await _row(home_back={"computer_name": "MacBook Pro", "pending": True}, state=_state([away]))
+
+        done = await _row(home_back={"computer_name": "MacBook Pro"}, state=_state([away, back]))
+
+        assert "copied" not in done.content
+
+    @pytest.mark.asyncio
+    async def test_a_turn_that_was_never_away_says_nothing(self):
+        home = await _row(home_back=self.BACK)
+
+        assert "is back" not in home.content
+
+    @pytest.mark.asyncio
+    async def test_a_subagent_says_nothing_of_it(self):
+        sub = await _row(is_subagent=True, home_away=self.AWAY)
+
+        assert "Home lives on" not in sub.content
+        assert "home_away" not in _provenance(sub)
 
 
 class TestTheRowIsRenderedOnce:

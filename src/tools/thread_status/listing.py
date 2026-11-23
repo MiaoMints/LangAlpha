@@ -9,10 +9,11 @@ from __future__ import annotations
 
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Any, Literal, get_args
 
-from src.server.database.wakeups.contract import as_datetime
+from src.server.contracts.status import REPORT_BACK_STATUSES
+from src.server.database.wakeups.contract import as_datetime, plan_reset_of
 from src.server.services.commands.notice import killed_by
 from src.tools.wakeups.clock import user_zone_of, zone_of
 from src.tools.wakeups.describe import pending_line, schedule_of, short_desc
@@ -61,6 +62,13 @@ class Item:
     #: ended, which orders the ended ones newest first.
     at: datetime
     more: tuple[str, ...] = ()
+    #: When it was set (a command or task started, a wakeup made), or None
+    #: where its rows do not say. Never shown: what reports back to a
+    #: request reads it (``pending_work``).
+    set_at: datetime | None = None
+    #: Ended with a report to the thread still to come. Never shown either:
+    #: the listing tells ended items by how they ended.
+    owed: bool = False
 
 
 def _one_line(text: Any, cap: int = _DESCRIPTION_MAX) -> str:
@@ -126,9 +134,15 @@ def command_state(row: Mapping[str, Any], now: datetime) -> str:
 
 def command_item(row: Mapping[str, Any], now: datetime) -> Item:
     """A command's line; an ended one says ``reported`` once the ledger has
-    its end reaching the agent."""
+    its end reaching the agent. One the user or the after-turn hour stopped
+    is told at the thread's next turn and starts none, so it owes no report."""
     status = row["status"]
     ended = status != "running"
+    owed = (
+        ended
+        and not row.get("reported")
+        and (status == "completed" or (status == "failed" and row.get("failure_reason") != "after_turn_limit"))
+    )
     return Item(
         id=str(row["command_id"]),
         type="command",
@@ -141,6 +155,8 @@ def command_item(row: Mapping[str, Any], now: datetime) -> Item:
         ),
         more=(f"log {row.get('log_path')}",),
         at=as_datetime(row.get("ended_at") if ended else row.get("started_at")) or now,
+        set_at=as_datetime(row.get("started_at")),
+        owed=owed,
     )
 
 
@@ -158,6 +174,11 @@ def command_detail(row: Mapping[str, Any], now: datetime) -> str:
     tail = (row.get("output_tail") or "").rstrip()
     if not running and tail:
         lines.append(f"Last lines of the log:\n{_last_lines(tail)}")
+    # Showing the end drops the notice, which is where a handed-off job's chart
+    # layer read-back otherwise reaches the agent.
+    if published := row.get("outbox_report"):
+        # Apart from the log's last lines, as the stop's answer sets it.
+        lines.append(f"\n{published}")
     return "\n".join(lines)
 
 
@@ -183,6 +204,10 @@ def task_state(row: Mapping[str, Any], now: datetime) -> str:
 
 
 def task_item(row: Mapping[str, Any], now: datetime, progress: str | None = None) -> Item:
+    """A task's line. Its report-back never stamps the run delivered, only a
+    ``TaskOutput`` read does, so ``owed`` holds for one whose report did
+    reach a turn too: only one that ended after that turn began is surely
+    still owed (``pending_work``'s ``ended_since``)."""
     status = task_status(row)
     ended = status != "running"
     return Item(
@@ -196,6 +221,8 @@ def task_item(row: Mapping[str, Any], now: datetime, progress: str | None = None
             None if ended else progress,
         ),
         at=as_datetime(row.get("finalized_at") if ended else row.get("started_at")) or now,
+        set_at=as_datetime(row.get("started_at")),
+        owed=row.get("status") in REPORT_BACK_STATUSES and not row.get("result_delivered_at"),
     )
 
 
@@ -250,17 +277,31 @@ def _wakeup_when(row: Mapping[str, Any], now: datetime, user_tz: str) -> str:
     return short_desc({**row, "label": None})
 
 
+def _plan_wait(row: Mapping[str, Any], now: datetime, user_tz: str) -> str | None:
+    """That a fire of the wakeup waits for the Claude plan to reset, which
+    then delivers it; None where none does."""
+    hold = row.get("notice_plan_hold")
+    if not hold or int(row.get("last_fired_seq") or 0) <= int(row.get("delivered_seq") or 0):
+        return None
+    if (reset := plan_reset_of(hold)) is None:
+        return "waiting for the Claude plan to reset"
+    return f"waiting for the Claude plan to reset at {_when(reset, now, user_tz)}"
+
+
 def wakeup_item(row: Mapping[str, Any], now: datetime, user_tz: str) -> Item:
     ended = _wakeup_ended(row, now)
     label = _one_line(row.get("label"))
+    held = _plan_wait(row, now, user_tz)
+    set_at = as_datetime(row.get("created_at"))
     if ended is None:
         nxt = as_datetime(row.get("next_fire_at")) or (schedule_of(row) or [None])[0]
         return Item(
             id=str(row.get("short_id")),
             type="wakeup",
             status="pending",
-            text=_parts(label, _wakeup_when(row, now, user_tz)),
+            text=_parts(label, _wakeup_when(row, now, user_tz), held),
             at=nxt or now,
+            set_at=set_at,
         )
     at = as_datetime(
         row.get("last_fired_at") if ended == "fired" else row.get("updated_at")
@@ -270,15 +311,18 @@ def wakeup_item(row: Mapping[str, Any], now: datetime, user_tz: str) -> Item:
         id=str(row.get("short_id")),
         type="wakeup",
         status="stopped" if ended == "cancelled" else "completed",
-        text=_parts(label or _wakeup_when(row, now, user_tz), how),
+        text=_parts(label or _wakeup_when(row, now, user_tz), how, held),
         at=at,
+        set_at=set_at,
+        # A fire whose notice no turn has taken in yet.
+        owed=int(row.get("last_fired_seq") or 0) > int(row.get("delivered_seq") or 0),
     )
 
 
 def wakeup_detail(item: Item, row: Mapping[str, Any], now: datetime, user_tz: str) -> str:
     """``item`` is ``wakeup_item`` of the same row."""
     if item.status == "pending":
-        return pending_line(row, now, user_tz).removeprefix("- ")
+        return _parts(pending_line(row, now, user_tz).removeprefix("- "), _plan_wait(row, now, user_tz))
     return f"{item.id}  wakeup · {item.text}"
 
 
@@ -380,12 +424,14 @@ def automation_detail(row: Mapping[str, Any], now: datetime, automations_dir: st
 
 
 def analyst_item(label: Mapping[str, Any], now: datetime) -> Item:
+    handed = label.get("handed_at")
     return Item(
         id=str(label.get("thread_id")),
         type="analyst",
         status="running",
         text=_parts(_one_line(label.get("workspace_name")), _one_line(label.get("title")), "working"),
         at=now,
+        set_at=datetime.fromtimestamp(handed, tz=timezone.utc) if isinstance(handed, int | float) else None,
     )
 
 

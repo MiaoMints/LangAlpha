@@ -9,6 +9,7 @@ import rehypeRaw from 'rehype-raw';
 import rehypeKatex from 'rehype-katex';
 import rehypeSanitize, { defaultSchema } from 'rehype-sanitize';
 import 'katex/dist/katex.min.css';
+import './Markdown.css';
 import SyntaxHighlighter, { oneDark, oneLight } from './SyntaxHighlighter';
 import { Copy, Check } from 'lucide-react';
 import { useTheme } from '@/contexts/ThemeContext';
@@ -18,15 +19,18 @@ import { copyText } from '@/lib/clipboard';
 import WorkspaceImage from './WorkspaceImage';
 import { isFilePath, isImagePath, normalizeFilePath, parseFolderHref, parseWsPath } from '../utils/filePaths';
 import { useWorkspaceFolders } from '../contexts/WorkspaceContext';
-import { useShareLinkOpener } from '../contexts/ShareLinkOpenerContext';
+import { useLinkActions } from '../contexts/LinkActionsContext';
+import { isWebAddress, WebLinkMenu } from './WebLinkMenu';
 import { onOtherComputer, parseAgentHref, parseAgentPath } from '../utils/agentPaths';
-import { normalizeFileRefs } from '../utils/normalizeFileRefs';
+import { prepareMarkdownSource } from '../utils/markdownSource';
 import { splitFileLocation, type OpenFileHandler } from '../utils/fileLocation';
-import { mapOutsideCode, mapOutsideMultilineCode } from '../utils/markdownSegments';
 import { splitMarkdownBlocks, scanStreamingBlock } from '../utils/markdownBlocks';
 import { repairStreamingTail } from '../utils/streamingTail';
 import { blockFreshKeys, rehypeFreshText, useRevealFade } from '../utils/revealFade';
 import CitationBubble from './CitationBubble';
+import { FootnoteLink, isFootnoteLink } from './markdown/FootnoteLink';
+import MermaidDiagram from './markdown/MermaidDiagram';
+import TableScroller from './markdown/TableScroller';
 import { InPlaceSwap } from '@/components/ui/crossfade';
 
 // Sanitize schema: extends GitHub-style defaults to allow KaTeX output,
@@ -37,6 +41,7 @@ const sanitizeSchema = {
     ...(defaultSchema.tagNames ?? []),
     // Custom citation element
     'cite-bubble',
+    'mark',
     // MathML (KaTeX accessibility tree inside .katex-mathml)
     'math', 'annotation', 'semantics',
     'mi', 'mn', 'mo', 'mrow', 'mfrac', 'msqrt', 'mroot', 'mstyle',
@@ -170,25 +175,28 @@ const CodeBlock = React.memo(function CodeBlock({ language, code, compact = fals
   // just code on a light gray background. Page-break-inside:avoid keeps
   // the block together across pages.
   if (isForceLight) {
+    const source = (
+      <SyntaxHighlighter
+        language={language || 'text'}
+        style={oneLight}
+        customStyle={{
+          margin: 0,
+          padding: '0.8rem 1rem',
+          backgroundColor: 'transparent',
+          fontSize: compact ? '0.75rem' : '0.8rem',
+          lineHeight: '1.6',
+        }}
+        codeTagProps={{ style: { backgroundColor: 'transparent' } }}
+        wrapLongLines
+      >
+        {code}
+      </SyntaxHighlighter>
+    );
     return (
       <div style={{ margin: compact ? '4px 0' : '6px 0' }}>
         <div className="rounded overflow-hidden"
           style={{ backgroundColor: '#f7f6f3', pageBreakInside: 'avoid', breakInside: 'avoid' }}>
-          <SyntaxHighlighter
-            language={language || 'text'}
-            style={oneLight}
-            customStyle={{
-              margin: 0,
-              padding: '0.8rem 1rem',
-              backgroundColor: 'transparent',
-              fontSize: compact ? '0.75rem' : '0.8rem',
-              lineHeight: '1.6',
-            }}
-            codeTagProps={{ style: { backgroundColor: 'transparent' } }}
-            wrapLongLines
-          >
-            {code}
-          </SyntaxHighlighter>
+          {language === 'mermaid' && !live ? <MermaidDiagram code={code} theme="light" fallback={source} /> : source}
         </div>
       </div>
     );
@@ -207,7 +215,7 @@ const CodeBlock = React.memo(function CodeBlock({ language, code, compact = fals
             {/* Both labels hold the one cell, so the button is as wide as the
                 wider of them in every language and the header never shifts. */}
             <button onClick={handleCopy}
-              className="press text-xs text-(--color-text-tertiary) hover:text-(--color-text-secondary)"
+              className="tap-target press text-xs text-(--color-text-tertiary) hover:text-(--color-text-secondary)"
               style={{ background: 'none', border: 'none', cursor: 'pointer' }}>
               <InPlaceSwap
                 swapped={copied}
@@ -218,7 +226,9 @@ const CodeBlock = React.memo(function CodeBlock({ language, code, compact = fals
             </button>
           </div>
         )}
-        <TypingLine.Provider value={live ? { line: typingLine } : null}>{highlighted}</TypingLine.Provider>
+        <TypingLine.Provider value={live ? { line: typingLine } : null}>
+          {language === 'mermaid' && !live ? <MermaidDiagram code={code} theme={effectiveTheme} fallback={highlighted} /> : highlighted}
+        </TypingLine.Provider>
       </div>
     </div>
   );
@@ -291,13 +301,18 @@ const em = ({ node: _node, ...props }: MarkdownComponentProps) => (
 const del = ({ node: _node, ...props }: MarkdownComponentProps) => (
   <del style={{ color: 'var(--color-text-tertiary)', textDecoration: 'line-through' }} {...props} />
 );
+// A task list reports what the author wrote, and nothing saves a change to it.
+// `checked` is absent on an open task, which would leave the box uncontrolled
+// and tappable.
+function TaskCheckbox({ checked }: { checked?: boolean }): React.ReactElement {
+  const { t } = useTranslation();
+  return (
+    <input type="checkbox" checked={!!checked} disabled aria-label={t(checked ? 'chat.taskDone' : 'chat.taskOpen')}
+      style={{ marginRight: '6px', accentColor: 'var(--color-accent-primary)', opacity: 1 }} />
+  );
+}
 const input = ({ node: _node, type, checked, ...props }: MarkdownComponentProps) => {
-  if (type === 'checkbox') {
-    return (
-      <input type="checkbox" checked={checked} readOnly
-        style={{ marginRight: '6px', accentColor: 'var(--color-accent-primary)' }} />
-    );
-  }
+  if (type === 'checkbox') return <TaskCheckbox checked={checked} />;
   return <input {...props} />;
 };
 const img = ({ node: _node, ...props }: MarkdownComponentProps) => <WorkspaceImage {...props} />;
@@ -363,10 +378,12 @@ const chatBlockquote = ({ node: _node, ...props }: MarkdownComponentProps) => (
 // A page of this app opens in place, through the router and past the host's
 // leave guard; anything else opens in a new tab so the conversation survives
 // the detour, unless the chat around it takes the click (an app or file link
-// it opens as a panel tab). A modified click is always the new tab.
+// it opens as a panel tab). A modified click is always the new tab. Where the
+// chat has a computer's browser, a web link's right-click menu offers it too.
 function MarkdownLink({ href, ...props }: MarkdownComponentProps) {
   const route = useInRouterContext() ? appRoutePath(href) : null;
-  const openShareLink = useShareLinkOpener();
+  const { openShareLink, openInBrowser } = useLinkActions();
+  if (isFootnoteLink(props)) return <FootnoteLink href={href} {...props} />;
   if (route !== null) return <GuardedLink to={route} {...props} />;
   const onClick = openShareLink && href
     ? (e: React.MouseEvent) => {
@@ -374,7 +391,9 @@ function MarkdownLink({ href, ...props }: MarkdownComponentProps) {
         if (openShareLink(href)) e.preventDefault();
       }
     : undefined;
-  return <a href={href} target="_blank" rel="noopener noreferrer" onClick={onClick} {...props} />;
+  const link = <a href={href} target="_blank" rel="noopener noreferrer" onClick={onClick} {...props} />;
+  if (!openInBrowser || !isWebAddress(href)) return link;
+  return <WebLinkMenu href={href} openInBrowser={openInBrowser}>{link}</WebLinkMenu>;
 }
 const chatA = ({ node: _node, ...props }: MarkdownComponentProps) => (
   <MarkdownLink className="underline hover:opacity-80 transition-opacity [overflow-wrap:anywhere] [word-break:normal]" style={{ color: 'var(--color-accent-primary)' }} {...props} />
@@ -384,9 +403,9 @@ const chatHr = ({ node: _node, ...props }: MarkdownComponentProps) => (
 );
 const chatTable = ({ node: _node, ...props }: MarkdownComponentProps) => (
   <div className="pt-[8px] pb-[18px]">
-    <div className="overflow-x-auto rounded-lg" style={{ border: '1px solid var(--color-border-muted)' }}>
+    <TableScroller className="rounded-lg">
       <table className="m-0 w-full border-collapse" {...props} />
-    </div>
+    </TableScroller>
   </div>
 );
 const chatThead = ({ node: _node, ...props }: MarkdownComponentProps) => <thead style={{ backgroundColor: 'var(--color-bg-input)' }} {...props} />;
@@ -394,6 +413,7 @@ const chatTbody = ({ node: _node, ...props }: MarkdownComponentProps) => <tbody 
 const chatTr = ({ node: _node, ...props }: MarkdownComponentProps) => <tr {...props} />;
 const chatTh = ({ node: _node, style, ...props }: MarkdownComponentProps) => (
   <th
+    scope="col"
     className="align-top not-first:border-l"
     style={{
       textAlign: 'left',
@@ -467,14 +487,14 @@ const panelHr = ({ node: _node, ...props }: MarkdownComponentProps) => (
   <hr className="my-3 border-0" style={{ borderTop: '1px solid var(--color-border-muted)' }} {...props} />
 );
 const panelTable = ({ node: _node, ...props }: MarkdownComponentProps) => (
-  <div className="my-2 overflow-x-auto rounded" style={{ border: '1px solid var(--color-border-muted)' }}>
+  <TableScroller className="my-2 rounded">
     <table className="w-full border-collapse text-left" style={{ minWidth: '100%' }} {...props} />
-  </div>
+  </TableScroller>
 );
 const panelThead = ({ node: _node, ...props }: MarkdownComponentProps) => <thead style={{ backgroundColor: 'var(--color-bg-input)' }} {...props} />;
 const panelTr = ({ node: _node, ...props }: MarkdownComponentProps) => <tr className="last:border-b-0" style={{ borderBottom: '1px solid var(--color-border-muted)' }} {...props} />;
 const panelTh = ({ node: _node, ...props }: MarkdownComponentProps) => (
-  <th className="px-3 py-2 whitespace-nowrap" style={{ color: 'var(--color-text-primary)', fontWeight: 600, borderBottom: '1px solid var(--color-border-muted)' }} {...props} />
+  <th scope="col" className="px-3 py-2 whitespace-nowrap" style={{ color: 'var(--color-text-primary)', fontWeight: 600, borderBottom: '1px solid var(--color-border-muted)' }} {...props} />
 );
 const panelTd = ({ node: _node, ...props }: MarkdownComponentProps) => (
   <td className="px-3 py-2 wrap-break-word align-top" style={{ color: 'var(--color-text-primary)' }} {...props} />
@@ -529,21 +549,21 @@ const PANEL_COMPONENTS = {
 
 // Compact table components -- reuse panel styles for consistency
 const compactTable = ({ node: _node, ...props }: MarkdownComponentProps) => (
-  <div className="my-1 overflow-x-auto rounded" style={{ border: '1px solid var(--color-border-muted)' }}>
+  <TableScroller className="my-1 rounded">
     <table className="w-full border-collapse text-left" style={{ minWidth: '100%', fontSize: '0.85em' }} {...props} />
-  </div>
+  </TableScroller>
 );
 const compactThead = ({ node: _node, ...props }: MarkdownComponentProps) => <thead style={{ backgroundColor: 'var(--color-bg-input)' }} {...props} />;
 const compactTr = ({ node: _node, ...props }: MarkdownComponentProps) => <tr className="last:border-b-0" style={{ borderBottom: '1px solid var(--color-border-muted)' }} {...props} />;
 const compactTh = ({ node: _node, ...props }: MarkdownComponentProps) => (
-  <th className="px-2 py-1.5 whitespace-nowrap" style={{ color: 'var(--color-text-primary)', fontWeight: 600, borderBottom: '1px solid var(--color-border-muted)' }} {...props} />
+  <th scope="col" className="px-2 py-1.5 whitespace-nowrap" style={{ color: 'var(--color-text-primary)', fontWeight: 600, borderBottom: '1px solid var(--color-border-muted)' }} {...props} />
 );
 const compactTd = ({ node: _node, ...props }: MarkdownComponentProps) => (
   <td className="px-2 py-1.5 wrap-break-word align-top" style={{ color: 'var(--color-text-primary)' }} {...props} />
 );
 
 const COMPACT_COMPONENTS = {
-  strong, em, del, ul, ol, li,
+  strong, em, del, input, ul, ol, li,
   p: compactP, h1: compactH1, h2: compactH2, h3: compactH3,
   code: compactCode, pre: CompactPre,
   a: panelA, blockquote: panelBlockquote, hr: panelHr,
@@ -577,222 +597,23 @@ const VARIANTS: Record<string, VariantConfig> = {
 
 export { CodeBlock };
 
-/**
- * Fix malformed GFM tables so remark-gfm can parse them.
- *
- * Common LLM mistakes:
- *  - Separator row has fewer columns than the header row
- *  - Data rows have fewer/more columns than the header
- *  - Merged/mangled cells like "|---|------ 1 | ..."
- *
- * Strategy: detect table blocks (consecutive lines starting/ending with |),
- * count header columns, then rebuild the separator and pad/trim data rows.
- */
-function fixMarkdownTables(content: string): string {
-  if (!content || typeof content !== 'string') return content;
-
-  const lines = content.split('\n');
-  const result: string[] = [];
-  let i = 0;
-
-  while (i < lines.length) {
-    const line = lines[i];
-    const trimmed = line.trim();
-
-    // Detect a potential table header: must have at least 2 pipes and look like "| ... | ... |"
-    if (trimmed.startsWith('|') && trimmed.endsWith('|') && (trimmed.match(/\|/g) || []).length >= 3) {
-      const headerCols = trimmed.split('|').slice(1, -1); // cells between outer pipes
-      const colCount = headerCols.length;
-
-      // Check if next line is a separator (pipes + dashes/colons/spaces only)
-      if (i + 1 < lines.length && /^\|[\s\-:|]+\|$/.test(lines[i + 1].trim())) {
-        const sepCols = lines[i + 1].trim().split('|').slice(1, -1).length;
-
-        // If separator column count doesn't match header, rebuild it
-        if (sepCols !== colCount) {
-          result.push(line);
-          result.push('|' + Array(colCount).fill('---').join('|') + '|');
-          i += 2;
-        } else {
-          // Separator is fine, push both
-          result.push(line);
-          result.push(lines[i + 1]);
-          i += 2;
-        }
-
-        // Now process data rows: pad or trim cells to match colCount
-        while (i < lines.length) {
-          const row = lines[i].trim();
-          if (!row.startsWith('|')) break; // end of table
-
-          const cells = row.split('|');
-          // Split gives ['', cell1, cell2, ..., ''] for "|a|b|"
-          // Handle malformed rows that don't end with |
-          const hasTrailingPipe = row.endsWith('|');
-          const inner = hasTrailingPipe ? cells.slice(1, -1) : cells.slice(1);
-
-          if (inner.length === colCount) {
-            result.push(lines[i]); // row is fine
-          } else if (inner.length < colCount) {
-            // Pad with empty cells
-            const padded = [...inner, ...Array(colCount - inner.length).fill(' ')];
-            result.push('|' + padded.join('|') + '|');
-          } else {
-            // Too many cells -- trim to colCount
-            result.push('|' + inner.slice(0, colCount).join('|') + '|');
-          }
-          i++;
-        }
-        continue;
-      }
-    }
-
-    result.push(line);
-    i++;
-  }
-
-  return result.join('\n');
-}
-
-/**
- * Strip YAML front matter (--- delimited block at start of content).
- * Without this, `---` renders as <hr> and YAML fields as plain text.
- */
-function stripFrontMatter(content: string): string {
-  if (!content || typeof content !== 'string') return content;
-  if (!content.startsWith('---\n') && !content.startsWith('---\r\n')) return content;
-  const end = content.indexOf('\n---', 3);
-  if (end === -1) return content;
-  // Skip past closing "---" and optional newline
-  const rest = content.slice(end + 4);
-  return rest.startsWith('\n') ? rest.slice(1) : rest.startsWith('\r\n') ? rest.slice(2) : rest;
-}
-
-// A cashtag: `$AAPL`, `$BRK.B`. Followed by a dollar, `^`, `_`, `{`, `(` or a
-// backslash, it is the start of a formula (`$X$`, `$P(A)$`, `$X_t$`) instead.
-const TICKER = String.raw`[A-Z]{1,5}(?:\.[A-Z]{1,2})?(?![\p{L}\p{N}$^_{(\\])`;
-const TICKER_DOLLAR_RE = new RegExp(String.raw`(?<![\\$])\$(?=${TICKER})`, 'gu');
-const OPENS_TICKER_RE = new RegExp(String.raw`^\$${TICKER}`, 'u');
-
-/**
- * Escape dollar signs used as currency ($129.82, $/bbl, in millions ($)) or in
- * front of a ticker ($AAPL, $BRK.B) so remark-math does not treat them as
- * inline-math delimiters. remark-math pairs any two dollars, so `$AAPL and
- * $MSFT` would set "AAPL and " as a formula. $$ (display math) is left alone.
- *
- * Capitals after a dollar also start formulas (`$N = 5$`), so a ticker-shaped
- * one stays math when the next dollar in its paragraph closes it: touching
- * the text before it, not just after an opening bracket or quote (the dollar
- * in `($x$)` opens a formula of its own), and not itself opening a ticker.
- */
-function escapeCurrencyDollars(content: string): string {
-  if (!content || typeof content !== 'string') return content;
-  // A dollar standing for the unit (`85 $/bbl`, `($)`) opens nothing either;
-  // after a word it closes a formula, as in `($x$)`.
-  const currency = content
-    .replace(/(?<!\$)\$(?!\$)(?=[-+]?\d)/g, '\\$')
-    .replace(/(?<=^|[\s(])\$(?=[/)])/gm, '\\$');
-  return currency.replace(TICKER_DOLLAR_RE, (dollar, at: number) => (closesInlineMath(currency, at + 1) ? dollar : '\\$'));
-}
-
-// The next dollar is found first and only the text up to it searched for a
-// blank line, so a list with a cashtag on every row stays one pass.
-function closesInlineMath(content: string, from: number): boolean {
-  for (let i = content.indexOf('$', from); i >= 0; i = content.indexOf('$', i + 1)) {
-    if (content[i - 1] === '\\') continue;
-    if (content[i + 1] === '$') { i++; continue; }
-    if (/\n[ \t]*\n/.test(content.slice(from, i))) return false;
-    return !/[\s([{"“]/.test(content[i - 1]) && !OPENS_TICKER_RE.test(content.slice(i, i + 12));
-  }
-  return false;
-}
-
-/**
- * Normalize LaTeX delimiters for remark-math compatibility.
- *
- * LLMs often emit \[...\] (display) and \(...\) (inline) notation,
- * but remark-math only recognizes $$...$$ and $...$ delimiters.
- */
-function normalizeLatexDelimiters(content: string): string {
-  if (!content || typeof content !== 'string') return content;
-
-  // Convert display math: \[...\] -> $$...$$
-  // Match \[ ... \] allowing newlines in between
-  content = content.replace(/\\\[([\s\S]*?)\\\]/g, (_, math) => `$$${math}$$`);
-
-  // Convert inline math: \(...\) -> $...$
-  content = content.replace(/\\\((.*?)\\\)/g, (_, math) => `$${math}$`);
-
-  return content;
-}
-
-// A whole line holding one `$$...$$` equation. The body has no unescaped `$`,
-// so two equations on one line, or `$$` closing mid-line, never match.
-const ONE_LINE_DISPLAY_MATH_RE = /^( {0,3})\$\$((?:[^$\\\n]|\\.)+)\$\$[ \t]*$/gm;
-
-/**
- * Give display math written on a single line a block of its own.
- *
- * remark-math only opens a display block on a `$$` line by itself, so
- * `$$x$$` (and `\[x\]`, which normalizeLatexDelimiters has already turned into
- * it) parses as inline math even when it is the whole line. The equation moves
- * onto its own line between fences; `$$x$$` inside a sentence stays inline,
- * and an equation still streaming in has no closing `$$` to match yet.
- */
-function blockOneLineDisplayMath(content: string): string {
-  if (!content || typeof content !== 'string') return content;
-  return content.replace(ONE_LINE_DISPLAY_MATH_RE, (line, indent: string, body: string) =>
-    body.trim() ? `${indent}$$\n${indent}${body.trim()}\n${indent}$$` : line,
-  );
-}
-
-/**
- * Drop the row break LLMs leave after the last row of a numbered environment.
- *
- * LaTeX, and KaTeX since 0.18, read that `\\` as opening one more row and
- * number it, so the block grows an empty line tagged with the next equation
- * number. The unnumbered forms (`aligned`, `align*`, matrices) draw nothing
- * for it, so only the three numbered ones are touched.
- */
-function dropTrailingRowBreaks(content: string): string {
-  if (!content || typeof content !== 'string') return content;
-  return content.replace(/\\\\\s*(?=\\end\{(?:align|gather|alignat)\})/g, '');
-}
-
-/**
- * Convert inline citation patterns ([label](url)) into <cite-bubble> HTML tags.
- * rehype-raw will parse these into the AST and the CitationBubble component renders them.
- */
-function escapeHtmlAttr(s: string): string {
-  return s.replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;');
-}
-
-function transformCitationBubbles(content: string): string {
-  if (!content || typeof content !== 'string') return content;
-  return content.replace(
-    /\(\[([^\]]+)\]\((https?:\/\/[^)]+)\)\)/g,
-    (_, label, url) => {
-      // Encode $ as %24 so escapeCurrencyDollars won't mangle URLs (e.g. ?price=$100)
-      const safeUrl = url.replace(/\$/g, '%24');
-      return `<cite-bubble label="${escapeHtmlAttr(label)}" href="${escapeHtmlAttr(safeUrl)}"></cite-bubble>`;
-    }
-  );
-}
-
 type MarkdownVariant = 'chat' | 'panel' | 'compact';
 
 const REMARK_PLUGINS: React.ComponentProps<typeof ReactMarkdown>['remarkPlugins'] = [
   [remarkGfm, { singleTilde: false }], remarkCjkFriendly, remarkMath,
 ];
-type RehypePlugins = NonNullable<React.ComponentProps<typeof ReactMarkdown>['rehypePlugins']>;
+export type RehypePlugins = NonNullable<React.ComponentProps<typeof ReactMarkdown>['rehypePlugins']>;
 const REHYPE_PLUGINS: RehypePlugins = [
   [rehypeKatex, { strict: false }], rehypeRaw, [rehypeSanitize, sanitizeSchema],
 ];
 
-// The fade pass runs after the sanitizer: it only wraps text the sanitizer
-// already passed, in spans carrying a mark id.
-const withFreshText = (fresh: string): RehypePlugins =>
-  fresh ? [...REHYPE_PLUGINS, [rehypeFreshText, fresh] as RehypePlugins[number]] : REHYPE_PLUGINS;
+// The rehype passes, then those that run after the sanitizer: the caller's
+// and the fade's. They only rework what the sanitizer already passed (the
+// fade wraps text in spans carrying a mark id).
+const withPostSanitizePasses = (fresh: string, after: RehypePlugins | undefined): RehypePlugins => {
+  const base = after?.length ? [...REHYPE_PLUGINS, ...after] : REHYPE_PLUGINS;
+  return fresh ? [...base, [rehypeFreshText, fresh] as RehypePlugins[number]] : base;
+};
 
 interface MarkdownBlockProps {
   source: string;
@@ -801,6 +622,9 @@ interface MarkdownBlockProps {
   live: boolean;
   /** The reveals still fading in over this block (`blockFreshKeys`), '' for none. */
   fresh: string;
+  rehypeAfter: RehypePlugins | undefined;
+  /** This block's pass from `rehypeForBlock`, run last. */
+  blockPass: RehypePlugins[number] | null;
 }
 
 // One parsed block. Memoized on its source and its fresh key, so a streaming
@@ -815,9 +639,12 @@ interface MarkdownBlockProps {
 // rebuild every highlighted token on each new line. Closing the fence counts
 // its lines at once, one remount per fence. While the block is live, that
 // fence highlights only its typing line per tick (CodeBlock).
-const MarkdownBlock = React.memo(function MarkdownBlock({ source, components, live, fresh }: MarkdownBlockProps) {
+const MarkdownBlock = React.memo(function MarkdownBlock({ source, components, live, fresh, rehypeAfter, blockPass }: MarkdownBlockProps) {
   const { lineKey, openFence } = useMemo(() => scanStreamingBlock(source), [source]);
-  const rehypePlugins = useMemo(() => withFreshText(fresh), [fresh]);
+  const rehypePlugins = useMemo(() => {
+    const passes = withPostSanitizePasses(fresh, rehypeAfter);
+    return blockPass ? [...passes, blockPass] : passes;
+  }, [fresh, rehypeAfter, blockPass]);
   return (
     <LiveFence.Provider value={live ? openFence : -1}>
       <ReactMarkdown key={lineKey} remarkPlugins={REMARK_PLUGINS} rehypePlugins={rehypePlugins} components={components}>
@@ -840,34 +667,43 @@ interface MarkdownProps {
   codeTheme?: 'light' | 'dark';
   /** The content is still arriving, so a fence open at its end is still being written. */
   streaming?: boolean;
+  /**
+   * Rehype passes run after the sanitizer, over the tree it passed. Hoist or
+   * memoize the array: it is part of every block's memo.
+   */
+  rehypeAfter?: RehypePlugins;
+  /**
+   * A rehype pass for each block, after the sanitizer, made from which line
+   * of `content` each line of the block's parsed text came from (both
+   * 1-based): the parse is of a prepared copy, block by block. Hoist it: it
+   * is part of every block's memo.
+   */
+  rehypeForBlock?: (fileLine: (line: number) => number) => RehypePlugins[number];
 }
 
-function Markdown({ content, variant = 'panel', className = '', style, onOpenFile, onAnchorLink, codeTheme, streaming = false }: MarkdownProps): React.ReactElement {
+// An image the source embeds, by its destination as written: `<...>` or bare.
+// Each part is bounded and kept to its line, so a line of `![` with no `]`
+// costs one short look per opener rather than a scan to the end of the reply.
+const IMAGE_EMBED_RE = /!\[[^\]\n]{0,500}\]\(\s*(?:<([^>\n]{0,2048})>|([^)\s]{1,2048}))/g;
+
+/** The images `source` embeds, as one key: the link components close over it,
+ *  and a key that holds while streamed text adds no embed keeps them stable. */
+function embeddedImagesKey(source: string): string {
+  const found = new Set<string>();
+  for (const match of source.matchAll(IMAGE_EMBED_RE)) found.add(match[1] ?? match[2]);
+  return [...found].sort().join('\n');
+}
+
+function Markdown({ content, variant = 'panel', className = '', style, onOpenFile, onAnchorLink, codeTheme, streaming = false, rehypeAfter, rehypeForBlock }: MarkdownProps): React.ReactElement {
   const config = VARIANTS[variant];
   const folders = useWorkspaceFolders();
   const rootDir = folders?.rootDir;
   const otherRoots = folders?.otherRoots;
-  // Every pass below rewrites prose before the markdown parser sees it, so each
-  // one has to say how much of the string it may touch. Inside code, markdown
-  // stops interpreting escapes and raw HTML — a rewrite that lands there is
-  // visible corruption and makes the Copy button return unparseable text.
-  const processed = useMemo(() => {
-    // Whole-string by design: front matter is anchored at the start, and
-    // normalizeFileRefs deliberately unwraps backticks around file refs.
-    const base = normalizeFileRefs(stripFrontMatter(content), rootDir, otherRoots);
-    // Table repair is line-structural, so it reads whole lines and has to stay
-    // out of the code spans that own one — fenced, or inline across a break.
-    const tables = mapOutsideMultilineCode(base, fixMarkdownTables);
-    // These inject characters and tags, which is corruption inside any code.
-    const prose = mapOutsideCode(tables, (text) =>
-      dropTrailingRowBreaks(normalizeLatexDelimiters(escapeCurrencyDollars(transformCitationBubbles(text))))
-    );
-    // Line-structural again, and after the delimiter pass so `\[x\]` arrives
-    // already spelled `$$x$$`.
-    return mapOutsideMultilineCode(prose, blockOneLineDisplayMath);
-  }, [content, rootDir, otherRoots]);
+  const prepared = useMemo(() => prepareMarkdownSource(content, rootDir, otherRoots), [content, rootDir, otherRoots]);
+  const processed = prepared.text;
 
   const split = useMemo(() => splitMarkdownBlocks(processed), [processed]);
+  const embeddedImages = useMemo(() => embeddedImagesKey(processed), [processed]);
   // The block still being written renders with its tail held to the shape it
   // will settle in (utils/streamingTail): a lone `-` under a line is not a
   // heading, a link being typed is not a run of brackets.
@@ -882,6 +718,15 @@ function Markdown({ content, variant = 'panel', className = '', style, onOpenFil
   const rootRef = useRef<HTMLDivElement>(null);
   const marks = useRevealFade(rootRef, processed.slice(0, shown), streaming);
   const freshKeys = useMemo(() => blockFreshKeys(blocks, marks), [blocks, marks]);
+  const blockPasses = useMemo(() => {
+    if (!rehypeForBlock) return null;
+    let first = 0;
+    return blocks.map((block) => {
+      const at = first;
+      first += block.split('\n').length - 1;
+      return rehypeForBlock((line) => prepared.lineOf(at + line - 1) + 1);
+    });
+  }, [blocks, prepared, rehypeForBlock]);
 
   const components = useMemo(() => {
     let result = config.components;
@@ -930,8 +775,11 @@ function Markdown({ content, variant = 'panel', className = '', style, onOpenFil
       result = { ...result, code: fileAwareCode };
     }
 
+    const embedded = new Set(
+      embeddedImages ? embeddedImages.split('\n').map((src) => normalizeFilePath(src, folders)) : [],
+    );
     const fileAwareA = ({ node: _node, href, children, ...props }: MarkdownComponentProps) => {
-      if (onAnchorLink && href?.startsWith('#') && href.length > 1) {
+      if (onAnchorLink && href?.startsWith('#') && href.length > 1 && !isFootnoteLink(props)) {
         return (
           <a
             className="underline hover:opacity-80 transition-opacity cursor-pointer"
@@ -943,10 +791,12 @@ function Markdown({ content, variant = 'panel', className = '', style, onOpenFil
         );
       }
       if (isFilePath(href, folders)) {
-        // Image file linked as [name](path.png) -- render as embedded image.
-        // The destination goes over raw: WorkspaceImage reads it the same way
-        // this link does, and normalizing here would decode it twice.
-        if (isImagePath(href)) {
+        // Image file linked as [name](path.png) -- render as embedded image,
+        // unless the text embeds it as well: a list of the files beside the
+        // picture itself would show it twice. The destination goes over raw:
+        // WorkspaceImage reads it the same way this link does, and
+        // normalizing here would decode it twice.
+        if (isImagePath(href) && !embedded.has(normalizeFilePath(href!, folders))) {
           return <WorkspaceImage src={href} alt={textOf(children)} />;
         }
         if (onOpenFile) {
@@ -981,14 +831,14 @@ function Markdown({ content, variant = 'panel', className = '', style, onOpenFil
       return <DefaultA node={_node} href={href} {...props}>{children}</DefaultA>;
     };
     return { ...result, a: fileAwareA };
-  }, [onOpenFile, onAnchorLink, variant, config.components, codeTheme, folders]);
+  }, [onOpenFile, onAnchorLink, variant, config.components, codeTheme, folders, embeddedImages]);
 
   // Rendered markdown is always long-form reading content — every call site
   // (transcript, detail panels, memos) gets the content face here.
   return (
     <div
       ref={rootRef}
-      className={`font-content ${config.className} ${className}`.trim()}
+      className={`markdown-root font-content ${config.className} ${className}`.trim()}
       style={{ ...config.style, ...style }}
     >
       {blocks.map((block, i) => (
@@ -996,14 +846,13 @@ function Markdown({ content, variant = 'panel', className = '', style, onOpenFil
           {/* mdast-to-hast puts a newline text node between top-level siblings;
               keep the DOM identical to a whole-document render. */}
           {i > 0 && '\n'}
-          <MarkdownBlock source={block} components={components} live={streaming && i === blocks.length - 1} fresh={freshKeys[i]} />
+          <MarkdownBlock source={block} components={components} live={streaming && i === blocks.length - 1} fresh={freshKeys[i]} rehypeAfter={rehypeAfter} blockPass={blockPasses?.[i] ?? null} />
         </React.Fragment>
       ))}
     </div>
   );
 }
 
-export { transformCitationBubbles, escapeHtmlAttr };
 // Shallow compare: a caller that varies `style` must hoist the object, or the
 // memo never hits and every tick re-parses the document.
 export default React.memo(Markdown);

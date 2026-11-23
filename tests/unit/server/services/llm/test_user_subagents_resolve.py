@@ -20,6 +20,7 @@ from src.server.services.llm.subagents import (
     resolve_user_subagents,
 )
 from src.server.services.llm.user_models import ModelSource
+from src.server.services.policy import ALLOW_ALL
 
 USER = "user-1"
 
@@ -97,7 +98,9 @@ def _no_bundled_agents(monkeypatch):
 def unknown(monkeypatch) -> set[str]:
     """Model names the manifest lacks; every other name resolves."""
     names: set[str] = set()
-    monkeypatch.setattr(turn_subagents, "model_resolves", lambda _pref, name: name not in names)
+    from src.server.services.llm import claude_code
+
+    monkeypatch.setattr(claude_code, "model_resolves", lambda _pref, name: name not in names)
     return names
 
 
@@ -109,11 +112,15 @@ def on_plan(monkeypatch) -> AsyncMock:
     return check
 
 
-async def _resolve(deployment: SubagentsConfig | None = None, *, requested=None) -> ResolvedSubagents:
+async def _resolve(
+    deployment: SubagentsConfig | None = None, *, requested=None, claude_code: bool = False,
+    policy=ALLOW_ALL, model_pref=None,
+) -> ResolvedSubagents:
     reads = await read_user_subagents(USER, deployment or _deployment())
     return await resolve_user_subagents(
-        USER, reads, model_pref={}, permits=_deny, is_byok=False,
+        USER, reads, model_pref=model_pref or {}, permits=_deny, is_byok=False,
         search_api="tavily", search_depth="standard", requested=requested,
+        claude_code=claude_code, policy=policy,
     )
 
 
@@ -299,6 +306,56 @@ async def test_a_pin_the_manifest_lacks_runs_as_inherit_whoever_set_it(
     on_plan.assert_not_awaited()
 
 
+@pytest.mark.asyncio
+async def test_a_pin_the_policy_refuses_runs_as_inherit_whoever_set_it(rows, plugin_rows, on_plan):
+    """Unlike the plan, the policy holds the deployment's own pins too."""
+    from src.config.models import PolicyLayer
+    from src.server.services.policy import merge
+
+    on_plan.return_value = True
+    rows += [_custom("macro-desk", model="m-user"), _custom("other-desk", model="m-ok")]
+    policy = merge(None, PolicyLayer.model_validate({"models": {"allowed": ["m-ok"]}}))
+
+    resolved = await _resolve(policy=policy)
+
+    assert resolved.definitions["macro"].model is None
+    assert resolved.definitions["macro-desk"].model is None
+    assert resolved.definitions["other-desk"].model == "m-ok"
+
+
+@pytest.mark.asyncio
+async def test_a_pin_on_a_custom_model_named_as_an_allowed_one_runs_as_inherit(
+    rows, plugin_rows, on_plan
+):
+    from src.config.models import PolicyLayer
+    from src.server.services.policy import merge
+
+    on_plan.return_value = True
+    rows += [_custom("other-desk", model="m-ok")]
+    policy = merge(None, PolicyLayer.model_validate({"models": {"allowed": ["m-ok"]}}))
+    pref = {"custom_models": [{"name": "m-ok", "model_id": "x", "provider": "openai"}]}
+
+    resolved = await _resolve(policy=policy, model_pref=pref)
+
+    assert resolved.definitions["other-desk"].model is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("claude_code", [False, True])
+async def test_a_pin_on_a_claude_code_row_runs_only_where_claude_code_runs(rows, plugin_rows, on_plan, claude_code):
+    """There it runs a CLI of its own; a turn whose workspace has no Claude
+    Code has no runtime for it, so it runs as inherit, whichever writer
+    pinned it."""
+    on_plan.return_value = True
+    rows += [_custom("macro-desk", model="claude-sonnet-5-5-code")]
+    plugin_rows += [_plugin_row("desk", model="claude-haiku-5-5-code")]
+
+    resolved = await _resolve(claude_code=claude_code)
+
+    pins = (resolved.definitions["macro-desk"].model, resolved.definitions["desk"].model)
+    assert pins == (("claude-sonnet-5-5-code", "claude-haiku-5-5-code") if claude_code else (None, None))
+
+
 def _system(tier=None, provider="p-1") -> tuple[str, dict]:
     entry = {"provider": provider} if provider else {}
     if tier is not None:
@@ -334,7 +391,7 @@ async def test_the_plan_check_exempts_a_model_the_user_brings_a_key_or_subscript
     monkeypatch, host_mode, classified, is_byok, has_key, access_type, expected
 ):
     monkeypatch.setattr("src.config.settings.HOST_MODE", host_mode)
-    monkeypatch.setattr("src.server.dependencies.usage_limits.platform_gating_active", lambda: host_mode == "platform")
+    monkeypatch.setattr("src.server.services.platform_client.platform_gating_active", lambda: host_mode == "platform")
     mc = MagicMock()
     mc.get_provider_info.return_value = {"access_type": access_type} if access_type else {}
     mc.get_model_config.return_value = None  # no built-in under the custom model's name

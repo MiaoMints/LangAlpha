@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import re
 import shlex
+import tomllib
 from pathlib import Path
 
 import pytest
@@ -22,14 +23,14 @@ from ptc_agent.core.sandbox._defaults import (
 
 _ROOT = Path(__file__).resolve().parents[4]
 _DOCKERFILE = _ROOT / "Dockerfile.sandbox"
+_UV_LOCK = _ROOT / "uv.lock"
 _MCP_SETUP = _ROOT / "src" / "ptc_agent" / "core" / "sandbox" / "mcp_setup.py"
 _IMAGE_RECIPE = (
     _ROOT / "src" / "ptc_agent" / "core" / "sandbox" / "providers" / "_image_recipe.py"
 )
-
-# `echo '<spec>' > /tmp/…overrides.txt` — the uv --override file, written
-# inline by every install path.
-_OVERRIDE_RE = re.compile(r"echo '([^']+)' > /tmp/[\w.]*overrides\.txt")
+_SSH_BOOTSTRAP = (
+    _ROOT / "src" / "ptc_agent" / "core" / "sandbox" / "providers" / "_ssh_bootstrap.py"
+)
 
 _ARG_RE = re.compile(r"^ARG\s+(\w+)=(\S+)", re.MULTILINE)
 _SUBST_RE = re.compile(r"\$\{(\w+)\}")
@@ -68,16 +69,7 @@ def _dockerfile_install_packages() -> list[str]:
     tokens = shlex.split(_expand(command, _dockerfile_args()))
     start = tokens.index("install") + 1
     end = tokens.index("&&", start)
-    packages: list[str] = []
-    skip_value = False
-    for token in tokens[start:end]:
-        if skip_value:
-            skip_value = False
-        elif token.startswith("-"):
-            skip_value = token == "--override"
-        else:
-            packages.append(token)
-    return packages
+    return [token for token in tokens[start:end] if not token.startswith("-")]
 
 
 def test_dockerfile_mirrors_default_dependencies():
@@ -102,17 +94,57 @@ def test_both_playwright_ports_ride_one_version():
     assert f"playwright@{SANDBOX_PLAYWRIGHT_VERSION}" in _expand(npm_line, args)
 
 
-@pytest.mark.parametrize("path", [_DOCKERFILE, _MCP_SETUP, _IMAGE_RECIPE])
-def test_curl_cffi_override_is_spelled_identically(path: Path):
-    """yfinance caps curl_cffi below what scrapling[all] needs; every install
-    path resolves it with the same override, or one image ships a resolver
-    conflict the others don't."""
-    specs = _OVERRIDE_RE.findall(path.read_text())
-    assert specs, f"no uv --override spec found in {path.name}"
-    assert set(specs) == {"curl_cffi>=0.14"}
+def test_sandbox_yfinance_is_the_version_the_server_locks():
+    """A rebuilt image must not move the sandbox's Yahoo client ahead of (or
+    behind) the one uv.lock gives the server."""
+    locked = next(
+        package["version"]
+        for package in tomllib.loads(_UV_LOCK.read_text())["package"]
+        if package["name"] == "yfinance"
+    )
+    assert f"yfinance=={locked}" in DEFAULT_DEPENDENCIES
 
 
-def test_no_range_specifiers_in_default_dependencies():
-    """The list is joined into a shell command, where ``<`` becomes a redirect."""
-    offenders = [d for d in DEFAULT_DEPENDENCIES if "<" in d or ">" in d]
-    assert offenders == []
+@pytest.mark.parametrize("path", [_DOCKERFILE, _MCP_SETUP, _IMAGE_RECIPE, _SSH_BOOTSTRAP])
+def test_no_install_path_overrides_curl_cffi(path: Path):
+    """yfinance requires curl_cffi>=0.17 and scrapling needs less, so nothing
+    conflicts. An --override would replace yfinance's own floor and let an
+    older curl_cffi through."""
+    assert "--override" not in path.read_text()
+
+
+def _install_args(command: str) -> list[str]:
+    """The installer's arguments as the shell splits them, operators apart."""
+    lexer = shlex.shlex(command, posix=True, punctuation_chars=True)
+    lexer.whitespace_split = True
+    tokens = list(lexer)
+    start = tokens.index("install") + 1
+    end = tokens.index("&&", start) if "&&" in tokens[start:] else len(tokens)
+    return [token for token in tokens[start:end] if not token.startswith("-")]
+
+
+@pytest.mark.asyncio
+async def test_every_install_command_quotes_the_list():
+    """Each path joins the list into a shell command, where an unquoted
+    ``html-to-markdown>=3.5`` is a redirect to a file named ``=3.5`` and the
+    floor never reaches the installer."""
+    from unittest.mock import AsyncMock, MagicMock
+
+    from ptc_agent.core.sandbox import mcp_setup
+    from ptc_agent.core.sandbox.providers._image_recipe import Run, image_steps
+
+    assert any(">" in d for d in DEFAULT_DEPENDENCIES)
+    recipe = next(
+        command
+        for step in image_steps(working_dir="/home/workspace", mcp_packages=None, cpu=2)
+        if isinstance(step, Run)
+        for command in step.commands
+        if "uv pip install --system" in command
+    )
+    assert _install_args(recipe) == list(DEFAULT_DEPENDENCIES)
+
+    sandbox = MagicMock()
+    sandbox._runtime_call = AsyncMock(return_value=MagicMock(exit_code=0, stdout=""))
+    await mcp_setup._install_dependencies(sandbox)
+    no_snapshot = sandbox._runtime_call.await_args_list[0].args[1]
+    assert _install_args(no_snapshot) == list(DEFAULT_DEPENDENCIES)

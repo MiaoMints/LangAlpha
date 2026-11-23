@@ -83,13 +83,12 @@ const baseChatState = () => ({
   hasActiveSubagents: false,
   awaitingReportBack: false,
   reportBackOwed: false,
-  workspaceStarting: false as const,
-  turnHeld: null,
+  turnStatus: { workspaceStarting: false as const, turnHeld: null, cliQueue: null },
   isCompacting: false as const,
   setIsCompacting: vi.fn(),
   queuedSend: null,
   isLoadingHistory: false,
-  olderHistory: { status: 'end' as const, load: vi.fn() },
+  olderHistory: { snapshot: { status: 'end' as const, aligned: false, hasAhead: false }, load: vi.fn(), backfill: vi.fn() },
   isReconnecting: false,
   modelStatus: null as Record<string, unknown> | null,
   fallbackSuggestion: null,
@@ -100,6 +99,7 @@ const baseChatState = () => ({
   returnedEdit: null as string | null,
   clearReturnedEdit: vi.fn(),
   editDrafts: createEditDraftStore(() => 'thread-1'),
+  watchCommentSends: vi.fn(() => () => {}),
   handleSendMessage: vi.fn(),
   stopWorkflow: vi.fn(),
   stopCompaction: vi.fn(),
@@ -167,7 +167,7 @@ export function chatMessagesMock(original: unknown) {
 }
 
 export function workspaceFilesMock() {
-  return { useWorkspaceFiles: () => ({ files: [], loading: false, error: null, refresh: vi.fn() }) };
+  return { useWorkspaceFiles: () => ({ files: [], loading: false, error: null, refresh: vi.fn(), refreshInBackground: vi.fn() }) };
 }
 
 export function navigationDataMock(original: unknown) {

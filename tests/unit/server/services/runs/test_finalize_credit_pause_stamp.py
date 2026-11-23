@@ -19,7 +19,7 @@ from src.server.contracts.status import (
     classify_interrupts,
 )
 from src.server.database.runs.lifecycle import ProducerRecord
-from src.server.services.automation_settlement import run_failure_message
+from src.server.services.automation_outcomes import run_failure_message
 from src.server.services.runs.finalization import (
     assemble_finalize_artifacts,
     classify_outcome,
@@ -103,7 +103,7 @@ async def _outcome(handler, kind="stream_end", *, graph=None, stop_events=None):
         handler=handler,
         cancelled_by_user=False,
         workspace_id=None,
-        user_id=None,
+        recorded_as=None,
         stop_events=stop_events,
     )
 
@@ -435,6 +435,25 @@ async def test_the_record_keeps_the_main_lanes_fallback_notices():
     assert kept["metadata"] == {"after_message_id": "m-1"}
     assert kept["props"]["to_model"] == "backup"
     assert "sekret" not in kept["props"]["error"]
+
+
+@pytest.mark.asyncio
+async def test_the_record_keeps_the_main_lanes_admitted_cli_waits_as_their_marks():
+    """A wait the step after it never committed still replays: the record has
+    the mark's own id, so a committed one replays once."""
+    from src.llms.claude_code import CliWait
+
+    wait = CliWait(computer_id="c-1", name="Mac", running=4, cap=4, settable=True, max=8)
+    handler = await _streamed(
+        ((), "custom", wait.event("waiting")),
+        ((), "custom", wait.event("admitted", 329)),
+        (("task:k7",), "custom", CliWait(computer_id="c-1", name="Mac", running=4, cap=4, settable=True,
+                                         max=8).event("admitted", 12)),
+    )
+
+    (kept,) = handler.record().model_fallbacks
+    mark = wait.mark(329, "m-1")
+    assert (kept["id"], kept["name"], kept["props"]) == (mark["id"], mark["name"], mark["props"])
 
 
 @pytest.mark.asyncio

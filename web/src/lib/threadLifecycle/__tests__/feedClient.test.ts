@@ -22,6 +22,7 @@ import {
   getEffectiveObservation,
   resetThreadLifecycle,
 } from '../store';
+import { isThreadRemoved } from '@/lib/deletedThreads';
 import { CACHE_ONLY_META, queryKeys } from '@/lib/queryKeys';
 import { threadFieldMutationKey } from '@/lib/threadFieldMutations';
 import {
@@ -230,6 +231,20 @@ describe('threadLifecycleFeed — thread_archived', () => {
     });
   });
 
+  it.each(['thread_archived', 'thread_deleted', 'thread_unarchived'])(
+    'reads comments and destinations again on %s, which no artifact event says',
+    async (type) => {
+      const invalidate = vi.spyOn(queryClient, 'invalidateQueries');
+      startThreadLifecycleFeed(queryClient);
+      await flush();
+      invalidate.mockClear();
+      conns[0].emit({ event: 'thread_lifecycle', type, thread_id: 't-x', workspace_id: 'w1' });
+      await flush(400);
+      expect(invalidate).toHaveBeenCalledWith({ queryKey: queryKeys.artifacts.allDestinations });
+      expect(invalidate).toHaveBeenCalledWith({ queryKey: queryKeys.artifacts.allQueued });
+    },
+  );
+
   it('drops the row from cached lists and the Show-more store, sparing the archived view', async () => {
     // Cross-tab archive: the invalidate only reaches enabled observers, so the
     // event must remove the row from the caches + the nav store directly —
@@ -294,6 +309,22 @@ describe('threadLifecycleFeed — thread_archived', () => {
     expect(invalidate).toHaveBeenCalledWith({
       queryKey: queryKeys.threads.byWorkspace('w1'),
     });
+  });
+
+  it('marks a thread archived in another tab removed, until one brings it back', async () => {
+    // The nav tree's reveal reads the mark: a thread open here and archived
+    // elsewhere is in no page, and one brought back is in one again.
+    startThreadLifecycleFeed(queryClient);
+    await flush();
+    const emit = (type: string) => conns[0].emit({ event: 'thread_lifecycle', type, thread_id: 't-x', workspace_id: 'w1' });
+
+    emit('thread_archived');
+    await flush(400);
+    expect(isThreadRemoved('t-x')).toBe(true);
+
+    emit('thread_unarchived');
+    await flush(400);
+    expect(isThreadRemoved('t-x')).toBe(false);
   });
 });
 
@@ -725,6 +756,45 @@ describe('threadLifecycleFeed — cache-only list refetch', () => {
 });
 
 describe('threadLifecycleFeed — snapshot invalidation', () => {
+  it('a reconnect reads open artifacts again, their events having no replay', async () => {
+    startThreadLifecycleFeed(queryClient);
+    await flush();
+    const commentsKey = queryKeys.artifacts.comments('a1');
+    const queuedKey = queryKeys.artifacts.queued('t1');
+    const statusKey = queryKeys.artifacts.status('a1');
+    const sharedKey = queryKeys.shareLinks.shared('w1');
+    for (const key of [commentsKey, queuedKey, statusKey, sharedKey]) queryClient.setQueryData(key, []);
+
+    conns[0].emit({ event: 'snapshot', as_of_seq: 1, oldest_included_unseen_seq: 0, live: [], unseen: [] });
+    await flush(400);
+
+    expect(queryClient.getQueryState(commentsKey)?.isInvalidated).toBe(true);
+    expect(queryClient.getQueryState(queuedKey)?.isInvalidated).toBe(true);
+    expect(queryClient.getQueryState(sharedKey)?.isInvalidated).toBe(true);
+    // It reads the computer, so only a view that needs it asks.
+    expect(queryClient.getQueryState(statusKey)?.isInvalidated).toBe(false);
+  });
+
+  it.each([
+    ['names no thread, as Mark all read does', undefined, true],
+    ['names a thread, whose deck alone reads again', 't1', false],
+  ])('a comment change that %s', async (_rule, threadId, every) => {
+    startThreadLifecycleFeed(queryClient);
+    await flush();
+    const named = queryKeys.artifacts.queued('t1');
+    const other = queryKeys.artifacts.queued('t2');
+    for (const key of [named, other]) queryClient.setQueryData(key, []);
+
+    conns[0].emit({
+      event: 'thread_lifecycle', type: 'artifact_comment', artifact_id: 'a1', workspace_id: 'w1', path: 'r.html',
+      thread_id: threadId, comment_ids: ['c1'],
+    });
+    await flush();
+
+    expect(queryClient.getQueryState(named)?.isInvalidated).toBe(true);
+    expect(queryClient.getQueryState(other)?.isInvalidated).toBe(every);
+  });
+
   it('a snapshot scopes its invalidate to the workspaces it touches', async () => {
     const invalidate = vi.spyOn(queryClient, 'invalidateQueries');
     startThreadLifecycleFeed(queryClient);
@@ -774,5 +844,170 @@ describe('threadLifecycleFeed — snapshot invalidation', () => {
     liveConns()[0].emit({ event: 'snapshot', as_of_seq: 3, oldest_included_unseen_seq: 0, live: [], unseen: [] });
     await flush(400);
     expect(invalidate).toHaveBeenCalledWith({ queryKey: queryKeys.threads.all });
+  });
+});
+
+describe('threadLifecycleFeed — shared workspaces', () => {
+  const sharedList = (...ids: string[]) => ({
+    can_create: false,
+    workspaces: ids.map((id) => ({
+      workspace: { workspace_id: id },
+      shared: { role: 'member', can_manage: false, everyone: false, created_by: null },
+    })),
+  });
+
+  it('a members change reads the people again and touches no thread', async () => {
+    startThreadLifecycleFeed(queryClient);
+    await flush();
+    queryClient.setQueryData(queryKeys.sharedWorkspaces.members('w1'), []);
+    queryClient.setQueryData(queryKeys.threads.byWorkspace('w1'), { threads: [] });
+
+    conns[0].emit({ event: 'thread_lifecycle', type: 'shared_members', workspace_id: 'w1' });
+    await flush(400);
+
+    expect(queryClient.getQueryState(queryKeys.sharedWorkspaces.members('w1'))?.isInvalidated).toBe(true);
+    expect(queryClient.getQueryState(queryKeys.threads.byWorkspace('w1'))?.isInvalidated).toBe(false);
+  });
+
+  it("another member's turn ending reads the shared workspace's files again", async () => {
+    startThreadLifecycleFeed(queryClient);
+    await flush();
+    queryClient.setQueryData(queryKeys.sharedWorkspaces.list(), sharedList('w1'));
+    queryClient.setQueryData(queryKeys.workspaceFiles.workspace('w1'), []);
+    queryClient.setQueryData(queryKeys.workspaceFiles.workspace('mine'), []);
+
+    for (const [ws, t] of [['w1', 't1'], ['mine', 't2']]) {
+      conns[0].emit({
+        event: 'thread_lifecycle', type: 'run_settled', thread_id: t, workspace_id: ws,
+        run_id: `r-${t}`, run_seq: 3, status: 'completed',
+      });
+    }
+    await flush(400);
+
+    expect(queryClient.getQueryState(queryKeys.workspaceFiles.workspace('w1'))?.isInvalidated).toBe(true);
+    expect(queryClient.getQueryState(queryKeys.workspaceFiles.workspace('mine'))?.isInvalidated).toBe(false);
+  });
+
+  it("a connection's first snapshot reads the shared list again, its events having no replay", async () => {
+    queryClient.setQueryData(queryKeys.sharedWorkspaces.list(), sharedList('w1'));
+    startThreadLifecycleFeed(queryClient);
+    await flush();
+
+    conns[0].emit({ event: 'snapshot', as_of_seq: 1, oldest_included_unseen_seq: 0, live: [], unseen: [] });
+    await flush(400);
+
+    expect(queryClient.getQueryState(queryKeys.sharedWorkspaces.list())?.isInvalidated).toBe(true);
+  });
+});
+
+describe('threadLifecycleFeed: agent requests waiting on the user', () => {
+  const pendingKey = queryKeys.cliApprovals.pending();
+  const cached = (ids: string[]) => ids.map((approval_id) => ({ approval_id }));
+  const frame = (seq: number, extra: Record<string, unknown> = {}) => ({
+    event: 'snapshot', as_of_seq: seq, oldest_included_unseen_seq: 0, live: [], unseen: [], ...extra,
+  });
+
+  it('a cli_approval event reads the waiting list again', async () => {
+    startThreadLifecycleFeed(queryClient);
+    await flush();
+    queryClient.setQueryData(pendingKey, cached(['ap-1']));
+
+    conns[0].emit({ event: 'thread_lifecycle', type: 'cli_approval', approval_id: 'ap-1', status: 'approved' });
+    await flush();
+
+    expect(queryClient.getQueryState(pendingKey)?.isInvalidated).toBe(true);
+  });
+
+  it('a snapshot reads the list again only when its ids differ from the cached ones', async () => {
+    startThreadLifecycleFeed(queryClient);
+    await flush();
+    conns[0].emit(frame(1, { pending_approvals: [] }));
+    await flush(400);
+
+    queryClient.setQueryData(pendingKey, cached(['ap-1', 'ap-2']));
+    conns[0].emit(frame(2, { pending_approvals: ['ap-2', 'ap-1'] }));
+    await flush(400);
+    expect(queryClient.getQueryState(pendingKey)?.isInvalidated).toBe(false);
+
+    conns[0].emit(frame(3, { pending_approvals: ['ap-2'] }));
+    await flush(400);
+    expect(queryClient.getQueryState(pendingKey)?.isInvalidated).toBe(true);
+  });
+
+  it("a snapshot without the field leaves the list alone, except a connection's first", async () => {
+    startThreadLifecycleFeed(queryClient);
+    await flush();
+    queryClient.setQueryData(pendingKey, cached(['ap-1']));
+
+    conns[0].emit(frame(1));
+    await flush(400);
+    expect(queryClient.getQueryState(pendingKey)?.isInvalidated).toBe(true);
+
+    queryClient.setQueryData(pendingKey, cached(['ap-1']));
+    conns[0].emit(frame(2));
+    await flush(400);
+    expect(queryClient.getQueryState(pendingKey)?.isInvalidated).toBe(false);
+  });
+});
+
+describe('threadLifecycleFeed: vendor terms waiting on the user', () => {
+  const pendingKey = queryKeys.vendorTerms.pending();
+  const cached = (vendors: string[]) => vendors.map((vendor) => ({ vendor }));
+  const frame = (seq: number, extra: Record<string, unknown> = {}) => ({
+    event: 'snapshot', as_of_seq: seq, oldest_included_unseen_seq: 0, live: [], unseen: [], ...extra,
+  });
+
+  it('a vendor_terms event reads the pending list again', async () => {
+    startThreadLifecycleFeed(queryClient);
+    await flush();
+    queryClient.setQueryData(pendingKey, []);
+
+    conns[0].emit({ event: 'thread_lifecycle', type: 'vendor_terms', vendors: ['firecrawl'] });
+    await flush();
+
+    expect(queryClient.getQueryState(pendingKey)?.isInvalidated).toBe(true);
+  });
+
+  it('a snapshot reads the list again only when its vendors differ from the cached ones', async () => {
+    startThreadLifecycleFeed(queryClient);
+    await flush();
+    conns[0].emit(frame(1, { pending_vendor_terms: [] }));
+    await flush(400);
+
+    queryClient.setQueryData(pendingKey, cached(['firecrawl']));
+    conns[0].emit(frame(2, { pending_vendor_terms: ['firecrawl'] }));
+    await flush(400);
+    expect(queryClient.getQueryState(pendingKey)?.isInvalidated).toBe(false);
+
+    conns[0].emit(frame(3, { pending_vendor_terms: [] }));
+    await flush(400);
+    expect(queryClient.getQueryState(pendingKey)?.isInvalidated).toBe(true);
+  });
+
+  // A request answered and asked again while detached names the same vendor
+  // with a new requested_at, which only reading the list again shows.
+  it("a connection's first snapshot reads the list again even when its vendors match", async () => {
+    startThreadLifecycleFeed(queryClient);
+    await flush();
+    queryClient.setQueryData(pendingKey, cached(['firecrawl']));
+
+    conns[0].emit(frame(1, { pending_vendor_terms: ['firecrawl'] }));
+    await flush(400);
+    expect(queryClient.getQueryState(pendingKey)?.isInvalidated).toBe(true);
+  });
+
+  it("a snapshot without the field leaves the list alone, except a connection's first", async () => {
+    startThreadLifecycleFeed(queryClient);
+    await flush();
+    queryClient.setQueryData(pendingKey, cached(['firecrawl']));
+
+    conns[0].emit(frame(1));
+    await flush(400);
+    expect(queryClient.getQueryState(pendingKey)?.isInvalidated).toBe(true);
+
+    queryClient.setQueryData(pendingKey, cached(['firecrawl']));
+    conns[0].emit(frame(2));
+    await flush(400);
+    expect(queryClient.getQueryState(pendingKey)?.isInvalidated).toBe(false);
   });
 });

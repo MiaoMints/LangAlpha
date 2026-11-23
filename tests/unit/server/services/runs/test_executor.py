@@ -127,6 +127,24 @@ class TestCancelStaleWorkflowRunning:
         assert task_info.explicit_cancel is True
         mock_inner.cancel.assert_called_once()
 
+    @pytest.mark.asyncio
+    async def test_a_run_is_judged_stale_where_it_runs(self):
+        """A Home turn in its stand-in runs in a workspace other than its
+        thread's; a follow-up routed back to Home must not cancel it."""
+        btm = _make_btm()
+        task_info = _make_task_info(status=LocalRunStatus.RUNNING)
+        task_info.metadata = {"workspace_id": "home", "runs_in": "stand-in"}
+        btm.executions[("thread-1", "run-1")] = task_info
+        judged: list[str] = []
+
+        def is_stale(workspace_id: str) -> bool:
+            judged.append(workspace_id)
+            return workspace_id == "home"
+
+        assert await btm.cancel_stale_workflow("thread-1", is_stale=is_stale) is False
+        assert judged == ["stand-in"]
+        assert not task_info.cancel_event.is_set()
+
 
 # ---------------------------------------------------------------------------
 # signal_cancel — user stop force-cancels inner_task (immediacy)
@@ -207,6 +225,44 @@ class TestCancelWorkflowForceCancelsInner:
         ) is True
         assert task_info.explicit_cancel is True
         assert task_info.user_stop is False
+
+    @pytest.mark.asyncio
+    async def test_restart_cancel_marks_the_run_for_resume(self):
+        btm = _make_btm()
+        task_info = _make_task_info(status=LocalRunStatus.RUNNING)
+        btm.executions[("thread-1", "run-1")] = task_info
+
+        assert await btm.signal_cancel(
+            "thread-1", "run-1", user_initiated=False, restart=True
+        ) is True
+        assert task_info.restart is True
+        assert task_info.user_stop is False
+
+    @pytest.mark.asyncio
+    async def test_restart_cancel_after_a_user_stop_stays_the_users(self):
+        """Nothing resumes a turn the user stopped, whichever cancel came
+        first to the still-RUNNING task."""
+        btm = _make_btm()
+        task_info = _make_task_info(status=LocalRunStatus.RUNNING)
+        btm.executions[("thread-1", "run-1")] = task_info
+
+        assert await btm.signal_cancel("thread-1", user_initiated=True) is True
+        assert await btm.signal_cancel(
+            "thread-1", "run-1", user_initiated=False, restart=True
+        ) is True
+        assert task_info.user_stop is True
+        assert task_info.restart is False
+
+    @pytest.mark.asyncio
+    async def test_a_user_stop_after_the_restart_cancel_unmarks_the_run(self):
+        btm = _make_btm()
+        task_info = _make_task_info(status=LocalRunStatus.RUNNING)
+        btm.executions[("thread-1", "run-1")] = task_info
+
+        await btm.signal_cancel("thread-1", "run-1", user_initiated=False, restart=True)
+        await btm.signal_cancel("thread-1", user_initiated=True)
+        assert task_info.user_stop is True
+        assert task_info.restart is False
 
 
 # ---------------------------------------------------------------------------
@@ -532,6 +588,7 @@ class TestMarkCancelledUserLabeling:
         task_info.metadata = {
             "workspace_id": "ws-1",
             "user_id": "user-1",
+            "recorded_as": "user-1",
             "run_handle": run_handle,
         }
         btm.executions[(task_info.thread_id, task_info.run_id)] = task_info
@@ -617,9 +674,11 @@ class TestFailedRunRecordsItsModelCall:
         task_info = _make_task_info(thread_id="thread-fail", run_id="run-fail")
         handler = MagicMock()
         handler.agent_config.credential_source = credential_source
+        handler.agent_config.credential_payer = None  # recorded at turn start
         task_info.metadata = {
             "workspace_id": "ws-1",
             "user_id": "user-1",
+            "recorded_as": "user-1",
             "run_handle": MagicMock(),
             "handler": handler,
         }
@@ -677,6 +736,7 @@ class TestThrownFinalizeLeavesEntryRunning:
         task_info.metadata = {
             "workspace_id": "ws-1",
             "user_id": "user-1",
+            "recorded_as": "user-1",
             "run_handle": run_handle,
         }
         btm.executions[(task_info.thread_id, task_info.run_id)] = task_info
@@ -716,6 +776,32 @@ class TestThrownFinalizeLeavesEntryRunning:
         # Waiters are NOT released on a thrown CAS: the row is unfinalized,
         # so they must hit their timeout instead of reading it as done.
         assert not task_info.persistence_complete.is_set()
+        assert task_info.finish_failed_finalize is not None
+
+    @pytest.mark.asyncio
+    async def test_thrown_cas_keeps_the_terminal_effects_for_its_own_commit(self):
+        btm = _make_btm()
+        task_info = _make_task_info(thread_id="thread-cas", run_id="run-cas")
+        _, coordinator = self._wire(
+            btm, task_info, finalize_side_effect=RuntimeError("commit answer lost")
+        )
+        await self._run_finalize(btm, task_info, coordinator)
+
+        btm._apply_post_terminal_effects = AsyncMock()
+        with patch("src.server.services.runs.coordinator.RunCoordinator") as coord_cls:
+            await task_info.finish_failed_finalize(
+                {"status": "error", "metadata": {"recovery": "scanner"}}, tail=False
+            )
+            coord_cls.get_instance.return_value.post_finalize_tail.assert_not_called()
+            await task_info.finish_failed_finalize(
+                {"status": "completed", "metadata": {}}, tail=True
+            )
+
+        coord_cls.get_instance.return_value.post_finalize_tail.assert_called_once()
+        verdict = btm._apply_post_terminal_effects.await_args.args[2]
+        assert (verdict.applied, verdict.status) == (True, "completed")
+        assert btm._apply_post_terminal_effects.await_args.kwargs["kind"] == "stream_end"
+        assert task_info.persistence_complete.is_set()
 
     @pytest.mark.asyncio
     async def test_applied_cas_still_marks_terminal(self):
@@ -733,6 +819,126 @@ class TestThrownFinalizeLeavesEntryRunning:
 
         assert task_info.status == LocalRunStatus.COMPLETED
         assert task_info.metadata.get("run_handle") is None
+
+
+class TestFailedFinalizeCleanup:
+    """An entry left RUNNING by a thrown finalize leaves on the first sweep
+    after its row is settled, instead of keeping its workspace busy and its
+    slot taken until the abandoned timeout. With the writer fence on, the
+    recovery scanner owns the settle; without it, nothing else would settle
+    the row before a restart, so the sweep does. Whoever settled the row, the
+    owner's terminal effects the raise skipped run then; a row with no
+    recovery stamp is the finalize's own commit, whose answer was lost, so the
+    coordinator tail runs too."""
+
+    def _entry(self, btm, *, failed=True):
+        info = _make_task_info(thread_id="thread-ff", run_id="run-ff")
+        info.finish_failed_finalize = AsyncMock() if failed else None
+        info.metadata = {"run_handle": MagicMock()}
+        btm.executions[("thread-ff", "run-ff")] = info
+        return info
+
+    async def _sweep(self, btm, row, *, fenced=True, reconciled="error"):
+        get_run = AsyncMock(side_effect=row if isinstance(row, list) else [row, row])
+        coordinator = MagicMock()
+        coordinator.fail_open_run = AsyncMock()
+        coordinator.reconcile_orphaned_dispatch = AsyncMock(return_value=reconciled)
+        with patch("src.server.database.runs.lifecycle.get_run", get_run), \
+             patch("src.server.services.writer_guard.guard_enabled", return_value=fenced), \
+             patch("src.server.services.runs.coordinator.RunCoordinator") as coord_cls:
+            coord_cls.get_instance.return_value = coordinator
+            await btm._cleanup_abandoned_tasks()
+        return get_run, coordinator
+
+    @pytest.mark.asyncio
+    async def test_a_row_recovery_settled_gets_the_owner_effects_only(self):
+        btm = _make_btm()
+        info = self._entry(btm)
+        row = {"status": "error", "metadata": {"recovery": "scanner"}}
+
+        _, coordinator = await self._sweep(btm, row)
+
+        assert ("thread-ff", "run-ff") not in btm.executions
+        info.finish_failed_finalize.assert_awaited_once_with(row, tail=False)
+        coordinator.fail_open_run.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_a_row_its_own_finalize_settled_gets_its_terminal_effects(self):
+        btm = _make_btm()
+        info = self._entry(btm)
+        row = {"status": "completed", "metadata": {"msg_type": "ptc"}}
+
+        await self._sweep(btm, row)
+
+        info.finish_failed_finalize.assert_awaited_once_with(row, tail=True)
+        assert ("thread-ff", "run-ff") not in btm.executions
+
+    @pytest.mark.asyncio
+    async def test_a_deleted_row_drops_the_entry(self):
+        btm = _make_btm()
+        info = self._entry(btm)
+
+        await self._sweep(btm, None)
+
+        assert ("thread-ff", "run-ff") not in btm.executions
+        info.finish_failed_finalize.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_an_unreadable_row_keeps_the_entry(self):
+        btm = _make_btm()
+        self._entry(btm)
+
+        with patch(
+            "src.server.database.runs.lifecycle.get_run",
+            AsyncMock(side_effect=TimeoutError()),
+        ):
+            await btm._cleanup_abandoned_tasks()
+
+        assert ("thread-ff", "run-ff") in btm.executions
+
+    @pytest.mark.asyncio
+    async def test_a_fenced_row_still_in_progress_waits_for_recovery(self):
+        btm = _make_btm()
+        self._entry(btm)
+
+        _, coordinator = await self._sweep(btm, {"status": "in_progress"})
+
+        assert ("thread-ff", "run-ff") in btm.executions
+        coordinator.reconcile_orphaned_dispatch.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_an_unfenced_row_still_in_progress_is_settled_here(self):
+        btm = _make_btm()
+        info = self._entry(btm)
+        settled = {"status": "error", "metadata": {"recovery": "dispatch_consumer_crash"}}
+
+        _, coordinator = await self._sweep(
+            btm, [{"status": "in_progress"}, settled], fenced=False
+        )
+
+        coordinator.reconcile_orphaned_dispatch.assert_awaited_once()
+        info.finish_failed_finalize.assert_awaited_once_with(settled, tail=False)
+        assert ("thread-ff", "run-ff") not in btm.executions
+
+    @pytest.mark.asyncio
+    async def test_an_unfenced_settle_that_fails_keeps_the_entry(self):
+        btm = _make_btm()
+        info = self._entry(btm)
+
+        await self._sweep(btm, {"status": "in_progress"}, fenced=False, reconciled=None)
+
+        info.finish_failed_finalize.assert_not_awaited()
+        assert ("thread-ff", "run-ff") in btm.executions
+
+    @pytest.mark.asyncio
+    async def test_a_running_entry_with_no_failed_finalize_is_left_alone(self):
+        btm = _make_btm()
+        self._entry(btm, failed=False)
+
+        get_run, _ = await self._sweep(btm, None)
+
+        get_run.assert_not_awaited()
+        assert ("thread-ff", "run-ff") in btm.executions
 
 
 # ---------------------------------------------------------------------------
@@ -2153,7 +2359,7 @@ class TestRunEndCountsSettledSubagents:
             error=None,
             metadata={"is_byok": False},
             workspace_id="ws-1",
-            user_id="user-1",
+            recorded_as="user-1",
         )
 
     @pytest.mark.asyncio
@@ -2214,6 +2420,55 @@ class TestAppendRunEndEvent:
             return_value=None,
         ) as read:
             yield read
+
+    @pytest.fixture(autouse=True)
+    def images(self):
+        with patch(
+            "src.server.services.runs.finalization.settled_images",
+            new_callable=AsyncMock,
+            return_value={},
+        ) as read:
+            yield read
+
+    @pytest.mark.asyncio
+    async def test_terminal_frame_carries_the_runs_image_urls(self, images):
+        """The reply streamed each image as a path; the frame says where each
+        one was captured, which the live view shows in its place."""
+        import json as _json
+
+        btm = _make_btm()
+        btm.event_storage_backend = "redis"
+        images.return_value = {"charts/a.png": "https://cdn.example/a.png"}
+        calls: list = []
+
+        with patch(
+            "src.server.services.runs.stream_writer.get_cache_client",
+            return_value=_sentinel_cache(calls),
+        ):
+            await btm.append_run_end_event("t-1", "r-1", "completed")
+
+        images.assert_awaited_once_with("r-1")
+        wire = next(c for c in calls if c[0] == "xadd")[2][b"event"].decode("utf-8")
+        assert _json.loads(wire.split("data: ", 1)[1])["images"] == {
+            "charts/a.png": "https://cdn.example/a.png",
+        }
+
+    @pytest.mark.asyncio
+    async def test_a_run_without_images_sends_no_image_field(self):
+        import json as _json
+
+        btm = _make_btm()
+        btm.event_storage_backend = "redis"
+        calls: list = []
+
+        with patch(
+            "src.server.services.runs.stream_writer.get_cache_client",
+            return_value=_sentinel_cache(calls),
+        ):
+            await btm.append_run_end_event("t-1", "r-1", "completed")
+
+        wire = next(c for c in calls if c[0] == "xadd")[2][b"event"].decode("utf-8")
+        assert "images" not in _json.loads(wire.split("data: ", 1)[1])
 
     @pytest.mark.asyncio
     async def test_returned_chat_app_steers_close_the_stream_ahead_of_run_end(
@@ -2277,6 +2532,44 @@ class TestAppendRunEndEvent:
             "input_tokens": 1460,
             "output_tokens": 20,
         }
+
+    @pytest.mark.parametrize(
+        ("outcome", "reading", "field"),
+        [
+            ("completed", {"reason": "threshold"}, {"reason": "threshold"}),
+            ("completed", None, None),
+            ("completed", "unread", "absent"),
+            ("interrupted", "unread", None),
+        ],
+    )
+    @pytest.mark.asyncio
+    async def test_terminal_frame_says_nothing_to_summarize_apart_from_a_failed_read(
+        self, outcome, reading, field
+    ):
+        """A null hint says the next send summarizes nothing; a read that
+        failed leaves the field out, which sends the client to the status. An
+        interrupted run resumes past its turn start, so it reads nothing."""
+        import json as _json
+
+        from src.server.services.thread_status import UNREAD
+
+        btm = _make_btm()
+        btm.event_storage_backend = "redis"
+        calls: list = []
+
+        with patch(
+            "src.server.services.runs.stream_writer.get_cache_client",
+            return_value=_sentinel_cache(calls),
+        ), patch(
+            "src.server.services.thread_status.read_next_summary",
+            new_callable=AsyncMock,
+            return_value=UNREAD if reading == "unread" else reading,
+        ):
+            await btm.append_run_end_event("t-1", "r-1", outcome)
+
+        wire = next(c for c in calls if c[0] == "xadd")[2][b"event"].decode("utf-8")
+        frame = _json.loads(wire.split("data: ", 1)[1])
+        assert frame.get("next_summary", "absent") == field
 
     @pytest.mark.asyncio
     async def test_no_truth_frame_reads_no_totals(self, totals):

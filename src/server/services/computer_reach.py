@@ -25,13 +25,17 @@ from ptc_agent.agent.tools.computer_reach import (
     Attached,
     ComputerTarget,
     ComputerUnreachable,
+    Shipment,
+    Shipped,
+    ShipmentTooLarge,
     file_refusal,
 )
-from ptc_agent.core.paths import lexical_path
+from ptc_agent.core.paths import langalpha_config_dir, lexical_path, logged_path
 from ptc_agent.core.project_context import (
     MachinePaths,
     ProjectContext,
     context_without_project,
+    current_project,
     project_bound,
 )
 from ptc_agent.core.sandbox.files import FileOverCap
@@ -49,6 +53,11 @@ from src.server.database.workspace_binding import (
     get_computers_with_folders,
 )
 from src.server.models.computer import ComputerStatus
+from src.server.services.account import ACCOUNT_SUSPENDED
+from src.server.services.computer_usage.causes import computer_cause
+from src.server.services.persistence.ship import StoreUnreachable, ship_via_store
+from src.server.services.persistence.transfer import TransferRuntimeError, transfer_mode
+from src.server.services.policy import OWN_MACHINES, POLICY_DENIED
 from src.tools.messaging.tools import ATTACH_MAX_BYTES, SEND_MAX_BYTES
 from src.tools.secretary.utils import spoken_computer_name
 
@@ -81,8 +90,8 @@ class _Reached:
     #: The last wake, running or done. A call that stops waiting leaves it
     #: running, and the next call waits on it rather than starting another.
     wake: asyncio.Task[Session] | None = None
-    #: The session the login home was read for, and that home.
-    home: tuple[Session, str | None] | None = None
+    #: The session the machine's paths were read for, and those paths.
+    paths: tuple[Session, MachinePaths] | None = None
     #: When a call last counted as use of the computer.
     stamped: float = float("-inf")
 
@@ -146,8 +155,34 @@ def pick_computer(rows: Sequence[Mapping[str, Any]], wanted: str) -> Mapping[str
 def _why_not(name: str, error: BaseException) -> str:
     """The agent's sentence for a computer that could not be woken."""
     if isinstance(error, HTTPException):
-        # The plan's computer limit; its message is the platform's own copy.
         detail = error.detail if isinstance(error.detail, dict) else {}
+        if detail.get("type") == "service_unavailable":
+            # Its copy asks a person to try again; read by the agent, that
+            # only repeats the call into the same refusal.
+            return (
+                f'Computer "{name}" was not used: whether this account may use '
+                "it could not be checked, so nothing ran there. Tell the user."
+            )
+        # A refusal's own copy speaks to the person it refuses ("your
+        # organization", "ask an admin"); these two are said to the agent.
+        if detail.get("type") == ACCOUNT_SUSPENDED:
+            return (
+                f'Computer "{name}" was not used: this account\'s access through '
+                "the user's organization has ended, so nothing ran there. Tell "
+                "the user."
+            )
+        if detail.get("type") == POLICY_DENIED and detail.get("rule") == OWN_MACHINES:
+            by = (
+                "the user's organization"
+                if detail.get("set_by") == "organization"
+                else "this deployment"
+            )
+            return (
+                f'Computer "{name}" was not used: {by} does not allow work on '
+                "the user's own machines, so nothing ran there. Use a computer "
+                "the user did not bring, or tell the user."
+            )
+        # The plan's computer limit, in its own copy.
         reason = str(detail.get("message") or "the user's plan does not allow it now")
         return f'Computer "{name}" could not start: {reason}'
     if isinstance(error, SSHConnectError):
@@ -246,6 +281,25 @@ class TurnComputers:
         target, _ = await self._at(row)
         return target
 
+    async def target(self, computer: str | None) -> ComputerTarget:
+        if computer and computer.strip() and (reached := await self.reach(computer)):
+            return reached
+        return await self._here()
+
+    async def _here(self) -> ComputerTarget:
+        """The turn's own computer, read from Home's folder as its tools read it."""
+        sandbox = self._own_session.sandbox
+        assert sandbox is not None, "the turn's own computer has no sandbox"
+        rows = await get_computer_roster(self._user_id)
+        own = next((r for r in rows if str(r["computer_id"]) == self._own), None)
+        return ComputerTarget(
+            computer_id=self._own or "",
+            name=_label(own) if own is not None else "this computer",
+            session=self._own_session,
+            project=current_project() or ProjectContext(workspace_id="", dir_name=None),
+            root=sandbox.layout.root,
+        )
+
     async def _at(self, row: Mapping[str, Any]) -> tuple[ComputerTarget, dict[str, str]]:
         """``row``'s computer, awake, as a call from Home reaches it, and the
         workspaces on it by folder."""
@@ -264,7 +318,7 @@ class TurnComputers:
                 workspace_id="",
                 dir_name=None,
                 sibling_dir_names=tuple(folders),
-                machine=MachinePaths(home=await self._home(computer_id, session)),
+                machine=await self._paths(computer_id, session),
             ),
             root=_root(row),
         )
@@ -273,24 +327,30 @@ class TurnComputers:
             await self._keep_alive(computer_id, session)
         return target, folders
 
-    async def _home(self, computer_id: str, session: Session) -> str | None:
+    async def _paths(self, computer_id: str, session: Session) -> MachinePaths:
         """The home of the user a computer's commands run as, once per session,
-        which opens the whole machine to a file call; None where a file call
-        would run as someone else, whose files stay held to the root and
-        ``/tmp``."""
+        which opens the whole machine to a file call, with LangAlpha's config
+        folder there held back; neither where a file call would run as
+        someone else, whose files stay held to the root and ``/tmp``."""
         sandbox = session.sandbox
         if sandbox is None or sandbox.runtime is None or not sandbox.files_as_command_user:
-            return None
+            return MachinePaths()
         record = self._record(computer_id)
-        if record.home is not None and record.home[0] is session:
-            return record.home[1]
+        if record.paths is not None and record.paths[0] is session:
+            return record.paths[1]
         try:
             home = (await sandbox.runtime.login_home()) or None
+            denied = (
+                (langalpha_config_dir(home, (await sandbox.runtime.login_config_home()) or None),)
+                if home
+                else ()
+            )
+            paths = MachinePaths(home=home, denied=denied)
         except Exception as e:  # noqa: BLE001 - held to the root, the call still runs
             logger.warning("Could not read the home of %s: %s", computer_id, e)
-            return None
-        record.home = (session, home)
-        return home
+            return MachinePaths()
+        record.paths = (session, paths)
+        return paths
 
     async def attach(self, files: Sequence[tuple[str, str]]) -> list[Attached]:
         """The files a send names, each by a computer and its whole path there.
@@ -400,6 +460,15 @@ class TurnComputers:
                 f'Computer "{name}" failed and cannot start until the user repairs '
                 "or rebuilds it in Computers."
             )
+        from src.server.services.ssh_computers import computer_unreachable
+
+        if await computer_unreachable(row):
+            # Its tunnel is down, which Postgres already says: dialing it
+            # would only wait out a connect that cannot land.
+            raise ComputerUnreachable(
+                f'Computer "{name}" can\'t be reached now, so its files and the '
+                "workspaces on it can't be read until it is back."
+            )
         # Only the row says whether another worker stopped the computer since
         # the last wake; this worker's handle outlives that, and a call on it
         # would bring the machine back up past admission with the row stopped.
@@ -410,20 +479,80 @@ class TurnComputers:
         if wake is None or (wake.done() and not _woke(wake, live)):
             # Out of the turn's project: a start lays out the bound project's
             # folder, and Home's has no place on this computer.
-            wake = record.wake = asyncio.get_running_loop().create_task(
-                manager.reach_computer(computer_id, user_id=self._user_id),
-                context=context_without_project(),
-            )
+            with computer_cause("reach"):
+                wake = record.wake = asyncio.get_running_loop().create_task(
+                    manager.reach_computer(computer_id, user_id=self._user_id),
+                    context=context_without_project(),
+                )
             _wakes.add(wake)
             wake.add_done_callback(_wakes.discard)
             wake.add_done_callback(partial(_log_failure, computer_id))
+        elif row is not None:
+            # A wake remembered from earlier in the turn passed the policy as
+            # it stood then; one set since must stop this call too.
+            from src.server.services.account import refuse_machine_use
+
+            try:
+                await refuse_machine_use(row.get("kind"), row.get("user_id"))
+            except HTTPException as e:
+                self._record_refusal(e, computer_id)
+                raise ComputerUnreachable(_why_not(name, e)) from e
         try:
             return await asyncio.shield(wake)
         except Exception as e:
+            self._record_refusal(e, computer_id)
             raise ComputerUnreachable(_why_not(name, e)) from e
+
+    def _record_refusal(self, error: BaseException, computer_id: str) -> None:
+        """A policy refusal becomes the agent's text here and never reaches
+        a handler, so it is recorded here, once a window for the computer
+        however often the agent asks for it again."""
+        from src.server.services.activity import AGENT, record_refusal
+
+        record_refusal(
+            error, self._user_id, detail={"computer_id": computer_id},
+            once=(self._user_id, "computer", computer_id), auth=AGENT,
+        )
 
     async def in_use(self, target: ComputerTarget) -> None:
         await self._keep_alive(target.computer_id, target.session)
+
+    async def ship(
+        self, source: ComputerTarget, shipment: Shipment, destination: ComputerTarget
+    ) -> Shipped | None:
+        """Through object storage when both computers move bytes to and from
+        it themselves, and the source's owner lets its files be stored: one
+        whose backup is off keeps its files out of the store, a copy's too.
+        Only a refusal meant for the agent crosses; any other failure is this
+        route's, and the server carries the copy instead."""
+        if transfer_mode(source.sandbox) != "direct" or transfer_mode(destination.sandbox) != "direct":
+            return None
+        row = await get_computer(source.computer_id)
+        if row is None or row.get("files_backup") is False:
+            return None
+        try:
+            return await ship_via_store(
+                self._user_id,
+                source.sandbox,
+                source.sandbox.working_dir,
+                destination.sandbox,
+                destination.sandbox.working_dir,
+                shipment,
+                source_name=source.name,
+                destination_name=destination.name,
+            )
+        except (ComputerUnreachable, ShipmentTooLarge):
+            raise
+        except Exception as e:  # noqa: BLE001 - the server route is the fallback for any of them
+            logger.warning(
+                "Copy of %s goes through the server: %s",
+                logged_path(shipment.path),
+                e,
+                # A store out of reach or a runtime that cannot run there is
+                # expected; anything else is worth its trace.
+                exc_info=not isinstance(e, (StoreUnreachable, TransferRuntimeError)),
+            )
+            return None
 
     async def _keep_alive(self, computer_id: str, session: Session) -> None:
         """Count the call as use of the computer, at most once a minute:

@@ -7,7 +7,7 @@ import type {
   OrderStatus,
   OrderSummary,
 } from './orders';
-import type { ReportSource, ThreadOrigin } from './api';
+import type { ArtifactCommentsShown, ReportSource, ThreadOrigin } from './api';
 import type { MarketTargetNotice } from '@/pages/ChatAgent/session/wakeupEvents';
 import type { WakeNotice } from './wakeups';
 
@@ -34,10 +34,12 @@ export type SSEEventType =
   | 'error'
   | 'model_retry'
   | 'model_fallback'
+  | 'claude_code_queue'
   | 'steering_delivered'
   | 'task_steering_accepted'
   | 'interrupt'
-  | 'finish';
+  | 'finish'
+  | 'turn_placement';
 
 /** Base interface for all SSE events */
 export interface BaseSSEEvent {
@@ -162,26 +164,20 @@ export interface ProvenanceEvent extends BaseSSEEvent {
   result_sha256?: string;
   result_size?: number;
   result_snippet?: string;
+  /** What reading this source cost the user, in credits. Absent or null on most. */
+  cost_credits?: number | null;
+  /** The data provider's website domain (e.g. "fiscal.ai"), set on `mcp_tool`
+   *  sources from a paid data catalog; its favicon stands in for the typed icon. */
+  site?: string | null;
   /** Replay envelope: added by GET /threads/{id}/messages/replay so the
    *  frontend can re-attach records to the right turn after reload. */
   turn_index?: number;
   response_id?: string;
+  thread_id?: string;
 }
 
-export interface TodoUpdatePayload {
-  todos: TodoItem[];
-  total: number;
-  completed: number;
-  in_progress: number;
-  pending: number;
-}
-
-export interface TodoItem {
-  id?: string;
-  content: string;
-  status: 'pending' | 'in_progress' | 'completed' | 'stale';
-  [key: string]: unknown;
-}
+/** The keys a `provenance` event carries for its transport, not its record. */
+export type ProvenanceEnvelopeKey = 'event' | '_eventId' | 'turn_index' | 'response_id' | 'thread_id';
 
 export interface WorkflowStatusEvent extends BaseSSEEvent {
   event: 'workflow_status';
@@ -204,6 +200,10 @@ export interface AttemptedModel {
   attempts?: number;
 }
 
+/** Whose fault a failed turn was: the model provider's, this service's, or
+ *  neither, the turn's own machine not answering. */
+export type ErrorKind = 'upstream' | 'internal' | 'computer_unreachable';
+
 export interface ErrorEvent extends BaseSSEEvent {
   event: 'error';
   /** Legacy single-field message; newer backends send ``error``/``message``. */
@@ -212,7 +212,14 @@ export interface ErrorEvent extends BaseSSEEvent {
   /** Enriched fields from ``stream_errors.error_event_data``. */
   error?: string;
   message?: string;
-  error_kind?: 'upstream' | 'internal';
+  /** ``computer_unreachable``: the turn's own machine did not answer, with
+   *  the connect code in ``error_code``. */
+  error_kind?: ErrorKind;
+  /** ``timeout``, ``unreachable`` or ``not_connected``. */
+  error_code?: string;
+  /** With ``computer_unreachable``: the computer that did not answer, when known. */
+  computer_id?: string;
+  computer_name?: string;
   status_code?: number | null;
   hints?: string[];
   /** User-configured (primary) model name, when the failure is model-attributable. */
@@ -254,6 +261,30 @@ export interface ModelFallbackEvent extends BaseSSEEvent {
   attempts_on_from?: number;
 }
 
+/**
+ * A Claude Code turn's wait for one of its computer's CLIs, which a computer
+ * runs at most `cap` of at once. `waiting` while it waits; `admitted` once it
+ * gets one after 5 s or more, which history replay sends again where the wait
+ * happened; `cleared` once it gets one sooner, too short to note. `wait_id`
+ * names the wait on every signal, since a turn that starts a second CLI can
+ * wait twice. Read through `readCliQueue` (`lib/claudeCodeQueue.ts`).
+ */
+export interface ClaudeCodeQueueEvent extends BaseSSEEvent {
+  event: 'claude_code_queue';
+  thread_id: string;
+  signal: 'waiting' | 'admitted' | 'cleared';
+  wait_id: string;
+  /** On `waiting` and `admitted`. */
+  computer_id?: string;
+  name?: string | null;
+  running?: number;
+  cap?: number;
+  settable?: boolean;
+  max?: number;
+  /** On `admitted` and `cleared`: whole seconds the turn waited. */
+  waited_s?: number;
+}
+
 /** A steer the run took in: the user's, or an agent's sent into the turn. */
 export interface DeliveredSteer {
   content: string;
@@ -263,8 +294,13 @@ export interface DeliveredSteer {
   platform?: string;
   /** The key its send went out under; absent on older checkpoints. */
   request_key?: string;
+  /** The account that sent it: in a shared workspace, the member whose name
+   *  its caption carries. */
+  user_id?: string;
   /** The agent that sent it (the Chief of Staff, Flash); absent when the user did. */
   origin?: ThreadOrigin;
+  /** On a steer that sent file comments, what the chat shows for it. */
+  artifact_comments?: ArtifactCommentsShown;
   report_source?: never;
   market_alert?: never;
   wakeup?: never;
@@ -448,6 +484,8 @@ export interface ActionRequest {
   workspace_id?: string;
   thread_id?: string;
   report_back?: boolean;
+  /** ptc_agent: the model the hand-off names, or null for the thread's own. */
+  model?: string | null;
   tool_call_id?: string;
   /**
    * The order attempt this request answers for. Its presence is what makes a
@@ -480,6 +518,34 @@ export interface FinishEvent extends BaseSSEEvent {
   finish_reason?: string;
 }
 
+/**
+ * Where a Home turn ran while the machine Home lives on could not be reached:
+ * on the user's cloud computer (`cloud_*`) standing in for it. `reason` is
+ * `command` for a report-back from a command that ran there. Carried by the
+ * `turn_placement` frame live and by the turn's query metadata on replay.
+ */
+export interface HomeFallback {
+  computer_id: string;
+  computer_name: string;
+  cloud_computer_id: string;
+  cloud_name: string;
+  /** When the turn was admitted (ISO): the first hand-back after it holds its files. */
+  at: string;
+  reason: 'unreachable' | 'command';
+}
+
+/**
+ * Sent once near the start of a Home turn that runs on the cloud stand-in,
+ * and of a retry of a Home turn, where null says this attempt runs on Home.
+ * A reconnect to a turn that ran there sends it again, with no id and no
+ * `workspace_id`, ahead of the run's own frames.
+ */
+export interface TurnPlacementEvent extends BaseSSEEvent {
+  event: 'turn_placement';
+  home_fallback: HomeFallback | null;
+  workspace_id?: string;
+}
+
 /** Discriminated union of all SSE events */
 export type SSEEvent =
   | MetadataEvent
@@ -496,8 +562,10 @@ export type SSEEvent =
   | ErrorEvent
   | ModelRetryEvent
   | ModelFallbackEvent
+  | ClaudeCodeQueueEvent
   | SteeringDeliveredEvent
   | TaskSteeringAcceptedEvent
   | UserMessageEvent
   | InterruptEvent
-  | FinishEvent;
+  | FinishEvent
+  | TurnPlacementEvent;

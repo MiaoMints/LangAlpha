@@ -11,6 +11,8 @@ from typing import Optional
 
 from fastapi import HTTPException
 
+from src.server.contracts.status import Stopper, chases_hand_offs, gives_back
+
 logger = logging.getLogger(__name__)
 
 
@@ -47,7 +49,10 @@ def _cancel_outcome(
 
 
 async def cancel_workflow(
-    thread_id: str, run_id: Optional[str] = None, *, by_user: bool = True
+    thread_id: str,
+    run_id: Optional[str] = None,
+    *,
+    by: Stopper = "user",
 ) -> dict:
     """
     Explicitly cancel a workflow execution (user stop) — v4 honest cancel.
@@ -69,11 +74,13 @@ async def cancel_workflow(
     *newer* turn the user started after the stopped one finished. Omitted =
     the thread's active run.
 
-    ``by_user=False`` is an agent's stop (the Chief of Staff's): the user's
-    steers stay queued rather than coming back to a caller who never sent
-    them, and a hand-off steered into a run that has since ended is stopped
-    where it went.
+    ``by`` names who asked (``Stopper``). Only the user's own stop hands
+    the run's steers back to its caller; any other leaves them with the run
+    for its ending to keep for its sender. An agent's or a suspension's stop
+    also stops a hand-off steered into a run that has since ended, where it
+    went.
     """
+    returns = gives_back(by)
     try:
         from src.server.services.runs.executor import (
             LocalRunExecutor,
@@ -134,7 +141,7 @@ async def cancel_workflow(
         held = 0
         if target_run_id:
             intent = await tl_db.request_run_cancel(
-                target_run_id, thread_id=thread_id, by_user=by_user
+                target_run_id, thread_id=thread_id, by=by
             )
             intent_state = intent["state"]
             logger.info(
@@ -142,9 +149,14 @@ async def cancel_workflow(
                 f"thread={thread_id}: {intent_state}"
             )
             held = intent.get("held_steers") or 0
-            if by_user and intent_state == "requested":
+            if returns and intent_state == "requested":
                 returned = intent.get("returned_steers") or []
-            elif by_user and intent_state in ("already_requested", "already_terminal"):
+                from src.server.services.artifacts.comments import (
+                    publish_returned_comments,
+                )
+
+                await publish_returned_comments(thread_id, returned)
+            elif returns and intent_state in ("already_requested", "already_terminal"):
                 # The stamp that returned them may be an earlier call's whose
                 # answer was lost.
                 from src.server.database.runs import outbox as outbox_db
@@ -194,7 +206,7 @@ async def cancel_workflow(
                     thread_id, target_run_id, force=True
                 )
 
-        if by_user and held and intent_state in ("requested", "already_requested"):
+        if returns and held and intent_state in ("requested", "already_requested"):
             # The stamp left the steers the run holds to its ending: the
             # model call reading them may be confirming them right now. The
             # ending gives back the ones its checkpoint never read.
@@ -213,14 +225,11 @@ async def cancel_workflow(
                 await outbox_db.keep_unanswered_steers(thread_id, target_run_id)
             returned = await outbox_db.list_returned_steers(target_run_id)
 
-        if intent_state == "already_terminal" and not by_user:
+        if intent_state == "already_terminal" and chases_hand_offs(by):
             from src.server.database.runs import outbox as outbox_db
 
             taken = await outbox_db.stop_hand_off_steers(thread_id, target_run_id)
-            stopped = [
-                await cancel_workflow(thread_id, later, by_user=False)
-                for later in taken
-            ]
+            stopped = [await cancel_workflow(thread_id, later, by=by) for later in taken]
             if any(o.get("cancelled") for o in stopped):
                 return _cancel_outcome(
                     cancelled=True,
@@ -328,7 +337,9 @@ async def _await_task_holds(thread_id: str, task_id: str) -> None:
         )
 
 
-async def cancel_subagent_task(thread_id: str, task_id: str) -> dict:
+async def cancel_subagent_task(
+    thread_id: str, task_id: str, *, task_run_id: str | None = None
+) -> dict:
     """Targeted stop for one background task (e.g. a workflow run).
 
     Local-first: when this worker owns the live writer, the registry cancel
@@ -336,9 +347,11 @@ async def cancel_subagent_task(thread_id: str, task_id: str) -> dict:
     on the task's active ledger run and nudge the owning worker over the
     shared cancel channel. A lost nudge degrades to the task finishing on
     its own — never a stuck state. Every answer carries the messages the
-    stop gave back, so asking again recovers a lost response.
+    stop gave back, so asking again recovers a lost response. With
+    ``task_run_id`` it stops only that run: one that ended before the stop
+    reached it leaves the task's next run running.
     """
-    outcome = await _cancel_subagent_task(thread_id, task_id)
+    outcome = await _cancel_subagent_task(thread_id, task_id, task_run_id)
     try:
         if outcome.get("cancelled"):
             await _await_task_holds(thread_id, task_id)
@@ -352,14 +365,18 @@ async def cancel_subagent_task(thread_id: str, task_id: str) -> dict:
     return outcome
 
 
-async def _cancel_subagent_task(thread_id: str, task_id: str) -> dict:
+async def _cancel_subagent_task(
+    thread_id: str, task_id: str, task_run_id: str | None
+) -> dict:
     try:
         from src.server.services.background_registry_store import (
             BackgroundRegistryStore,
         )
 
         registry_store = BackgroundRegistryStore.get_instance()
-        if await registry_store.cancel_task(thread_id, task_id):
+        if await registry_store.cancel_task(
+            thread_id, task_id, task_run_id=task_run_id
+        ):
             logger.info(
                 f"[cancel-task] local cancel thread={thread_id} task={task_id}"
             )
@@ -374,7 +391,7 @@ async def _cancel_subagent_task(thread_id: str, task_id: str) -> dict:
         from src.server.database.runs import subagent_runs as sr_db
 
         active = await sr_db.get_active_task_run(thread_id, task_id)
-        if active is None:
+        if active is None or task_run_id not in (None, str(active["task_run_id"])):
             statuses = await sr_db.get_latest_run_statuses(thread_id, [task_id])
             status = statuses.get(task_id)
             if status:
@@ -421,7 +438,9 @@ async def _cancel_subagent_task(thread_id: str, task_id: str) -> dict:
 
         from src.server.services.runs.cancel import publish_cancel_nudge
 
-        await publish_cancel_nudge(thread_id, None, task_id=task_id)
+        await publish_cancel_nudge(
+            thread_id, None, task_id=task_id, task_run_id=str(active["task_run_id"])
+        )
         logger.info(
             f"[cancel-task] intent stamped + nudge published "
             f"thread={thread_id} task={task_id}"

@@ -2,7 +2,7 @@
 
 import asyncio
 import shlex
-from collections.abc import AsyncIterator, Callable, Iterable, Mapping
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterable, Mapping
 from pathlib import Path
 from types import TracebackType
 from typing import Any
@@ -25,18 +25,25 @@ from ptc_agent.core.sandbox.providers._image_recipe import builtin_mcp_packages
 from ptc_agent.core.sandbox.jobs import (
     Ended,
     Failed,
+    JobContext,
     JobOutcome,
     JobRef,
     JobSpec,
     Running,
     StoppedJob,
 )
-from ptc_agent.core.sandbox.livefs_mount import HistoryFiles, MountHandle, TranscriptReach
+from ptc_agent.core.sandbox.livefs_mount import (
+    CallFiler,
+    HistoryFiles,
+    MountHandle,
+    TranscriptReach,
+)
 from ptc_agent.core.sandbox.retry import RetryPolicy, async_retry_with_backoff
 from ptc_agent.core.sandbox.runtime import (
     HostUnavailablePolicy,
     PreviewInfo,
     RuntimeState,
+    SandboxFailureKind,
     SandboxGoneError,
     SandboxRuntime,
     SandboxTransientError,
@@ -52,10 +59,10 @@ from ..project_context import ProjectContext, current_project
 from ..tool_generator import ToolFunctionGenerator
 
 from ptc_agent.core.sandbox._shared import (
-    REPLACE_UNLESS_NEWER_SCRIPT,
     SyncResult,
-    _internal_package_files,
+    _internal_package_uploads,
     publish_private_file,
+    publish_token_file,
 )
 from ptc_agent.core.sandbox import assets as _assets
 from ptc_agent.core.sandbox import execution as _execution
@@ -65,6 +72,7 @@ from ptc_agent.core.sandbox import mcp_setup as _mcp_setup
 from ptc_agent.core.sandbox import reconnect as _reconnect
 from ptc_agent.core.sandbox import tool_overlay as _tool_overlay
 from ptc_agent.core.sandbox import sessions as _sessions
+from ptc_agent.core.sandbox import unreachable as _unreachable
 
 logger = structlog.get_logger(__name__)
 
@@ -96,6 +104,12 @@ class PTCSandbox:
         # Set by the host while the file mount serves this sandbox; None
         # means the store-backed paths are not on its filesystem.
         self.livefs: MountHandle | None = None
+        # Set by the host: files who each command's call runs for, which a
+        # save through the mount and a call the ``la`` CLI makes both read.
+        self.call_filer: CallFiler | None = None
+        # Set by the host while it meters paid relay calls: the line naming
+        # what a command's calls, under its call id, cost.
+        self.paid_calls: Callable[[str], Awaitable[str]] | None = None
         # Set by the host on a machine the mount never serves, whose past
         # threads the file tools then read in process.
         self.history: HistoryFiles | None = None
@@ -204,6 +218,12 @@ class PTCSandbox:
         return type(self.provider).files_as_command_user
 
     @property
+    def installs_browser(self) -> bool:
+        """Whether this computer's machine sets the agent's browser up itself,
+        as one its owner brought does, rather than having it from the image."""
+        return type(self.provider).installs_browser
+
+    @property
     def recreatable(self) -> bool:
         """Whether the server rebuilds this computer, and so lays its files
         unasked; on one its owner brought, a missing folder is theirs to restore."""
@@ -254,6 +274,16 @@ class PTCSandbox:
         a sandbox a lazy reconnect is still starting."""
         await self._wait_ready()
 
+    async def login_config_home(self) -> str:
+        """The runtime's ``login_config_home`` once the sandbox is ready, read
+        as a command reaches the machine: an unreachable one is retried and
+        reconnected, then raises. One that keeps none answers without reaching
+        the machine, so its read never counts as the machine serving again."""
+        await self._wait_ready()
+        if not self.runtime.says_config_home:
+            return ""
+        return await self._runtime_call(self.runtime.login_config_home, retry_policy=RetryPolicy.SAFE)
+
     async def _wait_ready(self) -> None:
         """Wait for sandbox to be ready. Call at start of methods needing sandbox.
 
@@ -281,6 +311,7 @@ class PTCSandbox:
             )
 
         if self._init_error:
+            _unreachable.note_call(self, self._init_error)
             raise self._init_error
 
     def is_ready(self) -> bool:
@@ -586,24 +617,13 @@ class PTCSandbox:
 
         logger.info("Tools and MCP servers ready", sandbox_id=self.sandbox_id)
 
-    async def upload_token_file(self, payload: dict[str, Any]) -> bool:
-        """Write the market-data token the in-sandbox client reads.
-
-        A file, not an env var, so a fresh token reaches running MCP servers,
-        which re-read it when it changes. The server writes every token; the
-        sandbox only reads. True only once the write is confirmed.
-        """
+    async def publish_token_file(self, path: str, payload: dict[str, Any]) -> bool:
+        """Write a token the server mints into the file at ``path`` (the
+        market-data one, the ``la`` CLI's), which the sandbox only reads.
+        True only once the write is confirmed."""
         if not self.runtime:
             return False
-        return await publish_private_file(
-            self.runtime,
-            self._token_file_path,
-            payload,
-            what="sandbox token file",
-            script=REPLACE_UNLESS_NEWER_SCRIPT,
-            args=(str(payload["iat_ms"]),),
-            call=self._safe_call,
-        )
+        return await publish_token_file(self.runtime, path, payload, call=self._safe_call)
 
     async def upload_egress_relay_credentials(self, payload: dict | None) -> bool:
         """Write (or remove) the egress-relay credential file in the sandbox.
@@ -755,12 +775,45 @@ class PTCSandbox:
             )
             logger.info("Sandbox stopped", sandbox_id=self.sandbox_id)
         except Exception as e:
-            # Log warning but don't raise - sandbox may already be stopped or unavailable
+            # A refused stop raises, or the caller records the computer stopped
+            # over a machine still running, which Docker and SSH never stop on
+            # their own. A sandbox already gone or down is what a stop wants.
+            if await self._stop_already_done(e):
+                logger.info(
+                    "Sandbox already down; nothing to stop",
+                    sandbox_id=self.sandbox_id,
+                    error=str(e),
+                )
+                return
             logger.warning(
                 "Failed to stop sandbox",
                 sandbox_id=self.sandbox_id,
                 error=str(e),
             )
+            raise
+
+    async def _stop_already_done(self, exc: Exception) -> bool:
+        if self._is_gone(exc):
+            return True
+        if self.runtime is None:
+            return False
+        try:
+            # Read fresh: Daytona and E2B cache the state, which still says
+            # running when the stop landed but its response was lost.
+            state = await asyncio.wait_for(self.runtime.refresh_state(), timeout=30)
+        except Exception as e:  # noqa: BLE001 - an unreadable state is not down
+            return self._is_gone(e)
+        return state in (
+            RuntimeState.STOPPED,
+            RuntimeState.ARCHIVED,
+            RuntimeState.ARCHIVING,
+        )
+
+    def _is_gone(self, exc: Exception) -> bool:
+        return (
+            isinstance(exc, SandboxGoneError)
+            or self.provider.classify_error(exc) is SandboxFailureKind.SANDBOX_GONE
+        )
 
     async def _setup_workspace(self, dir_name: str | None = None) -> None:
         """Create workspace directory structure."""
@@ -841,7 +894,7 @@ class PTCSandbox:
         repo_root = config_dir or Path.cwd()
         local_src_dir = (repo_root / "src").resolve()
 
-        files = _internal_package_files(local_src_dir, livefs=self.mounts_livefs)
+        files = _internal_package_uploads(local_src_dir, type(self.provider))
         if not files:
             logger.warning(
                 "Skipping internal package upload - local src/__init__.py not found",
@@ -853,7 +906,7 @@ class PTCSandbox:
         sandbox = self.runtime
 
         # Collect unique parent dirs → single mkdir command
-        parent_dirs = {str(Path(str(internal_root / rel)).parent) for _, rel in files}
+        parent_dirs = {str(Path(str(internal_root / rel)).parent) for _, rel, _ in files}
         mkdir_cmd = "mkdir -p " + " ".join(shlex.quote(d) for d in sorted(parent_dirs))
         await self._runtime_call(
             sandbox.exec,
@@ -863,7 +916,7 @@ class PTCSandbox:
 
         batch: list[tuple[bytes | str, str]] = [
             (str(local_path), str(internal_root / rel_path))
-            for local_path, rel_path in files
+            for local_path, rel_path, _ in files
         ]
         # The vault helper ships even with no secrets, so `from vault import
         # get` always imports. Its source is stamped with this set, so it goes
@@ -876,6 +929,17 @@ class PTCSandbox:
             batch,
             retry_policy=RetryPolicy.SAFE,
         )
+        # Uploads land 0644.
+        modes: dict[int, list[str]] = {}
+        for _, rel_path, mode in files:
+            if mode is not None:
+                modes.setdefault(mode, []).append(shlex.quote(str(internal_root / rel_path)))
+        for mode, paths in modes.items():
+            await self._runtime_call(
+                sandbox.exec,
+                f"chmod {mode:o} {' '.join(paths)}",
+                retry_policy=RetryPolicy.SAFE,
+            )
         logger.debug(
             "Uploaded internal packages to sandbox",
             uploaded_files=len(batch),
@@ -913,19 +977,27 @@ class PTCSandbox:
         **kwargs: Any,
     ) -> Any:
         on_transient = self._ensure_sandbox_connected if allow_reconnect else None
-        result = await async_retry_with_backoff(
-            func,
-            *args,
-            retry_policy=retry_policy,
-            is_transient=self.provider.is_transient_error,
-            on_transient=on_transient,
-            rebind=self._make_rebinder(self.runtime) if allow_reconnect else None,
-            retries=retries,
-            initial_delay_s=initial_delay_s,
-            total_timeout=total_timeout,
-            **kwargs,
-        )
+        try:
+            result = await async_retry_with_backoff(
+                func,
+                *args,
+                retry_policy=retry_policy,
+                is_transient=self.provider.is_transient_error,
+                on_transient=on_transient,
+                rebind=self._make_rebinder(self.runtime) if allow_reconnect else None,
+                retries=retries,
+                initial_delay_s=initial_delay_s,
+                total_timeout=total_timeout,
+                **kwargs,
+            )
+        except Exception as e:
+            # After every retry and the reconnect: the call's last word on
+            # whether the machine answers, which a tool would otherwise
+            # swallow into text.
+            _unreachable.note_call(self, e)
+            raise
         _reconnect.call_served(self)
+        _unreachable.note_call(self, None)
         return result
 
     def _make_rebinder(
@@ -1106,6 +1178,7 @@ class PTCSandbox:
         disabled_skills: frozenset[str] = frozenset(),
         reusing_sandbox: bool = False,
         force_refresh: bool = False,
+        rebuild_overlay: bool = False,
         project: "ProjectContext | None" = None,
         root_owner_dir_name: str | None = None,
         workspace_dir_names: tuple[str, ...] = (),
@@ -1118,6 +1191,7 @@ class PTCSandbox:
             disabled_skills=disabled_skills,
             reusing_sandbox=reusing_sandbox,
             force_refresh=force_refresh,
+            rebuild_overlay=rebuild_overlay,
             project=project,
             root_owner_dir_name=root_owner_dir_name,
             workspace_dir_names=workspace_dir_names,
@@ -1224,18 +1298,14 @@ class PTCSandbox:
         *,
         working_dir: str | None = None,
         wait_s: float | None,
-        thread_id: str | None = None,
-        call_id: str | None = None,
-        allowed_servers: frozenset[str] | None = None,
+        context: JobContext = JobContext(),
     ) -> JobOutcome:
         return await _execution.start_bash_job(
             self,
             command,
             working_dir=working_dir,
             wait_s=wait_s,
-            thread_id=thread_id,
-            call_id=call_id,
-            allowed_servers=allowed_servers,
+            context=context,
         )
 
     async def run_foreground(self, spec: JobSpec, timeout: int) -> Ended | Failed:
@@ -1246,17 +1316,13 @@ class PTCSandbox:
         code: str,
         *,
         wait_s: float | None,
-        thread_id: str | None = None,
-        call_id: str | None = None,
-        allowed_servers: frozenset[str] | None = None,
+        context: JobContext = JobContext(),
     ) -> JobOutcome:
         return await _execution.start_code_job(
             self,
             code,
             wait_s=wait_s,
-            thread_id=thread_id,
-            call_id=call_id,
-            allowed_servers=allowed_servers,
+            context=context,
         )
 
     async def continue_job(self, outcome: Running, wait_s: float | None) -> JobOutcome:
@@ -1273,8 +1339,10 @@ class PTCSandbox:
 
     # -- sessions --
 
-    async def get_preview_url(self, port: int, expires_in: int = 3600) -> PreviewInfo:
-        return await _sessions.get_preview_url(self, port, expires_in)
+    async def get_preview_url(
+        self, port: int, expires_in: int = 3600, *, wake: bool = True
+    ) -> PreviewInfo:
+        return await _sessions.get_preview_url(self, port, expires_in, wake=wake)
 
     async def get_preview_link(self, port: int, *, wake: bool = True) -> PreviewInfo:
         return await _sessions.get_preview_link(self, port, wake=wake)
@@ -1340,6 +1408,11 @@ class PTCSandbox:
 
     async def awrite_file_text(self, filepath: str, content: str) -> bool:
         return await _files.awrite_file_text(self, filepath, content)
+
+    async def awrite_file_text_guarded(
+        self, filepath: str, content: str, guard: "_files.WriteGuard"
+    ) -> str | None:
+        return await _files.awrite_file_text_guarded(self, filepath, content, guard)
 
     def path_write_lock(self, normalized_path: str):
         return _files.path_write_lock(self, normalized_path)

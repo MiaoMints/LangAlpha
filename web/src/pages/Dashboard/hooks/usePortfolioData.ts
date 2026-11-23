@@ -1,57 +1,41 @@
 import { useCallback, useMemo, useState } from 'react';
-import { queryOptions, useQuery, useQueryClient } from '@tanstack/react-query';
+import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { useToast } from '@/components/ui/use-toast';
 import {
   addPortfolioHolding,
   deletePortfolioHolding,
-  getPortfolio,
   updatePortfolioHolding,
 } from '../utils/api';
+import { portfolioHoldingsQuery } from '@/hooks/membershipQueries';
 import { useQuotes, snapshotToStockPrice } from '@/lib/quotes';
+import { quotePlaces } from '@/lib/bars/currencyDisplay';
 import type { PortfolioHoldingPayload, PortfolioHoldingUpdatePayload } from '../utils/portfolio';
-import type { StockPrice } from '@/types/market';
+import { costBasis } from '../utils/portfolioSummary';
+import type { ExtendedSessionFields, StockPrice } from '@/types/market';
 
 export interface PortfolioRow {
   user_portfolio_id?: string | number;
   symbol: string;
   quantity?: number | null;
   average_cost?: number | null;
+  /** The currency its price and value are in: the quote's, else the holding's. */
   currency: string;
+  /** The currency its average cost was entered in. */
+  costCurrency: string;
   notes?: string;
   price: number;
+  /** The day's move against the previous close, for the session's headline. */
+  change?: number;
+  changePercent?: number;
   marketValue?: number | null;
   unrealizedPlPercent?: number | null;
   isPositive?: boolean;
   quoteAvailable?: boolean;
-  previousClose?: number | null;
-  earlyTradingChangePercent?: number | null;
-  lateTradingChangePercent?: number | null;
+  /** Places its prices print up to (lib/bars `quotePlaces`), from the quote's own currency and asset class, not the holding's. */
+  places: number;
+  session?: ExtendedSessionFields;
   [key: string]: unknown;
 }
-
-export interface PortfolioHolding {
-  user_portfolio_id: string;
-  symbol: string;
-  quantity?: number;
-  average_cost?: number | null;
-  currency?: string | null;
-  notes?: string;
-  [key: string]: unknown;
-}
-
-/**
- * The holdings list alone, for a reader that needs what is held but not its
- * quotes (the welcome flow's holdings entry). The same entry the hook below
- * polls, so a holding added anywhere shows everywhere.
- */
-export const portfolioHoldingsQuery = queryOptions({
-  queryKey: ['portfolioData'],
-  queryFn: async (): Promise<PortfolioHolding[]> => {
-    const { holdings: rawHoldings } = await getPortfolio() as { holdings?: PortfolioHolding[] };
-    return rawHoldings ?? [];
-  },
-  staleTime: 1000 * 30, // 30s fresh cache
-});
 
 interface PortfolioEditForm {
   quantity: string;
@@ -59,7 +43,7 @@ interface PortfolioEditForm {
   notes: string;
 }
 
-interface DeleteConfirmConfig {
+export interface DeleteConfirmConfig {
   open: boolean;
   title: string;
   message: string;
@@ -123,22 +107,27 @@ export function usePortfolioData() {
       const quoteAvailable = p.quoteAvailable !== false && p.price != null;
       const price = quoteAvailable ? p.price ?? 0 : 0;
       const marketValue = quoteAvailable ? q * price : null;
-      const plPct = quoteAvailable && ac != null && ac > 0 ? ((price - ac) / ac) * 100 : null;
+      const costCurrency = h.currency ?? 'USD';
+      const currency = p.currency ?? costCurrency;
+      const basis = costBasis({ symbol: sym, average_cost: ac, quantity: q, currency, costCurrency });
+      const plPct = marketValue != null && basis != null && basis > 0 ? ((marketValue - basis) / basis) * 100 : null;
       return {
         user_portfolio_id: h.user_portfolio_id,
         symbol: sym,
         quantity: q,
         average_cost: ac,
-        currency: h.currency ?? 'USD',
+        currency,
+        costCurrency,
         notes: h.notes ?? '',
         price,
+        change: quoteAvailable ? p.change ?? 0 : 0,
+        changePercent: quoteAvailable ? p.changePercent ?? 0 : 0,
         marketValue,
         quoteAvailable,
         unrealizedPlPercent: plPct,
         isPositive: quoteAvailable && plPct != null ? plPct >= 0 : true,
-        previousClose: p.previousClose ?? null,
-        earlyTradingChangePercent: p.earlyTradingChangePercent ?? null,
-        lateTradingChangePercent: p.lateTradingChangePercent ?? null,
+        session: p.session,
+        places: p.places ?? quotePlaces(sym, {}),
       };
     });
   }, [holdings, symbols, quotes]);
@@ -151,7 +140,7 @@ export function usePortfolioData() {
   }, [refetchHoldings, refetchQuotes]);
 
   const handleAdd = useCallback(
-    async (payload: PortfolioHoldingPayload) => {
+    async (payload: PortfolioHoldingPayload): Promise<boolean> => {
       try {
         await addPortfolioHolding(payload);
         setModalOpen(false);
@@ -161,11 +150,14 @@ export function usePortfolioData() {
           title: 'Holding added',
           description: `${payload.symbol} has been added to your portfolio.`,
         });
+        return true;
       } catch (e: unknown) {
         const err = e as ApiError;
         console.error('Add portfolio holding failed:', err?.response?.status, err?.response?.data, err?.message);
 
-        const msg = err?.response?.data?.detail || err?.response?.data?.message || '';
+        // A 422's detail is a list, not text; only a string can be shown or matched.
+        const raw = err?.response?.data?.detail || err?.response?.data?.message;
+        const msg = typeof raw === 'string' ? raw : '';
 
         if (msg.includes('NumericValueOutOfRange') || msg.includes('numeric overflow')) {
           toast({
@@ -180,6 +172,7 @@ export function usePortfolioData() {
             description: msg || 'Failed to add holding. Please try again.',
           });
         }
+        return false;
       }
     },
     [queryClient, toast]

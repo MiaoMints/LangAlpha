@@ -6,24 +6,60 @@ that use the ptc-agent library for code execution in Daytona sandboxes.
 """
 
 import copy
-import uuid
-from typing import Annotated, Any, Dict, List, Literal, Mapping, Optional, Union
+from typing import Annotated, Any, Callable, Dict, List, Literal, Mapping, Optional, Union
 
-from pydantic import AfterValidator, BaseModel, Field, field_validator
+from pydantic import (
+    AfterValidator,
+    BaseModel,
+    Field,
+    field_validator,
+    model_validator,
+)
 
 from src.server.models.additional_context import AdditionalContext
+from src.server.models.chart_view import ChartViews
+from src.server.models.chart_layer import PublishedLayer
 from src.server.models.command import FailureReason
+from src.server.utils.pg_sanitize import uuid_text
 
 from src.llms.reasoning import ReasoningLevel
 
+# The key is stored in a UUID column.
+RequestKey = Annotated[str, AfterValidator(uuid_text)]
 
-def _uuid_text(value: str) -> str:
-    # The key is stored in a UUID column, so anything else failed at the
-    # insert as a 500; refused here it is the client's 422.
-    return str(uuid.UUID(value))
+ArtifactCommentId = Annotated[str, AfterValidator(uuid_text)]
+
+# Comments one chat send may carry.
+MAX_ARTIFACT_COMMENTS_PER_SEND = 50
 
 
-RequestKey = Annotated[str, AfterValidator(_uuid_text)]
+class ShownComment(BaseModel):
+    """One comment as a reader is shown it in place of the message."""
+
+    comment_id: str
+    artifact_id: str
+    workspace_id: str
+    path: str
+    title: Optional[str] = None
+    number: int
+    #: The owner's words this send carried, clipped.
+    text: str
+    #: The comment had an exchange before these words.
+    follow_up: bool
+    #: The anchor's label and quote, so the message says what the comment is
+    #: on without opening the file, which a shared chat cannot.
+    label: Optional[str] = None
+    quote: Optional[str] = None
+
+
+class ShownSend(BaseModel):
+    """What a reader is shown for a message carrying file comments: the note
+    the owner typed and a chip per comment. It rides the query row, a steer's
+    payload and the ``steering_accepted`` event in this JSON shape."""
+
+    note: str
+    reading: Literal["chat", "file"]
+    comments: List[ShownComment]
 
 # Roles the chat path can VALIDLY persist into the ``messages`` channel. The
 # chat path writes ``{"role", "content"}`` dicts straight in; under DeltaChannel
@@ -130,7 +166,9 @@ def rejection_feedback(message: Optional[str]) -> str:
     return message.removeprefix(REJECTED_WITH_FEEDBACK).strip()
 
 
-def serialize_hitl_response_map(hitl_response: Mapping[str, Any]) -> Dict[str, dict]:
+def serialize_hitl_response_map(
+    hitl_response: Mapping[str, Any], *, escape: Optional[Callable[[str], str]] = None
+) -> Dict[str, dict]:
     """Convert validated HITLResponse models into plain dicts for LangGraph resume.
 
     LangChain's HumanInTheLoopMiddleware expects `resume` payloads to be
@@ -139,6 +177,9 @@ def serialize_hitl_response_map(hitl_response: Mapping[str, Any]) -> Dict[str, d
 
     For rejection decisions, this function also formats the message to clearly
     indicate that the user rejected the plan and includes their feedback.
+    ``escape`` is applied to each decision's message first: in a shared
+    workspace the answer reaches the model in a tool result, past the step
+    that escapes a tag a member typed, so it is escaped here.
     """
 
     serialized: Dict[str, dict] = {}
@@ -156,6 +197,14 @@ def serialize_hitl_response_map(hitl_response: Mapping[str, Any]) -> Dict[str, d
                 "Unsupported HITL response type: "
                 f"interrupt_id={interrupt_id} type={type(response)!r}"
             )
+
+        if escape is not None:
+            for decision in [
+                *(response_dict.get("decisions") or []),
+                *(response_dict.get("order_decisions") or {}).values(),
+            ]:
+                if isinstance(decision, dict) and isinstance(decision.get("message"), str):
+                    decision["message"] = escape(decision["message"])
 
         # Format rejection messages to be clear and include feedback
         if "decisions" in response_dict:
@@ -297,8 +346,9 @@ class ThreadOrigin(BaseModel):
     id: Optional[str] = Field(default=None, max_length=100)
     # automation: the automation's name at send time, capped as automations cap it
     name: Optional[str] = Field(default=None, max_length=255)
-    # agent: which agent dispatched the thread
-    agent: Optional[Literal["chief_of_staff"]] = None
+    # agent: which agent dispatched the thread; "cli" is a computer's agent
+    # through the ``la`` CLI, the server's stamp (``principal.stamp_origin``)
+    agent: Optional[Literal["chief_of_staff", "cli"]] = None
 
 
 class AnalystReport(BaseModel):
@@ -349,7 +399,8 @@ class CommandReport(BaseModel):
     non-zero exit), ``lost`` (its computer stopped under it), ``vanished``
     (no exit recorded while its computer ran) or ``after_turn_limit``
     (stopped an hour after its turn ended, which the caption calls stopped
-    early).
+    early). ``chart_layers`` are the chart layers it published, drawn as
+    the chart-layer card an inline call's result gets.
     """
 
     kind: Literal["command_report"]
@@ -359,6 +410,7 @@ class CommandReport(BaseModel):
     status: Literal["completed", "failed", "stopped"]
     failure_reason: Optional[FailureReason] = None
     tool_call_id: Optional[str] = None
+    chart_layers: Optional[List[PublishedLayer]] = None
 
 
 # What a report-back turn announces, kept on its query row for display only.
@@ -486,6 +538,11 @@ class ChatRequest(BaseModel):
         default=None,
         description="Additional context to be included. Supports: skills (skill instructions)",
     )
+    chart_views: ChartViews = Field(
+        default=None,
+        description="The charts on screen as the message is sent, for the turn's chart "
+        "snapshots; never shown to the model.",
+    )
 
     # LLM selection (optional)
     llm_model: Optional[str] = Field(
@@ -526,6 +583,14 @@ class ChatRequest(BaseModel):
         description="When True, enables priority service tier for faster "
         "responses (Codex OAuth models only), for this turn only. Omitted, the "
         "turn runs the thread's own, else the user's Settings.",
+    )
+
+    keep_full_context: bool = Field(
+        default=False,
+        description="When True, this turn starts without the summary a long "
+        "thread gets after a break, once the provider's prompt cache has "
+        "expired (`next_summary.reason` `cold` in the thread's status). A "
+        "summary at the threshold still runs. For this turn only.",
     )
 
     # Internal: query type override (e.g., "system" for report-back invocations)
@@ -624,6 +689,39 @@ class ChatRequest(BaseModel):
         description="Wakeup notices this wake turn delivers. Server use only.",
     )
 
+    # Comments the owner left on files, sent to this thread as this turn's
+    # message: the server takes their unsent words under the send's
+    # ``request_key`` and writes the message (``services/artifacts/comments``).
+    artifact_comment_ids: Optional[
+        Annotated[
+            List[ArtifactCommentId], Field(max_length=MAX_ARTIFACT_COMMENTS_PER_SEND)
+        ]
+    ] = Field(
+        default=None,
+        description="Comments on files to send to this thread with the message, "
+        "which then holds the typed text, if any, and each comment's unsent "
+        "words in pin order. Requires request_key and reading; a retransmit "
+        "with the same key sends the same comments once. Comments already "
+        "sent, deleted, or on a file whose comments may not go to this thread "
+        "are left out, and a send left with nothing is refused (409 "
+        "comments_unavailable).",
+    )
+    # Where the person would rather have the answers, which sets how much the
+    # agent says under each comment and how much in the chat.
+    reading: Optional[Literal["chat", "file"]] = Field(
+        default=None,
+        description="Where the user prefers answers to artifact_comment_ids: "
+        "their setting, or else 'chat' when the chat is on screen and 'file' "
+        "when it is not. Required with artifact_comment_ids, ignored without.",
+    )
+    # Server-set by the send that carries comments, and by the turn a parked
+    # steer of one becomes: what history shows in place of the message
+    # (``services/artifacts/comments.shown_send``). Display only.
+    artifact_comments: Optional[ShownSend] = Field(
+        default=None,
+        description="The file comments this turn's message carries. Server use only.",
+    )
+
     # Server-stamped: the burst-guard ZSET member held by this request's
     # admission. The route overwrites whatever a client sent (a forged value
     # could only orphan the caller's own slot until reap, but stamping keeps
@@ -631,6 +729,14 @@ class ChatRequest(BaseModel):
     burst_slot_id: Optional[str] = Field(
         default=None,
         description="Burst-guard slot held for this request. Server-stamped.",
+    )
+
+    # Server-stamped: the computer a computer's token's turn was checked to
+    # run on (``cli_approval.admit_turn``); its START refuses the run when
+    # the workspace has moved off it since.
+    checked_computer_id: Optional[str] = Field(
+        default=None,
+        description="The computer this turn was checked to run on. Server-stamped.",
     )
 
     # External thread identity (for channel integrations like Telegram, Slack)
@@ -681,6 +787,35 @@ class ChatRequest(BaseModel):
         "person's, even on a thread an automation started.",
     )
 
+    @field_validator("artifact_comment_ids")
+    @classmethod
+    def _distinct_artifact_comments(
+        cls, v: Optional[List[str]]
+    ) -> Optional[List[str]]:
+        if not v:
+            return None
+        return list(dict.fromkeys(v))
+
+    @model_validator(mode="after")
+    def _artifact_comments_are_a_send(self) -> "ChatRequest":
+        """Comments ride a new message only: an answer to a pause, an edit
+        or a regenerate has no message of the user's to carry them, and a
+        send without a key could not be retransmitted without sending them
+        twice. ``reading`` must come with them, since the agent's answer
+        depends on it and no default would be right for both."""
+        if not self.artifact_comment_ids:
+            return self
+        if not self.request_key:
+            raise ValueError("artifact_comment_ids requires request_key")
+        if self.reading is None:
+            raise ValueError("artifact_comment_ids requires reading")
+        if self.hitl_response or self.checkpoint_id or self.fork_from_turn is not None:
+            raise ValueError(
+                "artifact_comment_ids cannot ride a HITL answer, an edit or a "
+                "regenerate"
+            )
+        return self
+
     @field_validator("surface_rules")
     @classmethod
     def _normalize_surface_rules(cls, v: Optional[str]) -> Optional[str]:
@@ -693,6 +828,16 @@ class ChatRequest(BaseModel):
         if v is None:
             return None
         return v.strip() or None
+
+    def message_text(self) -> str:
+        """The words of the message the turn sends: the last message's text,
+        or its first text part; empty for a turn that sends none."""
+        if not self.messages:
+            return ""
+        content = self.messages[-1].content
+        if isinstance(content, str):
+            return content
+        return next((item.text for item in content if getattr(item, "text", None)), "")
 
 
 # =============================================================================

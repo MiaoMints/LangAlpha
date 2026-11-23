@@ -12,6 +12,12 @@ from typing import Any, NamedTuple, Optional
 
 from langchain_core.messages import AIMessage
 
+from ptc_agent.agent.middleware.image_capture import (
+    recorded_images,
+    resolve_image_paths,
+)
+from ptc_agent.agent.tools.plan import PLAN_TOOL_NAME
+
 # Markup is stripped from this raw head, so it leaves room for links and
 # tables to collapse and still fill the excerpt, and a long answer never
 # reaches the patterns whole.
@@ -79,6 +85,10 @@ class RunAnswer(NamedTuple):
 # along the way.
 _MESSAGING_TOOLS = frozenset({"send_message", "list_message_targets"})
 
+# Calls that are no work of the run's: the plan's close-out marks steps after
+# the answer, and a plan update anywhere only says where the work stands.
+_NOT_WORK = frozenset({PLAN_TOOL_NAME})
+
 
 def _result_sent(messages: list[Any]) -> Optional[str]:
     """The text of the send a run ended on: its last ``send_message`` call
@@ -91,6 +101,8 @@ def _result_sent(messages: list[Any]) -> Optional[str]:
             continue
         for call in reversed(message.tool_calls or []):
             name = call.get("name")
+            if name in _NOT_WORK:
+                continue
             if name not in _MESSAGING_TOOLS:
                 return None
             if name != "send_message":
@@ -130,6 +142,8 @@ async def read_run_answer(thread_id: str, run_id: str) -> RunAnswer:
             continue
         written, _, _ = split_content_blocks(message.content)
         if written and written.strip():
-            text = written
+            # The chats it goes to have no sandbox: the images show as their
+            # captures.
+            text = resolve_image_paths(written, recorded_images(message))
             break
     return RunAnswer(text=text, sent=_result_sent(turn.messages))

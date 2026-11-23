@@ -12,6 +12,8 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 
+from src.data_client.base import FetchResult
+
 from .conftest import assert_error, assert_ok_envelope
 
 _MOD = "plugins.langalpha_market_data.options_mcp_server"
@@ -98,6 +100,18 @@ class TestGetOptionsChain:
 
         assert_error(result, "not_found")
 
+    @pytest.mark.asyncio
+    async def test_an_underlying_outside_the_us_is_refused(self):
+        import plugins.langalpha_market_data.options_mcp_server as mod
+
+        fetch = AsyncMock()
+        with _ensure(mod, True), patch.object(mod._ginlix, "fetch_options_chain", new=fetch):
+            result = await mod.get_options_chain("0700.HK")
+
+        assert_error(result, "invalid_argument", symbol="0700.HK")
+        assert "currency" not in result
+        fetch.assert_not_awaited()
+
 
 # ---------------------------------------------------------------------------
 # get_options_prices
@@ -122,10 +136,29 @@ class TestGetOptionsPrices:
         assert_error(result, "client_unavailable")
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "lo, hi, detail",
+        [
+            ("2025-01-31", "2025-01-01", "start is after end"),
+            ("01/01/2025", "2025-01-31", "from_date must be YYYY-MM-DD, not '01/01/2025'"),
+        ],
+    )
+    async def test_bounds_refused_as_the_price_tools_refuse_them(self, lo, hi, detail):
+        import plugins.langalpha_market_data.options_mcp_server as mod
+
+        fetch = AsyncMock()
+        with _ensure(mod, True), patch.object(mod._ginlix, "fetch_options_prices", new=fetch):
+            result = await mod.get_options_prices(_OPT, lo, hi)
+
+        assert_error(result, "invalid_argument", symbol=_OPT)
+        assert result["detail"] == detail
+        fetch.assert_not_awaited()
+
+    @pytest.mark.asyncio
     async def test_success_ascending_and_underlying_currency(self):
         import plugins.langalpha_market_data.options_mcp_server as mod
 
-        fetch = AsyncMock(return_value=list(_OPT_ROWS_DESC))
+        fetch = AsyncMock(return_value=FetchResult(list(_OPT_ROWS_DESC)))
         with _ensure(mod, True), patch.object(mod._ginlix, "fetch_options_prices", new=fetch):
             result = await mod.get_options_prices(_OPT, "2025-01-01", "2025-01-31", interval="1day")
 
@@ -142,7 +175,7 @@ class TestGetOptionsPrices:
     async def test_interval_alias_normalized(self):
         import plugins.langalpha_market_data.options_mcp_server as mod
 
-        fetch = AsyncMock(return_value=list(_OPT_ROWS_DESC))
+        fetch = AsyncMock(return_value=FetchResult(list(_OPT_ROWS_DESC)))
         with _ensure(mod, True), patch.object(mod._ginlix, "fetch_options_prices", new=fetch):
             result = await mod.get_options_prices(_OPT, "2025-01-01", "2025-01-31", interval="1d")
 
@@ -154,7 +187,7 @@ class TestGetOptionsPrices:
         """Options prices serve the full canonical vocab (incl. 1week)."""
         import plugins.langalpha_market_data.options_mcp_server as mod
 
-        fetch = AsyncMock(return_value=list(_OPT_ROWS_DESC))
+        fetch = AsyncMock(return_value=FetchResult(list(_OPT_ROWS_DESC)))
         with _ensure(mod, True), patch.object(mod._ginlix, "fetch_options_prices", new=fetch):
             result = await mod.get_options_prices(_OPT, "2025-01-01", "2025-03-31", interval="1week")
 
@@ -209,6 +242,28 @@ class TestGetOptionsSnapshot:
         assert "symbol" not in result  # batch payload has no single symbol
 
     @pytest.mark.asyncio
+    async def test_rows_carry_local_times_and_a_stale_mark(self):
+        import plugins.langalpha_market_data.options_mcp_server as mod
+
+        stale = {
+            "ticker": _OPT, "type": "options", "name": "AAPL $220.00 call", "market_status": "open",
+            # 2026-10-23 10:54:03 New York, weeks before the read.
+            "session": {"close": 222.0, "change_percent": 0.0, "volume": 1.0,
+                        "timeframe": "DELAYED", "last_updated": 1792767243597000000},
+            "greeks": {"delta": 0.98}, "implied_volatility": 2.8, "open_interest": 33,
+        }
+        canned = {"count": 1, "data": [stale], "source": "ginlix-data"}
+        fetch = AsyncMock(return_value=canned)
+        with _ensure(mod, True), patch.object(mod._ginlix, "fetch_options_snapshot", new=fetch):
+            result = await mod.get_options_snapshot(_OPT)
+
+        row = result["data"][0]
+        assert row["session"]["last_updated"] == "2026-10-23 10:54:03"
+        assert row["session"]["stale"] is True
+        assert row["implied_volatility"] == 2.8
+        assert "greeks" in row
+
+    @pytest.mark.asyncio
     async def test_currency_omitted_when_underlying_unresolvable(self):
         import plugins.langalpha_market_data.options_mcp_server as mod
 
@@ -230,3 +285,43 @@ class TestGetOptionsSnapshot:
             result = await mod.get_options_snapshot(_OPT)
 
         assert_error(result, "upstream_error")
+
+
+class TestTruncatedOptionsPrices:
+    @pytest.mark.asyncio
+    async def test_the_page_cap_reaches_the_envelope(self):
+        import plugins.langalpha_market_data.options_mcp_server as mod
+
+        fetch = AsyncMock(return_value=FetchResult(list(_OPT_ROWS_DESC), True))
+        with _ensure(mod, True), patch.object(mod._ginlix, "fetch_options_prices", new=fetch):
+            result = await mod.get_options_prices(_OPT, "2025-01-01", "2025-01-31")
+
+        assert_ok_envelope(result, count=2)
+        assert result["truncated"] is True
+
+
+class TestUnknownVenueCurrency:
+    @pytest.mark.asyncio
+    async def test_an_unknown_venue_gets_no_currency_and_a_us_class_share_keeps_usd(self):
+        import plugins.langalpha_market_data.options_mcp_server as mod
+
+        fetch = AsyncMock(return_value={"results": [], "truncated": False})
+        with _ensure(mod, True), patch.object(mod._ginlix, "fetch_options_chain", new=fetch):
+            unknown = await mod.get_options_chain("ZZZZ4.SA")
+            class_share = await mod.get_options_chain("BRK.B")
+
+        assert "currency" not in unknown
+        assert class_share["currency"] == "USD"
+
+
+class TestTruncatedOptionsChain:
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("more", [True, False])
+    async def test_more_contracts_than_limit_reaches_the_envelope(self, more):
+        import plugins.langalpha_market_data.options_mcp_server as mod
+
+        fetch = AsyncMock(return_value={"results": [_CONTRACT], "truncated": more})
+        with _ensure(mod, True), patch.object(mod._ginlix, "fetch_options_chain", new=fetch):
+            result = await mod.get_options_chain("AAPL", limit=1)
+
+        assert result.get("truncated", False) is more

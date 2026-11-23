@@ -18,14 +18,13 @@ from zoneinfo import ZoneInfo
 
 from src.server.database import automation as auto_db
 from src.server.database import automation_executions as exec_db
+from src.server.services import automation_computer_wait
 from src.server.services.automation_executor import (
     ABANDONED_AFTER_SECONDS,
     AutomationExecutor,
 )
-from src.server.services.automation_settlement import (
-    INTERRUPTED_ERROR,
-    settle_abandoned,
-)
+from src.server.services.automation_outcomes import INTERRUPTED_ERROR
+from src.server.services.automation_settlement import settle_abandoned
 from src.utils.timezone_utils import zone_or_none
 
 logger = logging.getLogger(__name__)
@@ -131,6 +130,10 @@ class AutomationScheduler:
                     return
                 await asyncio.sleep(0.5)
 
+    async def _sweep(self) -> None:
+        await self._sweep_abandoned_firings()
+        await self._sweep_parked_firings()
+
     async def _sweep_abandoned_firings(self) -> None:
         """Settle firings whose process stopped holding them.
 
@@ -171,6 +174,13 @@ class AutomationScheduler:
                     f"[SCHEDULER] Settled an abandoned firing as {outcome}: "
                     f"execution_id={execution_id}"
                 )
+
+    async def _sweep_parked_firings(self) -> None:
+        """Start the firings parked for a computer that is back, or skip
+        those it no longer waits for (``automation_computer_wait``)."""
+        await automation_computer_wait.sweep_parked(
+            self.dispatch, stopping=self._shutdown_event.is_set
+        )
 
     def dispatch(
         self, automation: Dict[str, Any], execution_id: str, *, name: str
@@ -235,13 +245,11 @@ class AutomationScheduler:
             )
         if self._sweep_task is None or self._sweep_task.done():
             self._sweep_task = asyncio.create_task(
-                self._sweep_abandoned_firings(), name="automation_sweep"
+                self._sweep(), name="automation_sweep"
             )
 
     async def _run_execution(
-        self,
-        automation: Dict[str, Any],
-        execution_id: str,
+        self, automation: Dict[str, Any], execution_id: str
     ) -> None:
         """Wrapper that catches exceptions from executor."""
         try:

@@ -21,12 +21,15 @@ from src.tools.web.manifest import (
 class TestManifestLoading:
     def test_loads_known_providers(self):
         providers = get_web_providers()
-        assert {"tavily", "serper", "bocha", "exa", "parallel", "firecrawl", "inhouse"} <= set(
+        assert {"tavily", "serper", "bocha", "exa", "parallel", "deepseek", "firecrawl", "inhouse"} <= set(
             providers
         )
 
     def test_search_capable_providers(self):
-        assert {"tavily", "serper", "bocha", "exa", "parallel"} == set(
+        # `auto` is ours: the manifest lists it because it is a search provider
+        # to callers (it walks a fallback chain), even though its entry carries
+        # no levels of its own.
+        assert {"tavily", "serper", "bocha", "exa", "parallel", "deepseek", "auto"} == set(
             providers_with_capability(CAPABILITY_SEARCH)
         )
 

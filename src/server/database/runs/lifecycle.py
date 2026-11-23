@@ -17,6 +17,7 @@ from typing import Any, Awaitable, Callable, Dict, List, Optional
 
 import psycopg
 from psycopg.rows import dict_row
+from psycopg.types.json import Jsonb
 
 from src.server.database import conversation as qr_db
 from src.server.database import order_attempts as oa_db
@@ -35,10 +36,25 @@ from src.server.database.runs.outbox import (
     release_deferred_notifications,
     settle_run_steers,
     steer_ordering_key,
+    unhold_run_reports,
 )
-from src.server.contracts.status import TERMINAL_STATUSES
+from src.server.contracts.status import (
+    RESTART_INTERRUPTED_META,
+    SUSPENSION_STOP_META,
+    TERMINAL_STATUSES,
+    Stopper,
+    gives_back,
+    is_restart_interrupted,
+    stopper_of,
+    stops_mark,
+)
+from src.server.database.claude_code_hosted import CLI_COMPUTER
+from src.server.database.conversation.shared_thread_reads import (
+    keep_members_seen_over_quiet,
+)
+from src.server.database.home_workspace import STAND_IN_COMPUTER
 from src.server.database.provenance import MAIN_PROVENANCE_LANE
-from src.server.database.runs.hook_jobs import is_unchanged_quiet
+from src.server.database.runs.hook_jobs import SHARED_ORG_META, is_unchanged_quiet
 from src.server.utils.pg_sanitize import SafeJson, normalize_uuid
 
 logger = logging.getLogger(__name__)
@@ -169,7 +185,8 @@ class ProducerRecord:
     saved. ``reasoning_ms`` is None when nothing could time the main agent's
     thinking (a recovered run whose stream or checkpoint could not be read),
     so the row's facts stay unset. ``model_fallbacks`` are the main lane's
-    fallback ui records as streamed, kept only for a stopped or failed run,
+    notice ui records as streamed (model fallbacks, and Claude Code CLI
+    waits), kept only for a stopped or failed run,
     whose last step may never have committed its own. ``error_frame`` is the
     main lane's last error frame as streamed, kept only for a failed run.
     """
@@ -366,7 +383,8 @@ async def start_run(
     """The START transaction: fork cleanup + query row + in_progress run row +
     thread projection.
 
-    Returns the run row. Raises DuplicateRequestError / RunSlotBusyError /
+    Returns the run row, with the thread's ``thread_title`` (None for a
+    thread gone). Raises DuplicateRequestError / RunSlotBusyError /
     AttemptConflictError, each backed by a DB constraint, so two workers
     racing the same admission cannot both win regardless of what they read,
     and, for a fork, StaleForkError when the branch tip moved. A HITL answer
@@ -561,15 +579,20 @@ async def start_run(
                     run_row = dict(await cur.fetchone())
                 await land_fork_steers(conn, kept_steers, run_id)
 
-                async with conn.cursor() as cur:
+                async with conn.cursor(row_factory=dict_row) as cur:
                     await cur.execute(
                         """
                         UPDATE conversation_threads
                         SET current_status = 'in_progress', updated_at = NOW()
                         WHERE conversation_thread_id = %s
+                        RETURNING title
                         """,
                         (thread_id,),
                     )
+                    thread = await cur.fetchone()
+                # What a background run's start notice names, from the write
+                # START makes anyway, so the notice waits on no read of its own.
+                run_row["thread_title"] = thread["title"] if thread else None
 
                 if before_commit is not None:
                     await before_commit(conn)
@@ -663,8 +686,10 @@ async def finalize_run(
     the row first wins — the row lock linearizes cancel vs finalize).
     Callers must read the terminal status from the returned row, not from
     what they asked for. Pre-existing intent stamps metadata.cancelled_by_user
-    regardless of the requested status (intent only ever comes from a user
-    /cancel); a requested 'cancelled' finalize backfills cancel_requested_at
+    regardless of the requested status (true, unless the intent is the
+    account's suspension's, ``SUSPENSION_STOP_META``, which is no user stop)
+    and drops a restart's stamp, since nothing resumes a stop someone asked
+    for; a requested 'cancelled' finalize backfills cancel_requested_at
     so terminal cancelled rows are self-consistent — on terminal rows the
     flag is the user-provenance marker, the timestamp only the decision time. usage_writer runs inside the transaction on the
     same connection so a persist failure aborts the terminal transition
@@ -719,11 +744,16 @@ async def finalize_run(
                                     THEN NOW()
                                 ELSE cancel_requested_at
                             END,
-                            metadata = COALESCE(metadata, '{}'::jsonb) || %s::jsonb
+                            metadata = (COALESCE(metadata, '{}'::jsonb) || %s::jsonb
                                 || CASE
-                                    WHEN cancel_requested_at IS NOT NULL
-                                        THEN '{"cancelled_by_user": true}'::jsonb
-                                    ELSE '{}'::jsonb
+                                    WHEN cancel_requested_at IS NULL
+                                        THEN '{}'::jsonb
+                                    WHEN COALESCE(metadata->>%s, '') = 'true'
+                                        THEN '{"cancelled_by_user": false}'::jsonb
+                                    ELSE '{"cancelled_by_user": true}'::jsonb
+                                END) - CASE
+                                    WHEN cancel_requested_at IS NOT NULL THEN %s::text
+                                    ELSE ''
                                 END,
                             warnings = %s,
                             errors = %s,
@@ -746,6 +776,8 @@ async def finalize_run(
                             outcome.interrupt_reason,
                             status,
                             SafeJson(run_metadata),
+                            SUSPENSION_STOP_META,
+                            RESTART_INTERRUPTED_META,
                             outcome.warnings or [],
                             outcome.errors or [],
                             outcome.execution_time,
@@ -786,9 +818,16 @@ async def finalize_run(
 
                 seen_run_seq = None
                 if final_status == "completed" and is_unchanged_quiet(run_meta):
-                    seen_run_seq = await _keep_seen_over_quiet(
-                        conn, thread_id, run_row["run_seq"]
-                    )
+                    if run_meta.get(SHARED_ORG_META):
+                        # A shared thread's seen pointer is each member's.
+                        if run_row["run_seq"] is not None:
+                            await keep_members_seen_over_quiet(
+                                conn, thread_id, run_row["run_seq"]
+                            )
+                    else:
+                        seen_run_seq = await _keep_seen_over_quiet(
+                            conn, thread_id, run_row["run_seq"]
+                        )
 
                 await qr_db._sync_provenance_for_response(
                     conn,
@@ -825,9 +864,14 @@ async def finalize_run(
                 # POST would collide with it, and the turn that resumes it
                 # takes them in as a steer. An interrupted turn that later
                 # errors or cancels releases here, so a parked job can never
-                # be stranded. Same transaction as the terminal CAS, so
+                # be stranded. A turn a restart stopped keeps them parked
+                # too, for the turn that resumes it, and gives back the ones
+                # it held (``report_back.restart`` releases them should no
+                # resume come). Same transaction as the terminal CAS, so
                 # release and successor hooks commit together.
-                if final_status in ("completed", "error", "cancelled"):
+                if is_restart_interrupted(run_row):
+                    await unhold_run_reports(conn, thread_id, run_id)
+                elif final_status in ("completed", "error", "cancelled"):
                     released = await release_deferred_notifications(
                         conn, thread_id
                     )
@@ -845,15 +889,7 @@ async def finalize_run(
                     thread_id=thread_id,
                     run_id=run_id,
                     final_status=final_status,
-                    user_cancel=(
-                        final_status == "cancelled"
-                        and bool(run_meta.get("cancelled_by_user"))
-                        and not run_meta.get("stopped_by_agent")
-                    ),
-                    agent_stop=(
-                        final_status == "cancelled"
-                        and bool(run_meta.get("stopped_by_agent"))
-                    ),
+                    stopper=stopper_of(run_row),
                 )
 
                 if conn.info.transaction_status == psycopg.pq.TransactionStatus.INERROR:
@@ -893,7 +929,10 @@ async def _get_finalize_row(run_id: str) -> Optional[Dict[str, Any]]:
 
 
 async def request_run_cancel(
-    run_id: str, thread_id: Optional[str] = None, *, by_user: bool = True
+    run_id: str,
+    thread_id: Optional[str] = None,
+    *,
+    by: Stopper = "user",
 ) -> Dict[str, Any]:
     """Durable cancel intent: honest, idempotent, never a recorded losing cancel.
 
@@ -912,16 +951,18 @@ async def request_run_cancel(
     row as in_progress — one lap would misreport that as already_requested
     while no intent ever landed. The second lap stamps the now-visible row.
 
-    ``by_user=False`` is an agent's stop: it marks the run ``stopped_by_agent``
-    and leaves the user's steers for the run's ending to keep.
+    A stop by anyone but the user (``by``) leaves the user's steers for the
+    run's ending to keep, and marks the run with ``stops_mark(by)`` in the
+    stamp's own UPDATE, so the first stop stamped is the one recorded.
     """
+    by_user = gives_back(by)
     sql = """
         UPDATE conversation_responses
         SET cancel_requested_at = NOW()"""
-    if not by_user:
-        sql += """,
-            metadata = COALESCE(metadata, '{}'::jsonb)
-                || '{"stopped_by_agent": true}'::jsonb"""
+    if (mark := stops_mark(by)) is not None:
+        sql += f""",
+            metadata = COALESCE(metadata, '{{}}'::jsonb)
+                || jsonb_build_object('{mark}', true)"""
     sql += """
         WHERE conversation_response_id = %s
           AND status = 'in_progress'
@@ -1006,6 +1047,35 @@ async def get_run(run_id: str) -> Optional[Dict[str, Any]]:
             return dict(row) if row else None
 
 
+async def get_run_replay_facts(run_id: str) -> Optional[Dict[str, Any]]:
+    async with pool.get_db_connection() as conn:
+        async with conn.cursor() as cur:
+            await cur.execute(
+                "SELECT replay_facts FROM conversation_responses "
+                "WHERE conversation_response_id = %s",
+                (run_id,),
+            )
+            row = await cur.fetchone()
+            return row[0] if row else None
+
+
+async def cancel_requested_runs(run_ids: list[str]) -> set[str]:
+    """Of ``run_ids``, the runs still in progress that carry cancel intent."""
+    if not run_ids:
+        return set()
+    async with pool.get_db_connection() as conn:
+        async with conn.cursor(row_factory=dict_row) as cur:
+            await cur.execute(
+                """
+                SELECT conversation_response_id FROM conversation_responses
+                WHERE conversation_response_id = ANY(%s::uuid[])
+                  AND status = 'in_progress' AND cancel_requested_at IS NOT NULL
+                """,
+                (run_ids,),
+            )
+            return {str(row["conversation_response_id"]) for row in await cur.fetchall()}
+
+
 async def get_run_brief(conn, run_id: str) -> Optional[Dict[str, Any]]:
     """A run's id, thread, request key and status, read on ``conn``.
 
@@ -1069,6 +1139,57 @@ async def get_active_run(thread_id: str) -> Optional[Dict[str, Any]]:
             return dict(row) if row else None
 
 
+async def open_runs_of_user(
+    user_id: str, *, started_before: Optional[datetime] = None
+) -> List[Dict[str, Any]]:
+    """The user's turns still in progress, started before ``started_before``
+    when given: ``conversation_response_id`` and ``conversation_thread_id``
+    of each."""
+    async with pool.get_db_connection() as conn:
+        async with conn.cursor(row_factory=dict_row) as cur:
+            await cur.execute(
+                """
+                SELECT conversation_response_id, conversation_thread_id
+                FROM conversation_responses
+                WHERE user_id = %s AND status = 'in_progress'
+                  AND (%s::timestamptz IS NULL OR created_at < %s::timestamptz)
+                """,
+                (user_id, started_before, started_before),
+            )
+            return [dict(r) for r in await cur.fetchall()]
+
+
+async def user_has_running_work(user_id: str) -> bool:
+    """Whether the user has anything an account stop acts on: a turn, a
+    subagent run or a background command in progress, or a running
+    computer. The first three are found through their status indexes, so
+    each reads every row in progress on the deployment, not the user's: a
+    cost the size of the work running at the time, paid once per notice.
+    Notices are rare, and an index by user would be paid at every run's
+    start; computers have one."""
+    async with pool.get_db_connection() as conn:
+        async with conn.cursor() as cur:
+            await cur.execute(
+                """
+                SELECT EXISTS (
+                           SELECT 1 FROM conversation_responses
+                           WHERE user_id = %(u)s AND status = 'in_progress')
+                    OR EXISTS (
+                           SELECT 1 FROM subagent_runs
+                           WHERE user_id = %(u)s AND status = 'in_progress')
+                    OR EXISTS (
+                           SELECT 1 FROM command_runs
+                           WHERE user_id = %(u)s AND status = 'running')
+                    OR EXISTS (
+                           SELECT 1 FROM computers
+                           WHERE user_id = %(u)s AND status = 'running')
+                """,
+                {"u": user_id},
+            )
+            row = await cur.fetchone()
+            return bool(row and row[0])
+
+
 async def workspace_has_active_run(workspace_id: str) -> bool:
     """Any live root run on any thread of the workspace — cross-worker,
     unlike the in-process task map."""
@@ -1089,6 +1210,24 @@ async def workspace_has_active_run(workspace_id: str) -> bool:
             return bool((await cur.fetchone())[0])
 
 
+def live_runs_exist(workspace: str) -> str:
+    """SQL true when any root or background run is in progress on the threads
+    of the workspace ``workspace`` names (a placeholder or a column), so every
+    reader asking whether a workspace is busy asks the same question."""
+    return f"""
+        EXISTS (
+            SELECT 1 FROM conversation_responses r
+            JOIN conversation_threads t
+              ON t.conversation_thread_id = r.conversation_thread_id
+            WHERE t.workspace_id = {workspace} AND r.status = 'in_progress'
+            UNION ALL
+            SELECT 1 FROM subagent_runs r
+            JOIN conversation_threads t
+              ON t.conversation_thread_id = r.thread_id
+            WHERE t.workspace_id = {workspace} AND r.status = 'in_progress'
+        )"""
+
+
 async def workspace_has_live_runs(cur, workspace_id: str) -> bool:
     """Any root or background run in progress on the workspace's threads.
 
@@ -1097,26 +1236,16 @@ async def workspace_has_live_runs(cur, workspace_id: str) -> bool:
     FOR SHARE until its run row commits.
     """
     await cur.execute(
-        """
-        SELECT EXISTS (
-            SELECT 1 FROM conversation_responses r
-            JOIN conversation_threads t
-              ON t.conversation_thread_id = r.conversation_thread_id
-            WHERE t.workspace_id = %(workspace_id)s AND r.status = 'in_progress'
-            UNION ALL
-            SELECT 1 FROM subagent_runs r
-            JOIN conversation_threads t
-              ON t.conversation_thread_id = r.thread_id
-            WHERE t.workspace_id = %(workspace_id)s AND r.status = 'in_progress'
-        ) AS busy
-        """,
+        f"SELECT {live_runs_exist('%(workspace_id)s')} AS busy",
         {"workspace_id": workspace_id},
     )
     return (await cur.fetchone())["busy"]
 
 
 async def computer_has_active_run(computer_id: str) -> bool:
-    """Any live root run on any workspace bound to the computer.
+    """Any live root run on any workspace bound to the computer, or whose
+    Claude Code CLI runs on it for a workspace on another (``CLI_COMPUTER``),
+    or that runs in Home's stand-in on it (``STAND_IN_COMPUTER``).
 
     The machine-scoped twin of ``workspace_has_active_run``, and a join rather
     than a counter column because a torn-down computer takes every project on it
@@ -1125,7 +1254,7 @@ async def computer_has_active_run(computer_id: str) -> bool:
     two functions return the same thing.
     """
     async with pool.get_db_connection() as conn:
-        async with conn.cursor() as cur:
+        async with conn.cursor(row_factory=dict_row) as cur:
             await cur.execute(
                 """
                 SELECT EXISTS(
@@ -1134,12 +1263,17 @@ async def computer_has_active_run(computer_id: str) -> bool:
                     JOIN conversation_threads t
                       ON t.conversation_thread_id = r.conversation_thread_id
                     JOIN workspaces w ON w.workspace_id = t.workspace_id
-                    WHERE w.computer_id = %s AND r.status = 'in_progress'
-                )
+                    WHERE r.status = 'in_progress'
+                      AND (w.computer_id = %s OR r.metadata @> %s OR r.metadata @> %s)
+                ) AS active
                 """,
-                (computer_id,),
+                (
+                    computer_id,
+                    Jsonb({CLI_COMPUTER: computer_id}),
+                    Jsonb({STAND_IN_COMPUTER: computer_id}),
+                ),
             )
-            return bool((await cur.fetchone())[0])
+            return (await cur.fetchone())["active"]
 
 
 async def get_latest_attempt(
@@ -1147,6 +1281,7 @@ async def get_latest_attempt(
     *,
     before_turn: Optional[int] = None,
     wait_for_finalize: bool = False,
+    without_key: Optional[str | tuple[str, ...]] = None,
 ) -> Optional[Dict[str, Any]]:
     """The thread's most recent attempt row — /retry's validation target.
 
@@ -1161,12 +1296,18 @@ async def get_latest_attempt(
     ``wait_for_finalize`` reads the row ``FOR SHARE``, which waits out a
     finalize in flight: its terminal CAS holds the row until it commits, so
     a run whose finalize has already run its release pass never reads live.
+
+    ``without_key`` passes over attempts whose metadata holds that key, or
+    any of those keys.
     """
     clauses = ["conversation_thread_id = %s"]
     params: list[Any] = [thread_id]
     if before_turn is not None:
         clauses.append("turn_index < %s")
         params.append(before_turn)
+    for key in (without_key,) if isinstance(without_key, str) else without_key or ():
+        clauses.append("NOT (COALESCE(metadata, '{}'::jsonb) ? %s)")
+        params.append(key)
     lock = "FOR SHARE" if wait_for_finalize else ""
     async with pool.get_db_connection() as conn:
         async with conn.cursor(row_factory=dict_row) as cur:
@@ -1182,6 +1323,24 @@ async def get_latest_attempt(
             )
             row = await cur.fetchone()
             return dict(row) if row else None
+
+
+async def get_latest_run_id(thread_id: str) -> Optional[str]:
+    """``get_latest_attempt``'s run id alone, for a poll that reads it every
+    second."""
+    async with pool.get_db_connection() as conn:
+        async with conn.cursor() as cur:
+            await cur.execute(
+                """
+                SELECT conversation_response_id::text FROM conversation_responses
+                WHERE conversation_thread_id = %s
+                ORDER BY run_seq DESC
+                LIMIT 1
+                """,
+                (thread_id,),
+            )
+            row = await cur.fetchone()
+            return row[0] if row else None
 
 
 async def thread_has_dispatch_gen(thread_id: str, dispatch_gen: str) -> bool:
@@ -1341,9 +1500,11 @@ async def get_continued_runs(thread_id: str, run_id: str) -> List[str]:
     A run that ends interrupted waits on the user and reports nothing; the
     next attempt on the thread, a resume or a message past the interrupt,
     carries its work on and reports for it, as ``carried_pair`` has it carry
-    a summary's pair. So a report on the last leg answers every leg back to
-    the first one that did not follow an interrupt, which is the run a
-    hand-off named. Empty when ``run_id`` is not a run of ``thread_id``.
+    a summary's pair. A run a restart stopped reports nothing either, and the
+    turn that resumes it carries it on the same way. So a report on the last
+    leg answers every leg back to the first one that did not follow an
+    interrupt or a restart, which is the run a hand-off named. Empty when
+    ``run_id`` is not a run of ``thread_id``.
     """
     thread, run = normalize_uuid(thread_id), normalize_uuid(run_id)
     if thread is None or run is None:
@@ -1352,7 +1513,7 @@ async def get_continued_runs(thread_id: str, run_id: str) -> List[str]:
         async with conn.cursor(row_factory=dict_row) as cur:
             await cur.execute(
                 """
-                SELECT conversation_response_id, status
+                SELECT conversation_response_id, status, metadata
                 FROM conversation_responses
                 WHERE conversation_thread_id = %s
                   AND run_seq <= (
@@ -1367,10 +1528,10 @@ async def get_continued_runs(thread_id: str, run_id: str) -> List[str]:
             )
             rows = await cur.fetchall()
     # The first row is the run itself; each earlier one joins while it ended
-    # interrupted.
+    # interrupted, or stopped by a restart.
     chain = [str(r["conversation_response_id"]) for r in rows[:1]]
     for row in rows[1:]:
-        if row["status"] != "interrupted":
+        if row["status"] != "interrupted" and not is_restart_interrupted(row):
             break
         chain.append(str(row["conversation_response_id"]))
     return chain[::-1]
@@ -1464,5 +1625,11 @@ async def pointer_pinned_by_fork(
 async def find_run_by_request_key(request_key: str) -> Optional[Dict[str, Any]]:
     async with pool.get_db_connection() as conn:
         return await _run_by_request_key(conn, request_key)
+
+
+async def request_key_has_run(conn, request_key: str) -> bool:
+    """Whether a run took ``request_key``, read on the caller's connection so
+    it can follow a lock the caller holds."""
+    return await _run_by_request_key(conn, request_key) is not None
 
 

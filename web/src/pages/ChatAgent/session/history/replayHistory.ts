@@ -19,15 +19,16 @@ import type { HtmlWidgetData, MessageRecord } from '../../hooks/utils/types';
 import {
   buildModelFallbackSegment, appendNotificationSegmentOnce, mapToolCallIdToAgentId,
 } from '../../hooks/utils/messageFinalizers';
-import { applyCallUsage, handleContextWindowEvent } from '../../hooks/utils/contextWindowEvent';
-import { handleProvenance } from '../stream/mainEventHandlers';
+import { handleContextWindowEvent } from '../../hooks/utils/contextWindowEvent';
+import { applyCallUsage } from '../tokenUsage';
+import { handleCliQueue, handlePlanBilled, handleProvenance } from '../stream/mainEventHandlers';
+import { eventOrder } from '../eventOrder';
 import {
   handleHistoryUserMessage,
   handleHistoryReasoningSignal,
   handleHistoryReasoningContent,
   handleHistoryTextContent,
   handleHistoryToolCalls,
-  handleHistoryTodoUpdate,
   handleHistoryHtmlWidget,
   handleHistorySteeringDelivered,
   handleHistoryTaskArtifactStatus,
@@ -43,8 +44,12 @@ import { createApprovalEvidence, recordApprovalEvidence } from '../interrupts/cl
 import { projectHistoryInterrupt } from '../interrupts/fromHistoryEvent';
 import type { HistoryRuntime } from '../runtime';
 import type { HistoryPageInfo, LoadedHistoryPage } from './olderPages';
+import type { PageBudget } from './pageBudget';
 import { applyHistoryToolResult, markSteeredResumeCards, settleResumedInterrupts } from './resumeSettlement';
 import { readStreamFailure } from '../stream/streamFailure';
+import { readStop } from '../stream/stopBubble';
+import { readTurnRefusal } from '@/lib/turnRefusal';
+import { applyPlanSnapshot, readPlanSteps } from '../planUpdate';
 
 /** A bubble the replay opened for a turn that nothing has written to. */
 function isEmptyStub(m: MessageRecord): boolean {
@@ -65,8 +70,8 @@ export interface ReplayHistoryDeps {
    *  what the load will return. The caller settles here what only it can judge
    *  (a run that is over), so the transcript never appears unsettled first. */
   beforeReveal?: (ok: boolean) => void;
-  /** Page size for the newest page; omitted replays the whole thread. */
-  limit?: number;
+  /** What the newest page may carry; omitted replays the whole thread. */
+  page?: PageBudget;
   /** Replay the page before this turn instead, into a transcript of its own:
    *  an older page (loadOlderHistoryPage), with `signal` to abort its fetch. */
   beforeTurn?: number;
@@ -93,13 +98,7 @@ export async function loadConversationHistory(
   // may have started after reading the one this replay names.
   const liveRunEpoch = rt.latestRunEpochRef.current;
 
-  // The todo card shows only the last state, so it is written once, with the
-  // transcript and the caller's settle step. Written per event, it showed the
-  // replay's in-progress todos over the loading transcript, then shrank when
-  // a run that was over got its leftovers marked stale.
-  let lastTodoCard: Record<string, unknown> | null = null;
   const reveal = (ok: boolean) => {
-    if (lastTodoCard) rt.updateTodoListCard?.(lastTodoCard);
     deps.beforeReveal?.(ok);
     rt.setIsLoadingHistory(false);
     rt.historyLoadingRef.current = false;
@@ -204,6 +203,12 @@ export async function loadConversationHistory(
     // not render can be left to the page that holds the call.
     const seenToolCallIds = new Set<string>();
     const carryEvents: SSEEvent[] = [];
+    // The reply of the turn the replay is in, which a frame with no turn of
+    // its own (an artifact, a notice) belongs to.
+    const activeReplyId = (): string | null => (currentActivePairIndex !== null
+      ? (assistantMessagesByPair.get(currentActivePairIndex) ?? null) : null);
+    // That turn's next order, for a frame that carries no id of its own.
+    const nextCount = (): number => (currentActivePairState ? ++currentActivePairState.contentOrderCounter : 0);
     try {
       const onEvent = (_rawEvent: Record<string, unknown>): void => {
       stripHistory();
@@ -267,17 +272,8 @@ export async function loadConversationHistory(
       // Subagent context_window events are routed through the isSubagent block below.
       if (eventType === 'context_window' && !isSubagent) {
         handleContextWindowEvent(event, {
-          getMsgId: () => currentActivePairIndex !== null
-            ? (assistantMessagesByPair.get(currentActivePairIndex) ?? null) : null,
-          nextOrder: () => {
-            const eventId = event._eventId;
-            if (eventId != null) return Number(eventId);
-            if (currentActivePairState) {
-              currentActivePairState.contentOrderCounter++;
-              return currentActivePairState.contentOrderCounter;
-            }
-            return 0;
-          },
+          getMsgId: activeReplyId,
+          nextOrder: () => eventOrder(event, nextCount),
           setMessages: rt.setMessages,
           setTokenUsage: rt.setTokenUsage,
           live: false,
@@ -297,17 +293,41 @@ export async function loadConversationHistory(
         // so the last turn's fallbacks win (user_message boundaries and
         // replayed error events clear it along the way).
         deps.applyFallbackSuggestion(event);
-        const msgId = currentActivePairIndex !== null
-          ? (assistantMessagesByPair.get(currentActivePairIndex) ?? null) : null;
+        const msgId = activeReplyId();
         if (msgId) {
-          const order = event._eventId != null
-            ? Number(event._eventId)
-            : (currentActivePairState ? ++currentActivePairState.contentOrderCounter : 0);
+          const order = eventOrder(event, nextCount);
           const segment = buildModelFallbackSegment(event, rt.t, order);
           rt.setMessages((prev) => updateMessage(prev, msgId, (msg) => {
             if (msg.role !== 'assistant') return msg;
             return appendNotificationSegmentOnce(msg as AssistantMessage, segment);
           }));
+        }
+        return;
+      }
+
+      // A reply whose last request was billed to usage credits replays its
+      // notice under it, as the live stream drew it. Main agent only.
+      if (eventType === 'claude_code_plan') {
+        const msgId = activeReplyId();
+        if (!isSubagent && msgId) {
+          handlePlanBilled({
+            assistantMessageId: msgId,
+            event,
+            order: eventOrder(event, nextCount),
+            setMessages: setMessagesForHandlers,
+          });
+        }
+        return;
+      }
+
+      // A turn that waited for a Claude Code CLI replays the wait's notice
+      // where it happened, as the live stream's `admitted` drew it: the
+      // server sends the frame there. The live line has no replay: a reload
+      // finds the wait over or not yet recorded. Main agent only.
+      if (eventType === 'claude_code_queue') {
+        const msgId = activeReplyId();
+        if (!isSubagent && msgId) {
+          handleCliQueue({ assistantMessageId: msgId, event, order: eventOrder(event, nextCount), setMessages: setMessagesForHandlers });
         }
         return;
       }
@@ -318,17 +338,16 @@ export async function loadConversationHistory(
       // as the live stream did, which is what offers its Retry.
       if (eventType === 'error' && !isSubagent) {
         rt.setFallbackSuggestion(null);
-        const msgId = currentActivePairIndex !== null
-          ? (assistantMessagesByPair.get(currentActivePairIndex) ?? null) : null;
+        const msgId = activeReplyId();
         if (msgId) {
           // A failure the server classified carries only the text it chose to
           // show, none for its own (internal) faults; an older row's raw text
           // is all an unclassified one has.
           const text = (event.error || event.message || '') as string;
+          const failure = readStreamFailure(event, text, readTurnRefusal(event), rt.workspaceId, rt.t);
           handleHistoryError({
             assistantMessageId: msgId,
-            failure: readStreamFailure(event, text)
-              ?? { message: text || 'An error occurred while processing your request.' },
+            failure: failure ?? { message: text || 'An error occurred while processing your request.' },
             unloaded: event.type === 'replay_unavailable',
             setMessages: setMessagesForHandlers,
           });
@@ -351,7 +370,7 @@ export async function loadConversationHistory(
           pairStateByPair,
           refs: { newMessagesStartIndexRef: rt.newMessagesStartIndexRef },
           setMessages: setMessagesForHandlers,
-          onCopyDelivered: (key) => rt.requestKeyRef.current.settle(key),
+          onCopyDelivered: (key) => rt.requestKeyRef.current.settle(key, 'accepted'),
         });
         return;
       }
@@ -516,6 +535,7 @@ export async function loadConversationHistory(
             assistantMessageId: currentAssistantMessageId,
             content: '',
             finishReason: event.finish_reason,
+            stop: readStop(event),
             pairState,
             setMessages: setMessagesForHandlers,
             eventId: event._eventId as number | undefined,
@@ -529,29 +549,19 @@ export async function loadConversationHistory(
         return;
       }
 
-      // Handle artifact events (e.g., todo_update)
+      // Handle artifact events (e.g., the plan)
       // In history replay, artifacts DO have turn_index, so we can use it directly
       //
-      // NOTE: `chart_annotation` artifacts are intentionally NOT replayed here
-      // (only the live stream applies them to the annotation store). On reload,
+      // NOTE: `chart_layer` artifacts are intentionally NOT replayed here
+      // (only the live stream applies them to the layer store). On reload,
       // every live chart (MarketView's, and the chat's chart tab through
       // `MarketChartSurface`) repopulates the store from Postgres with
-      // `useChartAnnotationSync`, and the inline card renders from the
-      // replayed `tool_call_result.artifact`.
+      // `useChartLayerSync`, and the inline card renders from the replayed
+      // tool result's `chart_layers`.
       if (eventType === 'artifact') {
         const artifactType = event.artifact_type;
-        if (artifactType === 'todo_update') {
-          const payload = event.payload || {};
-
-          // Floating todo card: last event wins, written at the reveal
-          lastTodoCard = {
-            todos: Array.isArray(payload.todos) ? payload.todos : [],
-            total: payload.total || 0,
-            completed: payload.completed || 0,
-            in_progress: payload.in_progress || 0,
-            pending: payload.pending || 0,
-          };
-
+        const steps = readPlanSteps(artifactType, event.payload);
+        if (steps) {
           // Artifacts in history replay have turn_index - use it!
           if (hasPairIndex) {
             const pairIndex = event.turn_index!;
@@ -567,15 +577,7 @@ export async function loadConversationHistory(
               return;
             }
 
-            handleHistoryTodoUpdate({
-              assistantMessageId: currentAssistantMessageId,
-              artifactType: artifactType as string,
-              artifactId: event.artifact_id as string,
-              payload,
-              pairState: pairState,
-              setMessages: setMessagesForHandlers,
-              eventId: event._eventId as number | undefined,
-            });
+            applyPlanSnapshot(setMessagesForHandlers, currentAssistantMessageId, steps, eventOrder(event, () => ++pairState.contentOrderCounter));
           } else {
             // Fallback: artifacts without turn_index (shouldn't happen in history, but handle gracefully)
             console.warn('[History] Artifact without turn_index, using active pair fallback');
@@ -593,15 +595,8 @@ export async function loadConversationHistory(
             }
 
             if (targetAssistantMessageId && targetPairState) {
-              handleHistoryTodoUpdate({
-                assistantMessageId: targetAssistantMessageId,
-                artifactType: artifactType as string,
-                artifactId: event.artifact_id as string,
-                payload,
-                pairState: targetPairState,
-                setMessages: setMessagesForHandlers,
-                eventId: event._eventId as number | undefined,
-              });
+              const pair = targetPairState;
+              applyPlanSnapshot(setMessagesForHandlers, targetAssistantMessageId, steps, eventOrder(event, () => ++pair.contentOrderCounter));
             }
           }
         }
@@ -816,7 +811,7 @@ export async function loadConversationHistory(
       }
     };
       const result = await replayThreadHistory(threadIdToUse, onEvent, {
-        limit: deps.limit, beforeTurn: deps.beforeTurn, signal: deps.signal,
+        page: deps.page, beforeTurn: deps.beforeTurn, signal: deps.signal,
       });
       stripHistory();
       // An older page that did not arrive whole is no page.
@@ -904,12 +899,13 @@ export async function loadConversationHistory(
       lastTurnIndex: maxReplayedTurnIndex,
       carry: { events: carryEvents, subagents: subagentHistoryByTaskId, steeredAgentIds },
     });
+    // The thread's ratings (best-effort), started before the transcript shows
+    // so its turns read as loading rather than unrated. Not awaited: the
+    // reveal opens the composer, and a turn sent while the load still waited
+    // on the ratings read as taking the load over, so the load ran again once
+    // that turn ended and replayed it.
+    if (rt.threadId) void deps.loadFeedback(rt.threadId);
     reveal(true);
-
-    // Fetch feedback state for the thread (best-effort)
-    if (rt.threadId) {
-      await deps.loadFeedback(rt.threadId);
-    }
     return true;
   } catch (error: unknown) {
     if (olderPage) throw error;

@@ -65,6 +65,10 @@ _HOME_DESCRIPTION = (
 )
 
 
+# The `<workspace>` block's facts of the computer, as get_workspace_naming reads them.
+_COMPUTER_FACTS = ("computer_name", "computers", "computer_kind", "provider_config", "root_dir")
+
+
 async def _read_harness_blocks(
     user_id: str | None,
     session: Session,
@@ -93,7 +97,9 @@ async def _read_harness_blocks(
     from src.tools.secretary.activity import read_activity
 
     try:
-        computers = await get_computer_roster(user_id)
+        computers = _home_where_the_turn_runs(
+            await get_computer_roster(user_id), session.computer_id
+        )
     except Exception:  # noqa: BLE001 - the turn runs on its own computer
         logger.warning("Could not read the computers of %s", user_id, exc_info=True)
         return {"activity": None}, None
@@ -108,8 +114,25 @@ async def _read_harness_blocks(
     return {"activity": activity}, reach
 
 
+def _home_where_the_turn_runs(
+    computers: list[dict[str, Any]], computer_id: str | None
+) -> list[dict[str, Any]]:
+    """The roster with ``is_home`` on the computer the turn runs on.
+
+    The same computer as Home's, except on a Home turn in its stand-in, which
+    runs on a cloud computer while the machine Home is on can't be reached:
+    there Home's tools run on the cloud computer, and the machine is one of
+    the others.
+    """
+    if not computer_id:
+        return computers
+    return [
+        {**c, "is_home": str(c["computer_id"]) == str(computer_id)} for c in computers
+    ]
+
+
 async def _read_workspace_naming(
-    workspace_id: str, role: AgentRole = "analyst"
+    workspace_id: str, role: AgentRole = "analyst", *, runs_in: str | None = None
 ) -> Workspace | None:
     """The workspace's name, description and computer for the `<workspace>` block.
 
@@ -127,6 +150,11 @@ async def _read_workspace_naming(
         from src.server.database.workspace import get_workspace_naming
 
         row = await get_workspace_naming(workspace_id) or {}
+        if runs_in and runs_in != workspace_id:
+            # The computer is the one the folder the turn runs in is on:
+            # Home's stand-in's, for a Home turn there.
+            placed = await get_workspace_naming(runs_in) or {}
+            row = {**row, **{key: placed.get(key) for key in _COMPUTER_FACTS}}
     except Exception as e:
         logger.warning(f"Failed to read the name of workspace {workspace_id}: {e}")
         return None
@@ -198,7 +226,9 @@ async def build_ptc_graph(
         workspace=workspace,
         store=store,
         on_signed_url=on_signed_url,
+        # A build with one account: the sender's own workspace.
         user_id=user_id,
+        owner_id=user_id,
         user_data_counts=user_data_counts,
         tool_summary=getattr(session, "mcp_tool_summary", None),
     )
@@ -218,6 +248,8 @@ async def build_ptc_graph_with_session(
     checkpointer: Any | None = None,
     background_registry: Any | None = None,
     user_id: str | None = None,
+    owner_id: str | None = None,
+    own_data: bool = True,
     user_profile: dict[str, Any] | None = None,
     thread_id: str | None = None,
     store: Any | None = None,
@@ -234,6 +266,9 @@ async def build_ptc_graph_with_session(
     window_coverage: WindowCoverage | None = None,
     cancel_notices: CancelNotices | None = None,
     reached_computers: set[str] | None = None,
+    claude_code_launcher: Any | None = None,
+    thread_history: Any | None = None,
+    member_context: Any | None = None,
 ) -> Any:
     """Build a BackgroundSubagentOrchestrator from a pre-acquired session (WorkspaceManager path).
 
@@ -249,13 +284,21 @@ async def build_ptc_graph_with_session(
     ``tool_view`` is the project's frozen registry and summary. The session's
     own fields belong to whichever project on the machine resolved last.
 
+    ``user_id`` is the turn's sender, ``owner_id`` the workspace's owner and
+    ``own_data`` whether the build may use the sender's own data
+    (``PTCAgent.create_agent``).
+
     ``subagent_switch`` reads the thread's subagent switch on every call; a
     build without one leaves subagents as built. ``window_coverage`` lets the
     main agent trim its checkpoint to its window (see ``compaction.window``);
     a build without one never trims. ``cancel_notices`` tells the agent of
     the user's cancels of its wakeups; a build without one tells it of none.
     ``reached_computers`` collects the user's other computers a Chief of Staff
-    turn ran calls on, for the turn's end to back up.
+    turn ran calls on, for the turn's end to back up. ``claude_code_launcher``
+    says where a Claude Code turn's CLI runs (``PTCAgent.create_agent``), and
+    ``thread_history`` serves the thread's own transcript to the file tools
+    and ``member_context`` names the member whose own context a shared
+    workspace's turn carries (``PTCAgent.create_agent``).
     """
     mcp_registry = (
         tool_view.mcp_registry if tool_view is not None else session.mcp_registry
@@ -282,22 +325,26 @@ async def build_ptc_graph_with_session(
         workspace,
         (harness_blocks, computers),
     ) = await asyncio.gather(
-        fetch_user_data_counts(user_id),
+        fetch_user_data_counts(user_id if own_data else None),
         asyncio.to_thread(PTCAgent, config),
-        _read_workspace_naming(workspace_id, role),
+        _read_workspace_naming(
+            project.owner_id if project else "",
+            role,
+            runs_in=project.workspace_id if project else None,
+        ),
         _read_harness_blocks(
-            user_id, session, workspace_id, thread_id, turn_context, role,
-            reached_computers,
+            user_id, session, project.owner_id if project else "", thread_id,
+            turn_context, role, reached_computers,
         ),
     )
 
-    if workspace_id and user_id:
+    if workspace_id and owner_id:
         from src.server.database.user_vault_secrets import get_user_secrets_decrypted
 
         # Leak detection redacts the owner's whole vault, read fresh: every
         # workspace can read every secret, and the sandbox's cached copy is
         # process-local, so a rotation handled by another worker leaves it stale.
-        vault_secrets = await get_user_secrets_decrypted(user_id)
+        vault_secrets = await get_user_secrets_decrypted(owner_id)
     else:
         vault_secrets = dict(getattr(session.sandbox, "vault_secrets", None) or {})
 
@@ -318,6 +365,8 @@ async def build_ptc_graph_with_session(
         on_signed_url=on_signed_url,
         vault_secrets=vault_secrets,
         user_id=user_id,
+        owner_id=owner_id,
+        own_data=own_data,
         user_data_counts=user_data_counts,
         # Session-cached tool summary (precomputed once per session) so the per
         # turn create_agent never recomputes it — keeps the prompt-cache prefix
@@ -333,6 +382,9 @@ async def build_ptc_graph_with_session(
         window_coverage=window_coverage,
         cancel_notices=cancel_notices,
         computers=computers,
+        claude_code_launcher=claude_code_launcher,
+        thread_history=thread_history,
+        member_context=member_context,
     )
 
     logger.debug(

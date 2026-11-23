@@ -1,13 +1,14 @@
 import { useMemo, type ReactNode } from 'react';
 import { motion } from '@/lib/framer';
+import { TickerLabel } from '@/components/TickerLogo';
 import { SkeletonBar } from '@/components/ui/skeleton';
 import { useLastShape } from '@/lib/lastShape';
 import { TWEEN } from '@/lib/motion';
 import { useTranslation } from 'react-i18next';
 import { useNavigate } from 'react-router';
 import { Pencil, Trash2, Eye, EyeOff } from 'lucide-react';
-import { getExtendedHoursInfo } from '@/lib/marketUtils';
-import { integer } from '@/lib/format';
+import { sessionQuote, type MarketStatusData } from '@/lib/marketUtils';
+import { DASH, formatList, integer } from '@/lib/format';
 import { useLocale } from '@/hooks/useLocale';
 import { formatMoney, quoteCurrency } from '@/lib/bars';
 import {
@@ -24,8 +25,6 @@ import {
   formatPortfolioMoney,
   normalizePortfolioCurrency,
 } from '../../utils/portfolioSummary';
-
-type MarketStatusData = Parameters<typeof getExtendedHoursInfo>[0];
 
 /** The pre- or after-hours move under a row's change: `AH 199.10 ▲ 0.34%`. */
 function ExtendedHours({
@@ -83,7 +82,7 @@ export function PortfolioTable({ children }: { children: ReactNode }) {
 
 interface WatchlistRowItemProps {
   item: WatchlistRow;
-  marketStatus: MarketStatusData;
+  marketStatus: MarketStatusData | null;
   onDelete?: (id: string) => void;
   /** The row's paperclip, set at the end of the symbol's cell. */
   attach?: ReactNode;
@@ -122,8 +121,9 @@ export function WatchlistRowItem({ item, marketStatus, onDelete, attach }: Watch
   // with the row's own listing suffix as the fallback for older payloads. An
   // index level prints bare.
   const code = quoteCurrency(item.currency, item.symbol, item.assetClass);
-
-  const { extPct, extType, extLabel } = getExtendedHoursInfo(marketStatus, item, { shortLabels: true });
+  // The stock header's split: the official close and its change, with the
+  // extended move beside it against its own anchor rather than inside both.
+  const { headline, ext } = sessionQuote(marketStatus, item, { shortLabels: true });
 
   const row = (
     <motion.tr
@@ -135,23 +135,27 @@ export function WatchlistRowItem({ item, marketStatus, onDelete, attach }: Watch
       onClick={() => navigate(`/market?symbol=${encodeURIComponent(item.symbol)}`)}
     >
       <td className="term-fill term-code term-strong dash-attach-cell">
-        <span title={item.symbol}>{watchlistLabel(item)}</span>
+        <TickerLabel symbol={item.symbol}><span title={item.symbol}>{watchlistLabel(item)}</span></TickerLabel>
         <span className="dash-sub">{t(watchlistKindKey(item))}</span>
         {attach}
       </td>
       <td className="term-num">
-        {hasQuote
-          ? formatMoney(Number(extType && item.previousClose != null ? item.previousClose : item.price), code, locale)
-          : 'N/A'}
+        {hasQuote ? formatMoney(headline.price, code, locale, { upTo: item.places }) : 'N/A'}
       </td>
       <td
         className="term-num"
-        title={hasQuote ? formatMoney(Number(item.change), code, locale, { signed: true }) : undefined}
+        title={hasQuote && headline.change != null ? formatMoney(headline.change, code, locale, { signed: true, upTo: item.places }) : undefined}
       >
-        {hasQuote ? <TermChange value={Number(item.changePercent)} /> : <span className="term-t3">N/A</span>}
-        {hasQuote && extType && extLabel && extPct != null && (
+        {!hasQuote ? (
+          <span className="term-t3">N/A</span>
+        ) : headline.pct != null ? (
+          <TermChange value={headline.pct} />
+        ) : (
+          <span className="term-t3">{DASH}</span>
+        )}
+        {hasQuote && ext && (
           <span className="block">
-            <ExtendedHours label={extLabel} price={formatMoney(Number(item.price), code, locale)} pct={extPct} />
+            <ExtendedHours label={ext.label} price={formatMoney(ext.price, code, locale, { upTo: item.places })} pct={ext.pct} />
           </span>
         )}
       </td>
@@ -176,7 +180,7 @@ export function WatchlistRowItem({ item, marketStatus, onDelete, attach }: Watch
 
 interface PortfolioRowItemProps {
   item: PortfolioRow;
-  marketStatus: MarketStatusData;
+  marketStatus: MarketStatusData | null;
   valuesHidden: boolean;
   onEdit?: (row: PortfolioRow) => void;
   onDelete?: (id: string) => void;
@@ -199,20 +203,13 @@ export function PortfolioRowItem({
   const currency = normalizePortfolioCurrency(item.currency);
   const hasId = !!item.user_portfolio_id;
 
-  const { extPct, extType, extLabel } = getExtendedHoursInfo(marketStatus, item, { shortLabels: true });
+  const { ext } = sessionQuote(marketStatus, item, { shortLabels: true });
   const displayMarketValue =
     hasQuote && item.marketValue != null
       ? formatPortfolioMoney(item.marketValue, currency, locale)
       : 'N/A';
-  // The price the row stands at, kept for the value's tooltip: the regular
-  // close while an extended session runs, as the change beside it measures.
-  const displayPrice = hasQuote
-    ? formatPortfolioMoney(
-        Number(extType && item.previousClose != null ? item.previousClose : item.price),
-        currency,
-        locale,
-      )
-    : undefined;
+  // The value's tooltip: the price the value is computed at.
+  const displayPrice = hasQuote ? formatMoney(item.price, currency, locale, { upTo: item.places }) : undefined;
 
   const row = (
     <motion.tr
@@ -224,7 +221,7 @@ export function PortfolioRowItem({
       onClick={() => navigate(`/market?symbol=${encodeURIComponent(item.symbol)}`)}
     >
       <td className="term-code term-strong">
-        <span title={item.symbol}>{item.symbol}</span>
+        <TickerLabel symbol={item.symbol}><span title={item.symbol}>{item.symbol}</span></TickerLabel>
       </td>
       <td className="term-fill term-t3 dash-attach-cell">
         {valuesHidden
@@ -243,9 +240,9 @@ export function PortfolioRowItem({
         ) : (
           <span className="term-t3">N/A</span>
         )}
-        {hasQuote && extType && extLabel && extPct != null && (
+        {hasQuote && ext && (
           <span className="block">
-            <ExtendedHours label={extLabel} price={formatPortfolioMoney(item.price, currency, locale)} pct={extPct} />
+            <ExtendedHours label={ext.label} price={formatMoney(ext.price, currency, locale, { upTo: item.places })} pct={ext.pct} />
           </span>
         )}
       </td>
@@ -284,6 +281,11 @@ export function HoldingsAddButton({ label, onClick }: HoldingsAddButtonProps) {
       + {label}
     </button>
   );
+}
+
+/** The symbols a P/L leaves out, three at most before a count of the rest. */
+function listSymbols(symbols: string[], locale: string, more: (n: number) => string): string {
+  return formatList(symbols.length > 3 ? [...symbols.slice(0, 3), more(symbols.length - 3)] : symbols, locale);
 }
 
 interface PortfolioNavSummaryProps {
@@ -341,6 +343,14 @@ export function PortfolioNavSummary({ rows, valuesHidden, onToggleHidden }: Port
                     ],
                   ]}
                 />
+              </div>
+            )}
+            {summary.totalCost > 0 && summary.uncosted.length > 0 && (
+              <div className="term-line term-word term-t3 mt-1">
+                {t('dashboard.widgets.holdings.plExcludes', {
+                  symbols: listSymbols([...new Set(summary.uncosted.map((h) => h.symbol))], locale, (n) => t('dashboard.widgets.holdings.andMore', { n })),
+                  currency: summary.currency,
+                })}
               </div>
             )}
           </div>

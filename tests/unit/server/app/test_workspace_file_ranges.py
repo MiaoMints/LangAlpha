@@ -14,14 +14,13 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from fastapi import HTTPException
 
-from src.server.app.workspace_files._shared import requested_byte_range
-from src.server.app.workspace_files.crud import (
-    RANGE_MAX_BYTES,
-    download_workspace_file,
-)
+from src.server.app.workspace_files._shared import RANGE_MAX_BYTES, requested_byte_range
+from src.server.app.workspace_files.crud import download_workspace_file
 from src.server.database.workspace_file_blobs import BlobFetchError
 
 _CRUD = "src.server.app.workspace_files.crud"
+_SHARED = "src.server.app.workspace_files._shared"
+_BACKUP = "src.server.app.workspace_files.backup_reads"
 _RANGED = "src.server.services.persistence.resolve.fetch_blob_range"
 _WHOLE = "src.server.services.persistence.resolve.fetch_blob"
 _SERVE_MAX = "src.server.services.persistence.resolve.SERVE_MAX_BYTES"
@@ -130,12 +129,12 @@ async def _download(row: dict, range_header: str | None = None):
             "src.server.services.workspace_files.db_get_workspace",
             AsyncMock(return_value=workspace),
         ),
-        patch(f"{_CRUD}.owner_work_dir", return_value="/home/workspace/reports"),
+        patch("src.server.app.workspace_files._shared.owner_work_dir", return_value="/home/workspace/reports"),
         patch(
-            f"{_CRUD}.FilePersistenceService.get_file_content",
+            f"{_BACKUP}.FilePersistenceService.get_file_content",
             AsyncMock(return_value=row),
         ),
-        patch(f"{_CRUD}.get_vault_secrets_for_redaction", vault),
+        patch(f"{_BACKUP}.get_vault_secrets_for_redaction", vault),
     ):
         response = await download_workspace_file(
             WS_ID, OWNER, request, path="report.pdf", attachment=False
@@ -176,7 +175,7 @@ async def test_a_ranged_mirror_download_reads_only_the_slice() -> None:
 async def test_a_mirror_range_stops_at_the_end_and_at_the_cap(
     header, cap, content_range
 ) -> None:
-    with patch(f"{_CRUD}.RANGE_MAX_BYTES", cap), patch(_RANGED, _stored(PDF)):
+    with patch(f"{_SHARED}.RANGE_MAX_BYTES", cap), patch(_RANGED, _stored(PDF)):
         response, _ = await _download(_row(blob_sha256=DIGEST), header)
     first, last = (int(n) for n in content_range[6:].split("/")[0].split("-"))
     assert response.headers["content-range"] == content_range
@@ -290,6 +289,6 @@ def test_a_ranged_download_is_described_to_script_from_another_origin() -> None:
 
     from src.server.app.setup import app
 
-    cors = next(m for m in app.user_middleware if m.cls is CORSMiddleware)
+    cors = next(m for m in app.user_middleware if issubclass(m.cls, CORSMiddleware))
     exposed = set(cors.kwargs["expose_headers"])
     assert {"Content-Range", "Accept-Ranges", "ETag"} <= exposed

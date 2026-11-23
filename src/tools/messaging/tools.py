@@ -31,6 +31,8 @@ from ptc_agent.agent.tools.computer_reach import (
     ComputerUnreachable,
 )
 from src.config import env
+from src.server.services.shared_workspaces.access import shared_org_of
+from src.tools.turn_tool import input_schema
 
 try:
     from langchain.tools import InjectedToolCallId
@@ -470,6 +472,22 @@ def _as_named(data: dict[str, Any], named: dict[int, str]) -> dict[str, Any]:
     }
 
 
+#: What a turn in a shared workspace gets from either tool, should a build
+#: path ever hand them to it.
+_SHARED_REFUSAL = "Messaging is not available in a shared workspace."
+
+
+async def _in_shared_workspace(turn: dict[str, Any]) -> bool:
+    """Whether the turn is in a shared workspace, where the tools must not act:
+    they reach the sender's own chats, and other members write what steers
+    the agent. Unknown counts as shared."""
+    try:
+        return await shared_org_of(turn["workspace_id"]) is not None
+    except Exception:
+        logger.warning("[messaging] shared workspace check failed", exc_info=True)
+        return True
+
+
 async def _send(
     *,
     text: str,
@@ -489,6 +507,8 @@ async def _send(
             "unavailable",
             "This turn has no user attached, so there is no one to message.",
         )
+    if await _in_shared_workspace(turn):
+        return _refusal("failed", "unavailable", f"{_SHARED_REFUSAL} Nothing was sent.")
     text = text or ""
     paths = [p.strip() for p in files or [] if isinstance(p, str) and p.strip()]
     if not text.strip() and not paths:
@@ -525,7 +545,7 @@ async def _send(
             return _refusal(
                 "failed",
                 "invalid_request",
-                "workspace_id is not a workspace id; take it from manage_workspaces. "
+                "workspace_id is not a workspace id; take it from `la workspaces list`. "
                 "Nothing was sent.",
             )
 
@@ -659,7 +679,7 @@ def _send_from_home(computers: ComputerReach | None) -> BaseTool:
         ] = None,
         workspace_id: Annotated[
             str | None,
-            "The id of the workspace the files are in, from manage_workspaces, when they "
+            "The id of the workspace the files are in, from `la workspaces list`, when they "
             "are not in Home. Omit it for Home's files.",
         ] = None,
         target: _TARGET_ARG = None,
@@ -682,6 +702,7 @@ def _send_from_home(computers: ComputerReach | None) -> BaseTool:
     return StructuredTool.from_function(
         coroutine=send_message,
         name="send_message",
+        args_schema=input_schema("send_message", send_message),
         description=SEND_MESSAGE_DESCRIPTION,
         response_format="content_and_artifact",
     )
@@ -691,6 +712,8 @@ async def _list_message_targets(config: RunnableConfig) -> str:
     turn = _turn(config)
     if not turn["user_id"]:
         return "This turn has no user attached, so there is no one to message."
+    if await _in_shared_workspace(turn):
+        return _SHARED_REFUSAL
     params = {
         key: value
         for key, value in (

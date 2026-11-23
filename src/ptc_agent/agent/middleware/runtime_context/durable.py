@@ -19,6 +19,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any
+from uuid import uuid4
 
 from langchain_core.messages import HumanMessage
 
@@ -43,11 +44,10 @@ class DurableUpdate:
     """One runtime-context row: something that moved, and who moved it.
 
     A durable row is written once, at a turn boundary or, like the notes
-    reminder and check-in, between tool batches, and persisted as a message;
-    a per-call contributor puts the same shape on the request and it is gone
-    with the call. ``schema_version`` travels with the row because a row
-    outlives the code that wrote it: a reader replaying an old thread has to
-    know which shape it is looking at before it can render it.
+    reminder and check-in, between tool batches, and persisted as a message
+    that stays where it was written. ``schema_version`` travels with the row
+    because a row outlives the code that wrote it: a reader replaying an old
+    thread has to know which shape it is looking at before it can render it.
     """
 
     kind: str
@@ -106,6 +106,15 @@ def build_update_message(update: DurableUpdate) -> HumanMessage:
             },
         },
     )
+
+
+def written_row(update: DurableUpdate) -> HumanMessage:
+    """The message carrying ``update`` for a writer outside a hook, such as
+    a model call that puts it into history ahead of its answer, which no
+    Pregel path stamps an id on."""
+    row = build_update_message(update)
+    row.id = str(uuid4())
+    return row
 
 
 def is_runtime_update_message(message: Any) -> bool:

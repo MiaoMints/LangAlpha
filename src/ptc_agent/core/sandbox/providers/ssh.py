@@ -24,11 +24,12 @@ import re
 import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable, Collection, Sequence
 from dataclasses import dataclass, field, replace
-from typing import Any
+from typing import Any, NamedTuple
 
 import asyncssh
 
 from ptc_agent.config.core import PlatformSecretDefinition, SSHConfig
+from ptc_agent.core.claude_code_managed import claude_code_managed_sh, parse_managed
 from ptc_agent.core.paths import DEFAULT_SANDBOX_ROOT
 from ptc_agent.core.sandbox.providers._ssh_connect import (
     GatewayAccess,
@@ -39,20 +40,29 @@ from ptc_agent.core.sandbox.providers._ssh_connect import (
     is_public_address,
     set_gateway_loader,
 )
+from ptc_agent.core.sandbox.providers._ssh_root import (
+    adopted_root,
+    claim_root_script,
+    folder_marked_message,
+    root_dir_error,
+    root_dir_script,
+)
 from ptc_agent.core.sandbox.providers._ssh_shell import (
     SUDO_CHECK,
-    claim_root_script,
     computer_dir,
     knows_computer_script,
     computers_dir,
     delete_script,
-    folder_marked_message,
     home_problem,
-    root_dir_error,
-    root_dir_script,
     stop_script,
 )
-from ptc_agent.core.sandbox.providers._ssh_transport import TRANSPORT_ERRORS, Link, pool
+from ptc_agent.core.sandbox.providers._ssh_pool import pool
+from ptc_agent.core.sandbox.providers._ssh_transport import (
+    TRANSPORT_ERRORS,
+    Link,
+    Machine,
+    ScriptResult,
+)
 from ptc_agent.core.sandbox.providers.ssh_errors import (
     MACHINE_ID_PATTERN,
     SSHConnectError,
@@ -116,8 +126,18 @@ _REQUIRED_TOOLS_DARWIN = (
     "install",
     "mktemp",
 )
+MUSL_UNSUPPORTED = "This computer runs musl (for example Alpine Linux), which LangAlpha's runtime doesn't support yet."
+#: Defines is_musl, whether this Linux runs on musl: the probe and the Claude
+#: Code CLI's installer both tell it this way.
+IS_MUSL_SH = (
+    "is_musl() { ! getconf GNU_LIBC_VERSION >/dev/null 2>&1 && "
+    "{ ls /lib/ld-musl-* >/dev/null 2>&1 || ldd --version 2>&1 | grep -qi musl; }; }\n"
+)
 # The installed runtime takes about this much of the home's filesystem.
 _DISK_NEEDED_BYTES = 3 * 1024**3
+# The oldest Node the computer's `langalpha` CLI runs on (cli/package.json's
+# engines). The runtime does not install Node, so the machine's own is used.
+_CLI_NODE_MAJOR = 20
 # What the Computers dialog shows of a machine: its system and its hardware.
 # Read by the probe, and again as the machine starts, since a system updates.
 MACHINE_FACTS_SCRIPT = r"""
@@ -132,7 +152,7 @@ echo "cpu=$({ sed -n 's/^model name[[:space:]]*:[[:space:]]*//p' /proc/cpuinfo; 
 echo "cores=$(nproc 2>/dev/null)"
 echo "memory=$(awk '/^MemTotal:/ {printf "%.0f", $2 * 1024}' /proc/meminfo 2>/dev/null)"; fi
 """
-_PROBE_SCRIPT = (r"""
+_PROBE_SCRIPT = (IS_MUSL_SH + r"""
 echo "os=$(uname -s)"
 echo "hostname=$(hostname 2>/dev/null || uname -n)"
 """ + MACHINE_FACTS_SCRIPT + r"""
@@ -143,12 +163,15 @@ if [ "$(id -u)" = 0 ]; then echo sudo=1
 elif e=$(LC_ALL=C sudo -n true </dev/null 2>&1 >/dev/null); then echo sudo=1
 else case "$e" in *tty*) echo sudo=tty ;; *) echo sudo=0 ;; esac; fi
 if command -v curl >/dev/null 2>&1 || command -v wget >/dev/null 2>&1; then echo fetch=1; fi
+echo "node=$(node -v 2>/dev/null)"
 tools="TOOLS"; [ "$(uname -s)" = Darwin ] && tools="DARWIN_TOOLS"
 m=""; for t in $tools; do command -v "$t" >/dev/null 2>&1 || m="$m $t"; done; echo "missing=${m# }"
+if [ "$(uname -s)" = Linux ] && is_musl; then echo libc=musl; fi
 [ -r /proc/sys/kernel/random/boot_id ] && echo bootid=1
 [ -n "$(sysctl -n kern.bootsessionuuid 2>/dev/null)" ] && echo bootid=1
 d="$HOME/.langalpha"; [ -d "$d" ] || d="$HOME"
 echo "disk=$(df -Pk "$d" 2>/dev/null | awk 'NR==2 {print $4 * 1024}')"
+""" + claude_code_managed_sh() + r"""echo "claude_code_managed=${cm# }"
 """).replace("DARWIN_TOOLS", " ".join(_REQUIRED_TOOLS_DARWIN)).replace(
     "TOOLS", " ".join(_REQUIRED_TOOLS)
 )
@@ -226,6 +249,14 @@ class SSHProbe:
     # Whether the machine holds the computer the probe was asked about
     # (``known_as``); False when it was asked about none.
     knows_computer: bool = False
+    # Whether an organization's managed Claude Code settings there keep
+    # Claude Code from running on the computer.
+    claude_code_blocked: bool = False
+    # The folder asked about, as the disk spells it once checked: a
+    # case-insensitive disk takes a name typed in another letter case for the
+    # same folder, and the computer must be kept under the spelling its
+    # commands print. Empty when none was asked about.
+    root_dir: str = ""
 
     def machine(self) -> dict[str, Any]:
         """The facts kept on the computer for its details, only those read."""
@@ -307,23 +338,25 @@ async def probe_ssh_target(
                         link, result.home, known_as, root_dir, connect_timeout
                     ),
                 )
+            result = replace(result, root_dir=root_dir or "")
             if root_dir and result.supported:
                 # Checked, never made: the create makes it, by the same rule.
-                exit_code, owner = await _check_root(
+                checked = await _check_root(
                     link,
                     root_dir,
                     home=result.home,
                     reclaim=reclaim,
                     timeout=connect_timeout + 20,
                 )
-                if exit_code == 10 and taking_over and owner == taking_over:
+                result = replace(result, root_dir=checked.root_dir)
+                if taking_over and checked.owner == taking_over:
                     return result
-                if exit_code == 10 and re.match(MACHINE_ID_PATTERN, owner):
+                if re.match(MACHINE_ID_PATTERN, checked.owner):
                     raise SSHFolderMarked(
-                        folder_marked_message(root_dir, host), owner
+                        folder_marked_message(checked.root_dir, host), checked.owner
                     )
                 error = root_dir_error(
-                    exit_code, path=root_dir, user=username, host=host
+                    checked.exit_code, path=checked.root_dir, user=username, host=host
                 )
                 if error is not None:
                     raise error
@@ -399,12 +432,24 @@ async def take_over_root(
                 timeout=connect_timeout,
             )
             home = found.stdout.decode(errors="replace").strip()
-            exit_code, marked = await _check_root(
-                link, root_dir, home=home, reclaim=(owner,), timeout=connect_timeout + 20
+            # Not adopted: the caller keeps *root_dir* as its probe found it, so
+            # one spelled otherwise now was renamed since, and is refused
+            # before the computer named is stopped.
+            checked = await _check_root(
+                link,
+                root_dir,
+                home=home,
+                reclaim=(owner,),
+                timeout=connect_timeout + 20,
+                adopt=False,
             )
-            if exit_code == 10 and re.match(MACHINE_ID_PATTERN, marked):
-                raise SSHFolderMarked(folder_marked_message(root_dir, host), marked)
-            error = root_dir_error(exit_code, path=root_dir, user=username, host=host)
+            if re.match(MACHINE_ID_PATTERN, checked.owner):
+                raise SSHFolderMarked(
+                    folder_marked_message(root_dir, host), checked.owner
+                )
+            error = root_dir_error(
+                checked.exit_code, path=root_dir, user=username, host=host
+            )
             if error is not None:
                 raise error
             if claim_as or forget:
@@ -439,6 +484,16 @@ async def take_over_root(
             ) from e
 
 
+class RootCheck(NamedTuple):
+    """What ``_check_root`` found of a folder."""
+
+    exit_code: int | None
+    # The computer whose mark refused the folder (exit 10), else "".
+    owner: str
+    # The folder checked, as the disk spells it.
+    root_dir: str
+
+
 async def _check_root(
     link: Link,
     root_dir: str,
@@ -446,9 +501,12 @@ async def _check_root(
     home: str,
     reclaim: Collection[str],
     timeout: float,
-) -> tuple[int | None, str]:
-    """``root_dir_script``'s exit for *root_dir*, which it checks, and the id
-    of the computer whose mark refused it ("" for any other exit).
+    adopt: bool = True,
+) -> RootCheck:
+    """``root_dir_script``'s answer for *root_dir*, checked as the disk
+    spells it when the two differ only in case or Unicode normalization
+    (``adopted_root``). Without *adopt* another spelling stays exit 12, so
+    nothing is reclaimed for a folder the caller would then refuse.
 
     A folder marked by one of *reclaim*, a computer whose removal could not
     reach the machine, holds what that removal would have taken: the
@@ -456,11 +514,18 @@ async def _check_root(
     the root. Those go, as its delete would have taken them, and the folder
     is checked again. A mark naming any other computer is refused as before.
     """
-    script = root_dir_script(root_dir, computers=computers_dir(home), computer_id=None)
+    computers = computers_dir(home)
+    script = root_dir_script(root_dir, computers=computers, computer_id=None)
     check = await link.run(script, timeout=timeout)
-    owner = check.stdout.decode(errors="replace").strip()
-    if check.exit_code != 10 or owner not in reclaim:
-        return check.exit_code, owner if check.exit_code == 10 else ""
+    if check.exit_code == 12 and adopt:
+        adopted = adopted_root(root_dir, check.stdout.decode(errors="replace"))
+        if adopted is not None:
+            root_dir = adopted
+            script = root_dir_script(root_dir, computers=computers, computer_id=None)
+            check = await link.run(script, timeout=timeout)
+    owner = _marked_by(check)
+    if owner not in reclaim:
+        return RootCheck(check.exit_code, owner, root_dir)
     cdir = computer_dir(home, owner)
     stop = await link.run(
         stop_script(cdir, root=False, computer_root=root_dir), timeout=timeout
@@ -471,7 +536,14 @@ async def _check_root(
             await link.run(stop_script(cdir, root=True), timeout=timeout, root=True)
     await link.run(delete_script(cdir, root=root_dir), timeout=timeout)
     again = await link.run(script, timeout=timeout)
-    return again.exit_code, again.stdout.decode(errors="replace").strip()
+    return RootCheck(again.exit_code, _marked_by(again), root_dir)
+
+
+def _marked_by(check: ScriptResult) -> str:
+    """The computer whose mark ``root_dir_script`` refused the folder for."""
+    if check.exit_code != 10:
+        return ""
+    return check.stdout.decode(errors="replace").strip()
 
 
 async def run_script(
@@ -521,7 +593,7 @@ async def _one_off(target: SSHTarget, private_key: str) -> AsyncIterator[Link]:
     """
     conn = await connect(target, private_key)
     try:
-        yield Link(target, conn)
+        yield Link(target, conn, helper=answered_by_helper(conn))
     finally:
         conn.close()
         await conn.wait_closed()
@@ -613,6 +685,21 @@ def read_machine(stdout: str) -> tuple[str, dict[str, Any]]:
     return _mac_model(facts.get("model", "")), machine_facts(facts)
 
 
+def _node_problem(version: str) -> str | None:
+    """Why the agent's `langalpha` CLI will not run here, if it will not.
+    Not blocking: everything else on the computer works without it."""
+    major = version.removeprefix("v").partition(".")[0]
+    if major.isdigit() and int(major) >= _CLI_NODE_MAJOR:
+        return None
+    found = (
+        f"Node {version} is too old" if major.isdigit() else "Node is not installed"
+    )
+    return (
+        f"{found} for the agent's langalpha command line; everything else "
+        f"works. Installing Node {_CLI_NODE_MAJOR} or later turns it on."
+    )
+
+
 def _probe_result(
     line: str,
     fingerprint: str,
@@ -640,6 +727,9 @@ def _probe_result(
     if os_name in SUPPORTED_OS:
         if facts.get("bash") != "1":
             blocking.append("bash is not installed, and every command runs in it.")
+        elif facts.get("libc") == "musl":
+            # The runtime's packages publish no musl wheels.
+            blocking.append(MUSL_UNSUPPORTED)
         else:
             if facts.get("fetch") != "1":
                 blocking.append(
@@ -671,6 +761,9 @@ def _probe_result(
             f"Only {disk_free / 1024**3:.1f} GB is free in {home}; the Python "
             "runtime needs about 3 GB."
         )
+    # Only where the machine can host a computer at all, or it is noise.
+    if not blocking and (node := _node_problem(facts.get("node", ""))):
+        problems.append(node)
     if facts.get("sudo") == "tty":
         problems.append(
             "sudo for this account requires a terminal (requiretty in sudoers), "
@@ -698,6 +791,7 @@ def _probe_result(
         cpu=read.get("cpu", ""),
         cores=read.get("cores"),
         memory_bytes=read.get("memory_bytes"),
+        claude_code_blocked=bool(parse_managed(facts.get("claude_code_managed", ""))),
     )
 
 
@@ -747,6 +841,7 @@ class SSHProvider(SandboxProvider):
     converges_env = True
     # The file mount needs root and /dev/fuse, which the owner need not grant.
     mounts_livefs = False
+    installs_browser = True
     platform_secret_namespace_env = None
     # Every computer here was laid out at v4 or later, and the older steps
     # move and delete folders by name in a root that holds the owner's files.
@@ -816,6 +911,14 @@ class SSHProvider(SandboxProvider):
 
     async def get(self, sandbox_id: str) -> SSHRuntime:
         return self._runtime(sandbox_id)
+
+    def machine(self, sandbox_id: str) -> Machine[Link]:
+        """The computer's machine, for work that runs its own channels on it
+        (a Claude Code turn, its token). It holds nothing of this provider's,
+        since the connection pool is the process's, so it outlives the
+        provider."""
+        runtime = self._runtime(sandbox_id)
+        return Machine(runtime.link, lambda: runtime.working_dir)
 
     async def close(self) -> None:
         # The pool belongs to the process, and other runtimes still use it.

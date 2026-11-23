@@ -645,10 +645,11 @@ except ImportError:
         already has the resolved values in os.environ, injected at creation
         time). Untrusted servers embed their full env/header mappings, whose
         values are either non-secret literals or ``${vault:NAME}`` placeholders
-        resolved in-sandbox against the vault file only. OAuth-connected
-        servers are only marked relay-bound: the runtime dials the egress relay
-        and reads the grant id from the sandbox's credential file, so the
-        vendor URL, the grant and every token stay host-side.
+        resolved in-sandbox against the vault file only. Relay-bound servers
+        (an OAuth connection, an organization connector, or a built-in whose
+        key the host holds per user) are only marked so: the runtime dials the egress relay and reads the
+        grant id from the sandbox's credential file, so the vendor URL, the
+        grant and every token stay host-side.
 
         Trust ships as the ``untrusted`` bool computed here — never as a raw
         ``source`` tag the runtime would have to re-interpret.
@@ -661,7 +662,7 @@ except ImportError:
         for server in server_configs:
             untrusted = is_untrusted_server(server)
             entry: dict[str, Any]
-            if server.oauth_connection_id is not None:
+            if server.relay_bound:
                 entry = {
                     "transport": "http",
                     "untrusted": untrusted,
@@ -699,7 +700,7 @@ except ImportError:
             if untrusted:
                 entry["headers"] = dict(server.headers or {})
                 entry["discovery_uses_secrets"] = discovery_should_use_secrets(server)
-            elif server.auth:
+            elif server.auth == "data_token":
                 # A built-in's headers are host credentials for discovery and
                 # never ship; the client brings the sandbox's own token instead.
                 entry["auth"] = server.auth
@@ -856,8 +857,8 @@ _EMISSION_PROBE_TOOL_2 = MCPToolInfo(
 # Third probe axis: the config/epilogue emission. One server per config
 # branch: builtin uv-stdio (path rewrite + env_keys), builtin http on the
 # sandbox's data token (auth kept, headers dropped), untrusted user http
-# (headers + secret-mode hint), OAuth relay-bound. Hash-relevant only; never
-# uploaded.
+# (headers + secret-mode hint), OAuth and organization relay-bound.
+# Hash-relevant only; never uploaded.
 _EMISSION_PROBE_SERVERS = [
     MCPServerConfig(
         name="probe_builtin",
@@ -886,6 +887,14 @@ _EMISSION_PROBE_SERVERS = [
         url="https://probe.example/oauth",
         source="user",
         oauth_connection_id="probe-conn",
+    ),
+    MCPServerConfig(
+        name="probe_org",
+        transport="http",
+        url="https://probe.example/org",
+        source="org",
+        org_connector_id="probe-org",
+        org_revision="1",
     ),
 ]
 

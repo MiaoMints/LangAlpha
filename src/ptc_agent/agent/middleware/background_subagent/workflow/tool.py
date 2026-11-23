@@ -9,7 +9,7 @@ from typing import Annotated, Any
 
 import structlog
 from langchain_core.messages import ToolMessage
-from langchain_core.tools import BaseTool, InjectedToolCallId, tool
+from langchain_core.tools import BaseTool, InjectedToolCallId
 from langgraph.config import get_config
 
 from ptc_agent.agent.backends.workflows import (
@@ -53,16 +53,20 @@ from ptc_agent.core.paths import (
 )
 from ptc_agent.core.project_context import current_project
 from src.observability import mark_tool_failed
+from src.tools.turn_tool import turn_tool
 
 logger = structlog.get_logger(__name__)
 
 # Derived from the canonical path vocabulary rather than re-spelled here: a
 # script under one of these lives in the store or in agent infrastructure, not
 # on the workspace filesystem the backend reads from.
+# A shared workspace member's memory is among them: the store serves it to
+# Read alone, which keeps what it returns out of the thread.
 _UNREADABLE_SCRIPT_PREFIXES: tuple[str, ...] = (
     f"{MEMORY_USER_DIR}/",
     f"{WorkspaceLayout.MEMORY_DIR}/",
     f"{MEMO_USER_DIR}/",
+    f"{WorkspaceLayout.MEMBERS_DIR}/",
 )
 
 
@@ -581,7 +585,7 @@ def create_run_workflow_tool(
             tool_call_id=tool_call_id,
         )
 
-    @tool("RunWorkflow")
+    @turn_tool("RunWorkflow")
     async def run_workflow(
         script: str | None = None,
         script_path: str | None = None,

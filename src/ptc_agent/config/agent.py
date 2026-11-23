@@ -7,9 +7,10 @@ Use src.config.loaders for file-based loading.
 """
 
 import os
+from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Literal, TypedDict
+from typing import TYPE_CHECKING, Any, Literal, NamedTuple, Protocol, TypedDict, runtime_checkable
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
@@ -55,6 +56,37 @@ class CredentialSource(StrEnum):
     NONE = "none"
 
 
+#: Who a model call bills, as the model picker and a failed turn's card name
+#: it. ``local`` is a server on the user's machine, which nobody bills.
+Payer = Literal["subscription", "own_key", "credits", "server_key", "local"]
+
+
+class CredentialPayer(NamedTuple):
+    """Who the turn's credential bills, and the user's account it bills when
+    it is theirs (``DeepSeek``, ``ChatGPT``, ``GLM Coding Plan``)."""
+
+    payer: Payer
+    account: str | None = None
+
+
+class IdleCompactConfig(BaseModel):
+    """Compaction of a thread idle after a turn, while its prompt cache is
+    warm, on routes whose cache entries live an hour (see
+    ``compaction.rebuild.TurnStartRebuilds.idle``, and for a Claude Code
+    session ``CompactionRules.idle_plan``). On only with the
+    ``idle_compaction`` feature (``src.config.features``)."""
+
+    #: The least context an idle thread is summarized at keeping its tail
+    #: (I2), and a Claude Code session compacted at; None takes
+    #: ``cold_compact_tokens``. Never where the user turned the summary after
+    #: a break off (see ``CompactionConfig.idle_tokens``).
+    threshold_tokens: int | None = Field(default=None, ge=0)
+    #: How long before the cache entry the summary reads expires it fires:
+    #: a minute past the five a firing is given up at, so a sweep or two can
+    #: claim it, and under the hour.
+    lead_seconds: int = Field(default=900, ge=360, lt=3600)
+
+
 class CompactionConfig(BaseModel):
     """Context compaction settings.
 
@@ -81,6 +113,27 @@ class CompactionConfig(BaseModel):
     truncate_args_idle_minutes: int | None = None
     truncate_args_keep_messages: int = 20
     truncate_args_max_length: int = 2000
+    #: The least context at which a turn start under the threshold rebuilds
+    #: a thread whose system prompt a deploy changed, once its prompt cache
+    #: has expired (see ``compaction.rebuild``); 0 never does.
+    rebuild_floor_tokens: int = 150_000
+    #: The least context at which a turn start under the threshold
+    #: summarizes a Claude thread whose prompt cache has expired, keeping the
+    #: tail where its prompt is not due (see ``compaction.rebuild``); 0
+    #: never does.
+    cold_compact_tokens: int = 300_000
+    idle_compact: IdleCompactConfig = IdleCompactConfig()
+
+    @property
+    def idle_tokens(self) -> int:
+        """The least context an idle thread keeps its tail from, as the turn
+        resolved it: 0 where ``cold_compact_tokens`` is, which the user's
+        "Summarize long threads after a break" off sets, else
+        ``idle_compact.threshold_tokens`` or ``cold_compact_tokens``."""
+        if not self.cold_compact_tokens:
+            return 0
+        threshold = self.idle_compact.threshold_tokens
+        return self.cold_compact_tokens if threshold is None else threshold
 
     #: Which named preset the numbers above came from, stamped by
     #: ``resolve_llm_config``. None means they are the deployment's own YAML
@@ -304,6 +357,105 @@ class LLMConfig(BaseModel):
         return list(dict.fromkeys(m for m in self.fallback or () if m and m != model))
 
 
+class Admitted(NamedTuple):
+    """What admission let a Claude Code CLI run on: ``hosted``, its credential
+    on a cloud computer (``saved_token`` or ``stored_token``, None on an own
+    computer), ``saved``, which setup token the user saved it may sign in
+    with, there or relayed to an own computer (named as ``hosted`` is), None
+    where it may sign in with none, and ``cli_computer``, the own computer
+    the server picked to run it for a workspace on a cloud computer that runs
+    none, None where the workspace's computer or the server runs it."""
+
+    hosted: str | None = None
+    saved: str | None = None
+    cli_computer: str | None = None
+
+
+@dataclass(frozen=True)
+class RunOn:
+    """What one subagent run is admitted on: its subagent type's, or the
+    model its Task named (``TaskModel.run_on``).
+
+    ``model`` is what the run's card shows, None on its launcher's model.
+    ``claude_code`` is where admission placed its CLI, set only for a run on
+    a Claude Code row, and ``claude_code_model`` the model that CLI runs.
+    ``model_override`` is the catalog name a Task named, which the run's row
+    keeps for a resume that names none.
+    """
+
+    model: SubagentModel | None = None
+    claude_code: Admitted | None = None
+    claude_code_model: str | None = None
+    model_override: str | None = None
+
+    def admission_kwargs(self) -> dict[str, Any]:
+        """The run ledger's ``start_task_run`` facts."""
+        admitted = self.claude_code
+        return {
+            "model": self.model,
+            "claude_code": admitted is not None,
+            "stored_token": bool(admitted is not None and admitted.saved),
+            "claude_code_model": self.claude_code_model,
+            "cli_computer": admitted.cli_computer if admitted is not None else None,
+            **({"model_override": self.model_override} if self.model_override else {}),
+        }
+
+
+@dataclass(frozen=True)
+class TaskModel:
+    """The model one Task runs on in place of its subagent's own, resolved
+    and gated as a turn's own model is.
+
+    ``name`` is the catalog name, which the run's ledger row keeps so a
+    resume can run the task on it again. ``model`` is what the run's card
+    shows, None where it is the turn's own model. ``claude_code`` is what
+    admission let the run's CLI run on, set only for a Claude Code row.
+    """
+
+    name: str
+    display_name: str
+    client: Any
+    guidance: str
+    model: SubagentModel | None = None
+    claude_code: Admitted | None = None
+
+    @property
+    def on_claude_code(self) -> bool:
+        return self.claude_code is not None
+
+    @property
+    def run_on(self) -> RunOn:
+        return RunOn(
+            model=self.model,
+            claude_code=self.claude_code,
+            claude_code_model=self.client.model if self.on_claude_code else None,
+            model_override=self.name,
+        )
+
+
+class TaskModelRefused(NamedTuple):
+    """Why a Task cannot run on the model it names: ``message`` is the whole
+    reply to the agent, ``reason`` the short form a resume of a task that
+    ran on it quotes."""
+
+    message: str
+    reason: str
+
+
+@runtime_checkable
+class TaskModelResolver(Protocol):
+    """The models one turn's Tasks name, gated as the turn's own model was."""
+
+    async def resolve(
+        self, name: str, subagent_type: str, *, keep: bool = False
+    ) -> "TaskModel | TaskModelRefused | None":
+        """``name`` for a task of ``subagent_type``, or why it cannot run
+        there; None where it is that subagent's own model, unless ``keep``:
+        a model a resume carries over stays the task's even while it is the
+        subagent's own, which follows the chat's model."""
+        ...
+
+
 class AgentConfig(BaseModel):
     """Agent-specific configuration.
 
@@ -339,7 +491,7 @@ class AgentConfig(BaseModel):
     #: what the deployment and the manifest declare.
     prompt_guidance: str | None = None
 
-    # Search API provider (tavily, serper, bocha, exa, parallel)
+    # Search API provider (tavily, serper, bocha, exa, parallel, deepseek)
     search_api: str = "tavily"
 
     # Search depth level name from the provider's manifest entry
@@ -378,6 +530,8 @@ class AgentConfig(BaseModel):
     credential_source: CredentialSource = Field(
         default=CredentialSource.NONE, exclude=True
     )
+    # Who that credential bills, as a failed turn names it; set beside it.
+    credential_payer: CredentialPayer | None = Field(default=None, exclude=True)
     subsidiary_llm_clients: dict[str, Any] = Field(default_factory=dict, exclude=True)
     # Scaffolding level per role key, for the model that role actually runs.
     # Written alongside the clients above, because a role without a client of
@@ -389,15 +543,25 @@ class AgentConfig(BaseModel):
     subagent_models: dict[str, SubagentModel] = Field(
         default_factory=dict, exclude=True
     )
+    # Whether admission let the turn run on Claude Code, which its run's row
+    # is stamped with, so its computer counts its CLI.
+    claude_code: bool = Field(default=False, exclude=True)
+    # What admission let a Claude Code turn run on, None on any other turn;
+    # the run's row is stamped from it, so the turn is counted as what it was
+    # let run on, and its CLI signs in with it.
+    claude_code_admitted: Admitted | None = Field(default=None, exclude=True)
+    # On a turn of another model, what admission let its subagents' Claude
+    # Code pins run on; None where they run the turn's model.
+    claude_code_pins: Admitted | None = Field(default=None, exclude=True)
+    # Resolves the model a Task names for one task, gated as this turn's own
+    # model was; None on a build that never went through the resolver, where
+    # a Task cannot name one.
+    task_models: TaskModelResolver | None = Field(default=None, exclude=True)
     # None permits standalone name resolution; [] means resolution rejected all candidates.
     fallback_llm_clients: list[Any] | None = Field(default=None, exclude=True)
     # Display names aligned index-for-index with ``fallback_llm_clients``
     # (skipped fallbacks drop from both lists).
     fallback_llm_names: list[str] | None = Field(default=None, exclude=True)
-    # Whether the fallbacks are a list the user saved rather than the
-    # deployment's. Only the user's may move a call their own key or
-    # subscription pays for onto the platform's key.
-    fallback_users_choice: bool = Field(default=False, exclude=True)
     # Forwarded by ``get_llm_client()`` to ``create_llm(cache_key=...)`` for
     # the lazy factory path.
     cache_key: str | None = Field(default=None, exclude=True)
@@ -410,6 +574,10 @@ class AgentConfig(BaseModel):
     # with ``SkillsConfig.user_skills_dir``, a config-file path.
     user_skills: list[Any] = Field(default_factory=list, exclude=True)
     disabled_skills: frozenset[str] = Field(default_factory=frozenset, exclude=True)
+    # Shipped skills the turn's computer does not carry (a shared workspace's
+    # leaves out those whose work is a person's own data). Not a disable: a
+    # skill another one requires still goes, and the filesystem scan skips it.
+    withheld_skills: frozenset[str] = Field(default_factory=frozenset, exclude=True)
     user_skill_dir: str | None = Field(default=None, exclude=True)
     # Workspace-tier bodies: a second host dir, because the sandbox delivery
     # path uploads ``user_skill_dir`` wholesale and must not touch these.

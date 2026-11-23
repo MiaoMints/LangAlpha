@@ -25,6 +25,7 @@ from src.server.services.market_targets.delivery import (
     execute_market_target,
     request_key,
 )
+from src.server.services.report_back.notify_turn import TURN_ROOM_WAIT_S
 from tests.unit.server.handlers.chat.redis_fakes import FakeCache
 
 MT_DB = "src.server.database.market_targets"
@@ -143,6 +144,10 @@ def _env(env: Env):
         patch(f"{MT_DB}.mark_delivered", new=env.mark),
         patch(f"{TL_DB}.find_run_by_request_key", new=AsyncMock(side_effect=_cycle(earlier))),
         patch(f"{TL_DB}.get_latest_attempt", new=AsyncMock(side_effect=_latest)),
+        patch(
+            "src.server.services.report_back.notify_turn._card_waits",
+            new=AsyncMock(return_value=False),
+        ),
         patch(f"{CONV}.get_thread_by_id", new=AsyncMock(return_value=env.thread)),
         patch(f"{WS_DB}.get_workspace", new=AsyncMock(return_value=env.workspace)),
         patch(
@@ -345,6 +350,34 @@ async def test_refusals_past_the_cap_with_retries_left_nack_into_backoff():
 
     env.mark.assert_not_awaited()
     env.exhaust.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_no_room_for_another_claude_code_turn_asks_again_by_the_clock_unspent():
+    env = Env(target=_target(), post_outcomes=[("full", None)])
+    room = AsyncMock(return_value=True)
+    with _env(env), patch("src.server.database.runs.outbox.wait_for_room", new=room):
+        await execute_market_target(_job(attempts=MAX_ATTEMPTS))
+
+    assert env.post.await_args.kwargs["room_fails_fast"]
+    room.assert_awaited_once_with("job-1", attempts=MAX_ATTEMPTS, wait_s=TURN_ROOM_WAIT_S)
+    env.exhaust.assert_not_awaited()
+    env.mark.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_a_suspended_accounts_notice_asks_again_each_hour_still_owed():
+    from src.server.services.report_back.notify_turn import SUSPENDED_WAIT_S
+
+    env = Env(target=_target(), post_outcomes=[("suspended", None)])
+    room = AsyncMock(return_value=True)
+    with _env(env), patch("src.server.database.runs.outbox.wait_for_room", new=room):
+        await execute_market_target(_job(attempts=MAX_ATTEMPTS))
+
+    assert env.post.await_args.kwargs["suspension_waits"]
+    room.assert_awaited_once_with("job-1", attempts=MAX_ATTEMPTS, wait_s=SUSPENDED_WAIT_S)
+    env.exhaust.assert_not_awaited()
+    env.mark.assert_not_awaited()
 
 
 def _held_for_the_next_turn(env: Env, attempts: int) -> None:
@@ -615,3 +648,20 @@ async def test_a_notice_on_a_thread_whose_workspace_was_deleted_is_dropped():
     env.defer.assert_not_awaited()
     env.exhaust.assert_not_awaited()
     env.mark.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_a_notice_whose_machine_is_asleep_waits_for_it_unread():
+    """Posted while the user's machine sleeps, the wake would fail at its
+    connect with the notice already stamped; parked, it arrives once the
+    machine connects."""
+    env = Env(target=_target())
+    away = AsyncMock(return_value=True)
+    with _env(env), patch(
+        "src.server.services.report_back.notify_turn.park_while_computer_away", new=away
+    ):
+        await execute_market_target(_job())
+
+    env.post.assert_not_awaited()
+    env.mark.assert_not_awaited()
+    assert away.await_args.kwargs["workspace_id"] == "ws-1"

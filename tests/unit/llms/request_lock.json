@@ -1,5 +1,5 @@
 {
- "claude-fable-5-1": {
+ "claude-fable-5-2": {
   "client": "ChatAnthropic",
   "graph_build": {
    "middleware": [
@@ -8,6 +8,7 @@
     "LargeResultEvictionMiddleware",
     "SubAgentMiddleware",
     "WakeupQuietGuardMiddleware",
+    "PlanCloseOutMiddleware",
     "CreditGateMiddleware",
     "RepeatCallGuardMiddleware",
     "ToolArgumentParsingMiddleware",
@@ -23,6 +24,7 @@
     "SteeringMiddleware",
     "BackgroundSubagentMiddleware",
     "AskUserMiddleware",
+    "PlanStateMiddleware",
     "StreamHeartbeatMiddleware",
     "CompactionMiddleware",
     "ModelResilienceMiddleware",
@@ -35,14 +37,14 @@
     "PatchToolCallsMiddleware",
     "TurnContextMiddleware",
     "BaselineContextMiddleware",
-    "NotesOffMiddleware",
+    "NotesDueMiddleware",
     "RowCarrierMiddleware",
     "SystemPinMiddleware",
     "ReasoningCompatibilityMiddleware"
    ],
    "model_is_the_client": true,
    "state_schema": "MainAgentState",
-   "system_prompt_sha256": "2d9ab72041b31b4988c135110fb38f00abacda9d6046a0f13deda54f26043569",
+   "system_prompt_sha256": "03b99eff6f277ea11471f19b45036b66efdcfc5b233fdf9cf0adf97541a073d8",
    "tools": [
     "AskUserQuestion",
     "Bash",
@@ -56,28 +58,29 @@
     "ShowWidget",
     "TaskOutput",
     "ThreadStatus",
+    "UpdatePlan",
     "WebFetch",
     "WebSearch",
     "Write",
-    "draw_chart_annotation",
     "get_company_overview",
     "get_daily_prices",
     "get_market_overview",
     "get_options_chain",
     "get_quote",
     "get_sec_filing",
-    "manage_chart_annotations",
+    "manage_chart_layers",
+    "reply_to_comment",
     "schedule_wakeup",
     "screen_stocks"
    ]
   },
   "metadata": {
    "billing_type": "byok",
-   "manifest_model": "claude-fable-5-1",
-   "pricing_model_id": "claude-fable-5-1",
+   "manifest_model": "claude-fable-5-2",
+   "pricing_model_id": "claude-fable-5-2",
    "pricing_provider": "anthropic",
    "provider_route": "anthropic",
-   "reasoning_effort": "high"
+   "reasoning_effort": "medium"
   },
   "request": {
    "body": {
@@ -88,9 +91,9 @@
       "role": "user"
      }
     ],
-    "model": "claude-fable-5-1",
+    "model": "claude-fable-5-2",
     "output_config": {
-     "effort": "high"
+     "effort": "medium"
     },
     "stream": true,
     "system": "You are a lock probe.",
@@ -121,7 +124,7 @@
    },
    "headers": {
     "accept": "application/json",
-    "anthropic-beta": "thinking-binding-controls-2026-08-01,mid-conversation-system-clear-at-2026-08-21,compact-2026-09-04",
+    "anthropic-beta": "thinking-binding-controls-2026-08-01,compact-2026-09-04",
     "anthropic-version": "2023-06-01",
     "connection": "keep-alive",
     "content-type": "application/json",
@@ -131,8 +134,8 @@
    "url": "https://api.anthropic.com/v1/messages"
   }
  },
- "claude-fable-5-1-oauth": {
-  "client": "ChatAnthropicOAuth",
+ "claude-fable-5-2-code": {
+  "client": "ClaudeCodeTarget",
   "graph_build": {
    "middleware": [
     "FrozenPromptMiddleware",
@@ -140,6 +143,7 @@
     "LargeResultEvictionMiddleware",
     "SubAgentMiddleware",
     "WakeupQuietGuardMiddleware",
+    "PlanCloseOutMiddleware",
     "CreditGateMiddleware",
     "RepeatCallGuardMiddleware",
     "ToolArgumentParsingMiddleware",
@@ -155,6 +159,7 @@
     "SteeringMiddleware",
     "BackgroundSubagentMiddleware",
     "AskUserMiddleware",
+    "PlanStateMiddleware",
     "StreamHeartbeatMiddleware",
     "CompactionMiddleware",
     "ModelResilienceMiddleware",
@@ -167,14 +172,14 @@
     "PatchToolCallsMiddleware",
     "TurnContextMiddleware",
     "BaselineContextMiddleware",
-    "NotesOffMiddleware",
+    "NotesDueMiddleware",
     "RowCarrierMiddleware",
     "SystemPinMiddleware",
     "ReasoningCompatibilityMiddleware"
    ],
    "model_is_the_client": true,
    "state_schema": "MainAgentState",
-   "system_prompt_sha256": "2d9ab72041b31b4988c135110fb38f00abacda9d6046a0f13deda54f26043569",
+   "system_prompt_sha256": "aeb8cbf25109306fb1947f90a29e7f98e4c4cae78e11a1f6d417946c7096eebb",
    "tools": [
     "AskUserQuestion",
     "Bash",
@@ -188,28 +193,114 @@
     "ShowWidget",
     "TaskOutput",
     "ThreadStatus",
+    "UpdatePlan",
     "WebFetch",
     "WebSearch",
     "Write",
-    "draw_chart_annotation",
     "get_company_overview",
     "get_daily_prices",
     "get_market_overview",
     "get_options_chain",
     "get_quote",
     "get_sec_filing",
-    "manage_chart_annotations",
+    "manage_chart_layers",
+    "reply_to_comment",
     "schedule_wakeup",
     "screen_stocks"
    ]
   },
   "metadata": {
    "billing_type": "oauth",
-   "manifest_model": "claude-fable-5-1-oauth",
-   "pricing_model_id": "claude-fable-5-1",
+   "manifest_model": "claude-fable-5-2-code",
+   "pricing_model_id": "claude-fable-5-2",
+   "pricing_provider": "claude-code",
+   "provider_route": "claude-code",
+   "reasoning_effort": "medium"
+  },
+  "request": null
+ },
+ "claude-fable-5-2-oauth": {
+  "client": "ChatAnthropicOAuth",
+  "graph_build": {
+   "middleware": [
+    "FrozenPromptMiddleware",
+    "TimeUpToolStopMiddleware",
+    "LargeResultEvictionMiddleware",
+    "SubAgentMiddleware",
+    "WakeupQuietGuardMiddleware",
+    "PlanCloseOutMiddleware",
+    "CreditGateMiddleware",
+    "RepeatCallGuardMiddleware",
+    "ToolArgumentParsingMiddleware",
+    "ComputerArgumentGuardMiddleware",
+    "ProtectedPathMiddleware",
+    "CodeValidationMiddleware",
+    "ToolErrorHandlingMiddleware",
+    "LeakDetectionMiddleware",
+    "ToolResultNormalizationMiddleware",
+    "FileOperationMiddleware",
+    "ProvenanceMiddleware",
+    "SkillsMiddleware",
+    "SteeringMiddleware",
+    "BackgroundSubagentMiddleware",
+    "AskUserMiddleware",
+    "PlanStateMiddleware",
+    "StreamHeartbeatMiddleware",
+    "CompactionMiddleware",
+    "ModelResilienceMiddleware",
+    "MultimodalStripMiddleware",
+    "MultimodalMiddleware",
+    "AnthropicPromptCachingMiddleware",
+    "SystemPromptCacheMiddleware",
+    "ToolSurfaceMiddleware",
+    "EmptyToolCallRetryMiddleware",
+    "PatchToolCallsMiddleware",
+    "TurnContextMiddleware",
+    "BaselineContextMiddleware",
+    "NotesDueMiddleware",
+    "RowCarrierMiddleware",
+    "SystemPinMiddleware",
+    "ReasoningCompatibilityMiddleware"
+   ],
+   "model_is_the_client": true,
+   "state_schema": "MainAgentState",
+   "system_prompt_sha256": "03b99eff6f277ea11471f19b45036b66efdcfc5b233fdf9cf0adf97541a073d8",
+   "tools": [
+    "AskUserQuestion",
+    "Bash",
+    "Edit",
+    "ExecuteCode",
+    "GetPreviewUrl",
+    "Glob",
+    "Grep",
+    "Read",
+    "RunWorkflow",
+    "ShowWidget",
+    "TaskOutput",
+    "ThreadStatus",
+    "UpdatePlan",
+    "WebFetch",
+    "WebSearch",
+    "Write",
+    "get_company_overview",
+    "get_daily_prices",
+    "get_market_overview",
+    "get_options_chain",
+    "get_quote",
+    "get_sec_filing",
+    "manage_chart_layers",
+    "reply_to_comment",
+    "schedule_wakeup",
+    "screen_stocks"
+   ]
+  },
+  "metadata": {
+   "billing_type": "oauth",
+   "manifest_model": "claude-fable-5-2-oauth",
+   "pricing_model_id": "claude-fable-5-2",
    "pricing_provider": "claude-oauth",
    "provider_route": "claude-oauth",
-   "reasoning_effort": "high"
+   "reasoning_effort": "medium"
   },
   "request": {
    "body": {
@@ -220,9 +311,9 @@
       "role": "user"
      }
     ],
-    "model": "claude-fable-5-1",
+    "model": "claude-fable-5-2",
     "output_config": {
-     "effort": "high"
+     "effort": "medium"
     },
     "stream": true,
     "system": [
@@ -262,7 +353,7 @@
    },
    "headers": {
     "accept": "application/json",
-    "anthropic-beta": "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,fine-grained-tool-streaming-2025-05-14,thinking-binding-controls-2026-08-01,mid-conversation-system-clear-at-2026-08-21,compact-2026-09-04",
+    "anthropic-beta": "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,fine-grained-tool-streaming-2025-05-14,thinking-binding-controls-2026-08-01,compact-2026-09-04",
     "anthropic-version": "2023-06-01",
     "connection": "keep-alive",
     "content-type": "application/json",
@@ -282,6 +373,7 @@
     "LargeResultEvictionMiddleware",
     "SubAgentMiddleware",
     "WakeupQuietGuardMiddleware",
+    "PlanCloseOutMiddleware",
     "CreditGateMiddleware",
     "RepeatCallGuardMiddleware",
     "ToolArgumentParsingMiddleware",
@@ -297,6 +389,7 @@
     "SteeringMiddleware",
     "BackgroundSubagentMiddleware",
     "AskUserMiddleware",
+    "PlanStateMiddleware",
     "StreamHeartbeatMiddleware",
     "CompactionMiddleware",
     "ModelResilienceMiddleware",
@@ -309,14 +402,14 @@
     "PatchToolCallsMiddleware",
     "TurnContextMiddleware",
     "BaselineContextMiddleware",
-    "NotesOffMiddleware",
+    "NotesDueMiddleware",
     "RowCarrierMiddleware",
     "SystemPinMiddleware",
     "ReasoningCompatibilityMiddleware"
    ],
    "model_is_the_client": true,
    "state_schema": "MainAgentState",
-   "system_prompt_sha256": "b2d382df779912b65839f5b9b29a567ac7014415796d2cc07335c84ed704e23c",
+   "system_prompt_sha256": "9225437fa208f3e8c84751a7e4393b46ad3f7ef3967f4781e605d283d26a4f71",
    "tools": [
     "AskUserQuestion",
     "Bash",
@@ -330,17 +423,18 @@
     "ShowWidget",
     "TaskOutput",
     "ThreadStatus",
+    "UpdatePlan",
     "WebFetch",
     "WebSearch",
     "Write",
-    "draw_chart_annotation",
     "get_company_overview",
     "get_daily_prices",
     "get_market_overview",
     "get_options_chain",
     "get_quote",
     "get_sec_filing",
-    "manage_chart_annotations",
+    "manage_chart_layers",
+    "reply_to_comment",
     "schedule_wakeup",
     "screen_stocks"
    ]
@@ -395,7 +489,7 @@
    },
    "headers": {
     "accept": "application/json",
-    "anthropic-beta": "thinking-binding-controls-2026-08-01,mid-conversation-system-clear-at-2026-08-21,compact-2026-09-04",
+    "anthropic-beta": "thinking-binding-controls-2026-08-01,compact-2026-09-04",
     "anthropic-version": "2023-06-01",
     "connection": "keep-alive",
     "content-type": "application/json",
@@ -405,8 +499,8 @@
    "url": "https://api.anthropic.com/v1/messages"
   }
  },
- "claude-haiku-5-5-oauth": {
-  "client": "ChatAnthropicOAuth",
+ "claude-haiku-5-5-code": {
+  "client": "ClaudeCodeTarget",
   "graph_build": {
    "middleware": [
     "FrozenPromptMiddleware",
@@ -414,6 +508,7 @@
     "LargeResultEvictionMiddleware",
     "SubAgentMiddleware",
     "WakeupQuietGuardMiddleware",
+    "PlanCloseOutMiddleware",
     "CreditGateMiddleware",
     "RepeatCallGuardMiddleware",
     "ToolArgumentParsingMiddleware",
@@ -429,6 +524,7 @@
     "SteeringMiddleware",
     "BackgroundSubagentMiddleware",
     "AskUserMiddleware",
+    "PlanStateMiddleware",
     "StreamHeartbeatMiddleware",
     "CompactionMiddleware",
     "ModelResilienceMiddleware",
@@ -441,14 +537,14 @@
     "PatchToolCallsMiddleware",
     "TurnContextMiddleware",
     "BaselineContextMiddleware",
-    "NotesOffMiddleware",
+    "NotesDueMiddleware",
     "RowCarrierMiddleware",
     "SystemPinMiddleware",
     "ReasoningCompatibilityMiddleware"
    ],
    "model_is_the_client": true,
    "state_schema": "MainAgentState",
-   "system_prompt_sha256": "b2d382df779912b65839f5b9b29a567ac7014415796d2cc07335c84ed704e23c",
+   "system_prompt_sha256": "f6b99a98d890ee56fca977ed60e2f822e9f0b66d4acd7f5c0700675658c296eb",
    "tools": [
     "AskUserQuestion",
     "Bash",
@@ -462,17 +558,103 @@
     "ShowWidget",
     "TaskOutput",
     "ThreadStatus",
+    "UpdatePlan",
     "WebFetch",
     "WebSearch",
     "Write",
-    "draw_chart_annotation",
     "get_company_overview",
     "get_daily_prices",
     "get_market_overview",
     "get_options_chain",
     "get_quote",
     "get_sec_filing",
-    "manage_chart_annotations",
+    "manage_chart_layers",
+    "reply_to_comment",
+    "schedule_wakeup",
+    "screen_stocks"
+   ]
+  },
+  "metadata": {
+   "billing_type": "oauth",
+   "manifest_model": "claude-haiku-5-5-code",
+   "pricing_model_id": "claude-haiku-5-5",
+   "pricing_provider": "claude-code",
+   "provider_route": "claude-code",
+   "reasoning_effort": "medium"
+  },
+  "request": null
+ },
+ "claude-haiku-5-5-oauth": {
+  "client": "ChatAnthropicOAuth",
+  "graph_build": {
+   "middleware": [
+    "FrozenPromptMiddleware",
+    "TimeUpToolStopMiddleware",
+    "LargeResultEvictionMiddleware",
+    "SubAgentMiddleware",
+    "WakeupQuietGuardMiddleware",
+    "PlanCloseOutMiddleware",
+    "CreditGateMiddleware",
+    "RepeatCallGuardMiddleware",
+    "ToolArgumentParsingMiddleware",
+    "ComputerArgumentGuardMiddleware",
+    "ProtectedPathMiddleware",
+    "CodeValidationMiddleware",
+    "ToolErrorHandlingMiddleware",
+    "LeakDetectionMiddleware",
+    "ToolResultNormalizationMiddleware",
+    "FileOperationMiddleware",
+    "ProvenanceMiddleware",
+    "SkillsMiddleware",
+    "SteeringMiddleware",
+    "BackgroundSubagentMiddleware",
+    "AskUserMiddleware",
+    "PlanStateMiddleware",
+    "StreamHeartbeatMiddleware",
+    "CompactionMiddleware",
+    "ModelResilienceMiddleware",
+    "MultimodalStripMiddleware",
+    "MultimodalMiddleware",
+    "AnthropicPromptCachingMiddleware",
+    "SystemPromptCacheMiddleware",
+    "ToolSurfaceMiddleware",
+    "EmptyToolCallRetryMiddleware",
+    "PatchToolCallsMiddleware",
+    "TurnContextMiddleware",
+    "BaselineContextMiddleware",
+    "NotesDueMiddleware",
+    "RowCarrierMiddleware",
+    "SystemPinMiddleware",
+    "ReasoningCompatibilityMiddleware"
+   ],
+   "model_is_the_client": true,
+   "state_schema": "MainAgentState",
+   "system_prompt_sha256": "9225437fa208f3e8c84751a7e4393b46ad3f7ef3967f4781e605d283d26a4f71",
+   "tools": [
+    "AskUserQuestion",
+    "Bash",
+    "Edit",
+    "ExecuteCode",
+    "GetPreviewUrl",
+    "Glob",
+    "Grep",
+    "Read",
+    "RunWorkflow",
+    "ShowWidget",
+    "TaskOutput",
+    "ThreadStatus",
+    "UpdatePlan",
+    "WebFetch",
+    "WebSearch",
+    "Write",
+    "get_company_overview",
+    "get_daily_prices",
+    "get_market_overview",
+    "get_options_chain",
+    "get_quote",
+    "get_sec_filing",
+    "manage_chart_layers",
+    "reply_to_comment",
     "schedule_wakeup",
     "screen_stocks"
    ]
@@ -536,7 +718,7 @@
    },
    "headers": {
     "accept": "application/json",
-    "anthropic-beta": "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,fine-grained-tool-streaming-2025-05-14,thinking-binding-controls-2026-08-01,mid-conversation-system-clear-at-2026-08-21,compact-2026-09-04",
+    "anthropic-beta": "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,fine-grained-tool-streaming-2025-05-14,thinking-binding-controls-2026-08-01,compact-2026-09-04",
     "anthropic-version": "2023-06-01",
     "connection": "keep-alive",
     "content-type": "application/json",
@@ -556,6 +738,7 @@
     "LargeResultEvictionMiddleware",
     "SubAgentMiddleware",
     "WakeupQuietGuardMiddleware",
+    "PlanCloseOutMiddleware",
     "CreditGateMiddleware",
     "RepeatCallGuardMiddleware",
     "ToolArgumentParsingMiddleware",
@@ -571,6 +754,7 @@
     "SteeringMiddleware",
     "BackgroundSubagentMiddleware",
     "AskUserMiddleware",
+    "PlanStateMiddleware",
     "StreamHeartbeatMiddleware",
     "CompactionMiddleware",
     "ModelResilienceMiddleware",
@@ -583,14 +767,14 @@
     "PatchToolCallsMiddleware",
     "TurnContextMiddleware",
     "BaselineContextMiddleware",
-    "NotesOffMiddleware",
+    "NotesDueMiddleware",
     "RowCarrierMiddleware",
     "SystemPinMiddleware",
     "ReasoningCompatibilityMiddleware"
    ],
    "model_is_the_client": true,
    "state_schema": "MainAgentState",
-   "system_prompt_sha256": "2d9ab72041b31b4988c135110fb38f00abacda9d6046a0f13deda54f26043569",
+   "system_prompt_sha256": "03b99eff6f277ea11471f19b45036b66efdcfc5b233fdf9cf0adf97541a073d8",
    "tools": [
     "AskUserQuestion",
     "Bash",
@@ -604,17 +788,18 @@
     "ShowWidget",
     "TaskOutput",
     "ThreadStatus",
+    "UpdatePlan",
     "WebFetch",
     "WebSearch",
     "Write",
-    "draw_chart_annotation",
     "get_company_overview",
     "get_daily_prices",
     "get_market_overview",
     "get_options_chain",
     "get_quote",
     "get_sec_filing",
-    "manage_chart_annotations",
+    "manage_chart_layers",
+    "reply_to_comment",
     "schedule_wakeup",
     "screen_stocks"
    ]
@@ -669,7 +854,7 @@
    },
    "headers": {
     "accept": "application/json",
-    "anthropic-beta": "thinking-binding-controls-2026-08-01,mid-conversation-system-clear-at-2026-08-21,compact-2026-09-04",
+    "anthropic-beta": "thinking-binding-controls-2026-08-01,compact-2026-09-04",
     "anthropic-version": "2023-06-01",
     "connection": "keep-alive",
     "content-type": "application/json",
@@ -679,8 +864,8 @@
    "url": "https://api.anthropic.com/v1/messages"
   }
  },
- "claude-opus-5-5-oauth": {
-  "client": "ChatAnthropicOAuth",
+ "claude-opus-5-5-code": {
+  "client": "ClaudeCodeTarget",
   "graph_build": {
    "middleware": [
     "FrozenPromptMiddleware",
@@ -688,6 +873,7 @@
     "LargeResultEvictionMiddleware",
     "SubAgentMiddleware",
     "WakeupQuietGuardMiddleware",
+    "PlanCloseOutMiddleware",
     "CreditGateMiddleware",
     "RepeatCallGuardMiddleware",
     "ToolArgumentParsingMiddleware",
@@ -703,6 +889,7 @@
     "SteeringMiddleware",
     "BackgroundSubagentMiddleware",
     "AskUserMiddleware",
+    "PlanStateMiddleware",
     "StreamHeartbeatMiddleware",
     "CompactionMiddleware",
     "ModelResilienceMiddleware",
@@ -715,14 +902,14 @@
     "PatchToolCallsMiddleware",
     "TurnContextMiddleware",
     "BaselineContextMiddleware",
-    "NotesOffMiddleware",
+    "NotesDueMiddleware",
     "RowCarrierMiddleware",
     "SystemPinMiddleware",
     "ReasoningCompatibilityMiddleware"
    ],
    "model_is_the_client": true,
    "state_schema": "MainAgentState",
-   "system_prompt_sha256": "2d9ab72041b31b4988c135110fb38f00abacda9d6046a0f13deda54f26043569",
+   "system_prompt_sha256": "aeb8cbf25109306fb1947f90a29e7f98e4c4cae78e11a1f6d417946c7096eebb",
    "tools": [
     "AskUserQuestion",
     "Bash",
@@ -736,17 +923,103 @@
     "ShowWidget",
     "TaskOutput",
     "ThreadStatus",
+    "UpdatePlan",
     "WebFetch",
     "WebSearch",
     "Write",
-    "draw_chart_annotation",
     "get_company_overview",
     "get_daily_prices",
     "get_market_overview",
     "get_options_chain",
     "get_quote",
     "get_sec_filing",
-    "manage_chart_annotations",
+    "manage_chart_layers",
+    "reply_to_comment",
+    "schedule_wakeup",
+    "screen_stocks"
+   ]
+  },
+  "metadata": {
+   "billing_type": "oauth",
+   "manifest_model": "claude-opus-5-5-code",
+   "pricing_model_id": "claude-opus-5-5",
+   "pricing_provider": "claude-code",
+   "provider_route": "claude-code",
+   "reasoning_effort": "medium"
+  },
+  "request": null
+ },
+ "claude-opus-5-5-oauth": {
+  "client": "ChatAnthropicOAuth",
+  "graph_build": {
+   "middleware": [
+    "FrozenPromptMiddleware",
+    "TimeUpToolStopMiddleware",
+    "LargeResultEvictionMiddleware",
+    "SubAgentMiddleware",
+    "WakeupQuietGuardMiddleware",
+    "PlanCloseOutMiddleware",
+    "CreditGateMiddleware",
+    "RepeatCallGuardMiddleware",
+    "ToolArgumentParsingMiddleware",
+    "ComputerArgumentGuardMiddleware",
+    "ProtectedPathMiddleware",
+    "CodeValidationMiddleware",
+    "ToolErrorHandlingMiddleware",
+    "LeakDetectionMiddleware",
+    "ToolResultNormalizationMiddleware",
+    "FileOperationMiddleware",
+    "ProvenanceMiddleware",
+    "SkillsMiddleware",
+    "SteeringMiddleware",
+    "BackgroundSubagentMiddleware",
+    "AskUserMiddleware",
+    "PlanStateMiddleware",
+    "StreamHeartbeatMiddleware",
+    "CompactionMiddleware",
+    "ModelResilienceMiddleware",
+    "MultimodalStripMiddleware",
+    "MultimodalMiddleware",
+    "AnthropicPromptCachingMiddleware",
+    "SystemPromptCacheMiddleware",
+    "ToolSurfaceMiddleware",
+    "EmptyToolCallRetryMiddleware",
+    "PatchToolCallsMiddleware",
+    "TurnContextMiddleware",
+    "BaselineContextMiddleware",
+    "NotesDueMiddleware",
+    "RowCarrierMiddleware",
+    "SystemPinMiddleware",
+    "ReasoningCompatibilityMiddleware"
+   ],
+   "model_is_the_client": true,
+   "state_schema": "MainAgentState",
+   "system_prompt_sha256": "03b99eff6f277ea11471f19b45036b66efdcfc5b233fdf9cf0adf97541a073d8",
+   "tools": [
+    "AskUserQuestion",
+    "Bash",
+    "Edit",
+    "ExecuteCode",
+    "GetPreviewUrl",
+    "Glob",
+    "Grep",
+    "Read",
+    "RunWorkflow",
+    "ShowWidget",
+    "TaskOutput",
+    "ThreadStatus",
+    "UpdatePlan",
+    "WebFetch",
+    "WebSearch",
+    "Write",
+    "get_company_overview",
+    "get_daily_prices",
+    "get_market_overview",
+    "get_options_chain",
+    "get_quote",
+    "get_sec_filing",
+    "manage_chart_layers",
+    "reply_to_comment",
     "schedule_wakeup",
     "screen_stocks"
    ]
@@ -810,7 +1083,7 @@
    },
    "headers": {
     "accept": "application/json",
-    "anthropic-beta": "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,fine-grained-tool-streaming-2025-05-14,thinking-binding-controls-2026-08-01,mid-conversation-system-clear-at-2026-08-21,compact-2026-09-04",
+    "anthropic-beta": "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,fine-grained-tool-streaming-2025-05-14,thinking-binding-controls-2026-08-01,compact-2026-09-04",
     "anthropic-version": "2023-06-01",
     "connection": "keep-alive",
     "content-type": "application/json",
@@ -830,6 +1103,7 @@
     "LargeResultEvictionMiddleware",
     "SubAgentMiddleware",
     "WakeupQuietGuardMiddleware",
+    "PlanCloseOutMiddleware",
     "CreditGateMiddleware",
     "RepeatCallGuardMiddleware",
     "ToolArgumentParsingMiddleware",
@@ -845,6 +1119,7 @@
     "SteeringMiddleware",
     "BackgroundSubagentMiddleware",
     "AskUserMiddleware",
+    "PlanStateMiddleware",
     "StreamHeartbeatMiddleware",
     "CompactionMiddleware",
     "ModelResilienceMiddleware",
@@ -857,14 +1132,14 @@
     "PatchToolCallsMiddleware",
     "TurnContextMiddleware",
     "BaselineContextMiddleware",
-    "NotesOffMiddleware",
+    "NotesDueMiddleware",
     "RowCarrierMiddleware",
     "SystemPinMiddleware",
     "ReasoningCompatibilityMiddleware"
    ],
    "model_is_the_client": true,
    "state_schema": "MainAgentState",
-   "system_prompt_sha256": "2d9ab72041b31b4988c135110fb38f00abacda9d6046a0f13deda54f26043569",
+   "system_prompt_sha256": "03b99eff6f277ea11471f19b45036b66efdcfc5b233fdf9cf0adf97541a073d8",
    "tools": [
     "AskUserQuestion",
     "Bash",
@@ -878,17 +1153,18 @@
     "ShowWidget",
     "TaskOutput",
     "ThreadStatus",
+    "UpdatePlan",
     "WebFetch",
     "WebSearch",
     "Write",
-    "draw_chart_annotation",
     "get_company_overview",
     "get_daily_prices",
     "get_market_overview",
     "get_options_chain",
     "get_quote",
     "get_sec_filing",
-    "manage_chart_annotations",
+    "manage_chart_layers",
+    "reply_to_comment",
     "schedule_wakeup",
     "screen_stocks"
    ]
@@ -943,7 +1219,7 @@
    },
    "headers": {
     "accept": "application/json",
-    "anthropic-beta": "thinking-binding-controls-2026-08-01,mid-conversation-system-clear-at-2026-08-21,compact-2026-09-04",
+    "anthropic-beta": "thinking-binding-controls-2026-08-01,compact-2026-09-04",
     "anthropic-version": "2023-06-01",
     "connection": "keep-alive",
     "content-type": "application/json",
@@ -953,8 +1229,8 @@
    "url": "https://api.anthropic.com/v1/messages"
   }
  },
- "claude-sonnet-5-5-oauth": {
-  "client": "ChatAnthropicOAuth",
+ "claude-sonnet-5-5-code": {
+  "client": "ClaudeCodeTarget",
   "graph_build": {
    "middleware": [
     "FrozenPromptMiddleware",
@@ -962,6 +1238,7 @@
     "LargeResultEvictionMiddleware",
     "SubAgentMiddleware",
     "WakeupQuietGuardMiddleware",
+    "PlanCloseOutMiddleware",
     "CreditGateMiddleware",
     "RepeatCallGuardMiddleware",
     "ToolArgumentParsingMiddleware",
@@ -977,6 +1254,7 @@
     "SteeringMiddleware",
     "BackgroundSubagentMiddleware",
     "AskUserMiddleware",
+    "PlanStateMiddleware",
     "StreamHeartbeatMiddleware",
     "CompactionMiddleware",
     "ModelResilienceMiddleware",
@@ -989,14 +1267,14 @@
     "PatchToolCallsMiddleware",
     "TurnContextMiddleware",
     "BaselineContextMiddleware",
-    "NotesOffMiddleware",
+    "NotesDueMiddleware",
     "RowCarrierMiddleware",
     "SystemPinMiddleware",
     "ReasoningCompatibilityMiddleware"
    ],
    "model_is_the_client": true,
    "state_schema": "MainAgentState",
-   "system_prompt_sha256": "2d9ab72041b31b4988c135110fb38f00abacda9d6046a0f13deda54f26043569",
+   "system_prompt_sha256": "aeb8cbf25109306fb1947f90a29e7f98e4c4cae78e11a1f6d417946c7096eebb",
    "tools": [
     "AskUserQuestion",
     "Bash",
@@ -1010,17 +1288,103 @@
     "ShowWidget",
     "TaskOutput",
     "ThreadStatus",
+    "UpdatePlan",
     "WebFetch",
     "WebSearch",
     "Write",
-    "draw_chart_annotation",
     "get_company_overview",
     "get_daily_prices",
     "get_market_overview",
     "get_options_chain",
     "get_quote",
     "get_sec_filing",
-    "manage_chart_annotations",
+    "manage_chart_layers",
+    "reply_to_comment",
+    "schedule_wakeup",
+    "screen_stocks"
+   ]
+  },
+  "metadata": {
+   "billing_type": "oauth",
+   "manifest_model": "claude-sonnet-5-5-code",
+   "pricing_model_id": "claude-sonnet-5-5",
+   "pricing_provider": "claude-code",
+   "provider_route": "claude-code",
+   "reasoning_effort": "medium"
+  },
+  "request": null
+ },
+ "claude-sonnet-5-5-oauth": {
+  "client": "ChatAnthropicOAuth",
+  "graph_build": {
+   "middleware": [
+    "FrozenPromptMiddleware",
+    "TimeUpToolStopMiddleware",
+    "LargeResultEvictionMiddleware",
+    "SubAgentMiddleware",
+    "WakeupQuietGuardMiddleware",
+    "PlanCloseOutMiddleware",
+    "CreditGateMiddleware",
+    "RepeatCallGuardMiddleware",
+    "ToolArgumentParsingMiddleware",
+    "ComputerArgumentGuardMiddleware",
+    "ProtectedPathMiddleware",
+    "CodeValidationMiddleware",
+    "ToolErrorHandlingMiddleware",
+    "LeakDetectionMiddleware",
+    "ToolResultNormalizationMiddleware",
+    "FileOperationMiddleware",
+    "ProvenanceMiddleware",
+    "SkillsMiddleware",
+    "SteeringMiddleware",
+    "BackgroundSubagentMiddleware",
+    "AskUserMiddleware",
+    "PlanStateMiddleware",
+    "StreamHeartbeatMiddleware",
+    "CompactionMiddleware",
+    "ModelResilienceMiddleware",
+    "MultimodalStripMiddleware",
+    "MultimodalMiddleware",
+    "AnthropicPromptCachingMiddleware",
+    "SystemPromptCacheMiddleware",
+    "ToolSurfaceMiddleware",
+    "EmptyToolCallRetryMiddleware",
+    "PatchToolCallsMiddleware",
+    "TurnContextMiddleware",
+    "BaselineContextMiddleware",
+    "NotesDueMiddleware",
+    "RowCarrierMiddleware",
+    "SystemPinMiddleware",
+    "ReasoningCompatibilityMiddleware"
+   ],
+   "model_is_the_client": true,
+   "state_schema": "MainAgentState",
+   "system_prompt_sha256": "03b99eff6f277ea11471f19b45036b66efdcfc5b233fdf9cf0adf97541a073d8",
+   "tools": [
+    "AskUserQuestion",
+    "Bash",
+    "Edit",
+    "ExecuteCode",
+    "GetPreviewUrl",
+    "Glob",
+    "Grep",
+    "Read",
+    "RunWorkflow",
+    "ShowWidget",
+    "TaskOutput",
+    "ThreadStatus",
+    "UpdatePlan",
+    "WebFetch",
+    "WebSearch",
+    "Write",
+    "get_company_overview",
+    "get_daily_prices",
+    "get_market_overview",
+    "get_options_chain",
+    "get_quote",
+    "get_sec_filing",
+    "manage_chart_layers",
+    "reply_to_comment",
     "schedule_wakeup",
     "screen_stocks"
    ]
@@ -1084,7 +1448,7 @@
    },
    "headers": {
     "accept": "application/json",
-    "anthropic-beta": "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,fine-grained-tool-streaming-2025-05-14,thinking-binding-controls-2026-08-01,mid-conversation-system-clear-at-2026-08-21,compact-2026-09-04",
+    "anthropic-beta": "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,fine-grained-tool-streaming-2025-05-14,thinking-binding-controls-2026-08-01,compact-2026-09-04",
     "anthropic-version": "2023-06-01",
     "connection": "keep-alive",
     "content-type": "application/json",
@@ -1104,6 +1468,7 @@
     "LargeResultEvictionMiddleware",
     "SubAgentMiddleware",
     "WakeupQuietGuardMiddleware",
+    "PlanCloseOutMiddleware",
     "CreditGateMiddleware",
     "RepeatCallGuardMiddleware",
     "ToolArgumentParsingMiddleware",
@@ -1119,6 +1484,7 @@
     "SteeringMiddleware",
     "BackgroundSubagentMiddleware",
     "AskUserMiddleware",
+    "PlanStateMiddleware",
     "StreamHeartbeatMiddleware",
     "CompactionMiddleware",
     "ModelResilienceMiddleware",
@@ -1131,14 +1497,14 @@
     "PatchToolCallsMiddleware",
     "TurnContextMiddleware",
     "BaselineContextMiddleware",
-    "NotesOffMiddleware",
+    "NotesDueMiddleware",
     "RowCarrierMiddleware",
     "SystemPinMiddleware",
     "ReasoningCompatibilityMiddleware"
    ],
    "model_is_the_client": true,
    "state_schema": "MainAgentState",
-   "system_prompt_sha256": "b2d382df779912b65839f5b9b29a567ac7014415796d2cc07335c84ed704e23c",
+   "system_prompt_sha256": "9225437fa208f3e8c84751a7e4393b46ad3f7ef3967f4781e605d283d26a4f71",
    "tools": [
     "AskUserQuestion",
     "Bash",
@@ -1152,17 +1518,18 @@
     "ShowWidget",
     "TaskOutput",
     "ThreadStatus",
+    "UpdatePlan",
     "WebFetch",
     "WebSearch",
     "Write",
-    "draw_chart_annotation",
     "get_company_overview",
     "get_daily_prices",
     "get_market_overview",
     "get_options_chain",
     "get_quote",
     "get_sec_filing",
-    "manage_chart_annotations",
+    "manage_chart_layers",
+    "reply_to_comment",
     "schedule_wakeup",
     "screen_stocks"
    ]
@@ -1231,6 +1598,7 @@
     "LargeResultEvictionMiddleware",
     "SubAgentMiddleware",
     "WakeupQuietGuardMiddleware",
+    "PlanCloseOutMiddleware",
     "CreditGateMiddleware",
     "RepeatCallGuardMiddleware",
     "ToolArgumentParsingMiddleware",
@@ -1246,6 +1614,7 @@
     "SteeringMiddleware",
     "BackgroundSubagentMiddleware",
     "AskUserMiddleware",
+    "PlanStateMiddleware",
     "StreamHeartbeatMiddleware",
     "CompactionMiddleware",
     "ModelResilienceMiddleware",
@@ -1258,14 +1627,14 @@
     "PatchToolCallsMiddleware",
     "TurnContextMiddleware",
     "BaselineContextMiddleware",
-    "NotesOffMiddleware",
+    "NotesDueMiddleware",
     "RowCarrierMiddleware",
     "SystemPinMiddleware",
     "ReasoningCompatibilityMiddleware"
    ],
    "model_is_the_client": true,
    "state_schema": "MainAgentState",
-   "system_prompt_sha256": "b2d382df779912b65839f5b9b29a567ac7014415796d2cc07335c84ed704e23c",
+   "system_prompt_sha256": "9225437fa208f3e8c84751a7e4393b46ad3f7ef3967f4781e605d283d26a4f71",
    "tools": [
     "AskUserQuestion",
     "Bash",
@@ -1279,17 +1648,18 @@
     "ShowWidget",
     "TaskOutput",
     "ThreadStatus",
+    "UpdatePlan",
     "WebFetch",
     "WebSearch",
     "Write",
-    "draw_chart_annotation",
     "get_company_overview",
     "get_daily_prices",
     "get_market_overview",
     "get_options_chain",
     "get_quote",
     "get_sec_filing",
-    "manage_chart_annotations",
+    "manage_chart_layers",
+    "reply_to_comment",
     "schedule_wakeup",
     "screen_stocks"
    ]
@@ -1359,7 +1729,7 @@
    "url": "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.1-flash-lite-preview:generateContent"
   }
  },
- "gemini-3.8-flash": {
+ "gemini-4-carbon": {
   "client": "ChatGoogleGenerativeAI",
   "graph_build": {
    "middleware": [
@@ -1368,6 +1738,7 @@
     "LargeResultEvictionMiddleware",
     "SubAgentMiddleware",
     "WakeupQuietGuardMiddleware",
+    "PlanCloseOutMiddleware",
     "CreditGateMiddleware",
     "RepeatCallGuardMiddleware",
     "ToolArgumentParsingMiddleware",
@@ -1383,6 +1754,7 @@
     "SteeringMiddleware",
     "BackgroundSubagentMiddleware",
     "AskUserMiddleware",
+    "PlanStateMiddleware",
     "StreamHeartbeatMiddleware",
     "CompactionMiddleware",
     "ModelResilienceMiddleware",
@@ -1395,14 +1767,14 @@
     "PatchToolCallsMiddleware",
     "TurnContextMiddleware",
     "BaselineContextMiddleware",
-    "NotesOffMiddleware",
+    "NotesDueMiddleware",
     "RowCarrierMiddleware",
     "SystemPinMiddleware",
     "ReasoningCompatibilityMiddleware"
    ],
    "model_is_the_client": true,
    "state_schema": "MainAgentState",
-   "system_prompt_sha256": "b2d382df779912b65839f5b9b29a567ac7014415796d2cc07335c84ed704e23c",
+   "system_prompt_sha256": "03b99eff6f277ea11471f19b45036b66efdcfc5b233fdf9cf0adf97541a073d8",
    "tools": [
     "AskUserQuestion",
     "Bash",
@@ -1416,25 +1788,26 @@
     "ShowWidget",
     "TaskOutput",
     "ThreadStatus",
+    "UpdatePlan",
     "WebFetch",
     "WebSearch",
     "Write",
-    "draw_chart_annotation",
     "get_company_overview",
     "get_daily_prices",
     "get_market_overview",
     "get_options_chain",
     "get_quote",
     "get_sec_filing",
-    "manage_chart_annotations",
+    "manage_chart_layers",
+    "reply_to_comment",
     "schedule_wakeup",
     "screen_stocks"
    ]
   },
   "metadata": {
    "billing_type": "byok",
-   "manifest_model": "gemini-3.8-flash",
-   "pricing_model_id": "gemini-3.8-flash",
+   "manifest_model": "gemini-4-carbon",
+   "pricing_model_id": "gemini-4-carbon",
    "pricing_provider": "gemini",
    "provider_route": "gemini",
    "reasoning_effort": "medium"
@@ -1493,10 +1866,10 @@
     "x-server-timeout": "600"
    },
    "method": "POST",
-   "url": "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.8-flash:generateContent"
+   "url": "https://generativelanguage.googleapis.com/v1beta/models/gemini-4-carbon:generateContent"
   }
  },
- "gemini-4-argon": {
+ "gemini-4-hydrogen": {
   "client": "ChatGoogleGenerativeAI",
   "graph_build": {
    "middleware": [
@@ -1505,6 +1878,7 @@
     "LargeResultEvictionMiddleware",
     "SubAgentMiddleware",
     "WakeupQuietGuardMiddleware",
+    "PlanCloseOutMiddleware",
     "CreditGateMiddleware",
     "RepeatCallGuardMiddleware",
     "ToolArgumentParsingMiddleware",
@@ -1520,6 +1894,7 @@
     "SteeringMiddleware",
     "BackgroundSubagentMiddleware",
     "AskUserMiddleware",
+    "PlanStateMiddleware",
     "StreamHeartbeatMiddleware",
     "CompactionMiddleware",
     "ModelResilienceMiddleware",
@@ -1532,14 +1907,14 @@
     "PatchToolCallsMiddleware",
     "TurnContextMiddleware",
     "BaselineContextMiddleware",
-    "NotesOffMiddleware",
+    "NotesDueMiddleware",
     "RowCarrierMiddleware",
     "SystemPinMiddleware",
     "ReasoningCompatibilityMiddleware"
    ],
    "model_is_the_client": true,
    "state_schema": "MainAgentState",
-   "system_prompt_sha256": "2d9ab72041b31b4988c135110fb38f00abacda9d6046a0f13deda54f26043569",
+   "system_prompt_sha256": "03b99eff6f277ea11471f19b45036b66efdcfc5b233fdf9cf0adf97541a073d8",
    "tools": [
     "AskUserQuestion",
     "Bash",
@@ -1553,25 +1928,26 @@
     "ShowWidget",
     "TaskOutput",
     "ThreadStatus",
+    "UpdatePlan",
     "WebFetch",
     "WebSearch",
     "Write",
-    "draw_chart_annotation",
     "get_company_overview",
     "get_daily_prices",
     "get_market_overview",
     "get_options_chain",
     "get_quote",
     "get_sec_filing",
-    "manage_chart_annotations",
+    "manage_chart_layers",
+    "reply_to_comment",
     "schedule_wakeup",
     "screen_stocks"
    ]
   },
   "metadata": {
    "billing_type": "byok",
-   "manifest_model": "gemini-4-argon",
-   "pricing_model_id": "gemini-4-argon",
+   "manifest_model": "gemini-4-hydrogen",
+   "pricing_model_id": "gemini-4-hydrogen",
    "pricing_provider": "gemini",
    "provider_route": "gemini",
    "reasoning_effort": "medium"
@@ -1630,11 +2006,11 @@
     "x-server-timeout": "600"
    },
    "method": "POST",
-   "url": "https://generativelanguage.googleapis.com/v1beta/models/gemini-4-argon:generateContent"
+   "url": "https://generativelanguage.googleapis.com/v1beta/models/gemini-4-hydrogen:generateContent"
   }
  },
- "glm-5.2": {
-  "client": "ChatZai",
+ "gemini-4-neon": {
+  "client": "ChatGoogleGenerativeAI",
   "graph_build": {
    "middleware": [
     "FrozenPromptMiddleware",
@@ -1642,6 +2018,7 @@
     "LargeResultEvictionMiddleware",
     "SubAgentMiddleware",
     "WakeupQuietGuardMiddleware",
+    "PlanCloseOutMiddleware",
     "CreditGateMiddleware",
     "RepeatCallGuardMiddleware",
     "ToolArgumentParsingMiddleware",
@@ -1657,6 +2034,7 @@
     "SteeringMiddleware",
     "BackgroundSubagentMiddleware",
     "AskUserMiddleware",
+    "PlanStateMiddleware",
     "StreamHeartbeatMiddleware",
     "CompactionMiddleware",
     "ModelResilienceMiddleware",
@@ -1669,14 +2047,14 @@
     "PatchToolCallsMiddleware",
     "TurnContextMiddleware",
     "BaselineContextMiddleware",
-    "NotesOffMiddleware",
+    "NotesDueMiddleware",
     "RowCarrierMiddleware",
     "SystemPinMiddleware",
     "ReasoningCompatibilityMiddleware"
    ],
    "model_is_the_client": true,
    "state_schema": "MainAgentState",
-   "system_prompt_sha256": "2d9ab72041b31b4988c135110fb38f00abacda9d6046a0f13deda54f26043569",
+   "system_prompt_sha256": "03b99eff6f277ea11471f19b45036b66efdcfc5b233fdf9cf0adf97541a073d8",
    "tools": [
     "AskUserQuestion",
     "Bash",
@@ -1690,209 +2068,85 @@
     "ShowWidget",
     "TaskOutput",
     "ThreadStatus",
+    "UpdatePlan",
     "WebFetch",
     "WebSearch",
     "Write",
-    "draw_chart_annotation",
     "get_company_overview",
     "get_daily_prices",
     "get_market_overview",
     "get_options_chain",
     "get_quote",
     "get_sec_filing",
-    "manage_chart_annotations",
+    "manage_chart_layers",
+    "reply_to_comment",
     "schedule_wakeup",
     "screen_stocks"
    ]
   },
   "metadata": {
    "billing_type": "byok",
-   "manifest_model": "glm-5.2",
-   "pricing_model_id": "glm-5.2",
-   "pricing_provider": "z-ai",
-   "provider_route": "z-ai",
-   "reasoning_effort": "high"
+   "manifest_model": "gemini-4-neon",
+   "pricing_model_id": "gemini-4-neon",
+   "pricing_provider": "gemini",
+   "provider_route": "gemini",
+   "reasoning_effort": "medium"
   },
   "request": {
    "body": {
-    "max_tokens": 128000,
-    "messages": [
+    "contents": [
      {
-      "content": "You are a lock probe.",
-      "role": "system"
-     },
-     {
-      "content": "Look up AAPL.",
+      "parts": [
+       {
+        "text": "Look up AAPL."
+       }
+      ],
       "role": "user"
      }
     ],
-    "model": "glm-5.2",
-    "reasoning_effort": "high",
-    "stream": false,
-    "thinking": {
-     "clear_thinking": false,
-     "type": "enabled"
+    "generationConfig": {
+     "candidateCount": 1,
+     "thinkingConfig": {
+      "include_thoughts": true,
+      "thinking_level": "MEDIUM"
+     }
+    },
+    "safetySettings": [],
+    "systemInstruction": {
+     "parts": [
+      {
+       "text": "You are a lock probe."
+      }
+     ]
     },
     "tools": [
      {
-      "function": {
-       "description": "Look up a symbol.",
-       "name": "lock_probe",
-       "parameters": {
-        "properties": {
-         "symbol": {
-          "type": "string"
-         }
-        },
-        "required": [
-         "symbol"
-        ],
-        "type": "object"
+      "functionDeclarations": [
+       {
+        "description": "Look up a symbol.",
+        "name": "lock_probe",
+        "parameters": {
+         "properties": {
+          "symbol": {
+           "type": "STRING"
+          }
+         },
+         "required": [
+          "symbol"
+         ],
+         "type": "OBJECT"
+        }
        }
-      },
-      "type": "function"
+      ]
      }
     ]
    },
    "headers": {
-    "accept": "application/json",
-    "connection": "keep-alive",
     "content-type": "application/json",
-    "host": "api.z.ai"
+    "x-server-timeout": "600"
    },
    "method": "POST",
-   "url": "https://api.z.ai/api/paas/v4/chat/completions"
-  }
- },
- "glm-5.2-cn": {
-  "client": "ChatZai",
-  "graph_build": {
-   "middleware": [
-    "FrozenPromptMiddleware",
-    "TimeUpToolStopMiddleware",
-    "LargeResultEvictionMiddleware",
-    "SubAgentMiddleware",
-    "WakeupQuietGuardMiddleware",
-    "CreditGateMiddleware",
-    "RepeatCallGuardMiddleware",
-    "ToolArgumentParsingMiddleware",
-    "ComputerArgumentGuardMiddleware",
-    "ProtectedPathMiddleware",
-    "CodeValidationMiddleware",
-    "ToolErrorHandlingMiddleware",
-    "LeakDetectionMiddleware",
-    "ToolResultNormalizationMiddleware",
-    "FileOperationMiddleware",
-    "ProvenanceMiddleware",
-    "SkillsMiddleware",
-    "SteeringMiddleware",
-    "BackgroundSubagentMiddleware",
-    "AskUserMiddleware",
-    "StreamHeartbeatMiddleware",
-    "CompactionMiddleware",
-    "ModelResilienceMiddleware",
-    "MultimodalStripMiddleware",
-    "MultimodalMiddleware",
-    "AnthropicPromptCachingMiddleware",
-    "SystemPromptCacheMiddleware",
-    "ToolSurfaceMiddleware",
-    "EmptyToolCallRetryMiddleware",
-    "PatchToolCallsMiddleware",
-    "TurnContextMiddleware",
-    "BaselineContextMiddleware",
-    "NotesOffMiddleware",
-    "RowCarrierMiddleware",
-    "SystemPinMiddleware",
-    "ReasoningCompatibilityMiddleware"
-   ],
-   "model_is_the_client": true,
-   "state_schema": "MainAgentState",
-   "system_prompt_sha256": "2d9ab72041b31b4988c135110fb38f00abacda9d6046a0f13deda54f26043569",
-   "tools": [
-    "AskUserQuestion",
-    "Bash",
-    "Edit",
-    "ExecuteCode",
-    "GetPreviewUrl",
-    "Glob",
-    "Grep",
-    "Read",
-    "RunWorkflow",
-    "ShowWidget",
-    "TaskOutput",
-    "ThreadStatus",
-    "WebFetch",
-    "WebSearch",
-    "Write",
-    "draw_chart_annotation",
-    "get_company_overview",
-    "get_daily_prices",
-    "get_market_overview",
-    "get_options_chain",
-    "get_quote",
-    "get_sec_filing",
-    "manage_chart_annotations",
-    "schedule_wakeup",
-    "screen_stocks"
-   ]
-  },
-  "metadata": {
-   "billing_type": "byok",
-   "manifest_model": "glm-5.2-cn",
-   "pricing_model_id": "glm-5.2",
-   "pricing_provider": "z-ai-cn",
-   "provider_route": "z-ai-cn",
-   "reasoning_effort": "high"
-  },
-  "request": {
-   "body": {
-    "max_tokens": 128000,
-    "messages": [
-     {
-      "content": "You are a lock probe.",
-      "role": "system"
-     },
-     {
-      "content": "Look up AAPL.",
-      "role": "user"
-     }
-    ],
-    "model": "glm-5.2",
-    "reasoning_effort": "high",
-    "stream": false,
-    "thinking": {
-     "clear_thinking": false,
-     "type": "enabled"
-    },
-    "tools": [
-     {
-      "function": {
-       "description": "Look up a symbol.",
-       "name": "lock_probe",
-       "parameters": {
-        "properties": {
-         "symbol": {
-          "type": "string"
-         }
-        },
-        "required": [
-         "symbol"
-        ],
-        "type": "object"
-       }
-      },
-      "type": "function"
-     }
-    ]
-   },
-   "headers": {
-    "accept": "application/json",
-    "connection": "keep-alive",
-    "content-type": "application/json",
-    "host": "open.bigmodel.cn"
-   },
-   "method": "POST",
-   "url": "https://open.bigmodel.cn/api/paas/v4/chat/completions"
+   "url": "https://generativelanguage.googleapis.com/v1beta/models/gemini-4-neon:generateContent"
   }
  },
  "glm-5.3": {
@@ -1904,6 +2158,7 @@
     "LargeResultEvictionMiddleware",
     "SubAgentMiddleware",
     "WakeupQuietGuardMiddleware",
+    "PlanCloseOutMiddleware",
     "CreditGateMiddleware",
     "RepeatCallGuardMiddleware",
     "ToolArgumentParsingMiddleware",
@@ -1919,6 +2174,7 @@
     "SteeringMiddleware",
     "BackgroundSubagentMiddleware",
     "AskUserMiddleware",
+    "PlanStateMiddleware",
     "StreamHeartbeatMiddleware",
     "CompactionMiddleware",
     "ModelResilienceMiddleware",
@@ -1931,14 +2187,14 @@
     "PatchToolCallsMiddleware",
     "TurnContextMiddleware",
     "BaselineContextMiddleware",
-    "NotesOffMiddleware",
+    "NotesDueMiddleware",
     "RowCarrierMiddleware",
     "SystemPinMiddleware",
     "ReasoningCompatibilityMiddleware"
    ],
    "model_is_the_client": true,
    "state_schema": "MainAgentState",
-   "system_prompt_sha256": "2d9ab72041b31b4988c135110fb38f00abacda9d6046a0f13deda54f26043569",
+   "system_prompt_sha256": "03b99eff6f277ea11471f19b45036b66efdcfc5b233fdf9cf0adf97541a073d8",
    "tools": [
     "AskUserQuestion",
     "Bash",
@@ -1952,17 +2208,18 @@
     "ShowWidget",
     "TaskOutput",
     "ThreadStatus",
+    "UpdatePlan",
     "WebFetch",
     "WebSearch",
     "Write",
-    "draw_chart_annotation",
     "get_company_overview",
     "get_daily_prices",
     "get_market_overview",
     "get_options_chain",
     "get_quote",
     "get_sec_filing",
-    "manage_chart_annotations",
+    "manage_chart_layers",
+    "reply_to_comment",
     "schedule_wakeup",
     "screen_stocks"
    ]
@@ -2035,6 +2292,7 @@
     "LargeResultEvictionMiddleware",
     "SubAgentMiddleware",
     "WakeupQuietGuardMiddleware",
+    "PlanCloseOutMiddleware",
     "CreditGateMiddleware",
     "RepeatCallGuardMiddleware",
     "ToolArgumentParsingMiddleware",
@@ -2050,6 +2308,7 @@
     "SteeringMiddleware",
     "BackgroundSubagentMiddleware",
     "AskUserMiddleware",
+    "PlanStateMiddleware",
     "StreamHeartbeatMiddleware",
     "CompactionMiddleware",
     "ModelResilienceMiddleware",
@@ -2062,14 +2321,14 @@
     "PatchToolCallsMiddleware",
     "TurnContextMiddleware",
     "BaselineContextMiddleware",
-    "NotesOffMiddleware",
+    "NotesDueMiddleware",
     "RowCarrierMiddleware",
     "SystemPinMiddleware",
     "ReasoningCompatibilityMiddleware"
    ],
    "model_is_the_client": true,
    "state_schema": "MainAgentState",
-   "system_prompt_sha256": "2d9ab72041b31b4988c135110fb38f00abacda9d6046a0f13deda54f26043569",
+   "system_prompt_sha256": "03b99eff6f277ea11471f19b45036b66efdcfc5b233fdf9cf0adf97541a073d8",
    "tools": [
     "AskUserQuestion",
     "Bash",
@@ -2083,17 +2342,18 @@
     "ShowWidget",
     "TaskOutput",
     "ThreadStatus",
+    "UpdatePlan",
     "WebFetch",
     "WebSearch",
     "Write",
-    "draw_chart_annotation",
     "get_company_overview",
     "get_daily_prices",
     "get_market_overview",
     "get_options_chain",
     "get_quote",
     "get_sec_filing",
-    "manage_chart_annotations",
+    "manage_chart_layers",
+    "reply_to_comment",
     "schedule_wakeup",
     "screen_stocks"
    ]
@@ -2166,6 +2426,7 @@
     "LargeResultEvictionMiddleware",
     "SubAgentMiddleware",
     "WakeupQuietGuardMiddleware",
+    "PlanCloseOutMiddleware",
     "CreditGateMiddleware",
     "RepeatCallGuardMiddleware",
     "ToolArgumentParsingMiddleware",
@@ -2181,6 +2442,7 @@
     "SteeringMiddleware",
     "BackgroundSubagentMiddleware",
     "AskUserMiddleware",
+    "PlanStateMiddleware",
     "StreamHeartbeatMiddleware",
     "CompactionMiddleware",
     "ModelResilienceMiddleware",
@@ -2193,14 +2455,14 @@
     "PatchToolCallsMiddleware",
     "TurnContextMiddleware",
     "BaselineContextMiddleware",
-    "NotesOffMiddleware",
+    "NotesDueMiddleware",
     "RowCarrierMiddleware",
     "SystemPinMiddleware",
     "ReasoningCompatibilityMiddleware"
    ],
    "model_is_the_client": true,
    "state_schema": "MainAgentState",
-   "system_prompt_sha256": "2d9ab72041b31b4988c135110fb38f00abacda9d6046a0f13deda54f26043569",
+   "system_prompt_sha256": "03b99eff6f277ea11471f19b45036b66efdcfc5b233fdf9cf0adf97541a073d8",
    "tools": [
     "AskUserQuestion",
     "Bash",
@@ -2214,17 +2476,18 @@
     "ShowWidget",
     "TaskOutput",
     "ThreadStatus",
+    "UpdatePlan",
     "WebFetch",
     "WebSearch",
     "Write",
-    "draw_chart_annotation",
     "get_company_overview",
     "get_daily_prices",
     "get_market_overview",
     "get_options_chain",
     "get_quote",
     "get_sec_filing",
-    "manage_chart_annotations",
+    "manage_chart_layers",
+    "reply_to_comment",
     "schedule_wakeup",
     "screen_stocks"
    ]
@@ -2297,6 +2560,7 @@
     "LargeResultEvictionMiddleware",
     "SubAgentMiddleware",
     "WakeupQuietGuardMiddleware",
+    "PlanCloseOutMiddleware",
     "CreditGateMiddleware",
     "RepeatCallGuardMiddleware",
     "ToolArgumentParsingMiddleware",
@@ -2312,6 +2576,7 @@
     "SteeringMiddleware",
     "BackgroundSubagentMiddleware",
     "AskUserMiddleware",
+    "PlanStateMiddleware",
     "StreamHeartbeatMiddleware",
     "CompactionMiddleware",
     "ModelResilienceMiddleware",
@@ -2324,14 +2589,14 @@
     "PatchToolCallsMiddleware",
     "TurnContextMiddleware",
     "BaselineContextMiddleware",
-    "NotesOffMiddleware",
+    "NotesDueMiddleware",
     "RowCarrierMiddleware",
     "SystemPinMiddleware",
     "ReasoningCompatibilityMiddleware"
    ],
    "model_is_the_client": true,
    "state_schema": "MainAgentState",
-   "system_prompt_sha256": "2d9ab72041b31b4988c135110fb38f00abacda9d6046a0f13deda54f26043569",
+   "system_prompt_sha256": "03b99eff6f277ea11471f19b45036b66efdcfc5b233fdf9cf0adf97541a073d8",
    "tools": [
     "AskUserQuestion",
     "Bash",
@@ -2345,17 +2610,18 @@
     "ShowWidget",
     "TaskOutput",
     "ThreadStatus",
+    "UpdatePlan",
     "WebFetch",
     "WebSearch",
     "Write",
-    "draw_chart_annotation",
     "get_company_overview",
     "get_daily_prices",
     "get_market_overview",
     "get_options_chain",
     "get_quote",
     "get_sec_filing",
-    "manage_chart_annotations",
+    "manage_chart_layers",
+    "reply_to_comment",
     "schedule_wakeup",
     "screen_stocks"
    ]
@@ -2419,398 +2685,6 @@
    "url": "https://open.bigmodel.cn/api/paas/v4/chat/completions"
   }
  },
- "gpt-5.3-codex-spark-oauth": {
-  "client": "ChatCodexOpenAI",
-  "graph_build": {
-   "middleware": [
-    "FrozenPromptMiddleware",
-    "TimeUpToolStopMiddleware",
-    "LargeResultEvictionMiddleware",
-    "SubAgentMiddleware",
-    "WakeupQuietGuardMiddleware",
-    "CreditGateMiddleware",
-    "RepeatCallGuardMiddleware",
-    "ToolArgumentParsingMiddleware",
-    "ComputerArgumentGuardMiddleware",
-    "ProtectedPathMiddleware",
-    "CodeValidationMiddleware",
-    "ToolErrorHandlingMiddleware",
-    "LeakDetectionMiddleware",
-    "ToolResultNormalizationMiddleware",
-    "FileOperationMiddleware",
-    "ProvenanceMiddleware",
-    "SkillsMiddleware",
-    "SteeringMiddleware",
-    "BackgroundSubagentMiddleware",
-    "AskUserMiddleware",
-    "StreamHeartbeatMiddleware",
-    "CompactionMiddleware",
-    "ModelResilienceMiddleware",
-    "MultimodalStripMiddleware",
-    "MultimodalMiddleware",
-    "AnthropicPromptCachingMiddleware",
-    "SystemPromptCacheMiddleware",
-    "ToolSurfaceMiddleware",
-    "EmptyToolCallRetryMiddleware",
-    "PatchToolCallsMiddleware",
-    "TurnContextMiddleware",
-    "BaselineContextMiddleware",
-    "NotesOffMiddleware",
-    "RowCarrierMiddleware",
-    "SystemPinMiddleware",
-    "ReasoningCompatibilityMiddleware"
-   ],
-   "model_is_the_client": true,
-   "state_schema": "MainAgentState",
-   "system_prompt_sha256": "b2d382df779912b65839f5b9b29a567ac7014415796d2cc07335c84ed704e23c",
-   "tools": [
-    "AskUserQuestion",
-    "Bash",
-    "Edit",
-    "ExecuteCode",
-    "GetPreviewUrl",
-    "Glob",
-    "Grep",
-    "Read",
-    "RunWorkflow",
-    "ShowWidget",
-    "TaskOutput",
-    "ThreadStatus",
-    "WebFetch",
-    "WebSearch",
-    "Write",
-    "draw_chart_annotation",
-    "get_company_overview",
-    "get_daily_prices",
-    "get_market_overview",
-    "get_options_chain",
-    "get_quote",
-    "get_sec_filing",
-    "manage_chart_annotations",
-    "schedule_wakeup",
-    "screen_stocks"
-   ]
-  },
-  "metadata": {
-   "billing_type": "oauth",
-   "manifest_model": "gpt-5.3-codex-spark-oauth",
-   "pricing_model_id": "gpt-5.3-codex-spark",
-   "pricing_provider": "codex-oauth",
-   "provider_route": "codex-oauth",
-   "reasoning_effort": "medium"
-  },
-  "request": {
-   "body": {
-    "include": [
-     "reasoning.encrypted_content"
-    ],
-    "input": [
-     {
-      "content": "Look up AAPL.",
-      "role": "user",
-      "type": "message"
-     }
-    ],
-    "instructions": "You are a lock probe.",
-    "model": "gpt-5.3-codex-spark",
-    "reasoning": {
-     "effort": "medium",
-     "summary": "auto"
-    },
-    "store": false,
-    "stream": true,
-    "tools": [
-     {
-      "description": "Look up a symbol.",
-      "name": "lock_probe",
-      "parameters": {
-       "properties": {
-        "symbol": {
-         "type": "string"
-        }
-       },
-       "required": [
-        "symbol"
-       ],
-       "type": "object"
-      },
-      "type": "function"
-     }
-    ]
-   },
-   "headers": {
-    "accept": "application/json",
-    "connection": "keep-alive",
-    "content-type": "application/json",
-    "host": "chatgpt.com",
-    "originator": "codex_cli_rs"
-   },
-   "method": "POST",
-   "url": "https://chatgpt.com/backend-api/codex/responses"
-  }
- },
- "gpt-6-astra": {
-  "client": "ChatOpenAI",
-  "graph_build": {
-   "middleware": [
-    "FrozenPromptMiddleware",
-    "TimeUpToolStopMiddleware",
-    "LargeResultEvictionMiddleware",
-    "SubAgentMiddleware",
-    "WakeupQuietGuardMiddleware",
-    "CreditGateMiddleware",
-    "RepeatCallGuardMiddleware",
-    "ToolArgumentParsingMiddleware",
-    "ComputerArgumentGuardMiddleware",
-    "ProtectedPathMiddleware",
-    "CodeValidationMiddleware",
-    "ToolErrorHandlingMiddleware",
-    "LeakDetectionMiddleware",
-    "ToolResultNormalizationMiddleware",
-    "FileOperationMiddleware",
-    "ProvenanceMiddleware",
-    "SkillsMiddleware",
-    "SteeringMiddleware",
-    "BackgroundSubagentMiddleware",
-    "AskUserMiddleware",
-    "StreamHeartbeatMiddleware",
-    "CompactionMiddleware",
-    "ModelResilienceMiddleware",
-    "MultimodalStripMiddleware",
-    "MultimodalMiddleware",
-    "AnthropicPromptCachingMiddleware",
-    "SystemPromptCacheMiddleware",
-    "ToolSurfaceMiddleware",
-    "EmptyToolCallRetryMiddleware",
-    "PatchToolCallsMiddleware",
-    "TurnContextMiddleware",
-    "BaselineContextMiddleware",
-    "NotesOffMiddleware",
-    "RowCarrierMiddleware",
-    "SystemPinMiddleware",
-    "ReasoningCompatibilityMiddleware"
-   ],
-   "model_is_the_client": true,
-   "state_schema": "MainAgentState",
-   "system_prompt_sha256": "2d9ab72041b31b4988c135110fb38f00abacda9d6046a0f13deda54f26043569",
-   "tools": [
-    "AskUserQuestion",
-    "Bash",
-    "Edit",
-    "ExecuteCode",
-    "GetPreviewUrl",
-    "Glob",
-    "Grep",
-    "Read",
-    "RunWorkflow",
-    "ShowWidget",
-    "TaskOutput",
-    "ThreadStatus",
-    "WebFetch",
-    "WebSearch",
-    "Write",
-    "draw_chart_annotation",
-    "get_company_overview",
-    "get_daily_prices",
-    "get_market_overview",
-    "get_options_chain",
-    "get_quote",
-    "get_sec_filing",
-    "manage_chart_annotations",
-    "schedule_wakeup",
-    "screen_stocks"
-   ]
-  },
-  "metadata": {
-   "billing_type": "byok",
-   "manifest_model": "gpt-6-astra",
-   "pricing_model_id": "gpt-6-astra",
-   "pricing_provider": "openai",
-   "provider_route": "openai",
-   "reasoning_effort": "medium"
-  },
-  "request": {
-   "body": {
-    "input": [
-     {
-      "content": "You are a lock probe.",
-      "role": "system",
-      "type": "message"
-     },
-     {
-      "content": "Look up AAPL.",
-      "role": "user",
-      "type": "message"
-     }
-    ],
-    "model": "gpt-6-astra",
-    "prompt_cache_options": {
-     "mode": "implicit"
-    },
-    "reasoning": {
-     "effort": "medium",
-     "summary": "auto"
-    },
-    "stream": false,
-    "tools": [
-     {
-      "description": "Look up a symbol.",
-      "name": "lock_probe",
-      "parameters": {
-       "properties": {
-        "symbol": {
-         "type": "string"
-        }
-       },
-       "required": [
-        "symbol"
-       ],
-       "type": "object"
-      },
-      "type": "function"
-     }
-    ]
-   },
-   "headers": {
-    "accept": "application/json",
-    "connection": "keep-alive",
-    "content-type": "application/json",
-    "host": "api.openai.com"
-   },
-   "method": "POST",
-   "url": "https://api.openai.com/v1/responses"
-  }
- },
- "gpt-6-astra-oauth": {
-  "client": "ChatCodexOpenAI",
-  "graph_build": {
-   "middleware": [
-    "FrozenPromptMiddleware",
-    "TimeUpToolStopMiddleware",
-    "LargeResultEvictionMiddleware",
-    "SubAgentMiddleware",
-    "WakeupQuietGuardMiddleware",
-    "CreditGateMiddleware",
-    "RepeatCallGuardMiddleware",
-    "ToolArgumentParsingMiddleware",
-    "ComputerArgumentGuardMiddleware",
-    "ProtectedPathMiddleware",
-    "CodeValidationMiddleware",
-    "ToolErrorHandlingMiddleware",
-    "LeakDetectionMiddleware",
-    "ToolResultNormalizationMiddleware",
-    "FileOperationMiddleware",
-    "ProvenanceMiddleware",
-    "SkillsMiddleware",
-    "SteeringMiddleware",
-    "BackgroundSubagentMiddleware",
-    "AskUserMiddleware",
-    "StreamHeartbeatMiddleware",
-    "CompactionMiddleware",
-    "ModelResilienceMiddleware",
-    "MultimodalStripMiddleware",
-    "MultimodalMiddleware",
-    "AnthropicPromptCachingMiddleware",
-    "SystemPromptCacheMiddleware",
-    "ToolSurfaceMiddleware",
-    "EmptyToolCallRetryMiddleware",
-    "PatchToolCallsMiddleware",
-    "TurnContextMiddleware",
-    "BaselineContextMiddleware",
-    "NotesOffMiddleware",
-    "RowCarrierMiddleware",
-    "SystemPinMiddleware",
-    "ReasoningCompatibilityMiddleware"
-   ],
-   "model_is_the_client": true,
-   "state_schema": "MainAgentState",
-   "system_prompt_sha256": "2d9ab72041b31b4988c135110fb38f00abacda9d6046a0f13deda54f26043569",
-   "tools": [
-    "AskUserQuestion",
-    "Bash",
-    "Edit",
-    "ExecuteCode",
-    "GetPreviewUrl",
-    "Glob",
-    "Grep",
-    "Read",
-    "RunWorkflow",
-    "ShowWidget",
-    "TaskOutput",
-    "ThreadStatus",
-    "WebFetch",
-    "WebSearch",
-    "Write",
-    "draw_chart_annotation",
-    "get_company_overview",
-    "get_daily_prices",
-    "get_market_overview",
-    "get_options_chain",
-    "get_quote",
-    "get_sec_filing",
-    "manage_chart_annotations",
-    "schedule_wakeup",
-    "screen_stocks"
-   ]
-  },
-  "metadata": {
-   "billing_type": "oauth",
-   "manifest_model": "gpt-6-astra-oauth",
-   "pricing_model_id": "gpt-6-astra",
-   "pricing_provider": "codex-oauth",
-   "provider_route": "codex-oauth",
-   "reasoning_effort": "medium"
-  },
-  "request": {
-   "body": {
-    "include": [
-     "reasoning.encrypted_content"
-    ],
-    "input": [
-     {
-      "content": "Look up AAPL.",
-      "role": "user",
-      "type": "message"
-     }
-    ],
-    "instructions": "You are a lock probe.",
-    "model": "gpt-6-astra",
-    "reasoning": {
-     "effort": "medium",
-     "summary": "auto"
-    },
-    "store": false,
-    "stream": true,
-    "tools": [
-     {
-      "description": "Look up a symbol.",
-      "name": "lock_probe",
-      "parameters": {
-       "properties": {
-        "symbol": {
-         "type": "string"
-        }
-       },
-       "required": [
-        "symbol"
-       ],
-       "type": "object"
-      },
-      "type": "function"
-     }
-    ]
-   },
-   "headers": {
-    "accept": "application/json",
-    "connection": "keep-alive",
-    "content-type": "application/json",
-    "host": "chatgpt.com",
-    "originator": "codex_cli_rs"
-   },
-   "method": "POST",
-   "url": "https://chatgpt.com/backend-api/codex/responses"
-  }
- },
  "gpt-6-luna": {
   "client": "ChatOpenAI",
   "graph_build": {
@@ -2820,6 +2694,7 @@
     "LargeResultEvictionMiddleware",
     "SubAgentMiddleware",
     "WakeupQuietGuardMiddleware",
+    "PlanCloseOutMiddleware",
     "CreditGateMiddleware",
     "RepeatCallGuardMiddleware",
     "ToolArgumentParsingMiddleware",
@@ -2835,6 +2710,7 @@
     "SteeringMiddleware",
     "BackgroundSubagentMiddleware",
     "AskUserMiddleware",
+    "PlanStateMiddleware",
     "StreamHeartbeatMiddleware",
     "CompactionMiddleware",
     "ModelResilienceMiddleware",
@@ -2847,14 +2723,14 @@
     "PatchToolCallsMiddleware",
     "TurnContextMiddleware",
     "BaselineContextMiddleware",
-    "NotesOffMiddleware",
+    "NotesDueMiddleware",
     "RowCarrierMiddleware",
     "SystemPinMiddleware",
     "ReasoningCompatibilityMiddleware"
    ],
    "model_is_the_client": true,
    "state_schema": "MainAgentState",
-   "system_prompt_sha256": "b2d382df779912b65839f5b9b29a567ac7014415796d2cc07335c84ed704e23c",
+   "system_prompt_sha256": "9225437fa208f3e8c84751a7e4393b46ad3f7ef3967f4781e605d283d26a4f71",
    "tools": [
     "AskUserQuestion",
     "Bash",
@@ -2868,17 +2744,18 @@
     "ShowWidget",
     "TaskOutput",
     "ThreadStatus",
+    "UpdatePlan",
     "WebFetch",
     "WebSearch",
     "Write",
-    "draw_chart_annotation",
     "get_company_overview",
     "get_daily_prices",
     "get_market_overview",
     "get_options_chain",
     "get_quote",
     "get_sec_filing",
-    "manage_chart_annotations",
+    "manage_chart_layers",
+    "reply_to_comment",
     "schedule_wakeup",
     "screen_stocks"
    ]
@@ -2952,6 +2829,7 @@
     "LargeResultEvictionMiddleware",
     "SubAgentMiddleware",
     "WakeupQuietGuardMiddleware",
+    "PlanCloseOutMiddleware",
     "CreditGateMiddleware",
     "RepeatCallGuardMiddleware",
     "ToolArgumentParsingMiddleware",
@@ -2967,6 +2845,7 @@
     "SteeringMiddleware",
     "BackgroundSubagentMiddleware",
     "AskUserMiddleware",
+    "PlanStateMiddleware",
     "StreamHeartbeatMiddleware",
     "CompactionMiddleware",
     "ModelResilienceMiddleware",
@@ -2979,14 +2858,14 @@
     "PatchToolCallsMiddleware",
     "TurnContextMiddleware",
     "BaselineContextMiddleware",
-    "NotesOffMiddleware",
+    "NotesDueMiddleware",
     "RowCarrierMiddleware",
     "SystemPinMiddleware",
     "ReasoningCompatibilityMiddleware"
    ],
    "model_is_the_client": true,
    "state_schema": "MainAgentState",
-   "system_prompt_sha256": "b2d382df779912b65839f5b9b29a567ac7014415796d2cc07335c84ed704e23c",
+   "system_prompt_sha256": "9225437fa208f3e8c84751a7e4393b46ad3f7ef3967f4781e605d283d26a4f71",
    "tools": [
     "AskUserQuestion",
     "Bash",
@@ -3000,17 +2879,18 @@
     "ShowWidget",
     "TaskOutput",
     "ThreadStatus",
+    "UpdatePlan",
     "WebFetch",
     "WebSearch",
     "Write",
-    "draw_chart_annotation",
     "get_company_overview",
     "get_daily_prices",
     "get_market_overview",
     "get_options_chain",
     "get_quote",
     "get_sec_filing",
-    "manage_chart_annotations",
+    "manage_chart_layers",
+    "reply_to_comment",
     "schedule_wakeup",
     "screen_stocks"
    ]
@@ -3030,135 +2910,8 @@
     ],
     "input": [
      {
-      "content": "Look up AAPL.",
-      "role": "user",
-      "type": "message"
-     }
-    ],
-    "instructions": "You are a lock probe.",
-    "model": "gpt-6-luna",
-    "reasoning": {
-     "effort": "medium",
-     "summary": "auto"
-    },
-    "store": false,
-    "stream": true,
-    "tools": [
-     {
-      "description": "Look up a symbol.",
-      "name": "lock_probe",
-      "parameters": {
-       "properties": {
-        "symbol": {
-         "type": "string"
-        }
-       },
-       "required": [
-        "symbol"
-       ],
-       "type": "object"
-      },
-      "type": "function"
-     }
-    ]
-   },
-   "headers": {
-    "accept": "application/json",
-    "connection": "keep-alive",
-    "content-type": "application/json",
-    "host": "chatgpt.com",
-    "originator": "codex_cli_rs"
-   },
-   "method": "POST",
-   "url": "https://chatgpt.com/backend-api/codex/responses"
-  }
- },
- "gpt-6.1-sol": {
-  "client": "ChatOpenAI",
-  "graph_build": {
-   "middleware": [
-    "FrozenPromptMiddleware",
-    "TimeUpToolStopMiddleware",
-    "LargeResultEvictionMiddleware",
-    "SubAgentMiddleware",
-    "WakeupQuietGuardMiddleware",
-    "CreditGateMiddleware",
-    "RepeatCallGuardMiddleware",
-    "ToolArgumentParsingMiddleware",
-    "ComputerArgumentGuardMiddleware",
-    "ProtectedPathMiddleware",
-    "CodeValidationMiddleware",
-    "ToolErrorHandlingMiddleware",
-    "LeakDetectionMiddleware",
-    "ToolResultNormalizationMiddleware",
-    "FileOperationMiddleware",
-    "ProvenanceMiddleware",
-    "SkillsMiddleware",
-    "SteeringMiddleware",
-    "BackgroundSubagentMiddleware",
-    "AskUserMiddleware",
-    "StreamHeartbeatMiddleware",
-    "CompactionMiddleware",
-    "ModelResilienceMiddleware",
-    "MultimodalStripMiddleware",
-    "MultimodalMiddleware",
-    "AnthropicPromptCachingMiddleware",
-    "SystemPromptCacheMiddleware",
-    "ToolSurfaceMiddleware",
-    "EmptyToolCallRetryMiddleware",
-    "PatchToolCallsMiddleware",
-    "TurnContextMiddleware",
-    "BaselineContextMiddleware",
-    "NotesOffMiddleware",
-    "RowCarrierMiddleware",
-    "SystemPinMiddleware",
-    "ReasoningCompatibilityMiddleware"
-   ],
-   "model_is_the_client": true,
-   "state_schema": "MainAgentState",
-   "system_prompt_sha256": "2d9ab72041b31b4988c135110fb38f00abacda9d6046a0f13deda54f26043569",
-   "tools": [
-    "AskUserQuestion",
-    "Bash",
-    "Edit",
-    "ExecuteCode",
-    "GetPreviewUrl",
-    "Glob",
-    "Grep",
-    "Read",
-    "RunWorkflow",
-    "ShowWidget",
-    "TaskOutput",
-    "ThreadStatus",
-    "WebFetch",
-    "WebSearch",
-    "Write",
-    "draw_chart_annotation",
-    "get_company_overview",
-    "get_daily_prices",
-    "get_market_overview",
-    "get_options_chain",
-    "get_quote",
-    "get_sec_filing",
-    "manage_chart_annotations",
-    "schedule_wakeup",
-    "screen_stocks"
-   ]
-  },
-  "metadata": {
-   "billing_type": "byok",
-   "manifest_model": "gpt-6.1-sol",
-   "pricing_model_id": "gpt-6.1-sol",
-   "pricing_provider": "openai",
-   "provider_route": "openai",
-   "reasoning_effort": "medium"
-  },
-  "request": {
-   "body": {
-    "input": [
-     {
       "content": "You are a lock probe.",
-      "role": "system",
+      "role": "developer",
       "type": "message"
      },
      {
@@ -3167,138 +2920,7 @@
       "type": "message"
      }
     ],
-    "model": "gpt-6.1-sol",
-    "prompt_cache_options": {
-     "mode": "implicit"
-    },
-    "reasoning": {
-     "effort": "medium",
-     "summary": "auto"
-    },
-    "stream": false,
-    "tools": [
-     {
-      "description": "Look up a symbol.",
-      "name": "lock_probe",
-      "parameters": {
-       "properties": {
-        "symbol": {
-         "type": "string"
-        }
-       },
-       "required": [
-        "symbol"
-       ],
-       "type": "object"
-      },
-      "type": "function"
-     }
-    ]
-   },
-   "headers": {
-    "accept": "application/json",
-    "connection": "keep-alive",
-    "content-type": "application/json",
-    "host": "api.openai.com"
-   },
-   "method": "POST",
-   "url": "https://api.openai.com/v1/responses"
-  }
- },
- "gpt-6.1-sol-oauth": {
-  "client": "ChatCodexOpenAI",
-  "graph_build": {
-   "middleware": [
-    "FrozenPromptMiddleware",
-    "TimeUpToolStopMiddleware",
-    "LargeResultEvictionMiddleware",
-    "SubAgentMiddleware",
-    "WakeupQuietGuardMiddleware",
-    "CreditGateMiddleware",
-    "RepeatCallGuardMiddleware",
-    "ToolArgumentParsingMiddleware",
-    "ComputerArgumentGuardMiddleware",
-    "ProtectedPathMiddleware",
-    "CodeValidationMiddleware",
-    "ToolErrorHandlingMiddleware",
-    "LeakDetectionMiddleware",
-    "ToolResultNormalizationMiddleware",
-    "FileOperationMiddleware",
-    "ProvenanceMiddleware",
-    "SkillsMiddleware",
-    "SteeringMiddleware",
-    "BackgroundSubagentMiddleware",
-    "AskUserMiddleware",
-    "StreamHeartbeatMiddleware",
-    "CompactionMiddleware",
-    "ModelResilienceMiddleware",
-    "MultimodalStripMiddleware",
-    "MultimodalMiddleware",
-    "AnthropicPromptCachingMiddleware",
-    "SystemPromptCacheMiddleware",
-    "ToolSurfaceMiddleware",
-    "EmptyToolCallRetryMiddleware",
-    "PatchToolCallsMiddleware",
-    "TurnContextMiddleware",
-    "BaselineContextMiddleware",
-    "NotesOffMiddleware",
-    "RowCarrierMiddleware",
-    "SystemPinMiddleware",
-    "ReasoningCompatibilityMiddleware"
-   ],
-   "model_is_the_client": true,
-   "state_schema": "MainAgentState",
-   "system_prompt_sha256": "2d9ab72041b31b4988c135110fb38f00abacda9d6046a0f13deda54f26043569",
-   "tools": [
-    "AskUserQuestion",
-    "Bash",
-    "Edit",
-    "ExecuteCode",
-    "GetPreviewUrl",
-    "Glob",
-    "Grep",
-    "Read",
-    "RunWorkflow",
-    "ShowWidget",
-    "TaskOutput",
-    "ThreadStatus",
-    "WebFetch",
-    "WebSearch",
-    "Write",
-    "draw_chart_annotation",
-    "get_company_overview",
-    "get_daily_prices",
-    "get_market_overview",
-    "get_options_chain",
-    "get_quote",
-    "get_sec_filing",
-    "manage_chart_annotations",
-    "schedule_wakeup",
-    "screen_stocks"
-   ]
-  },
-  "metadata": {
-   "billing_type": "oauth",
-   "manifest_model": "gpt-6.1-sol-oauth",
-   "pricing_model_id": "gpt-6.1-sol",
-   "pricing_provider": "codex-oauth",
-   "provider_route": "codex-oauth",
-   "reasoning_effort": "medium"
-  },
-  "request": {
-   "body": {
-    "include": [
-     "reasoning.encrypted_content"
-    ],
-    "input": [
-     {
-      "content": "Look up AAPL.",
-      "role": "user",
-      "type": "message"
-     }
-    ],
-    "instructions": "You are a lock probe.",
-    "model": "gpt-6.1-sol",
+    "model": "gpt-6-luna",
     "reasoning": {
      "effort": "medium",
      "summary": "auto"
@@ -3344,6 +2966,7 @@
     "LargeResultEvictionMiddleware",
     "SubAgentMiddleware",
     "WakeupQuietGuardMiddleware",
+    "PlanCloseOutMiddleware",
     "CreditGateMiddleware",
     "RepeatCallGuardMiddleware",
     "ToolArgumentParsingMiddleware",
@@ -3359,6 +2982,7 @@
     "SteeringMiddleware",
     "BackgroundSubagentMiddleware",
     "AskUserMiddleware",
+    "PlanStateMiddleware",
     "StreamHeartbeatMiddleware",
     "CompactionMiddleware",
     "ModelResilienceMiddleware",
@@ -3371,14 +2995,14 @@
     "PatchToolCallsMiddleware",
     "TurnContextMiddleware",
     "BaselineContextMiddleware",
-    "NotesOffMiddleware",
+    "NotesDueMiddleware",
     "RowCarrierMiddleware",
     "SystemPinMiddleware",
     "ReasoningCompatibilityMiddleware"
    ],
    "model_is_the_client": true,
    "state_schema": "MainAgentState",
-   "system_prompt_sha256": "2d9ab72041b31b4988c135110fb38f00abacda9d6046a0f13deda54f26043569",
+   "system_prompt_sha256": "03b99eff6f277ea11471f19b45036b66efdcfc5b233fdf9cf0adf97541a073d8",
    "tools": [
     "AskUserQuestion",
     "Bash",
@@ -3392,17 +3016,18 @@
     "ShowWidget",
     "TaskOutput",
     "ThreadStatus",
+    "UpdatePlan",
     "WebFetch",
     "WebSearch",
     "Write",
-    "draw_chart_annotation",
     "get_company_overview",
     "get_daily_prices",
     "get_market_overview",
     "get_options_chain",
     "get_quote",
     "get_sec_filing",
-    "manage_chart_annotations",
+    "manage_chart_layers",
+    "reply_to_comment",
     "schedule_wakeup",
     "screen_stocks"
    ]
@@ -3476,6 +3101,7 @@
     "LargeResultEvictionMiddleware",
     "SubAgentMiddleware",
     "WakeupQuietGuardMiddleware",
+    "PlanCloseOutMiddleware",
     "CreditGateMiddleware",
     "RepeatCallGuardMiddleware",
     "ToolArgumentParsingMiddleware",
@@ -3491,6 +3117,7 @@
     "SteeringMiddleware",
     "BackgroundSubagentMiddleware",
     "AskUserMiddleware",
+    "PlanStateMiddleware",
     "StreamHeartbeatMiddleware",
     "CompactionMiddleware",
     "ModelResilienceMiddleware",
@@ -3503,14 +3130,14 @@
     "PatchToolCallsMiddleware",
     "TurnContextMiddleware",
     "BaselineContextMiddleware",
-    "NotesOffMiddleware",
+    "NotesDueMiddleware",
     "RowCarrierMiddleware",
     "SystemPinMiddleware",
     "ReasoningCompatibilityMiddleware"
    ],
    "model_is_the_client": true,
    "state_schema": "MainAgentState",
-   "system_prompt_sha256": "2d9ab72041b31b4988c135110fb38f00abacda9d6046a0f13deda54f26043569",
+   "system_prompt_sha256": "03b99eff6f277ea11471f19b45036b66efdcfc5b233fdf9cf0adf97541a073d8",
    "tools": [
     "AskUserQuestion",
     "Bash",
@@ -3524,17 +3151,18 @@
     "ShowWidget",
     "TaskOutput",
     "ThreadStatus",
+    "UpdatePlan",
     "WebFetch",
     "WebSearch",
     "Write",
-    "draw_chart_annotation",
     "get_company_overview",
     "get_daily_prices",
     "get_market_overview",
     "get_options_chain",
     "get_quote",
     "get_sec_filing",
-    "manage_chart_annotations",
+    "manage_chart_layers",
+    "reply_to_comment",
     "schedule_wakeup",
     "screen_stocks"
    ]
@@ -3554,12 +3182,16 @@
     ],
     "input": [
      {
+      "content": "You are a lock probe.",
+      "role": "developer",
+      "type": "message"
+     },
+     {
       "content": "Look up AAPL.",
       "role": "user",
       "type": "message"
      }
     ],
-    "instructions": "You are a lock probe.",
     "model": "gpt-6.1-terra",
     "reasoning": {
      "effort": "medium",
@@ -3597,7 +3229,7 @@
    "url": "https://chatgpt.com/backend-api/codex/responses"
   }
  },
- "grok-4.3": {
+ "gpt-6.2-astra": {
   "client": "ChatOpenAI",
   "graph_build": {
    "middleware": [
@@ -3606,6 +3238,7 @@
     "LargeResultEvictionMiddleware",
     "SubAgentMiddleware",
     "WakeupQuietGuardMiddleware",
+    "PlanCloseOutMiddleware",
     "CreditGateMiddleware",
     "RepeatCallGuardMiddleware",
     "ToolArgumentParsingMiddleware",
@@ -3621,6 +3254,7 @@
     "SteeringMiddleware",
     "BackgroundSubagentMiddleware",
     "AskUserMiddleware",
+    "PlanStateMiddleware",
     "StreamHeartbeatMiddleware",
     "CompactionMiddleware",
     "ModelResilienceMiddleware",
@@ -3633,14 +3267,14 @@
     "PatchToolCallsMiddleware",
     "TurnContextMiddleware",
     "BaselineContextMiddleware",
-    "NotesOffMiddleware",
+    "NotesDueMiddleware",
     "RowCarrierMiddleware",
     "SystemPinMiddleware",
     "ReasoningCompatibilityMiddleware"
    ],
    "model_is_the_client": true,
    "state_schema": "MainAgentState",
-   "system_prompt_sha256": "b2d382df779912b65839f5b9b29a567ac7014415796d2cc07335c84ed704e23c",
+   "system_prompt_sha256": "03b99eff6f277ea11471f19b45036b66efdcfc5b233fdf9cf0adf97541a073d8",
    "tools": [
     "AskUserQuestion",
     "Bash",
@@ -3654,34 +3288,32 @@
     "ShowWidget",
     "TaskOutput",
     "ThreadStatus",
+    "UpdatePlan",
     "WebFetch",
     "WebSearch",
     "Write",
-    "draw_chart_annotation",
     "get_company_overview",
     "get_daily_prices",
     "get_market_overview",
     "get_options_chain",
     "get_quote",
     "get_sec_filing",
-    "manage_chart_annotations",
+    "manage_chart_layers",
+    "reply_to_comment",
     "schedule_wakeup",
     "screen_stocks"
    ]
   },
   "metadata": {
    "billing_type": "byok",
-   "manifest_model": "grok-4.3",
-   "pricing_model_id": "grok-4.3",
-   "pricing_provider": "xai",
-   "provider_route": "xai",
+   "manifest_model": "gpt-6.2-astra",
+   "pricing_model_id": "gpt-6.2-astra",
+   "pricing_provider": "openai",
+   "provider_route": "openai",
    "reasoning_effort": "medium"
   },
   "request": {
    "body": {
-    "include": [
-     "reasoning.encrypted_content"
-    ],
     "input": [
      {
       "content": "You are a lock probe.",
@@ -3694,12 +3326,14 @@
       "type": "message"
      }
     ],
-    "model": "grok-4.3",
+    "model": "gpt-6.2-astra",
+    "prompt_cache_options": {
+     "mode": "implicit"
+    },
     "reasoning": {
      "effort": "medium",
      "summary": "auto"
     },
-    "store": false,
     "stream": false,
     "tools": [
      {
@@ -3724,14 +3358,14 @@
     "accept": "application/json",
     "connection": "keep-alive",
     "content-type": "application/json",
-    "host": "api.x.ai"
+    "host": "api.openai.com"
    },
    "method": "POST",
-   "url": "https://api.x.ai/v1/responses"
+   "url": "https://api.openai.com/v1/responses"
   }
  },
- "grok-4.3-oauth": {
-  "client": "ChatOpenAI",
+ "gpt-6.2-astra-oauth": {
+  "client": "ChatCodexOpenAI",
   "graph_build": {
    "middleware": [
     "FrozenPromptMiddleware",
@@ -3739,6 +3373,7 @@
     "LargeResultEvictionMiddleware",
     "SubAgentMiddleware",
     "WakeupQuietGuardMiddleware",
+    "PlanCloseOutMiddleware",
     "CreditGateMiddleware",
     "RepeatCallGuardMiddleware",
     "ToolArgumentParsingMiddleware",
@@ -3754,6 +3389,7 @@
     "SteeringMiddleware",
     "BackgroundSubagentMiddleware",
     "AskUserMiddleware",
+    "PlanStateMiddleware",
     "StreamHeartbeatMiddleware",
     "CompactionMiddleware",
     "ModelResilienceMiddleware",
@@ -3766,14 +3402,14 @@
     "PatchToolCallsMiddleware",
     "TurnContextMiddleware",
     "BaselineContextMiddleware",
-    "NotesOffMiddleware",
+    "NotesDueMiddleware",
     "RowCarrierMiddleware",
     "SystemPinMiddleware",
     "ReasoningCompatibilityMiddleware"
    ],
    "model_is_the_client": true,
    "state_schema": "MainAgentState",
-   "system_prompt_sha256": "b2d382df779912b65839f5b9b29a567ac7014415796d2cc07335c84ed704e23c",
+   "system_prompt_sha256": "03b99eff6f277ea11471f19b45036b66efdcfc5b233fdf9cf0adf97541a073d8",
    "tools": [
     "AskUserQuestion",
     "Bash",
@@ -3787,27 +3423,28 @@
     "ShowWidget",
     "TaskOutput",
     "ThreadStatus",
+    "UpdatePlan",
     "WebFetch",
     "WebSearch",
     "Write",
-    "draw_chart_annotation",
     "get_company_overview",
     "get_daily_prices",
     "get_market_overview",
     "get_options_chain",
     "get_quote",
     "get_sec_filing",
-    "manage_chart_annotations",
+    "manage_chart_layers",
+    "reply_to_comment",
     "schedule_wakeup",
     "screen_stocks"
    ]
   },
   "metadata": {
    "billing_type": "oauth",
-   "manifest_model": "grok-4.3-oauth",
-   "pricing_model_id": "grok-4.3",
-   "pricing_provider": "grok-oauth",
-   "provider_route": "grok-oauth",
+   "manifest_model": "gpt-6.2-astra-oauth",
+   "pricing_model_id": "gpt-6.2-astra",
+   "pricing_provider": "codex-oauth",
+   "provider_route": "codex-oauth",
    "reasoning_effort": "medium"
   },
   "request": {
@@ -3818,7 +3455,7 @@
     "input": [
      {
       "content": "You are a lock probe.",
-      "role": "system",
+      "role": "developer",
       "type": "message"
      },
      {
@@ -3827,13 +3464,13 @@
       "type": "message"
      }
     ],
-    "model": "grok-4.3",
+    "model": "gpt-6.2-astra",
     "reasoning": {
      "effort": "medium",
      "summary": "auto"
     },
     "store": false,
-    "stream": false,
+    "stream": true,
     "tools": [
      {
       "description": "Look up a symbol.",
@@ -3857,13 +3494,14 @@
     "accept": "application/json",
     "connection": "keep-alive",
     "content-type": "application/json",
-    "host": "api.x.ai"
+    "host": "chatgpt.com",
+    "originator": "codex_cli_rs"
    },
    "method": "POST",
-   "url": "https://api.x.ai/v1/responses"
+   "url": "https://chatgpt.com/backend-api/codex/responses"
   }
  },
- "grok-4.5": {
+ "gpt-6.2-sol": {
   "client": "ChatOpenAI",
   "graph_build": {
    "middleware": [
@@ -3872,6 +3510,7 @@
     "LargeResultEvictionMiddleware",
     "SubAgentMiddleware",
     "WakeupQuietGuardMiddleware",
+    "PlanCloseOutMiddleware",
     "CreditGateMiddleware",
     "RepeatCallGuardMiddleware",
     "ToolArgumentParsingMiddleware",
@@ -3887,6 +3526,7 @@
     "SteeringMiddleware",
     "BackgroundSubagentMiddleware",
     "AskUserMiddleware",
+    "PlanStateMiddleware",
     "StreamHeartbeatMiddleware",
     "CompactionMiddleware",
     "ModelResilienceMiddleware",
@@ -3899,14 +3539,14 @@
     "PatchToolCallsMiddleware",
     "TurnContextMiddleware",
     "BaselineContextMiddleware",
-    "NotesOffMiddleware",
+    "NotesDueMiddleware",
     "RowCarrierMiddleware",
     "SystemPinMiddleware",
     "ReasoningCompatibilityMiddleware"
    ],
    "model_is_the_client": true,
    "state_schema": "MainAgentState",
-   "system_prompt_sha256": "b2d382df779912b65839f5b9b29a567ac7014415796d2cc07335c84ed704e23c",
+   "system_prompt_sha256": "03b99eff6f277ea11471f19b45036b66efdcfc5b233fdf9cf0adf97541a073d8",
    "tools": [
     "AskUserQuestion",
     "Bash",
@@ -3920,34 +3560,32 @@
     "ShowWidget",
     "TaskOutput",
     "ThreadStatus",
+    "UpdatePlan",
     "WebFetch",
     "WebSearch",
     "Write",
-    "draw_chart_annotation",
     "get_company_overview",
     "get_daily_prices",
     "get_market_overview",
     "get_options_chain",
     "get_quote",
     "get_sec_filing",
-    "manage_chart_annotations",
+    "manage_chart_layers",
+    "reply_to_comment",
     "schedule_wakeup",
     "screen_stocks"
    ]
   },
   "metadata": {
    "billing_type": "byok",
-   "manifest_model": "grok-4.5",
-   "pricing_model_id": "grok-4.5",
-   "pricing_provider": "xai",
-   "provider_route": "xai",
+   "manifest_model": "gpt-6.2-sol",
+   "pricing_model_id": "gpt-6.2-sol",
+   "pricing_provider": "openai",
+   "provider_route": "openai",
    "reasoning_effort": "medium"
   },
   "request": {
    "body": {
-    "include": [
-     "reasoning.encrypted_content"
-    ],
     "input": [
      {
       "content": "You are a lock probe.",
@@ -3960,12 +3598,14 @@
       "type": "message"
      }
     ],
-    "model": "grok-4.5",
+    "model": "gpt-6.2-sol",
+    "prompt_cache_options": {
+     "mode": "implicit"
+    },
     "reasoning": {
      "effort": "medium",
      "summary": "auto"
     },
-    "store": false,
     "stream": false,
     "tools": [
      {
@@ -3990,14 +3630,14 @@
     "accept": "application/json",
     "connection": "keep-alive",
     "content-type": "application/json",
-    "host": "api.x.ai"
+    "host": "api.openai.com"
    },
    "method": "POST",
-   "url": "https://api.x.ai/v1/responses"
+   "url": "https://api.openai.com/v1/responses"
   }
  },
- "grok-4.5-oauth": {
-  "client": "ChatOpenAI",
+ "gpt-6.2-sol-oauth": {
+  "client": "ChatCodexOpenAI",
   "graph_build": {
    "middleware": [
     "FrozenPromptMiddleware",
@@ -4005,6 +3645,7 @@
     "LargeResultEvictionMiddleware",
     "SubAgentMiddleware",
     "WakeupQuietGuardMiddleware",
+    "PlanCloseOutMiddleware",
     "CreditGateMiddleware",
     "RepeatCallGuardMiddleware",
     "ToolArgumentParsingMiddleware",
@@ -4020,6 +3661,7 @@
     "SteeringMiddleware",
     "BackgroundSubagentMiddleware",
     "AskUserMiddleware",
+    "PlanStateMiddleware",
     "StreamHeartbeatMiddleware",
     "CompactionMiddleware",
     "ModelResilienceMiddleware",
@@ -4032,14 +3674,14 @@
     "PatchToolCallsMiddleware",
     "TurnContextMiddleware",
     "BaselineContextMiddleware",
-    "NotesOffMiddleware",
+    "NotesDueMiddleware",
     "RowCarrierMiddleware",
     "SystemPinMiddleware",
     "ReasoningCompatibilityMiddleware"
    ],
    "model_is_the_client": true,
    "state_schema": "MainAgentState",
-   "system_prompt_sha256": "b2d382df779912b65839f5b9b29a567ac7014415796d2cc07335c84ed704e23c",
+   "system_prompt_sha256": "03b99eff6f277ea11471f19b45036b66efdcfc5b233fdf9cf0adf97541a073d8",
    "tools": [
     "AskUserQuestion",
     "Bash",
@@ -4053,27 +3695,28 @@
     "ShowWidget",
     "TaskOutput",
     "ThreadStatus",
+    "UpdatePlan",
     "WebFetch",
     "WebSearch",
     "Write",
-    "draw_chart_annotation",
     "get_company_overview",
     "get_daily_prices",
     "get_market_overview",
     "get_options_chain",
     "get_quote",
     "get_sec_filing",
-    "manage_chart_annotations",
+    "manage_chart_layers",
+    "reply_to_comment",
     "schedule_wakeup",
     "screen_stocks"
    ]
   },
   "metadata": {
    "billing_type": "oauth",
-   "manifest_model": "grok-4.5-oauth",
-   "pricing_model_id": "grok-4.5",
-   "pricing_provider": "grok-oauth",
-   "provider_route": "grok-oauth",
+   "manifest_model": "gpt-6.2-sol-oauth",
+   "pricing_model_id": "gpt-6.2-sol",
+   "pricing_provider": "codex-oauth",
+   "provider_route": "codex-oauth",
    "reasoning_effort": "medium"
   },
   "request": {
@@ -4084,7 +3727,7 @@
     "input": [
      {
       "content": "You are a lock probe.",
-      "role": "system",
+      "role": "developer",
       "type": "message"
      },
      {
@@ -4093,13 +3736,13 @@
       "type": "message"
      }
     ],
-    "model": "grok-4.5",
+    "model": "gpt-6.2-sol",
     "reasoning": {
      "effort": "medium",
      "summary": "auto"
     },
     "store": false,
-    "stream": false,
+    "stream": true,
     "tools": [
      {
       "description": "Look up a symbol.",
@@ -4123,10 +3766,11 @@
     "accept": "application/json",
     "connection": "keep-alive",
     "content-type": "application/json",
-    "host": "api.x.ai"
+    "host": "chatgpt.com",
+    "originator": "codex_cli_rs"
    },
    "method": "POST",
-   "url": "https://api.x.ai/v1/responses"
+   "url": "https://chatgpt.com/backend-api/codex/responses"
   }
  },
  "grok-4.6": {
@@ -4138,6 +3782,7 @@
     "LargeResultEvictionMiddleware",
     "SubAgentMiddleware",
     "WakeupQuietGuardMiddleware",
+    "PlanCloseOutMiddleware",
     "CreditGateMiddleware",
     "RepeatCallGuardMiddleware",
     "ToolArgumentParsingMiddleware",
@@ -4153,6 +3798,7 @@
     "SteeringMiddleware",
     "BackgroundSubagentMiddleware",
     "AskUserMiddleware",
+    "PlanStateMiddleware",
     "StreamHeartbeatMiddleware",
     "CompactionMiddleware",
     "ModelResilienceMiddleware",
@@ -4165,14 +3811,14 @@
     "PatchToolCallsMiddleware",
     "TurnContextMiddleware",
     "BaselineContextMiddleware",
-    "NotesOffMiddleware",
+    "NotesDueMiddleware",
     "RowCarrierMiddleware",
     "SystemPinMiddleware",
     "ReasoningCompatibilityMiddleware"
    ],
    "model_is_the_client": true,
    "state_schema": "MainAgentState",
-   "system_prompt_sha256": "b2d382df779912b65839f5b9b29a567ac7014415796d2cc07335c84ed704e23c",
+   "system_prompt_sha256": "9225437fa208f3e8c84751a7e4393b46ad3f7ef3967f4781e605d283d26a4f71",
    "tools": [
     "AskUserQuestion",
     "Bash",
@@ -4186,17 +3832,18 @@
     "ShowWidget",
     "TaskOutput",
     "ThreadStatus",
+    "UpdatePlan",
     "WebFetch",
     "WebSearch",
     "Write",
-    "draw_chart_annotation",
     "get_company_overview",
     "get_daily_prices",
     "get_market_overview",
     "get_options_chain",
     "get_quote",
     "get_sec_filing",
-    "manage_chart_annotations",
+    "manage_chart_layers",
+    "reply_to_comment",
     "schedule_wakeup",
     "screen_stocks"
    ]
@@ -4271,6 +3918,7 @@
     "LargeResultEvictionMiddleware",
     "SubAgentMiddleware",
     "WakeupQuietGuardMiddleware",
+    "PlanCloseOutMiddleware",
     "CreditGateMiddleware",
     "RepeatCallGuardMiddleware",
     "ToolArgumentParsingMiddleware",
@@ -4286,6 +3934,7 @@
     "SteeringMiddleware",
     "BackgroundSubagentMiddleware",
     "AskUserMiddleware",
+    "PlanStateMiddleware",
     "StreamHeartbeatMiddleware",
     "CompactionMiddleware",
     "ModelResilienceMiddleware",
@@ -4298,14 +3947,14 @@
     "PatchToolCallsMiddleware",
     "TurnContextMiddleware",
     "BaselineContextMiddleware",
-    "NotesOffMiddleware",
+    "NotesDueMiddleware",
     "RowCarrierMiddleware",
     "SystemPinMiddleware",
     "ReasoningCompatibilityMiddleware"
    ],
    "model_is_the_client": true,
    "state_schema": "MainAgentState",
-   "system_prompt_sha256": "b2d382df779912b65839f5b9b29a567ac7014415796d2cc07335c84ed704e23c",
+   "system_prompt_sha256": "9225437fa208f3e8c84751a7e4393b46ad3f7ef3967f4781e605d283d26a4f71",
    "tools": [
     "AskUserQuestion",
     "Bash",
@@ -4319,17 +3968,18 @@
     "ShowWidget",
     "TaskOutput",
     "ThreadStatus",
+    "UpdatePlan",
     "WebFetch",
     "WebSearch",
     "Write",
-    "draw_chart_annotation",
     "get_company_overview",
     "get_daily_prices",
     "get_market_overview",
     "get_options_chain",
     "get_quote",
     "get_sec_filing",
-    "manage_chart_annotations",
+    "manage_chart_layers",
+    "reply_to_comment",
     "schedule_wakeup",
     "screen_stocks"
    ]
@@ -4404,6 +4054,7 @@
     "LargeResultEvictionMiddleware",
     "SubAgentMiddleware",
     "WakeupQuietGuardMiddleware",
+    "PlanCloseOutMiddleware",
     "CreditGateMiddleware",
     "RepeatCallGuardMiddleware",
     "ToolArgumentParsingMiddleware",
@@ -4419,6 +4070,7 @@
     "SteeringMiddleware",
     "BackgroundSubagentMiddleware",
     "AskUserMiddleware",
+    "PlanStateMiddleware",
     "StreamHeartbeatMiddleware",
     "CompactionMiddleware",
     "ModelResilienceMiddleware",
@@ -4431,14 +4083,14 @@
     "PatchToolCallsMiddleware",
     "TurnContextMiddleware",
     "BaselineContextMiddleware",
-    "NotesOffMiddleware",
+    "NotesDueMiddleware",
     "RowCarrierMiddleware",
     "SystemPinMiddleware",
     "ReasoningCompatibilityMiddleware"
    ],
    "model_is_the_client": true,
    "state_schema": "MainAgentState",
-   "system_prompt_sha256": "b2d382df779912b65839f5b9b29a567ac7014415796d2cc07335c84ed704e23c",
+   "system_prompt_sha256": "9225437fa208f3e8c84751a7e4393b46ad3f7ef3967f4781e605d283d26a4f71",
    "tools": [
     "AskUserQuestion",
     "Bash",
@@ -4452,17 +4104,18 @@
     "ShowWidget",
     "TaskOutput",
     "ThreadStatus",
+    "UpdatePlan",
     "WebFetch",
     "WebSearch",
     "Write",
-    "draw_chart_annotation",
     "get_company_overview",
     "get_daily_prices",
     "get_market_overview",
     "get_options_chain",
     "get_quote",
     "get_sec_filing",
-    "manage_chart_annotations",
+    "manage_chart_layers",
+    "reply_to_comment",
     "schedule_wakeup",
     "screen_stocks"
    ]
@@ -4537,6 +4190,7 @@
     "LargeResultEvictionMiddleware",
     "SubAgentMiddleware",
     "WakeupQuietGuardMiddleware",
+    "PlanCloseOutMiddleware",
     "CreditGateMiddleware",
     "RepeatCallGuardMiddleware",
     "ToolArgumentParsingMiddleware",
@@ -4552,6 +4206,7 @@
     "SteeringMiddleware",
     "BackgroundSubagentMiddleware",
     "AskUserMiddleware",
+    "PlanStateMiddleware",
     "StreamHeartbeatMiddleware",
     "CompactionMiddleware",
     "ModelResilienceMiddleware",
@@ -4564,14 +4219,14 @@
     "PatchToolCallsMiddleware",
     "TurnContextMiddleware",
     "BaselineContextMiddleware",
-    "NotesOffMiddleware",
+    "NotesDueMiddleware",
     "RowCarrierMiddleware",
     "SystemPinMiddleware",
     "ReasoningCompatibilityMiddleware"
    ],
    "model_is_the_client": true,
    "state_schema": "MainAgentState",
-   "system_prompt_sha256": "b2d382df779912b65839f5b9b29a567ac7014415796d2cc07335c84ed704e23c",
+   "system_prompt_sha256": "9225437fa208f3e8c84751a7e4393b46ad3f7ef3967f4781e605d283d26a4f71",
    "tools": [
     "AskUserQuestion",
     "Bash",
@@ -4585,17 +4240,18 @@
     "ShowWidget",
     "TaskOutput",
     "ThreadStatus",
+    "UpdatePlan",
     "WebFetch",
     "WebSearch",
     "Write",
-    "draw_chart_annotation",
     "get_company_overview",
     "get_daily_prices",
     "get_market_overview",
     "get_options_chain",
     "get_quote",
     "get_sec_filing",
-    "manage_chart_annotations",
+    "manage_chart_layers",
+    "reply_to_comment",
     "schedule_wakeup",
     "screen_stocks"
    ]
@@ -4670,6 +4326,7 @@
     "LargeResultEvictionMiddleware",
     "SubAgentMiddleware",
     "WakeupQuietGuardMiddleware",
+    "PlanCloseOutMiddleware",
     "CreditGateMiddleware",
     "RepeatCallGuardMiddleware",
     "ToolArgumentParsingMiddleware",
@@ -4685,6 +4342,7 @@
     "SteeringMiddleware",
     "BackgroundSubagentMiddleware",
     "AskUserMiddleware",
+    "PlanStateMiddleware",
     "StreamHeartbeatMiddleware",
     "CompactionMiddleware",
     "ModelResilienceMiddleware",
@@ -4697,14 +4355,14 @@
     "PatchToolCallsMiddleware",
     "TurnContextMiddleware",
     "BaselineContextMiddleware",
-    "NotesOffMiddleware",
+    "NotesDueMiddleware",
     "RowCarrierMiddleware",
     "SystemPinMiddleware",
     "ReasoningCompatibilityMiddleware"
    ],
    "model_is_the_client": true,
    "state_schema": "MainAgentState",
-   "system_prompt_sha256": "b2d382df779912b65839f5b9b29a567ac7014415796d2cc07335c84ed704e23c",
+   "system_prompt_sha256": "9225437fa208f3e8c84751a7e4393b46ad3f7ef3967f4781e605d283d26a4f71",
    "tools": [
     "AskUserQuestion",
     "Bash",
@@ -4718,17 +4376,18 @@
     "ShowWidget",
     "TaskOutput",
     "ThreadStatus",
+    "UpdatePlan",
     "WebFetch",
     "WebSearch",
     "Write",
-    "draw_chart_annotation",
     "get_company_overview",
     "get_daily_prices",
     "get_market_overview",
     "get_options_chain",
     "get_quote",
     "get_sec_filing",
-    "manage_chart_annotations",
+    "manage_chart_layers",
+    "reply_to_comment",
     "schedule_wakeup",
     "screen_stocks"
    ]
@@ -4801,6 +4460,7 @@
     "LargeResultEvictionMiddleware",
     "SubAgentMiddleware",
     "WakeupQuietGuardMiddleware",
+    "PlanCloseOutMiddleware",
     "CreditGateMiddleware",
     "RepeatCallGuardMiddleware",
     "ToolArgumentParsingMiddleware",
@@ -4816,6 +4476,7 @@
     "SteeringMiddleware",
     "BackgroundSubagentMiddleware",
     "AskUserMiddleware",
+    "PlanStateMiddleware",
     "StreamHeartbeatMiddleware",
     "CompactionMiddleware",
     "ModelResilienceMiddleware",
@@ -4828,14 +4489,14 @@
     "PatchToolCallsMiddleware",
     "TurnContextMiddleware",
     "BaselineContextMiddleware",
-    "NotesOffMiddleware",
+    "NotesDueMiddleware",
     "RowCarrierMiddleware",
     "SystemPinMiddleware",
     "ReasoningCompatibilityMiddleware"
    ],
    "model_is_the_client": true,
    "state_schema": "MainAgentState",
-   "system_prompt_sha256": "b2d382df779912b65839f5b9b29a567ac7014415796d2cc07335c84ed704e23c",
+   "system_prompt_sha256": "9225437fa208f3e8c84751a7e4393b46ad3f7ef3967f4781e605d283d26a4f71",
    "tools": [
     "AskUserQuestion",
     "Bash",
@@ -4849,17 +4510,18 @@
     "ShowWidget",
     "TaskOutput",
     "ThreadStatus",
+    "UpdatePlan",
     "WebFetch",
     "WebSearch",
     "Write",
-    "draw_chart_annotation",
     "get_company_overview",
     "get_daily_prices",
     "get_market_overview",
     "get_options_chain",
     "get_quote",
     "get_sec_filing",
-    "manage_chart_annotations",
+    "manage_chart_layers",
+    "reply_to_comment",
     "schedule_wakeup",
     "screen_stocks"
    ]
@@ -4923,135 +4585,6 @@
    "url": "https://api.x.ai/v1/responses"
   }
  },
- "kimi-k3-coding": {
-  "client": "ChatOpenAI",
-  "graph_build": {
-   "middleware": [
-    "FrozenPromptMiddleware",
-    "TimeUpToolStopMiddleware",
-    "LargeResultEvictionMiddleware",
-    "SubAgentMiddleware",
-    "WakeupQuietGuardMiddleware",
-    "CreditGateMiddleware",
-    "RepeatCallGuardMiddleware",
-    "ToolArgumentParsingMiddleware",
-    "ComputerArgumentGuardMiddleware",
-    "ProtectedPathMiddleware",
-    "CodeValidationMiddleware",
-    "ToolErrorHandlingMiddleware",
-    "LeakDetectionMiddleware",
-    "ToolResultNormalizationMiddleware",
-    "FileOperationMiddleware",
-    "ProvenanceMiddleware",
-    "SkillsMiddleware",
-    "SteeringMiddleware",
-    "BackgroundSubagentMiddleware",
-    "AskUserMiddleware",
-    "StreamHeartbeatMiddleware",
-    "CompactionMiddleware",
-    "ModelResilienceMiddleware",
-    "MultimodalStripMiddleware",
-    "MultimodalMiddleware",
-    "AnthropicPromptCachingMiddleware",
-    "SystemPromptCacheMiddleware",
-    "ToolSurfaceMiddleware",
-    "EmptyToolCallRetryMiddleware",
-    "PatchToolCallsMiddleware",
-    "TurnContextMiddleware",
-    "BaselineContextMiddleware",
-    "NotesOffMiddleware",
-    "RowCarrierMiddleware",
-    "SystemPinMiddleware",
-    "ReasoningCompatibilityMiddleware"
-   ],
-   "model_is_the_client": true,
-   "state_schema": "MainAgentState",
-   "system_prompt_sha256": "2d9ab72041b31b4988c135110fb38f00abacda9d6046a0f13deda54f26043569",
-   "tools": [
-    "AskUserQuestion",
-    "Bash",
-    "Edit",
-    "ExecuteCode",
-    "GetPreviewUrl",
-    "Glob",
-    "Grep",
-    "Read",
-    "RunWorkflow",
-    "ShowWidget",
-    "TaskOutput",
-    "ThreadStatus",
-    "WebFetch",
-    "WebSearch",
-    "Write",
-    "draw_chart_annotation",
-    "get_company_overview",
-    "get_daily_prices",
-    "get_market_overview",
-    "get_options_chain",
-    "get_quote",
-    "get_sec_filing",
-    "manage_chart_annotations",
-    "schedule_wakeup",
-    "screen_stocks"
-   ]
-  },
-  "metadata": {
-   "billing_type": "byok",
-   "manifest_model": "kimi-k3-coding",
-   "pricing_model_id": "k3",
-   "pricing_provider": "moonshot-coding",
-   "provider_route": "moonshot-coding",
-   "reasoning_effort": "high"
-  },
-  "request": {
-   "body": {
-    "input": [
-     {
-      "content": "You are a lock probe.",
-      "role": "system",
-      "type": "message"
-     },
-     {
-      "content": "Look up AAPL.",
-      "role": "user",
-      "type": "message"
-     }
-    ],
-    "model": "k3",
-    "reasoning": {
-     "effort": "high",
-     "summary": "auto"
-    },
-    "stream": false,
-    "tools": [
-     {
-      "description": "Look up a symbol.",
-      "name": "lock_probe",
-      "parameters": {
-       "properties": {
-        "symbol": {
-         "type": "string"
-        }
-       },
-       "required": [
-        "symbol"
-       ],
-       "type": "object"
-      },
-      "type": "function"
-     }
-    ]
-   },
-   "headers": {
-    "accept": "application/json",
-    "connection": "keep-alive",
-    "content-type": "application/json",
-    "host": "api.kimi.ai"
-   },
-   "method": "POST",
-   "url": "https://api.kimi.ai/coding/v1/responses"
-  }
- },
  "kimi-k3.1-pro": {
   "client": "ChatAnthropic",
   "graph_build": {
@@ -5061,6 +4594,7 @@
     "LargeResultEvictionMiddleware",
     "SubAgentMiddleware",
     "WakeupQuietGuardMiddleware",
+    "PlanCloseOutMiddleware",
     "CreditGateMiddleware",
     "RepeatCallGuardMiddleware",
     "ToolArgumentParsingMiddleware",
@@ -5076,6 +4610,7 @@
     "SteeringMiddleware",
     "BackgroundSubagentMiddleware",
     "AskUserMiddleware",
+    "PlanStateMiddleware",
     "StreamHeartbeatMiddleware",
     "CompactionMiddleware",
     "ModelResilienceMiddleware",
@@ -5088,14 +4623,14 @@
     "PatchToolCallsMiddleware",
     "TurnContextMiddleware",
     "BaselineContextMiddleware",
-    "NotesOffMiddleware",
+    "NotesDueMiddleware",
     "RowCarrierMiddleware",
     "SystemPinMiddleware",
     "ReasoningCompatibilityMiddleware"
    ],
    "model_is_the_client": true,
    "state_schema": "MainAgentState",
-   "system_prompt_sha256": "2d9ab72041b31b4988c135110fb38f00abacda9d6046a0f13deda54f26043569",
+   "system_prompt_sha256": "03b99eff6f277ea11471f19b45036b66efdcfc5b233fdf9cf0adf97541a073d8",
    "tools": [
     "AskUserQuestion",
     "Bash",
@@ -5109,17 +4644,18 @@
     "ShowWidget",
     "TaskOutput",
     "ThreadStatus",
+    "UpdatePlan",
     "WebFetch",
     "WebSearch",
     "Write",
-    "draw_chart_annotation",
     "get_company_overview",
     "get_daily_prices",
     "get_market_overview",
     "get_options_chain",
     "get_quote",
     "get_sec_filing",
-    "manage_chart_annotations",
+    "manage_chart_layers",
+    "reply_to_comment",
     "schedule_wakeup",
     "screen_stocks"
    ]
@@ -5185,6 +4721,7 @@
     "LargeResultEvictionMiddleware",
     "SubAgentMiddleware",
     "WakeupQuietGuardMiddleware",
+    "PlanCloseOutMiddleware",
     "CreditGateMiddleware",
     "RepeatCallGuardMiddleware",
     "ToolArgumentParsingMiddleware",
@@ -5200,6 +4737,7 @@
     "SteeringMiddleware",
     "BackgroundSubagentMiddleware",
     "AskUserMiddleware",
+    "PlanStateMiddleware",
     "StreamHeartbeatMiddleware",
     "CompactionMiddleware",
     "ModelResilienceMiddleware",
@@ -5212,14 +4750,14 @@
     "PatchToolCallsMiddleware",
     "TurnContextMiddleware",
     "BaselineContextMiddleware",
-    "NotesOffMiddleware",
+    "NotesDueMiddleware",
     "RowCarrierMiddleware",
     "SystemPinMiddleware",
     "ReasoningCompatibilityMiddleware"
    ],
    "model_is_the_client": true,
    "state_schema": "MainAgentState",
-   "system_prompt_sha256": "2d9ab72041b31b4988c135110fb38f00abacda9d6046a0f13deda54f26043569",
+   "system_prompt_sha256": "03b99eff6f277ea11471f19b45036b66efdcfc5b233fdf9cf0adf97541a073d8",
    "tools": [
     "AskUserQuestion",
     "Bash",
@@ -5233,17 +4771,18 @@
     "ShowWidget",
     "TaskOutput",
     "ThreadStatus",
+    "UpdatePlan",
     "WebFetch",
     "WebSearch",
     "Write",
-    "draw_chart_annotation",
     "get_company_overview",
     "get_daily_prices",
     "get_market_overview",
     "get_options_chain",
     "get_quote",
     "get_sec_filing",
-    "manage_chart_annotations",
+    "manage_chart_layers",
+    "reply_to_comment",
     "schedule_wakeup",
     "screen_stocks"
    ]
@@ -5314,6 +4853,7 @@
     "LargeResultEvictionMiddleware",
     "SubAgentMiddleware",
     "WakeupQuietGuardMiddleware",
+    "PlanCloseOutMiddleware",
     "CreditGateMiddleware",
     "RepeatCallGuardMiddleware",
     "ToolArgumentParsingMiddleware",
@@ -5329,6 +4869,7 @@
     "SteeringMiddleware",
     "BackgroundSubagentMiddleware",
     "AskUserMiddleware",
+    "PlanStateMiddleware",
     "StreamHeartbeatMiddleware",
     "CompactionMiddleware",
     "ModelResilienceMiddleware",
@@ -5341,14 +4882,14 @@
     "PatchToolCallsMiddleware",
     "TurnContextMiddleware",
     "BaselineContextMiddleware",
-    "NotesOffMiddleware",
+    "NotesDueMiddleware",
     "RowCarrierMiddleware",
     "SystemPinMiddleware",
     "ReasoningCompatibilityMiddleware"
    ],
    "model_is_the_client": true,
    "state_schema": "MainAgentState",
-   "system_prompt_sha256": "2d9ab72041b31b4988c135110fb38f00abacda9d6046a0f13deda54f26043569",
+   "system_prompt_sha256": "03b99eff6f277ea11471f19b45036b66efdcfc5b233fdf9cf0adf97541a073d8",
    "tools": [
     "AskUserQuestion",
     "Bash",
@@ -5362,17 +4903,18 @@
     "ShowWidget",
     "TaskOutput",
     "ThreadStatus",
+    "UpdatePlan",
     "WebFetch",
     "WebSearch",
     "Write",
-    "draw_chart_annotation",
     "get_company_overview",
     "get_daily_prices",
     "get_market_overview",
     "get_options_chain",
     "get_quote",
     "get_sec_filing",
-    "manage_chart_annotations",
+    "manage_chart_layers",
+    "reply_to_comment",
     "schedule_wakeup",
     "screen_stocks"
    ]
@@ -5438,6 +4980,7 @@
     "LargeResultEvictionMiddleware",
     "SubAgentMiddleware",
     "WakeupQuietGuardMiddleware",
+    "PlanCloseOutMiddleware",
     "CreditGateMiddleware",
     "RepeatCallGuardMiddleware",
     "ToolArgumentParsingMiddleware",
@@ -5453,6 +4996,7 @@
     "SteeringMiddleware",
     "BackgroundSubagentMiddleware",
     "AskUserMiddleware",
+    "PlanStateMiddleware",
     "StreamHeartbeatMiddleware",
     "CompactionMiddleware",
     "ModelResilienceMiddleware",
@@ -5465,14 +5009,14 @@
     "PatchToolCallsMiddleware",
     "TurnContextMiddleware",
     "BaselineContextMiddleware",
-    "NotesOffMiddleware",
+    "NotesDueMiddleware",
     "RowCarrierMiddleware",
     "SystemPinMiddleware",
     "ReasoningCompatibilityMiddleware"
    ],
    "model_is_the_client": true,
    "state_schema": "MainAgentState",
-   "system_prompt_sha256": "2d9ab72041b31b4988c135110fb38f00abacda9d6046a0f13deda54f26043569",
+   "system_prompt_sha256": "03b99eff6f277ea11471f19b45036b66efdcfc5b233fdf9cf0adf97541a073d8",
    "tools": [
     "AskUserQuestion",
     "Bash",
@@ -5486,17 +5030,18 @@
     "ShowWidget",
     "TaskOutput",
     "ThreadStatus",
+    "UpdatePlan",
     "WebFetch",
     "WebSearch",
     "Write",
-    "draw_chart_annotation",
     "get_company_overview",
     "get_daily_prices",
     "get_market_overview",
     "get_options_chain",
     "get_quote",
     "get_sec_filing",
-    "manage_chart_annotations",
+    "manage_chart_layers",
+    "reply_to_comment",
     "schedule_wakeup",
     "screen_stocks"
    ]
@@ -5567,6 +5112,7 @@
     "LargeResultEvictionMiddleware",
     "SubAgentMiddleware",
     "WakeupQuietGuardMiddleware",
+    "PlanCloseOutMiddleware",
     "CreditGateMiddleware",
     "RepeatCallGuardMiddleware",
     "ToolArgumentParsingMiddleware",
@@ -5582,6 +5128,7 @@
     "SteeringMiddleware",
     "BackgroundSubagentMiddleware",
     "AskUserMiddleware",
+    "PlanStateMiddleware",
     "StreamHeartbeatMiddleware",
     "CompactionMiddleware",
     "ModelResilienceMiddleware",
@@ -5594,14 +5141,14 @@
     "PatchToolCallsMiddleware",
     "TurnContextMiddleware",
     "BaselineContextMiddleware",
-    "NotesOffMiddleware",
+    "NotesDueMiddleware",
     "RowCarrierMiddleware",
     "SystemPinMiddleware",
     "ReasoningCompatibilityMiddleware"
    ],
    "model_is_the_client": true,
    "state_schema": "MainAgentState",
-   "system_prompt_sha256": "b2d382df779912b65839f5b9b29a567ac7014415796d2cc07335c84ed704e23c",
+   "system_prompt_sha256": "9225437fa208f3e8c84751a7e4393b46ad3f7ef3967f4781e605d283d26a4f71",
    "tools": [
     "AskUserQuestion",
     "Bash",
@@ -5615,17 +5162,18 @@
     "ShowWidget",
     "TaskOutput",
     "ThreadStatus",
+    "UpdatePlan",
     "WebFetch",
     "WebSearch",
     "Write",
-    "draw_chart_annotation",
     "get_company_overview",
     "get_daily_prices",
     "get_market_overview",
     "get_options_chain",
     "get_quote",
     "get_sec_filing",
-    "manage_chart_annotations",
+    "manage_chart_layers",
+    "reply_to_comment",
     "schedule_wakeup",
     "screen_stocks"
    ]
@@ -5691,6 +5239,7 @@
     "LargeResultEvictionMiddleware",
     "SubAgentMiddleware",
     "WakeupQuietGuardMiddleware",
+    "PlanCloseOutMiddleware",
     "CreditGateMiddleware",
     "RepeatCallGuardMiddleware",
     "ToolArgumentParsingMiddleware",
@@ -5706,6 +5255,7 @@
     "SteeringMiddleware",
     "BackgroundSubagentMiddleware",
     "AskUserMiddleware",
+    "PlanStateMiddleware",
     "StreamHeartbeatMiddleware",
     "CompactionMiddleware",
     "ModelResilienceMiddleware",
@@ -5718,14 +5268,14 @@
     "PatchToolCallsMiddleware",
     "TurnContextMiddleware",
     "BaselineContextMiddleware",
-    "NotesOffMiddleware",
+    "NotesDueMiddleware",
     "RowCarrierMiddleware",
     "SystemPinMiddleware",
     "ReasoningCompatibilityMiddleware"
    ],
    "model_is_the_client": true,
    "state_schema": "MainAgentState",
-   "system_prompt_sha256": "b2d382df779912b65839f5b9b29a567ac7014415796d2cc07335c84ed704e23c",
+   "system_prompt_sha256": "9225437fa208f3e8c84751a7e4393b46ad3f7ef3967f4781e605d283d26a4f71",
    "tools": [
     "AskUserQuestion",
     "Bash",
@@ -5739,17 +5289,18 @@
     "ShowWidget",
     "TaskOutput",
     "ThreadStatus",
+    "UpdatePlan",
     "WebFetch",
     "WebSearch",
     "Write",
-    "draw_chart_annotation",
     "get_company_overview",
     "get_daily_prices",
     "get_market_overview",
     "get_options_chain",
     "get_quote",
     "get_sec_filing",
-    "manage_chart_annotations",
+    "manage_chart_layers",
+    "reply_to_comment",
     "schedule_wakeup",
     "screen_stocks"
    ]
@@ -5815,6 +5366,7 @@
     "LargeResultEvictionMiddleware",
     "SubAgentMiddleware",
     "WakeupQuietGuardMiddleware",
+    "PlanCloseOutMiddleware",
     "CreditGateMiddleware",
     "RepeatCallGuardMiddleware",
     "ToolArgumentParsingMiddleware",
@@ -5830,6 +5382,7 @@
     "SteeringMiddleware",
     "BackgroundSubagentMiddleware",
     "AskUserMiddleware",
+    "PlanStateMiddleware",
     "StreamHeartbeatMiddleware",
     "CompactionMiddleware",
     "ModelResilienceMiddleware",
@@ -5842,14 +5395,14 @@
     "PatchToolCallsMiddleware",
     "TurnContextMiddleware",
     "BaselineContextMiddleware",
-    "NotesOffMiddleware",
+    "NotesDueMiddleware",
     "RowCarrierMiddleware",
     "SystemPinMiddleware",
     "ReasoningCompatibilityMiddleware"
    ],
    "model_is_the_client": true,
    "state_schema": "MainAgentState",
-   "system_prompt_sha256": "b2d382df779912b65839f5b9b29a567ac7014415796d2cc07335c84ed704e23c",
+   "system_prompt_sha256": "9225437fa208f3e8c84751a7e4393b46ad3f7ef3967f4781e605d283d26a4f71",
    "tools": [
     "AskUserQuestion",
     "Bash",
@@ -5863,17 +5416,18 @@
     "ShowWidget",
     "TaskOutput",
     "ThreadStatus",
+    "UpdatePlan",
     "WebFetch",
     "WebSearch",
     "Write",
-    "draw_chart_annotation",
     "get_company_overview",
     "get_daily_prices",
     "get_market_overview",
     "get_options_chain",
     "get_quote",
     "get_sec_filing",
-    "manage_chart_annotations",
+    "manage_chart_layers",
+    "reply_to_comment",
     "schedule_wakeup",
     "screen_stocks"
    ]
@@ -5944,6 +5498,7 @@
     "LargeResultEvictionMiddleware",
     "SubAgentMiddleware",
     "WakeupQuietGuardMiddleware",
+    "PlanCloseOutMiddleware",
     "CreditGateMiddleware",
     "RepeatCallGuardMiddleware",
     "ToolArgumentParsingMiddleware",
@@ -5959,6 +5514,7 @@
     "SteeringMiddleware",
     "BackgroundSubagentMiddleware",
     "AskUserMiddleware",
+    "PlanStateMiddleware",
     "StreamHeartbeatMiddleware",
     "CompactionMiddleware",
     "ModelResilienceMiddleware",
@@ -5971,14 +5527,14 @@
     "PatchToolCallsMiddleware",
     "TurnContextMiddleware",
     "BaselineContextMiddleware",
-    "NotesOffMiddleware",
+    "NotesDueMiddleware",
     "RowCarrierMiddleware",
     "SystemPinMiddleware",
     "ReasoningCompatibilityMiddleware"
    ],
    "model_is_the_client": true,
    "state_schema": "MainAgentState",
-   "system_prompt_sha256": "b2d382df779912b65839f5b9b29a567ac7014415796d2cc07335c84ed704e23c",
+   "system_prompt_sha256": "9225437fa208f3e8c84751a7e4393b46ad3f7ef3967f4781e605d283d26a4f71",
    "tools": [
     "AskUserQuestion",
     "Bash",
@@ -5992,17 +5548,18 @@
     "ShowWidget",
     "TaskOutput",
     "ThreadStatus",
+    "UpdatePlan",
     "WebFetch",
     "WebSearch",
     "Write",
-    "draw_chart_annotation",
     "get_company_overview",
     "get_daily_prices",
     "get_market_overview",
     "get_options_chain",
     "get_quote",
     "get_sec_filing",
-    "manage_chart_annotations",
+    "manage_chart_layers",
+    "reply_to_comment",
     "schedule_wakeup",
     "screen_stocks"
    ]
@@ -6073,6 +5630,7 @@
     "LargeResultEvictionMiddleware",
     "SubAgentMiddleware",
     "WakeupQuietGuardMiddleware",
+    "PlanCloseOutMiddleware",
     "CreditGateMiddleware",
     "RepeatCallGuardMiddleware",
     "ToolArgumentParsingMiddleware",
@@ -6088,6 +5646,7 @@
     "SteeringMiddleware",
     "BackgroundSubagentMiddleware",
     "AskUserMiddleware",
+    "PlanStateMiddleware",
     "StreamHeartbeatMiddleware",
     "CompactionMiddleware",
     "ModelResilienceMiddleware",
@@ -6100,14 +5659,14 @@
     "PatchToolCallsMiddleware",
     "TurnContextMiddleware",
     "BaselineContextMiddleware",
-    "NotesOffMiddleware",
+    "NotesDueMiddleware",
     "RowCarrierMiddleware",
     "SystemPinMiddleware",
     "ReasoningCompatibilityMiddleware"
    ],
    "model_is_the_client": true,
    "state_schema": "MainAgentState",
-   "system_prompt_sha256": "b2d382df779912b65839f5b9b29a567ac7014415796d2cc07335c84ed704e23c",
+   "system_prompt_sha256": "9225437fa208f3e8c84751a7e4393b46ad3f7ef3967f4781e605d283d26a4f71",
    "tools": [
     "AskUserQuestion",
     "Bash",
@@ -6121,17 +5680,18 @@
     "ShowWidget",
     "TaskOutput",
     "ThreadStatus",
+    "UpdatePlan",
     "WebFetch",
     "WebSearch",
     "Write",
-    "draw_chart_annotation",
     "get_company_overview",
     "get_daily_prices",
     "get_market_overview",
     "get_options_chain",
     "get_quote",
     "get_sec_filing",
-    "manage_chart_annotations",
+    "manage_chart_layers",
+    "reply_to_comment",
     "schedule_wakeup",
     "screen_stocks"
    ]
@@ -6202,6 +5762,7 @@
     "LargeResultEvictionMiddleware",
     "SubAgentMiddleware",
     "WakeupQuietGuardMiddleware",
+    "PlanCloseOutMiddleware",
     "CreditGateMiddleware",
     "RepeatCallGuardMiddleware",
     "ToolArgumentParsingMiddleware",
@@ -6217,6 +5778,7 @@
     "SteeringMiddleware",
     "BackgroundSubagentMiddleware",
     "AskUserMiddleware",
+    "PlanStateMiddleware",
     "StreamHeartbeatMiddleware",
     "CompactionMiddleware",
     "ModelResilienceMiddleware",
@@ -6229,14 +5791,14 @@
     "PatchToolCallsMiddleware",
     "TurnContextMiddleware",
     "BaselineContextMiddleware",
-    "NotesOffMiddleware",
+    "NotesDueMiddleware",
     "RowCarrierMiddleware",
     "SystemPinMiddleware",
     "ReasoningCompatibilityMiddleware"
    ],
    "model_is_the_client": true,
    "state_schema": "MainAgentState",
-   "system_prompt_sha256": "b2d382df779912b65839f5b9b29a567ac7014415796d2cc07335c84ed704e23c",
+   "system_prompt_sha256": "9225437fa208f3e8c84751a7e4393b46ad3f7ef3967f4781e605d283d26a4f71",
    "tools": [
     "AskUserQuestion",
     "Bash",
@@ -6250,17 +5812,18 @@
     "ShowWidget",
     "TaskOutput",
     "ThreadStatus",
+    "UpdatePlan",
     "WebFetch",
     "WebSearch",
     "Write",
-    "draw_chart_annotation",
     "get_company_overview",
     "get_daily_prices",
     "get_market_overview",
     "get_options_chain",
     "get_quote",
     "get_sec_filing",
-    "manage_chart_annotations",
+    "manage_chart_layers",
+    "reply_to_comment",
     "schedule_wakeup",
     "screen_stocks"
    ]
@@ -6322,7 +5885,7 @@
    "url": "https://dashscope-intl.aliyuncs.com/compatible-mode/v1/responses"
   }
  },
- "qwen3.8-max": {
+ "qwen4-max": {
   "client": "ChatDashScope",
   "graph_build": {
    "middleware": [
@@ -6331,6 +5894,7 @@
     "LargeResultEvictionMiddleware",
     "SubAgentMiddleware",
     "WakeupQuietGuardMiddleware",
+    "PlanCloseOutMiddleware",
     "CreditGateMiddleware",
     "RepeatCallGuardMiddleware",
     "ToolArgumentParsingMiddleware",
@@ -6346,6 +5910,7 @@
     "SteeringMiddleware",
     "BackgroundSubagentMiddleware",
     "AskUserMiddleware",
+    "PlanStateMiddleware",
     "StreamHeartbeatMiddleware",
     "CompactionMiddleware",
     "ModelResilienceMiddleware",
@@ -6358,14 +5923,14 @@
     "PatchToolCallsMiddleware",
     "TurnContextMiddleware",
     "BaselineContextMiddleware",
-    "NotesOffMiddleware",
+    "NotesDueMiddleware",
     "RowCarrierMiddleware",
     "SystemPinMiddleware",
     "ReasoningCompatibilityMiddleware"
    ],
    "model_is_the_client": true,
    "state_schema": "MainAgentState",
-   "system_prompt_sha256": "2d9ab72041b31b4988c135110fb38f00abacda9d6046a0f13deda54f26043569",
+   "system_prompt_sha256": "03b99eff6f277ea11471f19b45036b66efdcfc5b233fdf9cf0adf97541a073d8",
    "tools": [
     "AskUserQuestion",
     "Bash",
@@ -6379,28 +5944,29 @@
     "ShowWidget",
     "TaskOutput",
     "ThreadStatus",
+    "UpdatePlan",
     "WebFetch",
     "WebSearch",
     "Write",
-    "draw_chart_annotation",
     "get_company_overview",
     "get_daily_prices",
     "get_market_overview",
     "get_options_chain",
     "get_quote",
     "get_sec_filing",
-    "manage_chart_annotations",
+    "manage_chart_layers",
+    "reply_to_comment",
     "schedule_wakeup",
     "screen_stocks"
    ]
   },
   "metadata": {
    "billing_type": "byok",
-   "manifest_model": "qwen3.8-max",
-   "pricing_model_id": "qwen3.8-max",
+   "manifest_model": "qwen4-max",
+   "pricing_model_id": "qwen4-max",
    "pricing_provider": "dashscope",
    "provider_route": "dashscope",
-   "reasoning_effort": "medium"
+   "reasoning_effort": "high"
   },
   "request": {
    "body": {
@@ -6416,9 +5982,9 @@
       "type": "message"
      }
     ],
-    "model": "qwen3.8-max",
+    "model": "qwen4-max",
     "reasoning": {
-     "effort": "medium"
+     "effort": "high"
     },
     "stream": false,
     "tools": [
@@ -6451,7 +6017,7 @@
    "url": "https://dashscope.aliyuncs.com/compatible-mode/v1/responses"
   }
  },
- "qwen3.8-max-intl": {
+ "qwen4-max-intl": {
   "client": "ChatDashScope",
   "graph_build": {
    "middleware": [
@@ -6460,6 +6026,7 @@
     "LargeResultEvictionMiddleware",
     "SubAgentMiddleware",
     "WakeupQuietGuardMiddleware",
+    "PlanCloseOutMiddleware",
     "CreditGateMiddleware",
     "RepeatCallGuardMiddleware",
     "ToolArgumentParsingMiddleware",
@@ -6475,6 +6042,7 @@
     "SteeringMiddleware",
     "BackgroundSubagentMiddleware",
     "AskUserMiddleware",
+    "PlanStateMiddleware",
     "StreamHeartbeatMiddleware",
     "CompactionMiddleware",
     "ModelResilienceMiddleware",
@@ -6487,14 +6055,14 @@
     "PatchToolCallsMiddleware",
     "TurnContextMiddleware",
     "BaselineContextMiddleware",
-    "NotesOffMiddleware",
+    "NotesDueMiddleware",
     "RowCarrierMiddleware",
     "SystemPinMiddleware",
     "ReasoningCompatibilityMiddleware"
    ],
    "model_is_the_client": true,
    "state_schema": "MainAgentState",
-   "system_prompt_sha256": "2d9ab72041b31b4988c135110fb38f00abacda9d6046a0f13deda54f26043569",
+   "system_prompt_sha256": "03b99eff6f277ea11471f19b45036b66efdcfc5b233fdf9cf0adf97541a073d8",
    "tools": [
     "AskUserQuestion",
     "Bash",
@@ -6508,28 +6076,29 @@
     "ShowWidget",
     "TaskOutput",
     "ThreadStatus",
+    "UpdatePlan",
     "WebFetch",
     "WebSearch",
     "Write",
-    "draw_chart_annotation",
     "get_company_overview",
     "get_daily_prices",
     "get_market_overview",
     "get_options_chain",
     "get_quote",
     "get_sec_filing",
-    "manage_chart_annotations",
+    "manage_chart_layers",
+    "reply_to_comment",
     "schedule_wakeup",
     "screen_stocks"
    ]
   },
   "metadata": {
    "billing_type": "byok",
-   "manifest_model": "qwen3.8-max-intl",
-   "pricing_model_id": "qwen3.8-max",
+   "manifest_model": "qwen4-max-intl",
+   "pricing_model_id": "qwen4-max",
    "pricing_provider": "dashscope-intl",
    "provider_route": "dashscope-intl",
-   "reasoning_effort": "medium"
+   "reasoning_effort": "high"
   },
   "request": {
    "body": {
@@ -6545,9 +6114,9 @@
       "type": "message"
      }
     ],
-    "model": "qwen3.8-max",
+    "model": "qwen4-max",
     "reasoning": {
-     "effort": "medium"
+     "effort": "high"
     },
     "stream": false,
     "tools": [

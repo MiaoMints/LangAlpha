@@ -13,6 +13,7 @@ import ChatInput, { type ChatInputProps } from '../chat-input';
 import { ChatInputRegistry, ContextBus } from '@/lib/contextBus';
 import { queryKeys } from '@/lib/queryKeys';
 import { getSkills } from '@/pages/ChatAgent/utils/api';
+import type { WorkspaceClaudeCode } from '@/hooks/useWorkspaceClaudeCode';
 
 vi.mock('@/pages/ChatAgent/utils/api', () => ({
   getSkills: vi.fn().mockResolvedValue([]),
@@ -23,7 +24,22 @@ vi.mock('@/pages/ChatAgent/utils/api', () => ({
 const mocks = vi.hoisted(() => ({
   preferences: null as unknown,
   mutateAsync: vi.fn(),
+  models: {} as Record<string, { models: string[] }>,
+  slotModels: {} as Record<string, { models: string[] }>,
+  metadata: {} as Record<string, { provider: string; sdk?: string }>,
+  where: { state: 'off', computerId: null, known: true } as WorkspaceClaudeCode,
+  setup: null as unknown,
 }));
+
+vi.mock('@/hooks/useWorkspaceClaudeCode', () => ({ useTurnClaudeCode: () => mocks.where }));
+
+vi.mock('@/hooks/useClaudeCode', async (importActual) => ({
+  ...(await importActual<typeof import('@/hooks/useClaudeCode')>()),
+  useClaudeCodeSetup: () => ({ setup: mocks.setup, isLoading: false, unread: false }),
+}));
+
+/** Where the server places the Chief of Staff's CLI, running a saved Claude Code Default. */
+const PLACED = { kind: 'picked', computer_id: 'cmp-mac', name: 'Studio Mac', refusal: null, default_runs: true };
 
 vi.mock('@/hooks/usePreferences', () => ({
   usePreferences: () => ({ preferences: mocks.preferences, isLoading: false, isLoaded: true }),
@@ -31,10 +47,12 @@ vi.mock('@/hooks/usePreferences', () => ({
 
 vi.mock('@/hooks/useAllModels', () => ({
   useAllModels: () => ({
-    models: {},
+    models: mocks.models,
+    slotModels: mocks.slotModels,
+    claudeCodeState: 'off',
     payers: {},
     validModelNames: new Set(),
-    metadata: {},
+    metadata: mocks.metadata,
     isLoading: false,
     systemDefaults: { default_model: 'model-default', background_model: 'model-background-default' },
     offPlanModels: new Set(),
@@ -53,16 +71,17 @@ vi.mock('../use-toast', () => ({
 }));
 
 vi.mock('../chat-input.modelMenu', () => ({
-  ChatInputModelMenu: ({ onSelectModel, selectedModel }: {
+  ChatInputModelMenu: ({ onSelectModel, selectedModel, groups }: {
     onSelectModel: (m: string) => void;
     selectedModel: string | null;
+    groups: Array<{ connections: Array<{ models: string[] }> }>;
   }) => (
     <>
       <span>{`pill:${selectedModel}`}</span>
+      <span>{`offered:${groups.flatMap((g) => g.connections.flatMap((c) => c.models)).join(',')}`}</span>
       <button type="button" onClick={() => onSelectModel('model-beta')}>pick-beta</button>
     </>
   ),
-  ChatInputEffortMenu: () => null,
   ModelTriggerMeasure: () => null,
 }));
 
@@ -109,7 +128,59 @@ describe('ChatInput scope picker', () => {
       model_preference: { preferred_model: 'model-alpha', preferred_background_model: 'model-bg' },
     };
     mocks.mutateAsync.mockReset().mockResolvedValue(undefined);
+    mocks.models = {};
+    mocks.slotModels = {};
+    mocks.metadata = {};
+    mocks.where = { state: 'off', computerId: null, known: true };
+    mocks.setup = null;
     vi.mocked(getSkills).mockClear();
+  });
+
+  // Where the server does not run a saved Claude Code Default for the Chief
+  // of Staff, the composer shows and sends the deployment's Default instead;
+  // a model a Home thread holds stays.
+  it.each([
+    ['does not run it there', { on: true, chief_of_staff: { ...PLACED, default_runs: false } }],
+    ['has Claude Code off', { chief_of_staff: null }],
+  ])("shows and sends the deployment's Default over a Claude Code one on the Chief of Staff where the server %s", async (_, setup) => {
+    mocks.metadata = { 'claude-x-code': { provider: 'claude-code', sdk: 'claude-code' } };
+    mocks.preferences = { model_preference: { preferred_model: 'claude-x-code' } };
+    mocks.setup = setup;
+    const onSend = vi.fn();
+    const { rerender } = renderInput({ onSend });
+    expect(await screen.findByText('pill:model-default')).toBeInTheDocument();
+    const box = screen.getByRole('textbox');
+    fireEvent.change(box, { target: { value: 'hello' } });
+    fireEvent.keyDown(box, { key: 'Enter' });
+    expect(onSend.mock.calls[0][0].modelOptions).toMatchObject({ model: 'model-default' });
+
+    rerender(composer({ scope: 'workspace', inHome: true, model: 'claude-x-code', onSend }));
+    expect(screen.getByText('pill:claude-x-code')).toBeInTheDocument();
+    rerender(composer({ scope: 'workspace', onSend }));
+    expect(screen.getByText('pill:claude-x-code')).toBeInTheDocument();
+  });
+
+  it('keeps a Claude Code Default on the Chief of Staff where the server runs it, whatever the row reads', () => {
+    mocks.metadata = { 'claude-x-code': { provider: 'claude-code', sdk: 'claude-code' } };
+    mocks.preferences = { model_preference: { preferred_model: 'claude-x-code' } };
+    mocks.setup = { on: true, chief_of_staff: PLACED };
+    mocks.where = { state: 'checking', computerId: null, known: false };
+    renderInput();
+    expect(screen.getByText('pill:claude-x-code')).toBeInTheDocument();
+  });
+
+  it('offers Claude Code models on the Chief of Staff, as in a workspace', () => {
+    mocks.models = { anthropic: { models: ['claude-x'] }, 'claude-code': { models: ['claude-x-code'] } };
+    mocks.slotModels = { anthropic: { models: ['claude-x'] } };
+    mocks.metadata = {
+      'claude-x': { provider: 'anthropic' },
+      'claude-x-code': { provider: 'claude-code', sdk: 'claude-code' },
+    };
+    const offered = () => screen.getByText(/^offered:/).textContent;
+    const { rerender } = renderInput();
+    expect(offered()).toBe('offered:claude-x,claude-x-code');
+    rerender(composer({ scope: 'workspace', inHome: true }));
+    expect(offered()).toBe('offered:claude-x,claude-x-code');
   });
   afterEach(() => {
     ContextBus.__resetForTests();

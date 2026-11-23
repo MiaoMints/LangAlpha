@@ -6,6 +6,7 @@
  */
 import {
   configureSSE,
+  releaseSSE,
   resetMockServer,
   mockAPI,
   test,
@@ -279,7 +280,7 @@ test.describe('Thread Gallery', () => {
     // card being gone, and by its composer being the one left.
     await expect(page).toHaveURL(/\/chat\/t\/b0000001-0000-4000-8000-000000000001$/, { timeout: 10000 });
     await expect(page.getByRole('heading', { name: 'Second thread', exact: true })).toHaveCount(0, { timeout: 10000 });
-    const composer = page.getByRole('textbox', { name: 'Type / for skills, @ for files' });
+    const composer = page.getByRole('textbox', { name: 'Message to the agent' });
     await expect(composer).toHaveCount(1, { timeout: 10000 });
     await expect(composer).toBeVisible();
   });
@@ -706,7 +707,7 @@ test.describe('Chat View -- SSE Streaming', () => {
 
     await page.getByRole('button', { name: 'New tab' }).click({ button: 'right' });
     const menu = page.getByRole('menu');
-    await expect(menu.getByRole('menuitem')).toHaveText(['Files', 'Chart']);
+    await expect(menu.getByRole('menuitem')).toHaveText(['Files', 'Chart', 'Status']);
     await menu.getByRole('menuitem', { name: 'Files' }).click();
 
     await expect(page.locator('[role="tab"]')).toHaveCount(2);
@@ -720,10 +721,16 @@ test.describe('Chat View -- SSE Streaming', () => {
       'GET /workspaces/a0000001-0000-4000-8000-000000000001/files': { files: ['report.pdf'] },
     });
     await configureEmptyReplay();
-    // Holds the panel's code back until the test lets it through.
+    // Holds the panel's code back until the test lets it through: the module
+    // on a dev server, its chunk in a build.
     let release;
     const held = new Promise((resolve) => { release = resolve; });
-    await page.route(/\/components\/FilePanel\.tsx(\?|$)/, async (route) => { await held; await route.continue(); });
+    let heldRequests = 0;
+    await page.route(/\/components\/FilePanel\.tsx(\?|$)|\/assets\/FilePanel-[\w-]+\.js$/, async (route) => {
+      heldRequests += 1;
+      await held;
+      await route.continue();
+    });
 
     await page.goto('/chat/t/b0000001-0000-4000-8000-000000000001');
     await page.waitForSelector('textarea', { timeout: 10000 });
@@ -732,6 +739,9 @@ test.describe('Chat View -- SSE Streaming', () => {
     await expect(page.locator('[data-panel-toggle-stand-in]')).toBeFocused();
     // Longer than the hand-off waits for a toggle that is not drawn at all.
     await page.waitForTimeout(2500);
+    // Without a hold the panel draws at once and the wait proves nothing, so
+    // a pattern that stops matching the panel's code must fail here.
+    expect(heldRequests).toBeGreaterThan(0);
     release();
 
     await expect(page.getByText('report.pdf')).toBeVisible({ timeout: 10000 });
@@ -755,7 +765,9 @@ test.describe('Chat View -- SSE Streaming', () => {
       path: '/api/v1/threads/b0000001-0000-4000-8000-000000000001/messages',
       events: [
         sseEvents.workspaceStatus('starting'),
-        sseEvents.workspaceStatus('ready'),
+        // Held until the test has seen the indicator: at the stream's 100ms
+        // gap the line came and went before a busy runner's click returned.
+        { ...sseEvents.workspaceStatus('ready'), holdUntil: 'workspace-started' },
         sseEvents.messageChunk('Workspace is ready. Here is your answer.'),
         sseEvents.finishStop(),
         sseEvents.creditUsage(),
@@ -772,9 +784,11 @@ test.describe('Chat View -- SSE Streaming', () => {
 
     // Warm-up indicator should appear
     await expect(page.getByText('Starting workspace...')).toBeVisible({ timeout: 10000 });
+    await releaseSSE('workspace-started');
 
     // Eventually the response arrives and the indicator goes away
     await expect(page.getByText('Workspace is ready. Here is your answer.')).toBeVisible({ timeout: 15000 });
+    await expect(page.getByText('Starting workspace...')).toHaveCount(0);
   });
 
   test('reconnect resumes in-progress stream', async ({ page }) => {

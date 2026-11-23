@@ -6,8 +6,8 @@ import { api } from '@/api/client';
 import { normalizeIndexKey } from '@/lib/marketUtils';
 import { isIndexFamilySpelling } from '@/lib/bars/exchanges';
 import type { RealTimePrice, SnapshotData, StockInfo, StockQuoteResult } from '@/types/market';
-import { quoteDecimals, roundQuote } from '@/lib/quotes/quoteAdapters';
 import type { CompanyOverviewArtifact } from '@/lib/quotes/overview';
+import type { StoredChartLayer } from '../types/chartLayer';
 
 // Legacy full-window bar loader now lives in lib/bars (so lib/ never imports a
 // page); re-exported for page-internal callers that still import it from here.
@@ -115,17 +115,16 @@ export function mapSnapshotToStockQuote(symbol: string, snap: SnapshotData | nul
     DividendYield: null,
   };
 
-  const dp = quoteDecimals(snap);
   const realTimePrice: RealTimePrice = {
     symbol: symbolUpper,
-    price: roundQuote(price, dp),
-    open: roundQuote(snap.open ?? 0, dp),
-    high: roundQuote(snap.high ?? 0, dp),
-    low: roundQuote(snap.low ?? 0, dp),
-    change: roundQuote(change, dp),
+    price,
+    open: snap.open ?? 0,
+    high: snap.high ?? 0,
+    low: snap.low ?? 0,
+    change,
     changePercent: changePct,
     volume: snap.volume ?? 0,
-    previousClose: roundQuote(previousClose, dp),
+    previousClose,
   };
 
   return { stockInfo, realTimePrice, snapshot: snap };
@@ -216,4 +215,37 @@ export async function deleteMarketThread(threadId: string): Promise<void> {
     // Silently fail - thread might already be deleted
     console.warn('[MarketView] Failed to delete thread:', threadId, error);
   }
+}
+
+/**
+ * Every layer the agent published on `symbol`'s charts in a workspace, all
+ * timeframes, as the server stores them.
+ */
+export async function fetchChartLayers(
+  workspaceId: string,
+  symbol: string,
+  signal?: AbortSignal,
+): Promise<StoredChartLayer[]> {
+  const { data } = await api.get<{ charts: { layers?: StoredChartLayer[] }[] }>(
+    `/api/v1/workspaces/${encodeURIComponent(workspaceId)}/chart-annotations`,
+    { params: { symbol }, signal },
+  );
+  return data.charts.flatMap((chart) => chart.layers ?? []);
+}
+
+/**
+ * Remove one agent-published chart layer by its id (`layer.id`) from the
+ * chart instance named by symbol and timeframe, as every chart-annotation
+ * route names it.
+ */
+export async function deleteChartLayer(
+  workspaceId: string,
+  layerId: string,
+  symbol: string,
+  timeframe: string,
+): Promise<void> {
+  await api.delete(
+    `/api/v1/workspaces/${encodeURIComponent(workspaceId)}/chart-annotations/items/${encodeURIComponent(layerId)}`,
+    { params: { symbol, timeframe } },
+  );
 }

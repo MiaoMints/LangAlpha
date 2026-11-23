@@ -5,6 +5,14 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
     <meta name="referrer" content="strict-origin-when-cross-origin" />
     <meta name="color-scheme" content="dark light" />
+    <!-- Where this document's frames may load, frame-src and nothing else. A
+         frame's navigations, its own included, are checked against it, so a
+         tampered report cannot send itself to another site with what it read.
+         Ahead of every script so it holds before any frame exists, and fixed
+         at build: a meta policy can be added to but never widened, so a frame
+         on an origin known only at runtime goes through /frame-host.html
+         (viewers/HostedFrame.tsx). -->
+    <!-- frame-policy: replaced in dev and at build by scripts/vite-plugins/framePolicy.ts -->
     <!-- This build reserves the strip macOS window buttons float over, so a
          desktop shell may hide the titlebar and hand the top of the window to
          it. Read by the shell after load; see watchChrome in desktop/src/main.js.
@@ -264,9 +272,17 @@
         // is what reserved a strip under a titlebar that was really there. An
         // older shell does not send it, and there the platform guess is still
         // the best available answer.
+        //
+        // Version 0.0.0 is a shell through 0.3.0 whose page landed in a renderer
+        // launched without the window's command-line switches. Every answer it
+        // read is then a default, `native` included, and believing it in a
+        // window whose titlebar is hidden leaves the logo under the window
+        // buttons and no drag region anywhere. The platform guess is right for
+        // the main window, the only one that loads this app.
         var shell = window.langalphaDesktop;
         if (!shell) return;
-        var hidden = shell.windowChrome
+        var known = shell.windowChrome && shell.version !== '0.0.0';
+        var hidden = known
           ? shell.windowChrome === 'hidden'
           : shell.platform === 'darwin';
         if (hidden) document.documentElement.classList.add('desktop-mac');

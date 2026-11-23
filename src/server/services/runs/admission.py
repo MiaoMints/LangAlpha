@@ -17,7 +17,16 @@ idempotent under the ownership flag.
 import asyncio
 import logging
 from functools import partial
-from typing import Any, Awaitable, Callable, Dict, Literal, NamedTuple, Optional
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Awaitable,
+    Callable,
+    Dict,
+    Literal,
+    NamedTuple,
+    Optional,
+)
 
 from fastapi import HTTPException
 
@@ -33,6 +42,10 @@ from src.config.settings import (
 # usage_limits.release_burst_slot intercept every scope-routed release.
 from src.server.dependencies import usage_limits
 
+if TYPE_CHECKING:
+    from src.server.database.runs.lifecycle import FinalizeResult
+    from src.server.services.shared_workspaces.turn import TurnIdentity
+
 logger = logging.getLogger(__name__)
 
 
@@ -46,6 +59,11 @@ class RunScope:
         self._handed_off = False
         self._admission_lock: Optional[asyncio.Lock] = None
         self._run_handle: Any = None
+
+    @property
+    def user_id(self) -> Optional[str]:
+        """The sender this run is for."""
+        return self._user_id
 
     @property
     def slot_owned(self) -> bool:
@@ -111,7 +129,13 @@ class RunScope:
         self._slot_owned = False
         self._handed_off = True
 
-    async def fail_open(self, reason: str, *, status: str = "cancelled") -> None:
+    async def fail_open(
+        self,
+        reason: str,
+        *,
+        status: str = "cancelled",
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> Optional["FinalizeResult"]:
         """Death-path teardown: release the lease and settle the open run.
 
         The caller is usually a stream task a client disconnect cancelled,
@@ -119,16 +143,18 @@ class RunScope:
         is cancelled again at once. So both steps start before the first
         suspension, side by side: the release never suspends, and
         ``fail_open_run`` settles in a protected task. A run left unsettled
-        here keeps its thread's fence and 409s every later turn.
+        here keeps its thread's fence and 409s every later turn. The
+        finalize's result, None when nothing was settled.
         """
         run_handle = self.owned_run_handle
         await self.release_slot()
-        if run_handle is not None:
-            from src.server.services.runs.coordinator import RunCoordinator
+        if run_handle is None:
+            return None
+        from src.server.services.runs.coordinator import RunCoordinator
 
-            await RunCoordinator.get_instance().fail_open_run(
-                run_handle, reason, status=status
-            )
+        return await RunCoordinator.get_instance().fail_open_run(
+            run_handle, reason, status=status, metadata=metadata
+        )
 
 
 # Margin added to the checkpoint-flush timeout when a new turn waits for a
@@ -388,6 +414,7 @@ async def resolve_retry_of(request: ChatRequest, thread_id: str):
             detail="retry_of_run_id cannot be combined with fork_from_turn",
         )
     from src.server.database.runs import lifecycle as tl_db
+    from src.server.services.runs.pending_input import can_retry
 
     prev = await tl_db.get_run(request.retry_of_run_id)
     if prev is None or str(prev["conversation_thread_id"]) != thread_id:
@@ -408,7 +435,7 @@ async def resolve_retry_of(request: ChatRequest, thread_id: str):
                 "latest_status": latest["status"] if latest else None,
             },
         )
-    if prev["status"] != "error":
+    if not can_retry(prev):
         raise HTTPException(
             status_code=409,
             detail={
@@ -443,7 +470,7 @@ async def begin_run(
     thread_id: str,
     run_id: str,
     workspace_id: Optional[str],
-    user_id: Optional[str],
+    identity: "TurnIdentity",
     is_byok: bool,
     query_content,
     query_type,
@@ -452,6 +479,8 @@ async def begin_run(
     fork,
     is_checkpoint_replay: bool,
     extra_run_metadata: Optional[dict] = None,
+    in_start: Optional[Callable[[Any], Awaitable[None]]] = None,
+    runs_in: Optional[str] = None,
 ):
     """The one START-txn entrypoint: maps a ChatRequest onto the durable
     attempt chain — retries chain onto the failed run's turn, forked
@@ -470,7 +499,10 @@ async def begin_run(
     (``claim_steer_or_refuse``). START runs in a task of its own, which a
     client leaving mid-START does not cancel: the run of a START whose
     request was cancelled is settled as stopped, message kept, once START
-    is done."""
+    is done. ``in_start`` runs inside that transaction too, on its
+    connection, for a write that must commit with the run or not at all.
+    ``runs_in`` is the workspace the turn runs in when not its thread's
+    (``refuse_moved_off``)."""
     from uuid import uuid4
 
     from src.server.services.runs.coordinator import (
@@ -481,10 +513,25 @@ async def begin_run(
     from src.server.services.runs.pending_input import executor_input_stamp
 
     retry_of = await resolve_retry_of(request, thread_id)
-    identity = dict(
+    user_id, recorded_as = identity.sender, identity.recorded_as
+    if identity.shared:
+        # A shared workspace's turn: its sender must still reach the
+        # workspace, and the thread it starts in, when the run commits. A
+        # removal, an audience change or a starter making the thread private
+        # since the route's check would have ended either.
+        in_start = partial(
+            _refuse_unreached_workspace,
+            identity.owner,
+            user_id,
+            await _sender_seat(user_id),
+            then=in_start,
+        )
+        in_start = partial(_refuse_private_thread, thread_id, user_id, then=in_start)
+    row = dict(
         thread_id=thread_id,
         workspace_id=workspace_id,
         user_id=user_id,
+        recorded_as=recorded_as,
         is_byok=is_byok,
     )
     started: list = []
@@ -495,6 +542,7 @@ async def begin_run(
             request_key=request.request_key,
             workspace_id=workspace_id,
             user_id=user_id,
+            recorded_as=recorded_as,
             is_byok=is_byok,
             # A retry is another attempt at a turn whose first attempt wrote the
             # query row; rewriting it would let a retry change what was asked.
@@ -542,8 +590,20 @@ async def begin_run(
             pending_input=executor_input_stamp(request),
             on_started=started.append,
             before_commit=(
-                partial(_start_checks, request, thread_id=thread_id, run_id=run_id)
-                if request.request_key or request.steer_job_id
+                partial(
+                    _start_checks,
+                    request,
+                    thread_id=thread_id,
+                    run_id=run_id,
+                    then=in_start,
+                    runs_in=runs_in,
+                )
+                if (
+                    request.request_key
+                    or request.steer_job_id
+                    or request.checked_computer_id
+                    or in_start
+                )
                 else None
             ),
         ),
@@ -554,7 +614,7 @@ async def begin_run(
         handle = await asyncio.shield(start)
     except Exception:
         committed = started[0] if started else await _committed_start(
-            run_id, **identity
+            run_id, **row
         )
         if committed is not None:
             scope.attach_run(committed)
@@ -564,7 +624,7 @@ async def begin_run(
         # for START and settles its run.
         scope.hold_admission_until(
             spawn_protected(
-                _settle_after_start(start, started, run_id, **identity),
+                _settle_after_start(start, started, run_id, **row),
                 f"start-settle-{run_id}",
             )
         )
@@ -574,7 +634,13 @@ async def begin_run(
 
 
 async def _start_checks(
-    request: "ChatRequest", conn, *, thread_id: str, run_id: str
+    request: "ChatRequest",
+    conn,
+    *,
+    thread_id: str,
+    run_id: str,
+    then: Optional[Callable[[Any], Awaitable[None]]] = None,
+    runs_in: Optional[str] = None,
 ) -> None:
     if request.request_key:
         await refuse_copy_read_as_steer(
@@ -582,6 +648,66 @@ async def _start_checks(
         )
     if request.steer_job_id:
         await claim_steer_or_refuse(conn, request.steer_job_id, run_id)
+    if then is not None:
+        await then(conn)
+    # After ``then``: a turn in Home's stand-in takes there the lock a
+    # removal of the stand-in's computer holds, which this read relies on.
+    if request.checked_computer_id:
+        from src.server.database.workspace import refuse_moved_off
+
+        await refuse_moved_off(
+            conn, thread_id, request.checked_computer_id, runs_in=runs_in
+        )
+
+
+async def _refuse_private_thread(
+    thread_id: str,
+    user_id: str,
+    conn,
+    *,
+    then: Optional[Callable[[Any], Awaitable[None]]] = None,
+) -> None:
+    """Read on START's connection: START has written the thread row by then,
+    so this comes after any make-private that committed first, and one still
+    to come waits on START's row lock and then sees this run."""
+    from src.server.database.conversation.thread_reach import hidden
+
+    if await hidden([thread_id], user_id, conn=conn):
+        raise HTTPException(status_code=404, detail="Thread not found")
+    if then is not None:
+        await then(conn)
+
+
+async def _sender_seat(user_id: str):
+    """The sender's seat, read before START: the auth service is never asked
+    inside its transaction, so which teams they are in is as of here. A
+    sender who may no longer use shared workspaces is refused as a thread
+    they do not reach."""
+    from src.server.services.shared_workspaces.access import caller_seat
+
+    seat = await caller_seat(user_id)
+    if seat is None:
+        raise HTTPException(status_code=404, detail="Thread not found")
+    return seat
+
+
+async def _refuse_unreached_workspace(
+    holder_id: str,
+    user_id: str,
+    seat,
+    conn,
+    *,
+    then: Optional[Callable[[Any], Awaitable[None]]] = None,
+) -> None:
+    """Read on START's connection under the rows that grant the sender's
+    reach (``reach_held``), so a removal or audience change either committed
+    first and refuses the run, or waits for it and then stops it."""
+    from src.server.database.shared_workspaces import reach_held
+
+    if not await reach_held(conn, holder_id, user_id, seat.org_id, seat.team_ids):
+        raise HTTPException(status_code=404, detail="Thread not found")
+    if then is not None:
+        await then(conn)
 
 
 async def _settle_after_start(
@@ -611,6 +737,7 @@ async def _committed_start(
     thread_id: str,
     workspace_id: Optional[str],
     user_id: Optional[str],
+    recorded_as: Optional[str],
     is_byok: bool,
 ):
     """The run a failed START left open on the ledger, if its row committed.
@@ -640,6 +767,7 @@ async def _committed_start(
         attempt_no=row["attempt_no"],
         workspace_id=workspace_id,
         user_id=user_id,
+        recorded_as=recorded_as,
         is_byok=is_byok,
         started_at=row["created_at"],
         # A disconnect settles this run as stopped, from the stamp START kept.

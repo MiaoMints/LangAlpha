@@ -1,7 +1,8 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { useMutationState } from '@tanstack/react-query';
 import { Search, Pin } from 'lucide-react';
-import { Link, useLocation } from 'react-router';
+import { Link, useLocation, useNavigate } from 'react-router';
+import { cn } from '@/lib/utils';
 import { Select } from '@/components/ui/select';
 import { usePreferences } from '@/hooks/usePreferences';
 import { PREFERENCE_MUTATION_KEY, useUpdatePreferences } from '@/hooks/useUpdatePreferences';
@@ -9,7 +10,7 @@ import { ModelTierConfig } from '@/components/model/ModelTierConfig';
 import { ModelSelector } from '@/components/model/ModelSelector';
 import { FallbackModelsPicker } from '@/components/model/FallbackModelsPicker';
 import { PayerOrder } from '@/components/model/PayerOrder';
-import { PayerBadge } from '@/components/model/PayerBadge';
+import { NameTag, PayerBadge } from '@/components/model/PayerBadge';
 import { isPlatformMode } from '@/config/hostMode';
 import { PerModelMatrix } from '@/components/model/PerModelMatrix';
 import { AccountTuningDefaults } from '@/components/model/AccountTuningDefaults';
@@ -17,6 +18,8 @@ import { DefaultModelScopeChoice } from '@/components/model/DefaultModelScopeCho
 import { useDefaultModelChange } from '@/hooks/useDefaultModelChange';
 import { useAllModels } from '@/hooks/useAllModels';
 import { useFavoriteModels } from '@/hooks/useFavoriteModels';
+import { useAccount } from '@/hooks/useAccount';
+import { modelRefusedBy } from '@/lib/accountRules';
 import { modelLabel, modelMatches } from '@/lib/modelLabel';
 import { Trans, useTranslation } from 'react-i18next';
 import { ModelAccessSection } from './ModelAccessSection';
@@ -28,6 +31,10 @@ import { SETTINGS, settingAt } from '../sections';
 import { BACKGROUND_AUTO, backgroundDefaultChoice, isModelWrite, modelPrefs, readDefaultModelScope, splitPreferenceWrite } from '@/lib/modelPreferences';
 import { useModelSlotCopy } from '@/components/model/useModelSlotCopy';
 import { paidByDeployment, paidByUser } from '@/lib/modelPayer';
+import { CLAUDE_CODE_CHOICE_URL, isClaudeCodeModel } from '@/lib/claudeCode';
+import { useDefaultModel } from '@/hooks/useSlotDefaultModels';
+import { useTurnDefaultModel } from '@/hooks/useTurnModels';
+import { useClaudeCodeSteps } from '@/hooks/useClaudeCodeSteps';
 import type { ModelSlot, DefaultModelScope, PreferencePatch } from '@/lib/modelPreferences';
 
 type ModelsMode = 'simple' | 'advanced';
@@ -44,6 +51,33 @@ function readStoredMode(): ModelsMode {
   }
 }
 
+/** The Default is a Claude Code model a Chief of Staff turn cannot run yet,
+ *  so its chats start on another one: said under the pick, with the way to
+ *  set Claude Code up, rather than left for the composer to show. */
+function ClaudeCodeDefaultHeld({ className }: { className?: string }) {
+  const { t } = useTranslation();
+  const navigate = useNavigate();
+  const { metadata } = useAllModels();
+  const chosen = useDefaultModel();
+  const startsOn = useTurnDefaultModel(true);
+  const held = !!chosen && !!startsOn && startsOn !== chosen && isClaudeCodeModel(metadata[chosen]);
+  const steps = useClaudeCodeSteps({ enabled: held });
+  if (!held || steps.status !== 'pending') return null;
+  return (
+    <p role="note" className={cn('flex flex-wrap items-center gap-x-2 gap-y-1 text-xs', className)} style={{ color: 'var(--color-text-secondary)' }}>
+      <span>{t('modelAccess.claudeCode.steps.defaultHeld', { home: t('agents.chiefOfStaff'), fallback: modelLabel(startsOn, metadata) })}</span>
+      <button
+        type="button"
+        className="tap-target font-medium underline underline-offset-2 hover:opacity-80"
+        style={{ color: 'var(--color-text-primary)' }}
+        onClick={() => navigate(CLAUDE_CODE_CHOICE_URL)}
+      >
+        {t('modelAccess.claudeCode.steps.setUp')}
+      </button>
+    </p>
+  );
+}
+
 /** Models: connections, the default and Background models, quick-access
  * models, and behind the advanced switch per-model tuning, account defaults
  * and routing.
@@ -56,7 +90,7 @@ function readStoredMode(): ModelsMode {
 export function ModelsPanel() {
   const { preferences: prefsData } = usePreferences();
   const { mutate } = useUpdatePreferences();
-  const { models: visibleModels, metadata: modelMetadata, payers, systemDefaults: hookSystemDefaults, validModelNames, catalogModelNames, isLoading: modelsLoading, compactionProfiles } = useAllModels();
+  const { models: visibleModels, slotModels, metadata: modelMetadata, payers, systemDefaults: hookSystemDefaults, validModelNames, catalogModelNames, isLoading: modelsLoading, compactionProfiles } = useAllModels();
   const { t } = useTranslation();
   const copy = useSettingCopy();
   const modelSlotCopy = useModelSlotCopy();
@@ -101,6 +135,9 @@ export function ModelsPanel() {
   // Model routing and tuning live in model_preference.
   const mPref = modelPrefs(prefsData);
   const favorites = useFavoriteModels();
+  // A favorite a rule refuses stays saved and says so.
+  const { policy } = useAccount();
+  const refusedModel = (m: string) => modelRefusedBy(policy, modelMetadata, m) !== null;
   // Every name the catalog still carries, access aside. A fallback the user
   // temporarily cannot reach is still configured; one the manifest dropped is
   // not, and _resolve_fallback_clients skips it without saying so, leaving the
@@ -120,9 +157,10 @@ export function ModelsPanel() {
   );
   // Once saved, those models are the user's choice and catch every turn, the
   // ones their plan or key pays for included, which the list no longer shows.
+  // A Claude Code turn takes no fallback, so its models are not such a turn.
   const savedCrossesPayer = mPref.fallback_models != null
     && fallbackModels.some((m) => paidByDeployment(payers[m]))
-    && Object.values(payers).some(paidByUser);
+    && Object.entries(payers).some(([m, payer]) => paidByUser(payer) && !isClaudeCodeModel(modelMetadata[m]));
 
   // While the question is open each select shows the model the answer would
   // write, and a cancel puts both back on the saved ones.
@@ -202,6 +240,7 @@ export function ModelsPanel() {
         <SettingsCardBody id={SETTINGS.defaultModels.anchor}>
           <ModelTierConfig
             models={visibleModels}
+            backgroundModels={slotModels}
             metadata={modelMetadata}
             primaryModel={shownDefault('default')}
             onPrimaryModelChange={setDefault('default')}
@@ -210,6 +249,7 @@ export function ModelsPanel() {
             payers={payers}
             auto={autoModels}
           />
+          <ClaudeCodeDefaultHeld className="mt-3" />
           {defaultQuestion && <DefaultModelScopeChoice className="mt-4" {...defaultQuestion} />}
           <PayerOrder className="mt-4" />
         </SettingsCardBody>
@@ -242,11 +282,16 @@ export function ModelsPanel() {
                   }}
                 >
                   {modelLabel(key, modelMetadata)}
-                  <PayerBadge payer={payers[key]} />
+                  {refusedModel(key)
+                    ? <NameTag>{t('modelAccess.status.notAllowed')}</NameTag>
+                    : <PayerBadge payer={payers[key]} />}
                   <button
                     type="button"
                     onClick={() => favorites.remove(key)}
-                    className="ml-0.5 hover:opacity-70"
+                    // 32px is the chips' line pitch (26 + 6): any taller and a tap
+                    // removes the model on the line above or below. Moved left so
+                    // the box ends at the chip's edge, off the next chip and Add.
+                    className="tap-target ml-0.5 hover:opacity-70 [--tap-target-h:32px] [--tap-target-x:-9.5px]"
                     style={{ color: 'var(--color-text-tertiary)' }}
                     aria-label={t('settings.removeModel', { model: modelLabel(key, modelMetadata) })}
                   >
@@ -310,7 +355,10 @@ export function ModelsPanel() {
                               key={m}
                               type="button"
                               onClick={() => (isStarred ? favorites.remove(m) : favorites.add(m))}
-                              className={`w-full flex items-center justify-between px-2 py-1.5 rounded-md text-xs transition-colors ${isStarred ? 'bg-(--color-bg-tag)' : 'hover:bg-(--color-bg-elevated)'}`}
+                              className={cn(
+                                'w-full flex items-center justify-between px-2 row-inset rounded-md text-xs transition-colors',
+                                isStarred ? 'bg-(--color-bg-tag)' : 'hover:bg-(--color-bg-elevated)',
+                              )}
                               style={{ color: 'var(--color-text-primary)' }}
                             >
                               <span className="flex min-w-0 items-center gap-2">
@@ -374,7 +422,7 @@ export function ModelsPanel() {
                 description={t('settings.modelTuning.fetchModelDesc')}
                 value={mPref.fetch_model ?? ''}
                 onChange={(v) => write({ fetch_model: v || null })}
-                models={visibleModels}
+                models={slotModels}
                 placeholder={modelSlotCopy.defaultsToBackground}
                 payers={payers}
                 metadata={modelMetadata}
@@ -390,7 +438,7 @@ export function ModelsPanel() {
                   // user clears compaction_model.
                   summarization_model: null,
                 })}
-                models={visibleModels}
+                models={slotModels}
                 placeholder={modelSlotCopy.defaultsToConversation}
                 payers={payers}
                 metadata={modelMetadata}
@@ -413,7 +461,7 @@ export function ModelsPanel() {
               <FallbackModelsPicker
                 selected={fallbackModels}
                 onChange={(list) => write({ fallback_models: list })}
-                models={visibleModels}
+                models={slotModels}
                 metadata={modelMetadata}
                 payers={payers}
                 skipped={{

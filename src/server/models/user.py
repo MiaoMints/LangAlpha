@@ -2,12 +2,13 @@
 
 from datetime import datetime
 from decimal import Decimal
-from typing import Annotated, Any, Dict, List, Literal, Optional
+from typing import Any, Dict, List, Literal, Optional
 from uuid import UUID
 
-from market_protocol import display_spelling
-from pydantic import BaseModel, BeforeValidator, ConfigDict, Field, StrictBool, field_validator
+from market_protocol import AssetClass, display_spelling, to_canonical
+from pydantic import BaseModel, ConfigDict, Field, StrictBool, ValidationInfo, field_validator
 
+from src.llms.claude_code import PlanOut
 from src.server.models.profile_vocabulary import STRUCTURED_PREFERENCES
 
 
@@ -16,18 +17,70 @@ from src.server.models.profile_vocabulary import STRUCTURED_PREFERENCES
 # =============================================================================
 
 
-def normalize_symbol(symbol: str) -> str:
+SYMBOL_MAX_LEN = 50
+"""The width of the symbol column a holding or watchlist row is stored in."""
+
+
+def normalize_symbol(symbol: str, instrument_type: Optional[str] = None) -> str:
     """The one spelling a row stores, so ``600519.SS`` and ``600519.SH`` are
-    one listing."""
-    return display_spelling(symbol)
+    one listing.
+
+    A coin is stored as its pair (``BTC-USD``), because every reader of a row
+    quotes its symbol alone through the stocks endpoint, and a bare coin there
+    is a US ticker: ``BTC`` is a bitcoin ETF at about $30 a share, and ``USDC``
+    a delisted OTC stock. A pair too long for the column keeps the bare spelling.
+    """
+    spelled = display_spelling(symbol)
+    if normalize_instrument_type(instrument_type) != "crypto":
+        return spelled
+    pair = _coin_pair(symbol, spelled)
+    return pair if pair is not None and len(pair) <= SYMBOL_MAX_LEN else spelled
 
 
-def _stored_symbol(v: Any) -> Any:
-    # A non-string is left for Pydantic to reject as one.
-    return normalize_symbol(v) if isinstance(v, str) else v
+def _coin_pair(symbol: str, spelled: str) -> Optional[str]:
+    """The pair the stocks endpoint reads this coin by, or None if no pair fits."""
+    try:
+        ref = to_canonical(symbol, asset_class=AssetClass.EQUITY)
+    except ValueError:
+        return None
+    if ref.asset_class is AssetClass.CRYPTO:
+        # A pair already (BTC-USD, BTCUSDT), or a key naming its base (BTC.CRYPTO).
+        return ref.symbol if "-" in ref.symbol else f"{ref.symbol}-{ref.price_currency}"
+    # Read as a ticker, it is the coin's own (RENDER, FDUSD): the endpoint
+    # splits a run only on the bases it knows, so it is not split here either,
+    # and the bare coin takes dollars.
+    return f"{spelled}-USD" if spelled.isascii() and spelled.isalnum() else None
 
 
-StoredSymbol = Annotated[str, BeforeValidator(_stored_symbol)]
+class _InstrumentRow(BaseModel):
+    """The identity a holding or watchlist row shares: its type, then its symbol.
+
+    ``instrument_type`` is declared first so it is validated by the time
+    ``symbol`` is, whose stored spelling depends on it; the length limit then
+    applies to that spelling, the one the column holds.
+    """
+
+    instrument_type: str = Field(
+        ...,
+        min_length=1,
+        max_length=30,
+        description=(
+            "Type of instrument. Common values: stock, etf, index, crypto, future, "
+            "commodity, currency. Other values are accepted."
+        ),
+    )
+    symbol: str = Field(..., max_length=SYMBOL_MAX_LEN, description="Instrument symbol")
+
+    @field_validator("instrument_type", mode="before")
+    @classmethod
+    def normalize_instrument_type_field(cls, v: Any) -> Any:
+        return normalize_instrument_type(v)
+
+    @field_validator("symbol", mode="before")
+    @classmethod
+    def normalize_symbol_field(cls, v: Any, info: ValidationInfo) -> Any:
+        # A non-string is left for Pydantic to reject as one.
+        return normalize_symbol(v, info.data.get("instrument_type")) if isinstance(v, str) else v
 
 
 # =============================================================================
@@ -137,6 +190,25 @@ class OtherPreference(BaseModel):
     auto_approve_workspace_creation: Optional[StrictBool] = Field(
         None, description="Create workspaces without asking; absent means ask."
     )
+    # Strict: off keeps the member's own context out of every shared
+    # workspace, so only a real boolean turns it off.
+    own_context_in_shared_workspaces: Optional[StrictBool] = Field(
+        None,
+        description=(
+            "Use the member's answer preferences and memory on their own messages "
+            "in shared workspaces whose organization allows it; absent means on."
+        ),
+    )
+    # Strict too: a value that is not one of the two would read as Stop,
+    # so it is refused rather than saved as if it meant something.
+    claude_code_plan_out: Optional[PlanOut] = Field(
+        None,
+        description=(
+            "What Claude Code turns do once the Claude plan is used up: stop "
+            "and wait for it to reset, or go on on the account's usage "
+            "credits; absent means stop."
+        ),
+    )
 
 
 class ModelPreference(BaseModel):
@@ -190,6 +262,13 @@ class UserCreate(UserBase):
     )
 
 
+# Where a user chose to work, asked once by the desktop app's first run and
+# read only while they have no computer Home can live on: ``own_machine``
+# keeps a cloud computer from being built for them. None is a user never
+# asked, who gets the cloud as before.
+ComputerChoice = Literal["own_machine", "cloud"]
+
+
 class UserUpdate(UserBase):
     """Request model for updating user profile."""
 
@@ -198,6 +277,80 @@ class UserUpdate(UserBase):
     )
     personalization_completed: Optional[bool] = Field(
         None, description="Whether personalization wizard is completed"
+    )
+    computer_choice: Optional[ComputerChoice] = Field(
+        None,
+        description=(
+            "Where the user works. It moves nothing; making a computer "
+            "primary does"
+        ),
+    )
+
+
+class OrganizationTeam(BaseModel):
+    id: str
+    name: str
+    role: Literal["admin", "member"]
+
+
+class OrganizationResponse(BaseModel):
+    #: Null, with the name, when only the account's suspension is known: the
+    #: auth service said so in its change notice and cannot be asked since.
+    id: Optional[str] = None
+    name: Optional[str] = None
+    suspended: bool = Field(
+        default=False,
+        description=(
+            "The account's access through this organization has ended: every "
+            "route but this one answers 403 account_suspended"
+        ),
+    )
+    teams: List[OrganizationTeam] = Field(
+        default_factory=list,
+        description="The account's teams in the organization, with its role in each",
+    )
+
+
+
+class ModelsPolicyResponse(BaseModel):
+    allowed: Optional[List[str]] = Field(
+        default=None, description="The models a turn may run; null allows any"
+    )
+
+
+class OwnModelAccessPolicyResponse(BaseModel):
+    api_keys: bool = Field(
+        description="Whether the user's own API keys, custom models and custom providers are used"
+    )
+    subscriptions: bool = Field(
+        description="Whether the user's own model sign-ins and Claude Code subscription are used"
+    )
+
+
+class PolicyResponse(BaseModel):
+    """What the user may do, for a client to grey out what would be refused."""
+
+    models: ModelsPolicyResponse
+    own_model_access: OwnModelAccessPolicyResponse
+    public_links: bool = Field(
+        default=True,
+        description="Whether the user's threads and files may be shared by a link that opens without signing in",
+    )
+    trading: bool = Field(
+        default=True,
+        description="Whether the agent may place, change or cancel a live order for the user",
+    )
+    own_machines: bool = Field(
+        default=True,
+        description="Whether the user's work may run on a machine they bring (an SSH computer)",
+    )
+    user_connectors: bool = Field(
+        default=True,
+        description="Whether MCP servers the user adds themselves are used (brokerages aside)",
+    )
+    set_by: Dict[str, Literal["deployment", "organization"]] = Field(
+        default_factory=dict,
+        description="Each restricted rule (e.g. 'models.allowed') and who set it",
     )
 
 
@@ -228,8 +381,22 @@ class UserResponse(UserBase):
         default=None,
         description="Display name of the user's active plan (e.g. 'Pro'). None when no subscription.",
     )
+    organization: Optional[OrganizationResponse] = Field(
+        default=None,
+        description="The organization the account belongs to, when this deployment acts on one",
+    )
+    policy: Optional[PolicyResponse] = Field(
+        default=None,
+        description=(
+            "The user's effective policy, on GET /users/me; null there means it is "
+            "unknown, and turns are refused until it is known again"
+        ),
+    )
     auth_provider: Optional[str] = Field(
         None, description="Authentication provider (e.g. google, github, email)"
+    )
+    computer_choice: Optional[ComputerChoice] = Field(
+        None, description="Where the user chose to work; null when never asked"
     )
     created_at: datetime = Field(description="Creation timestamp")
     updated_at: datetime = Field(description="Last update timestamp")
@@ -282,6 +449,13 @@ class UserPreferencesUpdate(UserPreferencesBase):
         "to existing threads: 'existing_threads' moves the threads still on the "
         "old default to the new one, 'new_threads' leaves them. Never stored; "
         "absent, model_preference.default_model_scope decides.",
+    )
+    expect_other_preference: Optional[Dict[str, Any]] = Field(
+        None,
+        description="Keys of other_preference with the value each held when "
+        "the client read it (null = absent). The write applies only if every "
+        "named key still holds exactly that, else 409 with code "
+        "'preference_changed' and nothing written. Never stored.",
     )
 
 
@@ -363,19 +537,9 @@ class WatchlistResponse(WatchlistBase):
 # -----------------------------------------------------------------------------
 
 
-class WatchlistItemBase(BaseModel):
+class WatchlistItemBase(_InstrumentRow):
     """Base watchlist item fields."""
 
-    symbol: StoredSymbol = Field(..., max_length=50, description="Instrument symbol")
-    instrument_type: str = Field(
-        ...,
-        min_length=1,
-        max_length=30,
-        description=(
-            "Type of instrument. Common values: stock, etf, index, crypto, future, "
-            "commodity, currency. Other values are accepted."
-        ),
-    )
     exchange: Optional[str] = Field(
         None, max_length=50, description="Exchange (e.g., 'NASDAQ')"
     )
@@ -387,11 +551,6 @@ class WatchlistItemBase(BaseModel):
     metadata: Optional[Dict[str, Any]] = Field(
         default_factory=dict, description="Additional metadata"
     )
-
-    @field_validator("instrument_type", mode="before")
-    @classmethod
-    def normalize_instrument_type_field(cls, v: Any) -> Any:
-        return normalize_instrument_type(v)
 
 
 class WatchlistItemCreate(WatchlistItemBase):
@@ -460,19 +619,9 @@ class WatchlistsResponse(BaseModel):
 # =============================================================================
 
 
-class PortfolioHoldingBase(BaseModel):
+class PortfolioHoldingBase(_InstrumentRow):
     """Base portfolio holding fields."""
 
-    symbol: StoredSymbol = Field(..., max_length=50, description="Instrument symbol")
-    instrument_type: str = Field(
-        ...,
-        min_length=1,
-        max_length=30,
-        description=(
-            "Type of instrument. Common values: stock, etf, index, crypto, future, "
-            "commodity, currency. Other values are accepted."
-        ),
-    )
     exchange: Optional[str] = Field(
         None, max_length=50, description="Exchange (e.g., 'NASDAQ')"
     )
@@ -490,11 +639,6 @@ class PortfolioHoldingBase(BaseModel):
     first_purchased_at: Optional[datetime] = Field(
         None, description="First purchase date"
     )
-
-    @field_validator("instrument_type", mode="before")
-    @classmethod
-    def normalize_instrument_type_field(cls, v: Any) -> Any:
-        return normalize_instrument_type(v)
 
 
 class PortfolioHoldingCreate(PortfolioHoldingBase):

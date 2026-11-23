@@ -4,8 +4,10 @@ import { useTranslation } from 'react-i18next';
 import { Search, X } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { isDesktopShell } from '@/lib/desktop';
+import { isFeatureEnabled, useFeatures } from '@/hooks/useFeatures';
 import { isImeComposing } from '@/lib/ime';
-import { GROUPS, SECTIONS, searchableSettings, sectionShown, type Section, type SettingEntry } from '../sections';
+import { matchesAllWords, queryWords } from '@/lib/textMatch';
+import { GROUPS, SECTIONS, searchableSettings, sectionShown, settingSearchText, type Section, type SettingEntry } from '../sections';
 
 /**
  * The page's navigation: a search over every setting, then the sections in
@@ -42,19 +44,15 @@ export function SettingsRail({ section }: { section: Section }) {
     return () => window.removeEventListener('keydown', onKeyDown);
   }, []);
 
-  const entries = useMemo(() => searchableSettings(isDesktopShell()), []);
-  const words = query.trim().toLowerCase().split(/\s+/).filter(Boolean);
+  const features = useFeatures().data;
+  const entries = useMemo(
+    () => searchableSettings(isDesktopShell(), (key) => isFeatureEnabled(features, key)),
+    [features],
+  );
+  const words = queryWords(query);
   const matches = words.length === 0
     ? []
-    : entries.filter((entry) => {
-        const text = [
-          t(entry.labelKey),
-          entry.descKey ? t(entry.descKey) : '',
-          ...(entry.alsoKeys ?? []).map((key) => t(key)),
-          t(SECTIONS[entry.section].labelKey),
-        ].join(' ').toLowerCase();
-        return words.every((word) => text.includes(word));
-      });
+    : entries.filter((entry) => matchesAllWords(settingSearchText(entry, t), words));
   const searching = words.length > 0;
   const shownActive = Math.min(active, Math.max(matches.length - 1, 0));
 
@@ -75,12 +73,13 @@ export function SettingsRail({ section }: { section: Section }) {
   }, [section, searching]);
 
   return (
-    <div className={cn('settings-rail', (searchOpen || searching) && 'is-searching')}>
-      <div className="settings-search">
+    <div className={cn('page-rail settings-rail', (searchOpen || searching) && 'is-searching')}>
+      <div className="page-search settings-search">
         <Search className="settings-search-icon" aria-hidden />
         <input
           ref={inputRef}
           type="search"
+          className="page-search-input"
           role="combobox"
           aria-expanded={searching}
           aria-controls={listId}
@@ -146,7 +145,7 @@ export function SettingsRail({ section }: { section: Section }) {
                   onMouseEnter={() => setActive(index)}
                   onClick={() => open(entry, false)}
                 >
-                  <Icon className="settings-rail-icon" aria-hidden />
+                  <Icon className="page-rail-icon" aria-hidden />
                   <span className="min-w-0">
                     <span className="settings-result-name">{t(entry.labelKey)}</span>
                     <span className="settings-result-section">{t(SECTIONS[entry.section].labelKey)}</span>
@@ -168,7 +167,7 @@ export function SettingsRail({ section }: { section: Section }) {
           </button>
           {GROUPS.map((group) => (
             <div key={group.labelKey} className="settings-rail-group">
-              <div className="settings-rail-label">{t(group.labelKey)}</div>
+              <div className="page-rail-label open-style:label-voice">{t(group.labelKey)}</div>
               {group.sections.filter(sectionShown).map((s) => {
                 const Icon = SECTIONS[s].icon;
                 const current = s === section;
@@ -176,11 +175,11 @@ export function SettingsRail({ section }: { section: Section }) {
                   <Link
                     key={s}
                     to={`?tab=${s}`}
-                    className={cn('settings-rail-link', current && 'is-active')}
+                    className={cn('page-rail-link', current && 'is-active')}
                     aria-current={current ? 'page' : undefined}
                   >
-                    <Icon className="settings-rail-icon" aria-hidden />
-                    <span className="settings-rail-name">{t(SECTIONS[s].labelKey)}</span>
+                    <Icon className="page-rail-icon" aria-hidden />
+                    <span className={cn('page-rail-name', current && 'rail-prompt')}>{t(SECTIONS[s].labelKey)}</span>
                   </Link>
                 );
               })}

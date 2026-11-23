@@ -17,7 +17,6 @@ from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any, NamedTuple
-from uuid import uuid4
 
 from langchain_core.messages import AnyMessage
 
@@ -29,7 +28,7 @@ from src.llms.model_spec import summary_reasoning_effort
 from src.llms.provider_compaction import deferred_text, readable_text
 
 from ptc_agent.agent.state import ensure_message_ids
-from ptc_agent.agent.middleware.runtime_context.durable import build_update_message
+from ptc_agent.agent.middleware.runtime_context.durable import written_row
 from ptc_agent.agent.middleware.runtime_context.restate import summary_note_row
 from ptc_agent.agent.middleware.compaction.types import (
     CompactionEvent,
@@ -50,6 +49,7 @@ from ptc_agent.agent.middleware.compaction.summarize import (
     is_other_model,
     preparer,
     server_summary,
+    thread_summary,
 )
 from ptc_agent.agent.middleware.compaction.measure import (
     estimate_for,
@@ -60,6 +60,7 @@ from ptc_agent.agent.middleware.compaction.utils import (
     build_compaction_event,
     build_summary_message,
     compacted_skills,
+    count_tokens_claude,
     count_tokens_tiktoken,
     get_effective_messages,
     partition_at_cutoff,
@@ -90,6 +91,7 @@ from ptc_agent.agent.middleware.thinking_binding import (
     without_thinking,
 )
 from ptc_agent.agent.transcript import TranscriptTarget, Window
+from ptc_agent.agent.tools.plan import PlanStepDict
 from ptc_agent.config.agent import CredentialSource
 from ptc_agent.agent.transcript.pointer import (
     TranscriptTurns,
@@ -129,6 +131,10 @@ class NativeAnswer(NamedTuple):
 Own = Callable[[list[AnyMessage], bool], Awaitable[NativeAnswer | str]]
 
 
+class NoOwnSummary(RuntimeError):
+    """The agent's own model wrote no summary where no other may."""
+
+
 @dataclass(frozen=True)
 class Compaction:
     """A summary in place of the start of the view."""
@@ -153,9 +159,7 @@ class Compaction:
         note = deferred_text(summary)
         if note is None:
             return None
-        row = build_update_message(summary_note_row(note, summary.id, datetime.now(tz=UTC)))
-        row.id = str(uuid4())
-        return row
+        return written_row(summary_note_row(note, summary.id, datetime.now(tz=UTC)))
 
     @property
     def unsent(self) -> set[str]:
@@ -212,9 +216,12 @@ class Summarizer:
     #: The user's own skill names, which the reload note may send the agent
     #: back to even under a retired built-in's name.
     user_skills: frozenset[str] = frozenset()
+    #: A shared workspace's thread, whose history names each member's
+    #: messages and escapes a tag typed in any other (``render_history``).
+    shared: bool = False
 
     @classmethod
-    def for_agent(cls, config: AgentConfig) -> Summarizer:
+    def for_agent(cls, config: AgentConfig, *, shared: bool = False) -> Summarizer:
         """The client ``resolve_compaction_client`` picks, else the named
         compaction model at the summary level."""
         model = resolve_compaction_client(config)
@@ -226,6 +233,7 @@ class Summarizer:
             config.compaction.token_threshold + _SUMMARY_HEADROOM,
             fallback=_summary_fallback(config),
             user_skills=frozenset(spec.name for spec in config.user_skills),
+            shared=shared,
         )
 
     async def compact(
@@ -243,12 +251,17 @@ class Summarizer:
         window: Window,
         progress: Progress | None = None,
         own: Own | None = None,
+        carried: bool = False,
+        own_only: bool = False,
+        brief_room: int | None = None,
+        plan: Sequence[PlanStepDict] = (),
     ) -> Compaction:
         """Summarize ``view`` before ``cutoff``, ``messages`` being the
         agent's checkpoint list (what ``window`` trimmed of it aside), by
         ``own`` when given (the agent's own model, from its own request),
         else from this model, then the next one (see ``_next``), then the
-        server (see ``summarize``).
+        server (see ``summarize``). With ``own_only``, ``own`` alone,
+        within the whole budget, and ``NoOwnSummary`` when it writes none.
 
         The transcript is saved first: the summary cites its turn files and
         ends pointing at it only if that save lands and ``workspace_id``'s
@@ -257,6 +270,13 @@ class Summarizer:
         ``notes_dir``, the main agent's scratchpad, are listed while the
         summary is written, and the summary names them after its pointer.
         ``progress`` hears how much of the summary has been written.
+        ``carried`` says the step it ends on is sent after it (see ``carry``).
+        ``plan`` is the plan in state, which the server's digest lists.
+
+        A ``brief_room`` makes it a brief for a model that keeps a session of
+        its own: no model is tried past this one, and when it writes none the
+        reader is handed the history itself, fitted to that many tokens
+        (``thread_summary``), not the server's digest.
         """
         to_summarize, preserved = partition_at_cutoff(view, cutoff)
         kept = keeps_turns(preserved)
@@ -274,29 +294,43 @@ class Summarizer:
 
         async def render(trimmed: list[AnyMessage]) -> list[AnyMessage]:
             trimmed = await aoffload_base64_content(backend, trimmed, thread_id=thread_id)
-            return build_summary_request(summary_prompt("transcript", kept, notes=bool(notes_dir)), trimmed, turns)
+            prompt = summary_prompt("transcript", kept, notes=bool(notes_dir), carried=carried)
+            return build_summary_request(prompt, trimmed, turns, shared=self.shared)
 
         remaining = budget - (time.monotonic() - started)
         # The notes are listed beside the summary and within its budget, so
         # the listing never holds the compaction past it, and it is dropped
         # with a summary that fails.
         listing = asyncio.create_task(anotes_pointer(backend, notes_dir, remaining))
-        server = functools.partial(
-            server_summary,
-            to_summarize,
-            preserved,
-            raw_messages=messages,
-            turns=turns,
-            window=window,
+        # The history itself goes to Claude Code, whose room is in Claude's tokens.
+        server = (
+            functools.partial(
+                thread_summary, to_summarize, turns=turns, limit=brief_room,
+                counter=count_tokens_claude, shared=self.shared,
+            )
+            if brief_room is not None
+            else functools.partial(
+                server_summary,
+                to_summarize,
+                raw_messages=messages,
+                turns=turns,
+                window=window,
+                plan=plan,
+                shared=self.shared,
+            )
         )
         try:
             # The agent's model gets the summary model's share, leaving the
             # summarizer a real call when it writes none.
-            summary = await _own_summary(own, to_summarize, kept, server, remaining * FIRST_SHARE)
+            summary = await _own_summary(
+                own, to_summarize, kept, server, remaining if own_only else remaining * FIRST_SHARE
+            )
+            if summary is None and own_only:
+                raise NoOwnSummary("the agent's own model wrote no summary")
             remaining = budget - (time.monotonic() - started)
             summary = summary or await awrite_summary(
                 model=self.model,
-                fallback=self._next(fallback),
+                fallback=None if brief_room is not None else self._next(fallback),
                 prepare=preparer(
                     to_summarize, limit=self.limit, counter=self.counter, render=render
                 ),
@@ -417,6 +451,7 @@ async def compact_messages(
     backend: SandboxBackend | None = None,
     workspace_id: str | None = None,
     notes_dir: str | None = None,
+    shared: bool = False,
 ) -> Compaction:
     """Manual /compact: summarize all but the tail automatic compaction
     keeps of the view, ``messages`` being the thread's checkpoint list and ``state`` its
@@ -425,7 +460,8 @@ async def compact_messages(
     scratchpad feature is on.
 
     Tier 1 has no part here: what it would trim is in the stretch the summary
-    replaces.
+    replaces. Nor does the plan: the next turn may open a new request, which
+    starts with none.
 
     Raises:
         ValueError: If the view leaves nothing to summarize.
@@ -441,7 +477,7 @@ async def compact_messages(
         transcript=transcript,
         shell=shell_reads_transcripts(backend),
     )
-    summarizer = Summarizer.for_agent(config)
+    summarizer = Summarizer.for_agent(config, shared=shared)
     main = _main_client(config)
     settings = config.compaction
     # The cutoff counts attachments, on the server's loop, as the strip the

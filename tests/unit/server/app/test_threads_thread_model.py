@@ -16,7 +16,7 @@ import pytest
 from httpx import ASGITransport, AsyncClient
 
 from ptc_agent.config.agent import CredentialSource
-from tests.conftest import create_test_app
+from tests.conftest import create_test_app, pin_chat_limit
 from src.server.services.llm.thread_model import NamedModel
 
 THREADS_MOD = "src.server.app.threads.messaging"
@@ -43,11 +43,11 @@ def _empty_async_gen(*_args, **_kwargs):
 
 def _app():
     from src.server.app.threads import router
-    from src.server.dependencies.usage_limits import ChatAuthResult, enforce_chat_limit
+    from src.server.dependencies.usage_limits import ChatAuthResult
 
     app = create_test_app(router)
-    app.dependency_overrides[enforce_chat_limit] = lambda: ChatAuthResult(
-        user_id=USER, access_tier=0
+    pin_chat_limit(
+        app, ChatAuthResult(user_id=USER, access_tier=0)
     )
     return app
 
@@ -143,7 +143,9 @@ async def test_a_turn_naming_no_model_runs_the_threads_own():
 
     assert resp.status_code == 200
     m["meta"].assert_awaited_once_with("tid-mine")
-    m["turn_model"].assert_awaited_once_with(USER, "tid-mine", named=None, held="m-pin")
+    m["turn_model"].assert_awaited_once_with(
+        USER, "tid-mine", named=None, held="m-pin", clear_dead=True
+    )
     assert _resolved_model(m["resolve"]) == "m-pin"
     # Nothing new was named, so there is nothing to keep.
     assert m["astream"].call_args.kwargs["named_model"] is None
@@ -181,18 +183,23 @@ async def test_home_is_bound_only_once_the_admission_gates_pass(admitted):
     credit = AsyncMock(
         side_effect=None if admitted else HTTPException(status_code=402, detail="quota")
     )
-    route = MagicMock(return_value=TurnRoute("home-ws", "chief_of_staff"))
+    route = MagicMock(return_value=TurnRoute("home-ws", "chief_of_staff", USER))
     bind = AsyncMock(return_value="home-ws")
     with (
         _send_stubs(owner_id=USER),
         patch("src.server.dependencies.usage_limits.enforce_credit_limit", new=credit),
         patch("src.server.services.turn_runtime.turn_route", new=route),
         patch("src.server.services.turn_runtime.ensure_home", new=bind),
+        patch(
+            "src.server.services.home_placement.place_home_turn",
+            new=AsyncMock(return_value=None),
+        ) as place,
     ):
         resp = await _send()
 
     assert resp.status_code == (200 if admitted else 402)
     assert bind.await_count == (1 if admitted else 0)
+    assert place.await_count == (1 if admitted else 0)
 
 
 @pytest.mark.asyncio
@@ -211,11 +218,39 @@ async def test_a_named_model_runs_and_is_kept():
 
     assert resp.status_code == 200
     m["turn_model"].assert_awaited_once_with(
-        USER, "tid-mine", named="m-named", held="m-pin"
+        USER, "tid-mine", named="m-named", held="m-pin", clear_dead=True
     )
     assert _resolved_model(m["resolve"]) == "m-named"
     # Kept only while the thread still holds the model this send read.
     assert m["astream"].call_args.kwargs["named_model"] == NamedModel("m-named", seen="m-pin")
+
+
+@pytest.mark.asyncio
+async def test_a_hand_off_naming_a_model_runs_it_and_keeps_it():
+    """A Chief of Staff hand-off is a background dispatch with the service
+    token; its named model is judged and kept as a person's send is."""
+    from fastapi.responses import JSONResponse
+
+    prime = AsyncMock(return_value=JSONResponse({"status": "dispatched"}))
+    with (
+        _send_stubs(owner_id=USER, stored_model="m-pin", turn_model="m-named") as m,
+        patch(f"{THREADS_MOD}._get_service_token", return_value="svc-token"),
+        patch(f"{THREADS_MOD}._prime_dispatch", new=prime),
+    ):
+        resp = await _send(
+            llm_model="m-named",
+            headers={
+                "X-Service-Token": "svc-token",
+                "X-User-Id": USER,
+                "X-Dispatch": "background",
+            },
+        )
+
+    assert resp.status_code == 200
+    assert _resolved_model(m["resolve"]) == "m-named"
+    kwargs = m["astream"].call_args.kwargs
+    assert kwargs["dispatched"] is True
+    assert kwargs["named_model"] == NamedModel("m-named", seen="m-pin")
 
 
 def _refusal(kind):
@@ -268,7 +303,7 @@ async def test_a_new_thread_holds_no_model():
         resp = await _send(path="/api/v1/threads/messages")
 
     assert resp.status_code == 200
-    assert m["turn_model"].await_args.kwargs == {"named": None, "held": None}
+    assert m["turn_model"].await_args.kwargs == {"named": None, "held": None, "clear_dead": True}
     assert _resolved_model(m["resolve"]) is None
 
 
@@ -312,3 +347,27 @@ async def test_keep_named_model_keeps_only_a_named_model(named_model, remembers)
         remember.assert_awaited_once_with("t-1", "m-a", seen="m-pin")
     else:
         remember.assert_not_awaited()
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "turn",
+    [
+        {"wakeup": {"v": 1, "notices": []}},
+        {"origin": {"type": "automation", "id": "a-1"}},
+        {"origin": {"type": "agent", "id": "cos-1", "agent": "chief_of_staff"}},
+        {"query_type": "system"},
+    ],
+    ids=["a-wakeup", "an-automation", "a-chief-of-staff-hand-off", "a-report-back"],
+)
+async def test_a_turn_nobody_started_runs_on_the_setup_token_the_user_stored(turn):
+    from src.server.services.llm.claude_code import Admitted
+
+    with (
+        _send_stubs(owner_id=USER, stored_model="m-pin", turn_model="m-pin") as m,
+        patch(f"{THREADS_MOD}._get_service_token", return_value="svc-token"),
+    ):
+        m["resolve"].return_value.claude_code_admitted = Admitted("stored_token", "stored_token")
+        resp = await _send(headers={"X-Service-Token": "svc-token"}, tuning=turn)
+
+    assert resp.status_code == 200
+    m["astream"].assert_called_once()

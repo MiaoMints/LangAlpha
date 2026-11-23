@@ -2,6 +2,7 @@ import React, { useEffect, useLayoutEffect, useMemo, useRef, useState } from 're
 import { useTranslation } from 'react-i18next';
 import type { PDFDocumentProxy } from 'pdfjs-dist';
 import { PanelLeft } from 'lucide-react';
+import { useElement } from '@/hooks/useElement';
 import { useStableHandler } from '@/hooks/useStableHandler';
 import { isRangedFile, markStale, type RangedFile } from '@/lib/rangedFile';
 import { Document, Page, pdfjs } from 'react-pdf';
@@ -9,6 +10,9 @@ import PdfRail, { type RailTab } from './pdf/PdfRail';
 import { type PageSize, sizeOf, withMeasured } from './pdf/pageSize';
 import { rangeTransport } from './pdf/rangeTransport';
 import { useReleasePages } from './pdf/useReleasePages';
+import { CountedRail } from './comments/pdf/CountedRail';
+import { PdfComments } from './comments/pdf/PdfComments';
+import type { ViewerCommentsTarget } from './comments/ViewerComments';
 import 'react-pdf/dist/Page/AnnotationLayer.css';
 import 'react-pdf/dist/Page/TextLayer.css';
 import './PdfViewer.css';
@@ -157,9 +161,11 @@ interface PdfViewerProps {
   focusPage?: number | null;
   focusSeq?: number | null;
   onPageCount?: (count: number) => void;
+  /** The owner's comments on the file's words. Left out, the file shows alone. */
+  comments?: ViewerCommentsTarget | null;
 }
 
-export default function PdfViewer({ data, onFileChanged, focusPage = null, focusSeq = null, onPageCount }: PdfViewerProps) {
+export default function PdfViewer({ data, onFileChanged, focusPage = null, focusSeq = null, onPageCount, comments = null }: PdfViewerProps) {
   const { t } = useTranslation();
   const [pageSizes, setPageSizes] = useState<PageSize[] | null>(null);
   const [zoom, setZoom] = useState<Zoom>('fit');
@@ -177,8 +183,12 @@ export default function PdfViewer({ data, onFileChanged, focusPage = null, focus
   // What the reader is typing into the page field; null while they are not.
   const [pageDraft, setPageDraft] = useState<string | null>(null);
 
-  // Always rendered, so every effect and handler below finds it set.
+  // Always rendered, so every effect and handler below finds it set. As
+  // state too, with the pages column: the comment layer is made over both
+  // once they are drawn.
   const scrollerRef = useRef<HTMLDivElement>(null);
+  const [scroller, placeScroller] = useElement(scrollerRef);
+  const [pagesColumn, setPagesColumn] = useState<HTMLDivElement | null>(null);
   // Where the reader is, taken at each scroll so a relayout can put them back.
   const anchor = useRef<Anchor>(pageTop(0));
   const anchorX = useRef(0.5);
@@ -466,6 +476,16 @@ export default function PdfViewer({ data, onFileChanged, focusPage = null, focus
   const railLabel = t(hasOutline ? 'pdfViewer.sidebar' : 'pdfViewer.pages');
   // The rail draws only from the current copy, never one being torn down.
   const railDoc = loaded && loaded.from === data && pageSizes ? loaded.pdf : null;
+  const rail = railOpen && railDoc && pageSizes ? {
+    pdf: railDoc,
+    pageSizes,
+    currentPage,
+    hasOutline,
+    tab: railTab,
+    onTabChange: setRailTab,
+    onGoToPage: scrollToPage,
+    onMeasure: measurePage,
+  } : null;
 
   // Leaving the field goes to the page typed, as Enter does: the number pad
   // iOS shows for it has no Return key.
@@ -480,14 +500,14 @@ export default function PdfViewer({ data, onFileChanged, focusPage = null, focus
   return (
     <div className="pdf-viewer">
       {/* Controls */}
-      <div className="pdf-controls">
+      <div className="pdf-controls rule-b">
         <div className="pdf-nav">
           <button
             type="button"
             onClick={() => setRailOpen((open) => !open)}
             disabled={!railDoc}
             aria-pressed={railOpen}
-            className="pdf-btn pdf-btn-icon"
+            className="pdf-btn pdf-btn-icon open-style:control-voice"
             aria-label={railLabel}
             title={railLabel}
           >
@@ -497,7 +517,7 @@ export default function PdfViewer({ data, onFileChanged, focusPage = null, focus
             type="button"
             onClick={() => scrollToPage(currentPage - 2)}
             disabled={!numPages || currentPage <= 1}
-            className="pdf-btn"
+            className="pdf-btn open-style:control-voice"
           >
             {t('pdfViewer.prev')}
           </button>
@@ -544,7 +564,7 @@ export default function PdfViewer({ data, onFileChanged, focusPage = null, focus
             type="button"
             onClick={() => scrollToPage(currentPage)}
             disabled={!numPages || currentPage >= numPages}
-            className="pdf-btn"
+            className="pdf-btn open-style:control-voice"
           >
             {t('pdfViewer.next')}
           </button>
@@ -554,7 +574,7 @@ export default function PdfViewer({ data, onFileChanged, focusPage = null, focus
             type="button"
             onClick={() => zoomOutTo && setZoom(zoomOutTo)}
             disabled={zoomOutTo === null}
-            className="pdf-btn"
+            className="pdf-btn open-style:control-voice"
             aria-label={t('pdfViewer.zoomOut')}
             title={t('pdfViewer.zoomOut')}
           >
@@ -565,7 +585,7 @@ export default function PdfViewer({ data, onFileChanged, focusPage = null, focus
             type="button"
             onClick={() => zoomInTo && setZoom(zoomInTo)}
             disabled={zoomInTo === null}
-            className="pdf-btn"
+            className="pdf-btn open-style:control-voice"
             aria-label={t('pdfViewer.zoomIn')}
             title={t('pdfViewer.zoomIn')}
           >
@@ -575,7 +595,7 @@ export default function PdfViewer({ data, onFileChanged, focusPage = null, focus
             type="button"
             onClick={() => setZoom('fit')}
             aria-pressed={zoom === 'fit'}
-            className="pdf-btn"
+            className="pdf-btn open-style:control-voice"
             title={t('pdfViewer.fitWidth')}
           >
             {t('pdfViewer.fit')}
@@ -584,82 +604,76 @@ export default function PdfViewer({ data, onFileChanged, focusPage = null, focus
       </div>
 
       <div className="pdf-body">
-        {railOpen && railDoc && pageSizes && (
-          <PdfRail
-            pdf={railDoc}
-            pageSizes={pageSizes}
-            currentPage={currentPage}
-            hasOutline={hasOutline}
-            tab={railTab}
-            onTabChange={setRailTab}
-            onGoToPage={scrollToPage}
-            onMeasure={measurePage}
-          />
-        )}
+        {/* Only the owner's view reads the file's comments, to count them on each page. */}
+        {rail && (comments ? <CountedRail target={comments} {...rail} /> : <PdfRail {...rail} />)}
 
-        {/* Document */}
-        <div
-          ref={scrollerRef}
-          className="pdf-scroller"
-          onScroll={onScroll}
-          style={{ '--pdf-gap': `${GAP}px` } as React.CSSProperties}
-        >
-          {/* react-pdf defaults to Suspense, which would discard `fileData` with this
-              never-committed component on every retry and reload forever. Effect
-              mode keeps the loading props and the error throw above; Page inherits it. */}
-          <Document
-            suspense={false}
-            className="pdf-pages"
-            file={fileData}
-            options={isRangedFile(data) ? RANGED_OPTIONS : DOCUMENT_OPTIONS}
-            onLoadSuccess={onDocumentLoadSuccess}
-            onLoadError={(err: Error) => setError(err)}
-            onItemClick={({ pageNumber }) => scrollToPage(pageNumber - 1)}
-            externalLinkTarget="_blank"
-            externalLinkRel="noopener noreferrer"
-            loading={<div className="pdf-loading">{t('pdfViewer.loading')}</div>}
+        {/* Document, in a box of its own that the comment layer covers. */}
+        <div className="pdf-document">
+          <div
+            ref={placeScroller}
+            className="pdf-scroller"
+            onScroll={onScroll}
+            style={{ '--pdf-gap': `${GAP}px` } as React.CSSProperties}
           >
-            {layout && pageSizes ? (
-              layout.heights.map((height, i) => (
-                <div
-                  key={i}
-                  className="pdf-page"
-                  data-pdf-slot={i}
-                  style={{ width: layout.widths[i], height }}
-                >
-                  {mounted.has(i) && (
-                    <div
-                      className="pdf-page-surface"
-                      style={stretch === 1 ? undefined : { transform: `scale(${stretch})` }}
-                    >
-                      <Page
-                        pageNumber={i + 1}
-                        scale={pageScale}
-                        devicePixelRatio={canvasPixelRatio(
-                          pageSizes[i].width * pageScale,
-                          pageSizes[i].height * pageScale,
-                        )}
-                        onLoadSuccess={(page) => measurePage(i, sizeOf(page))}
-                        loading={
-                          <div
-                            className="pdf-page-loading"
-                            style={{
-                              width: Math.floor(pageSizes[i].width * pageScale),
-                              height: Math.floor(pageSizes[i].height * pageScale),
-                            }}
-                          >
-                            {t('pdfViewer.rendering')}
-                          </div>
-                        }
-                      />
-                    </div>
-                  )}
-                </div>
-              ))
-            ) : (
-              <div className="pdf-loading">{t('pdfViewer.loading')}</div>
-            )}
-          </Document>
+            {/* react-pdf defaults to Suspense, which would discard `fileData` with this
+                never-committed component on every retry and reload forever. Effect
+                mode keeps the loading props and the error throw above; Page inherits it. */}
+            <Document
+              suspense={false}
+              className="pdf-pages"
+              inputRef={setPagesColumn}
+              file={fileData}
+              options={isRangedFile(data) ? RANGED_OPTIONS : DOCUMENT_OPTIONS}
+              onLoadSuccess={onDocumentLoadSuccess}
+              onLoadError={(err: Error) => setError(err)}
+              onItemClick={({ pageNumber }) => scrollToPage(pageNumber - 1)}
+              externalLinkTarget="_blank"
+              externalLinkRel="noopener noreferrer"
+              loading={<div className="pdf-loading">{t('pdfViewer.loading')}</div>}
+            >
+              {layout && pageSizes ? (
+                layout.heights.map((height, i) => (
+                  <div
+                    key={i}
+                    className="pdf-page"
+                    data-pdf-slot={i}
+                    style={{ width: layout.widths[i], height }}
+                  >
+                    {mounted.has(i) && (
+                      <div
+                        className="pdf-page-surface"
+                        style={stretch === 1 ? undefined : { transform: `scale(${stretch})` }}
+                      >
+                        <Page
+                          pageNumber={i + 1}
+                          scale={pageScale}
+                          devicePixelRatio={canvasPixelRatio(
+                            pageSizes[i].width * pageScale,
+                            pageSizes[i].height * pageScale,
+                          )}
+                          onLoadSuccess={(page) => measurePage(i, sizeOf(page))}
+                          loading={
+                            <div
+                              className="pdf-page-loading"
+                              style={{
+                                width: Math.floor(pageSizes[i].width * pageScale),
+                                height: Math.floor(pageSizes[i].height * pageScale),
+                              }}
+                            >
+                              {t('pdfViewer.rendering')}
+                            </div>
+                          }
+                        />
+                      </div>
+                    )}
+                  </div>
+                ))
+              ) : (
+                <div className="pdf-loading">{t('pdfViewer.loading')}</div>
+              )}
+            </Document>
+          </div>
+          {comments && <PdfComments scroller={scroller} content={pagesColumn} pdf={shownDoc} target={comments} />}
         </div>
       </div>
     </div>

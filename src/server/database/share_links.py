@@ -1,26 +1,53 @@
 """Share links: one row per file or app, private until ``shared_at`` is set.
 
+A file's row is also its artifact record, with versions and comments; that
+side of it is ``database/artifacts``. Every read here takes the record's
+columns too, so a file's link carries its record and no caller reads the row
+twice.
+
 Nothing here is cached. A revoke has to hold on the next request on every
 worker, and the row is the only place all of them can read it from.
 """
 
 from __future__ import annotations
 
+import hashlib
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Literal, Optional
 
 from psycopg.rows import dict_row
 
+from src.server.database.artifacts.records import (
+    ARTIFACT_COLUMNS,
+    Artifact,
+    artifact_from_row,
+)
 from src.server.database.pool import get_db_connection
 from src.server.database.share_codes import mint_share_code
 
 KIND_FILE = "file"
 KIND_APP = "app"
 
-_COLUMNS = (
-    "code, workspace_id, kind, path, port, title, files, shared_at, created_at, revision"
-)
+# Off ``share_links l``. An app's start command comes along in the same
+# statement, so no caller reads it per row; ``_link`` keeps only its key.
+_COLUMNS = f"""{ARTIFACT_COLUMNS}, l.kind, l.port, l.title,
+    (SELECT w.artifacts->'preview_servers'->>(l.port::text)
+       FROM workspaces w
+      WHERE l.kind = 'app' AND w.workspace_id = l.workspace_id) AS app_command"""
+
+
+def command_key(command: Optional[str]) -> Optional[str]:
+    """A short fingerprint of an app's start command, or None with none stored.
+
+    The owner's permission grant for an app is tied to it as well as to the
+    link's code: a port keeps its code whatever program serves it, and a
+    different program there must ask again. A digest, so the command itself
+    (which may carry a token) never leaves the server.
+    """
+    if not command:
+        return None
+    return hashlib.sha256(command.encode("utf-8")).hexdigest()[:16]
 
 
 def app_display_title(port: Optional[int], title: Optional[str] = None) -> str:
@@ -41,6 +68,14 @@ class ShareLink:
     # Moves on every share and every stop, so it never comes back to a value
     # a caller read before; ``shared_at`` does, when a stop clears it.
     revision: int = 0
+    #: A file's artifact record, read with the link; None for an app.
+    artifact: Optional[Artifact] = None
+    #: An app's ``command_key``; None for a file.
+    command_key: Optional[str] = None
+
+    @property
+    def artifact_id(self) -> Optional[str]:
+        return self.artifact.artifact_id if self.artifact else None
 
     @property
     def shared(self) -> bool:
@@ -67,6 +102,27 @@ def _link(record: dict[str, Any]) -> ShareLink:
         shared_at=record.get("shared_at"),
         created_at=record["created_at"],
         revision=record["revision"],
+        # An app row has an artifact_id too, from the column default, and
+        # never uses it.
+        artifact=artifact_from_row(record) if record["kind"] == KIND_FILE else None,
+        command_key=command_key(record.get("app_command")),
+    )
+
+
+def file_link(artifact: Artifact) -> ShareLink:
+    """A file's link as its record stands, with no read."""
+    return ShareLink(
+        code=artifact.code,
+        workspace_id=artifact.workspace_id,
+        kind=KIND_FILE,
+        path=artifact.path,
+        port=None,
+        title=None,
+        files=artifact.files,
+        shared_at=artifact.shared_at,
+        created_at=artifact.created_at,
+        revision=artifact.revision,
+        artifact=artifact,
     )
 
 
@@ -96,30 +152,16 @@ async def _insert_or_select(
     return existing
 
 
-async def ensure_file_link(workspace_id: str, path: str) -> ShareLink:
-    """The file's one link, created private on first sight."""
-    return await _insert_or_select(
-        "INSERT INTO share_links (code, workspace_id, kind, path) "
-        "VALUES (%s, %s, 'file', %s) "
-        "ON CONFLICT (workspace_id, path) WHERE kind = 'file' DO NOTHING "
-        f"RETURNING {_COLUMNS}",
-        (mint_share_code(), workspace_id, path),
-        f"SELECT {_COLUMNS} FROM share_links "
-        "WHERE workspace_id = %s AND kind = 'file' AND path = %s",
-        (workspace_id, path),
-    )
-
-
 async def ensure_app_link(workspace_id: str, port: int) -> ShareLink:
     """The app's one link, as it stands; see ``describe_app_link`` to rename it."""
     return await _insert_or_select(
-        "INSERT INTO share_links (code, workspace_id, kind, port) "
+        "INSERT INTO share_links AS l (code, workspace_id, kind, port) "
         "VALUES (%s, %s, 'app', %s) "
         "ON CONFLICT (workspace_id, port) WHERE kind = 'app' DO NOTHING "
         f"RETURNING {_COLUMNS}",
         (mint_share_code(), workspace_id, port),
-        f"SELECT {_COLUMNS} FROM share_links "
-        "WHERE workspace_id = %s AND kind = 'app' AND port = %s",
+        f"SELECT {_COLUMNS} FROM share_links l "
+        "WHERE l.workspace_id = %s AND l.kind = 'app' AND l.port = %s",
         (workspace_id, port),
     )
 
@@ -136,7 +178,8 @@ async def describe_app_link(
     async with get_db_connection() as conn:
         async with conn.cursor(row_factory=dict_row) as cur:
             await cur.execute(
-                "INSERT INTO share_links (code, workspace_id, kind, port, title, path) "
+                "INSERT INTO share_links AS l "
+                "(code, workspace_id, kind, port, title, path) "
                 "VALUES (%s, %s, 'app', %s, %s, %s) "
                 "ON CONFLICT (workspace_id, port) WHERE kind = 'app' "
                 "DO UPDATE SET title = EXCLUDED.title, path = EXCLUDED.path "
@@ -153,30 +196,7 @@ async def get_link(code: str) -> Optional[ShareLink]:
     async with get_db_connection() as conn:
         async with conn.cursor(row_factory=dict_row) as cur:
             await cur.execute(
-                f"SELECT {_COLUMNS} FROM share_links WHERE code = %s", (code,)
-            )
-            return await _fetch_link(cur)
-
-
-async def set_shared(
-    code: str, files: list[str], *, expected_revision: int
-) -> Optional[ShareLink]:
-    """Share with exactly ``files``, if the link is still the revision the caller read.
-
-    The caller builds ``files`` between that read and this write, long enough
-    for a Stop to land, and the compare-and-set keeps it from being
-    overwritten, even by a share and a stop that land in between and leave
-    ``shared_at`` as it was read. None means the link moved or is gone. The
-    row's check constraint refuses a list that does not carry the entry path.
-    """
-    async with get_db_connection() as conn:
-        async with conn.cursor(row_factory=dict_row) as cur:
-            await cur.execute(
-                "UPDATE share_links "
-                "SET shared_at = NOW(), files = %s, revision = revision + 1 "
-                "WHERE code = %s AND kind = 'file' AND revision = %s "
-                f"RETURNING {_COLUMNS}",
-                (list(files), code, expected_revision),
+                f"SELECT {_COLUMNS} FROM share_links l WHERE l.code = %s", (code,)
             )
             return await _fetch_link(cur)
 
@@ -186,9 +206,10 @@ async def set_private(code: str) -> Optional[ShareLink]:
     async with get_db_connection() as conn:
         async with conn.cursor(row_factory=dict_row) as cur:
             await cur.execute(
-                "UPDATE share_links "
-                "SET shared_at = NULL, files = NULL, revision = revision + 1 "
-                f"WHERE code = %s RETURNING {_COLUMNS}",
+                "UPDATE share_links l "
+                "SET shared_at = NULL, files = NULL, shared_seq = 0, "
+                "revision = l.revision + 1 "
+                f"WHERE l.code = %s RETURNING {_COLUMNS}",
                 (code,),
             )
             return await _fetch_link(cur)
@@ -198,9 +219,9 @@ async def list_shared(workspace_id: str) -> list[ShareLink]:
     async with get_db_connection() as conn:
         async with conn.cursor(row_factory=dict_row) as cur:
             await cur.execute(
-                f"SELECT {_COLUMNS} FROM share_links "
-                "WHERE workspace_id = %s AND shared_at IS NOT NULL "
-                "ORDER BY shared_at DESC",
+                f"SELECT {_COLUMNS} FROM share_links l "
+                "WHERE l.workspace_id = %s AND l.shared_at IS NOT NULL "
+                "ORDER BY l.shared_at DESC",
                 (workspace_id,),
             )
             return [_link(r) for r in await cur.fetchall()]

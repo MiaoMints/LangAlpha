@@ -5,19 +5,22 @@ A grant binds (user, workspace, credential) to one exact destination captured
 at creation. The relay authorizes every request with one query here; grant or
 connection status flips deny the next request with no sandbox convergence.
 
-Two kinds share the table, and they differ only in what resolves the
+Four kinds share the table, and they differ only in what resolves the
 credential: ``oauth_mcp`` names the connection whose token the relay spends,
-``header_mcp`` names the catalog row whose own headers it sends. Neither
-stores a credential value; the grant stores the *reference*, so a rotated
-secret and a revoked connection both take effect on the next request rather
-than on the next sync.
+``header_mcp`` names the catalog row whose own headers it sends,
+``platform_mcp`` names a built-in server whose key the host holds for the user
+(a provisioned vendor account), and ``org_mcp`` names an organization
+connector, whose credential the relay asks the auth service for or takes from
+the member's own connection. None stores a credential value; the grant stores
+the *reference*, so a rotated secret and a revoked connection both take effect
+on the next request rather than on the next sync.
 """
 
 import json
 import logging
 from collections.abc import Sequence
 from contextlib import asynccontextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 from psycopg.rows import dict_row
@@ -25,11 +28,14 @@ from psycopg.rows import dict_row
 from src.server.database.mcp_oauth import SERVABLE_PARAM, ConnectionStatus
 from src.server.database.pool import get_db_connection
 from src.server.database.sql_fences import advisory_key
+from src.server.database.org_keys import org_key
 
 logger = logging.getLogger(__name__)
 
 GRANT_KIND_OAUTH_MCP = "oauth_mcp"
 GRANT_KIND_HEADER_MCP = "header_mcp"
+GRANT_KIND_PLATFORM_MCP = "platform_mcp"
+GRANT_KIND_ORG_MCP = "org_mcp"
 
 
 @dataclass(frozen=True)
@@ -45,6 +51,10 @@ class GrantRef:
     kind: str
     server_name: str
     connection_id: str | None = None
+    # ``platform_mcp`` (and ``org_mcp``, which requires it). A built-in has no
+    # row to pin its address from, so the address comes from the operator's
+    # config, which no user can edit.
+    destination_url: str | None = None
 
     @property
     def subject(self) -> str:
@@ -64,6 +74,18 @@ class GrantRef:
         otherwise, and a row named after a uuid would collect the wrong grant.
         """
         return (self.kind, self.subject)
+
+
+@dataclass(frozen=True, kw_only=True)
+class OrgGrantRef(GrantRef):
+    """An ``org_mcp`` grant: the connector, and the address the resolve read
+    for it, which no catalog row holds for the upsert to read instead."""
+
+    kind: str = GRANT_KIND_ORG_MCP
+    connector_id: str
+    # ``field()`` keeps it required: a bare annotation would inherit the
+    # base's ``None`` default.
+    destination_url: str = field()
 
 
 @dataclass(frozen=True)
@@ -530,6 +552,132 @@ async def _upsert_header_grants(
     }
 
 
+async def _upsert_platform_grants(
+    cur: Any,
+    *,
+    user_id: str,
+    workspace_id: str,
+    computer_id: Any | None,
+    refs: Sequence[GrantRef],
+) -> dict[str, str]:
+    """Upsert one grant per built-in server whose key the host holds for the
+    user; returns name -> grant_id.
+
+    The address comes from the ref, unlike the oauth and header kinds, because
+    a built-in has no row to pin it from: the operator's config is the only
+    record, and no user can edit it. The relay re-reads that config per
+    request, address and tools alike, so a config change retires the grant's
+    reach before the next sync does.
+    """
+    if computer_id is not None:
+        await _adopt_grants_onto_computer(
+            cur,
+            workspace_id=workspace_id,
+            computer_id=computer_id,
+            kind=GRANT_KIND_PLATFORM_MCP,
+        )
+    await cur.execute(
+        f"""
+        INSERT INTO sandbox_egress_grants
+            (user_id, workspace_id, computer_id, kind, server_name,
+             destination_url, policy_required,
+             status, created_at, updated_at)
+        SELECT %s, %s::uuid, %s::uuid, %s, t.server_name, t.url,
+               false, 'active', NOW(), NOW()
+        FROM unnest(%s::text[], %s::text[]) AS t(server_name, url)
+        ON CONFLICT {_conflict_target(computer_id)}
+        DO UPDATE SET
+            computer_id = EXCLUDED.computer_id,
+            destination_url = EXCLUDED.destination_url,
+            status = 'active',
+            updated_at = NOW()
+        RETURNING server_name, grant_id
+        """,
+        (
+            user_id,
+            workspace_id,
+            computer_id,
+            GRANT_KIND_PLATFORM_MCP,
+            [r.server_name for r in refs],
+            [r.destination_url for r in refs],
+        ),
+    )
+    return {
+        str(row["server_name"]): str(row["grant_id"]) for row in await cur.fetchall()
+    }
+
+
+async def _upsert_org_grants(
+    cur: Any,
+    *,
+    user_id: str,
+    workspace_id: str,
+    computer_id: Any | None,
+    refs: Sequence[OrgGrantRef],
+) -> dict[str, str]:
+    """Upsert one grant per organization connector; returns name → grant_id.
+
+    No row stores the connector, so its address and id come from the resolve
+    that read the account, and the relay checks both against the account
+    again on every call. A member's connection is attached only when it is
+    theirs, for this connector, and servable, under the predicates the OAuth
+    half selects with; otherwise the grant carries none and the relay answers
+    that the member has to sign in. No tool policy: a connector at a
+    brokerage never resolves.
+    """
+    if computer_id is not None:
+        await _adopt_grants_onto_computer(
+            cur,
+            workspace_id=workspace_id,
+            computer_id=computer_id,
+            kind=GRANT_KIND_ORG_MCP,
+        )
+    await cur.execute(
+        f"""
+        INSERT INTO sandbox_egress_grants
+            (user_id, workspace_id, computer_id, kind, server_name,
+             connection_id, resolver_config, destination_url,
+             status, created_at, updated_at)
+        SELECT %(user_id)s::text, %(workspace_id)s::uuid, %(computer_id)s::uuid,
+               %(kind)s, t.server_name,
+               (SELECT c.connection_id FROM user_mcp_oauth_connections c
+                 WHERE c.connection_id = t.connection_id
+                   AND c.user_id = %(user_id)s::text
+                   AND c.server_name = t.org_key
+                   AND c.status = ANY(%(servable)s)),
+               jsonb_build_object('connector_id', t.connector_id),
+               t.destination_url, 'active', NOW(), NOW()
+        FROM unnest(
+            %(names)s::text[], %(connections)s::uuid[], %(keys)s::text[],
+            %(ids)s::text[], %(urls)s::text[]
+        ) AS t(server_name, connection_id, org_key, connector_id, destination_url)
+        ON CONFLICT {_conflict_target(computer_id)}
+        DO UPDATE SET
+            computer_id = EXCLUDED.computer_id,
+            resolver_config = EXCLUDED.resolver_config,
+            destination_url = EXCLUDED.destination_url,
+            status = 'active',
+            updated_at = NOW()
+        RETURNING server_name, grant_id
+        """,
+        {
+            "user_id": user_id,
+            "workspace_id": workspace_id,
+            "computer_id": computer_id,
+            "kind": GRANT_KIND_ORG_MCP,
+            "servable": SERVABLE_PARAM,
+            "names": [r.server_name for r in refs],
+            "connections": [r.connection_id for r in refs],
+            "keys": [org_key(r.connector_id) for r in refs],
+            "ids": [r.connector_id for r in refs],
+            "urls": [r.destination_url for r in refs],
+        },
+    )
+    return {
+        str(row["server_name"]): str(row["grant_id"]) for row in await cur.fetchall()
+    }
+
+
 async def sync_egress_grants(
     *,
     user_id: str,
@@ -658,6 +806,39 @@ async def sync_egress_grants(
                         )
                     ).items()
                 }
+            org_refs = [r for r in refs if isinstance(r, OrgGrantRef)]
+            if org_refs:
+                granted |= {
+                    (GRANT_KIND_ORG_MCP, subject): grant_id
+                    for subject, grant_id in (
+                        await _upsert_org_grants(
+                            cur,
+                            user_id=user_id,
+                            workspace_id=workspace_id,
+                            computer_id=computer_id,
+                            refs=org_refs,
+                        )
+                    ).items()
+                }
+
+            platform_refs = [
+                r
+                for r in refs
+                if r.kind == GRANT_KIND_PLATFORM_MCP and r.destination_url
+            ]
+            if platform_refs:
+                granted |= {
+                    (GRANT_KIND_PLATFORM_MCP, subject): grant_id
+                    for subject, grant_id in (
+                        await _upsert_platform_grants(
+                            cur,
+                            user_id=user_id,
+                            workspace_id=workspace_id,
+                            computer_id=computer_id,
+                            refs=platform_refs,
+                        )
+                    ).items()
+                }
 
             # This project's claims become exactly the granted set. A row is
             # shared by every project on the machine that resolved its
@@ -764,8 +945,8 @@ async def fetch_grant_for_relay(grant_id: str) -> dict[str, Any] | None:
     Authorization only, no credential. Every kind resolves its own credential
     afterwards, from the reference this read carries, so the hot path decrypts
     nothing here. None for an unknown grant_id (the route answers a uniform 404
-    for absent and wrong-scope alike), and likewise for an ``oauth_mcp`` grant
-    whose connection row is gone: the credential's identity has vanished, which
+    for absent and wrong-scope alike), and likewise for a grant naming a
+    connection whose row is gone: the credential's identity has vanished, which
     is the same answer as never having had one.
 
     ``computer_id`` comes back because one row now serves every project on a
@@ -777,7 +958,7 @@ async def fetch_grant_for_relay(grant_id: str) -> dict[str, Any] | None:
             await cur.execute(
                 """
                 SELECT g.user_id, g.workspace_id, g.computer_id, g.kind,
-                       g.connection_id, g.server_name,
+                       g.connection_id, g.server_name, g.resolver_config,
                        g.destination_url, g.allowed_methods, g.tool_denylist,
                        g.tool_direct_only,
                        g.status AS grant_status,
@@ -793,7 +974,7 @@ async def fetch_grant_for_relay(grant_id: str) -> dict[str, Any] | None:
             if not row:
                 return None
             connection_id = row["connection_id"]
-            if row["kind"] == GRANT_KIND_OAUTH_MCP and row["connection_status"] is None:
+            if connection_id is not None and row["connection_status"] is None:
                 return None
             return {
                 "user_id": row["user_id"],
@@ -804,6 +985,7 @@ async def fetch_grant_for_relay(grant_id: str) -> dict[str, Any] | None:
                 "kind": row["kind"],
                 "connection_id": str(connection_id) if connection_id else None,
                 "server_name": row["server_name"],
+                "resolver_config": row["resolver_config"] or {},
                 "destination_url": row["destination_url"],
                 "allowed_methods": row["allowed_methods"],
                 "tool_denylist": row["tool_denylist"],

@@ -8,7 +8,7 @@ import { ErrorBanner } from '@/components/ui/error-banner';
 import { Loader } from '@/components/ui/loader';
 import LogoLoading from '@/components/ui/logo-loading';
 import ChatInput, { type ChatInputHandle } from '@/components/ui/chat-input';
-import type { ComposerScope } from '@/components/ui/chat-input.types';
+import type { ComposerScope, ComposerSend } from '@/components/ui/chat-input.types';
 import { useStableHandler } from '@/hooks/useStableHandler';
 import { useWorkspace } from '@/hooks/useWorkspace';
 import { usePreferences } from '@/hooks/usePreferences';
@@ -17,7 +17,10 @@ import { compactNumber } from '@/lib/format';
 import { readTurnEndScroll } from '@/lib/turnEndScroll';
 import { LiveMessageList } from '../../ChatAgent/components/MessageList';
 import { MessageActionsProvider, type MessageActions } from '../../ChatAgent/components/messageList/MessageActionsContext';
+import { usePublishFile } from '../../ChatAgent/components/chatView/usePublishFile';
+import { useComposerGiveBack } from '../../ChatAgent/components/chatView/useComposerGiveBack';
 import { SubagentTelemetryContext, useHistoryTelemetry } from '../../ChatAgent/components/SubagentTelemetryContext';
+import { CliQueueLine } from '../../ChatAgent/components/CliQueueNotice';
 import { ChartSurfaceContext, type ChartSurface } from '../../ChatAgent/contexts/ChartSurfaceContext';
 import { WorkspaceProvider } from '../../ChatAgent/contexts/WorkspaceContext';
 import { computerFolders } from '../../ChatAgent/utils/agentPaths';
@@ -26,13 +29,15 @@ import { useComputerRoots } from '../../ChatAgent/hooks/useComputers';
 import { useThreadModel } from '../../ChatAgent/hooks/useThreadModel';
 import { useThreadSubagents } from '../../ChatAgent/hooks/useThreadSubagents';
 import { useThreadTuning } from '../../ChatAgent/hooks/useThreadTuning';
-import { ThreadNotices } from '../../ChatAgent/components/chatView/ThreadNotices';
+import { RetiredModelNotice } from '../../ChatAgent/components/chatView/RetiredModelNotice';
+import { useComposerNotices } from '../../ChatAgent/components/chatView/useComposerNotices';
+import { useNextSummary } from '../../ChatAgent/hooks/useNextSummaryHint';
 import { DispatchStatusProvider } from '../../ChatAgent/hooks/usePTCDispatchStatus';
 import { useStreamFollow } from '../../ChatAgent/components/chatView/transcriptFollow';
 import { useTranscriptFollow } from '../../ChatAgent/components/chatView/useTranscriptFollow';
 import { useActiveThreadPublisher } from '@/lib/threadLifecycle/useActiveThreadPublisher';
-import { appendPathSuffix, getPreviewUrl, summarizeThread, offloadThread } from '../../ChatAgent/utils/api';
-import { attachmentsToContexts } from '../../ChatAgent/utils/fileUpload';
+import { appendPathSuffix, getPreviewUrl, previewFailure, summarizeThread, offloadThread, type NextSummary } from '../../ChatAgent/utils/api';
+import { attachmentSendParts, type AttachmentMeta } from '../../ChatAgent/utils/fileUpload';
 import type { SubagentInfo } from '../../ChatAgent/components/ToolCallDetailView';
 import { useToolCallLookup } from '../../ChatAgent/components/chatView/toolCallLookup';
 import type { PreviewData } from '../../ChatAgent/hooks/utils/types';
@@ -41,11 +46,12 @@ import MarketChatHistoryButton from './MarketChatHistoryButton';
 import MarketDetailDialog, { type DialogPayload } from './MarketDetailDialog';
 import { getMarketThreadId, setMarketThreadId, clearMarketThreadId } from '../utils/threadPersistence';
 import { readMarketViewRoute } from '../utils/marketRoute';
-import { normalizeTimeframe } from '../stores/chartAnnotationStore';
+import { normalizeTimeframe } from '../utils/chartInstanceKey';
 import { chartSelectionStore, useChartSelections, isConfirmedFor } from '../stores/chartSelectionStore';
-import { buildChartSelectionSend } from '../utils/selectionSend';
+import { buildMarketSendContexts } from '../utils/selectionSend';
+import { layerAskContext } from '../utils/layerAsk';
 import { SelectionChips } from './SelectionChips';
-import { marketViewAnnotationContext } from '../constants/annotationPrompt';
+import { useChartAskHandler, useChartComposer } from '@/components/chart/chartComposer';
 import './MarketPanel.css';
 
 /** Compact status banner shown above the input (interrupt, compaction, etc.). */
@@ -71,18 +77,6 @@ interface SlashCommandLike {
 interface ActionCommandLike {
   name: string;
   type?: string;
-}
-interface ModelOptionsLike {
-  model?: string | null;
-  reasoningEffort?: string | null;
-  fastMode?: boolean | null;
-}
-
-interface AttachmentItem {
-  dataUrl: string;
-  file: { name: string; size: number };
-  type: string;
-  preview?: string | null;
 }
 
 interface MarketChatPanelProps {
@@ -297,6 +291,9 @@ function ChatBody(props: ChatBodyProps): React.ReactElement {
   const previewPortRef = useRef<number | null>(null);
   // ChatInput handle — lets edit/regenerate/retry read the current model picker.
   const chatInputRef = useRef<ChatInputHandle>(null);
+  // The chart's "ask about this layer" lands in this composer as a pill.
+  useChartAskHandler((req) => chatInputRef.current?.addContext(layerAskContext(req)));
+  const { collectViews } = useChartComposer();
   // Set when the user stops a running turn, so the input placeholder reflects it.
   const [wasStopped, setWasStopped] = useState(false);
 
@@ -321,17 +318,17 @@ function ChatBody(props: ChatBodyProps): React.ReactElement {
   const emptyWorkspacesHint = workspaces.length === 0 ? t('agents.market.workspaceDisabledReason') : null;
 
   // MarketView always has the live chart beside the chat, so inline
-  // chart-annotation cards collapse to a confirmation chip. Tell the chip
+  // chart layer cards collapse to a confirmation chip. Tell the chip
   // which instance is on screen + how to switch the chart, so a chip for a
   // different ticker/timeframe can jump the chart to it.
   const chartSurface = useMemo<ChartSurface>(
     () => ({
       chartPresent: true,
       activeSymbol: symbol ? symbol.toUpperCase() : undefined,
-      // Raw interval, not normalized: the chip compares this against an
-      // annotation's timeframe to decide "shown vs jump". A view-only interval
+      // Raw interval, not normalized: the chip compares this against a
+      // layer's timeframe to decide "shown vs jump". A view-only interval
       // like 1s (which collapses to 1day) must NOT read as active for a 1day
-      // annotation that the 1s chart can't actually display.
+      // layer that the 1s chart can't actually display.
       activeTimeframe: interval,
       onJumpToChart,
     }),
@@ -355,11 +352,11 @@ function ChatBody(props: ChatBodyProps): React.ReactElement {
         const url = appendPathSuffix(result.url, preview.path);
         setDialogPayload({ type: 'preview', preview: { ...preview, url, loading: false } });
       })
-      .catch(() => {
+      .catch((err: unknown) => {
         if (previewPortRef.current !== preview.port) return;
         setDialogPayload({
           type: 'preview',
-          preview: { ...preview, url: '', loading: false, error: true },
+          preview: { ...preview, url: '', loading: false, error: previewFailure(err) },
         });
       });
   }, [activeWorkspaceId]);
@@ -385,19 +382,11 @@ function ChatBody(props: ChatBodyProps): React.ReactElement {
   }, [symbol]);
 
   const readComposerOptions = useCallback(() => chatInputRef.current?.getModelOptions?.(), []);
-  const chat = useChatMessages(
-    activeWorkspaceId,
-    initialThreadId,
-    null,                       // updateTodoListCard
-    null,                       // updateSubagentCard
-    null,                       // finalizePendingTodos
-    null,                       // onFileArtifact
-    handlePreview,              // onPreviewUrl
-    null,                       // clearSubagentCards
-    null,                       // onWorkspaceCreated
-    platformValue,
+  const chat = useChatMessages(activeWorkspaceId, initialThreadId, {
+    onPreviewUrl: handlePreview,
+    platform: platformValue,
     readComposerOptions,
-  );
+  });
 
   const {
     messages,
@@ -430,21 +419,18 @@ function ChatBody(props: ChatBodyProps): React.ReactElement {
     // interrupted / compaction status banners.
     pendingInterrupt,
     hasActiveSubagents,
-    workspaceStarting,
+    turnStatus: { workspaceStarting, cliQueue },
     isCompacting,
     setIsCompacting,
     compactionTokens,
     tokenUsage,
-    insertNotification,
+    forThread,
     // Feedback thumbs. Send, edit, regenerate and retry come from
     // useTranscriptFollow below.
     handleThumbUp,
     handleThumbDown,
+    handleThumbDownFollowUp,
     feedbackByTurn,
-    returnedSteering,
-    clearReturnedSteering,
-    returnedEdit,
-    clearReturnedEdit,
     editDrafts,
   } = chat;
 
@@ -452,8 +438,8 @@ function ChatBody(props: ChatBodyProps): React.ReactElement {
   // contract as ChatAgent (no unseen dot for watched finishes, seen on open).
   useActiveThreadPublisher(threadId);
 
-  // The Chief of Staff runs the default model, as the full agent does in a workspace.
-  const threadModel = useThreadModel({ threadId, isLoading });
+  // The Chief of Staff's turn may start on another Default than the account's.
+  const threadModel = useThreadModel({ threadId, isLoading, chiefOfStaff: scope === 'all' });
   const threadSubagents = useThreadSubagents({ threadId });
   const { toSend: subagentsToSend } = threadSubagents;
   const threadTuning = useThreadTuning({ threadId });
@@ -480,8 +466,19 @@ function ChatBody(props: ChatBodyProps): React.ReactElement {
 
   const showTranscript = messages.length > 0 || isLoading || isLoadingHistory;
   const follow = useStreamFollow(messagesContainer, transcript, { live: isLoading, loading: isLoadingHistory });
-  const { handleSendMessage, handleEditMessage, handleRegenerate, handleRetry } = useTranscriptFollow(
+  // What the next send summarizes first, which every turn the reader starts carries.
+  const { summary: summaryHint, starters: summarized } = useNextSummary(chat);
+  const notices = useComposerNotices({
+    threadId,
+    threadModel,
+    subagents: threadSubagents,
     chat,
+    summary: summaryHint,
+    workspaceId: selectedWorkspaceId,
+    chiefOfStaff: scope === 'all',
+  });
+  const { handleSendMessage, handleEditMessage, handleRegenerate, handleRetry } = useTranscriptFollow(
+    { ...chat, ...summarized },
     follow,
     () => messagesContainer,
     readTurnEndScroll(preferences),
@@ -489,25 +486,10 @@ function ChatBody(props: ChatBodyProps): React.ReactElement {
 
   // Send: shape attachments + chart screenshot like ChatAgent does.
   const handleSend = useCallback(
-    (
-      message: string,
-      attachments: AttachmentItem[] = [],
-      slashCommands: SlashCommandLike[] = [],
-      modelOptions: ModelOptionsLike = {},
-    ) => {
-      // The drawing tools are always bound; inject the chart-annotation skill
-      // every send for its drawing guide and to tell the agent which ticker +
-      // timeframe "the chart" is (chart_id = SYMBOL:timeframe — drawing on the
-      // wrong timeframe won't show on the view the user is looking at).
-      const sym = symbol ? symbol.toUpperCase() : '';
-      const tf = normalizeTimeframe(interval);
-      const contexts: Record<string, unknown>[] = [
-        {
-          type: 'skills',
-          name: 'chart-annotation',
-          instruction: sym ? marketViewAnnotationContext(sym, tf) : undefined,
-        },
-      ];
+    ({ message, files, commands, modelOptions }: ComposerSend) => {
+      const slashCommands = commands as SlashCommandLike[];
+      const send = buildMarketSendContexts(symbol, interval, message, collectViews());
+      const contexts: Record<string, unknown>[] = [send.skill];
 
       // Skill contexts from typed slash commands (mirrors ChatView). Skip a
       // second chart-annotation context — it's always injected above.
@@ -519,57 +501,35 @@ function ChatBody(props: ChatBodyProps): React.ReactElement {
         }
       }
 
-      const metaItems: Record<string, unknown>[] = [];
+      const metaItems: AttachmentMeta[] = [];
 
       if (chartImage) {
         contexts.push({ type: 'image', data: chartImage, description: chartImageDesc || undefined });
-        metaItems.push({
-          name: chartImageDesc || 'Chart',
-          type: 'image',
-          size: 0,
-          preview: chartImage,
-          dataUrl: chartImage,
-        });
+        metaItems.push({ name: chartImageDesc || 'Chart', type: 'image', size: 0, dataUrl: chartImage });
       }
-      if (attachments && attachments.length > 0) {
-        contexts.push(...(attachmentsToContexts(attachments as never[]) as unknown as Record<string, unknown>[]));
-        attachments.forEach((a) => {
-          metaItems.push({
-            name: a.file.name,
-            type: a.type,
-            size: a.file.size,
-            preview: a.preview ?? null,
-            dataUrl: a.dataUrl,
-          });
-        });
-      }
+      const attached = attachmentSendParts(files);
+      contexts.push(...attached.contexts);
+      metaItems.push(...attached.meta);
 
-      // Append every confirmed chart selection (region/price level + note) for
-      // the live (sym, tf); a stale one is dropped. The same set is snapshotted
-      // for the sent message's cards, and a lone note becomes the message text
-      // when the user typed nothing (so the bubble isn't empty).
-      const {
-        contexts: selectionContexts,
-        snapshots: selectionSnapshots,
-        attachments: selectionAttachments,
-        outgoingMessage,
-      } = buildChartSelectionSend(sym, tf, message);
-      contexts.push(...selectionContexts);
-      metaItems.push(...selectionAttachments);
+      // The confirmed selections on the chart on screen; a lone note becomes
+      // the message text when the user typed nothing (so the bubble isn't empty).
+      contexts.push(...send.contexts);
+      metaItems.push(...send.attachments);
 
       const additionalContext = contexts.length > 0 ? contexts : null;
       const attachmentMeta = metaItems.length > 0 ? metaItems : null;
 
-      handleSendMessage(outgoingMessage, additionalContext, attachmentMeta, {
+      handleSendMessage(send.outgoingMessage, additionalContext, attachmentMeta, {
         ...modelOptions,
-        ...(selectionSnapshots.length > 0 ? { chartSelections: selectionSnapshots } : {}),
+        ...(send.snapshots.length > 0 ? { chartSelections: send.snapshots } : {}),
+        ...(send.chartViews.length > 0 ? { chartViews: send.chartViews } : {}),
         subagentsAllowed: subagentsToSend,
         ...tuningToSend,
       });
       onClearChartImage();
       chartSelectionStore.clearAll();
     },
-    [symbol, interval, chartImage, chartImageDesc, handleSendMessage, onClearChartImage, subagentsToSend, tuningToSend],
+    [symbol, interval, chartImage, chartImageDesc, handleSendMessage, onClearChartImage, subagentsToSend, tuningToSend, collectViews],
   );
 
   // Stop the running turn (the input's Stop button). Mirrors ChatView: the hook's
@@ -589,6 +549,7 @@ function ChatBody(props: ChatBodyProps): React.ReactElement {
   // the input's action verbs do the same thing here.
   const handleAction = useCallback((cmd: ActionCommandLike) => {
     if (!threadId || threadId === '__default__') return;
+    const thread = forThread(threadId);
 
     const surfaceActionError = (err: unknown, fallbackKey: string, busyKey = 'chat.compactBusy') => {
       const resp = (err as { response?: { status?: number; data?: unknown } } | undefined)?.response;
@@ -597,14 +558,14 @@ function ChatBody(props: ChatBodyProps): React.ReactElement {
         const obj = detail as { code?: string; message?: string };
         // A user Stop cancels the backend call; the shared cancellation wrapper
         // returns 409 {code: "request_cancelled"} — report a clean stop, not an error.
-        if (obj.code === 'request_cancelled') { insertNotification(t('chat.compactionStopped'), 'info'); return; }
-        if (obj.code === 'workflow_active') { insertNotification(t(busyKey), 'warning'); return; }
-        if (typeof obj.message === 'string' && obj.message.length > 0) { insertNotification(obj.message, 'warning'); return; }
-        insertNotification(t(fallbackKey), 'warning');
+        if (obj.code === 'request_cancelled') { thread.insertNotification(t('chat.compactionStopped'), 'info'); return; }
+        if (obj.code === 'workflow_active') { thread.insertNotification(t(busyKey), 'warning'); return; }
+        if (typeof obj.message === 'string' && obj.message.length > 0) { thread.insertNotification(obj.message, 'warning'); return; }
+        thread.insertNotification(t(fallbackKey), 'warning');
         return;
       }
-      if (typeof detail === 'string' && detail.length > 0) { insertNotification(detail, 'warning'); return; }
-      insertNotification(t(fallbackKey), 'warning');
+      if (typeof detail === 'string' && detail.length > 0) { thread.insertNotification(detail, 'warning'); return; }
+      thread.insertNotification(t(fallbackKey), 'warning');
     };
 
     if (cmd.name === 'compact') {
@@ -612,8 +573,9 @@ function ChatBody(props: ChatBodyProps): React.ReactElement {
       summarizeThread(threadId)
         .then((data: Record<string, unknown>) => {
           setIsCompacting?.(false);
+          thread.setNextSummary(null);
           const detail = (data.summary_text as string | undefined) || undefined;
-          insertNotification(t('chat.compactedNotification', { from: data.original_message_count }), 'info', detail);
+          thread.insertNotification(t('chat.compactedNotification', { from: data.original_message_count }), 'info', detail);
         })
         .catch((err: unknown) => { surfaceActionError(err, 'chat.compactionError'); setIsCompacting?.(false); });
     } else if (cmd.name === 'offload') {
@@ -621,14 +583,15 @@ function ChatBody(props: ChatBodyProps): React.ReactElement {
       offloadThread(threadId)
         .then((data: Record<string, unknown>) => {
           setIsCompacting?.(false);
-          insertNotification(t('chat.offloadedNotification', {
+          thread.setNextSummary((data.next_summary as NextSummary | null | undefined) ?? null);
+          thread.insertNotification(t('chat.offloadedNotification', {
             args: (data.offloaded_args as number) || 0,
             reads: (data.offloaded_reads as number) || 0,
           }));
         })
         .catch((err: unknown) => { surfaceActionError(err, 'chat.compactionError', 'chat.offloadBusy'); setIsCompacting?.(false); });
     }
-  }, [threadId, setIsCompacting, insertNotification, t]);
+  }, [threadId, setIsCompacting, forThread, t]);
 
   // Subagent navigation — chips deep-link to ChatAgent for full subagent view.
   const handleOpenSubagentTask = useCallback((info: SubagentInfo) => {
@@ -671,28 +634,20 @@ function ChatBody(props: ChatBodyProps): React.ReactElement {
   const stableRegenerate = useStableHandler((id: string) =>
     handleRegenerate(id, chatInputRef.current?.getModelOptions?.()));
   const stableRetry = useStableHandler(() => handleRetry(chatInputRef.current?.getModelOptions?.()));
-  // Steering the agent finished without reading comes back to the composer,
+  // Steering the agent finished without reading, edit text whose message is
+  // gone, and the files of a send a stop held back come back to the composer,
   // beside whatever was typed there since.
-  useEffect(() => {
-    if (returnedSteering) {
-      chatInputRef.current?.giveBack(returnedSteering);
-      clearReturnedSteering();
-    }
-  }, [returnedSteering, clearReturnedSteering]);
-  // Edit text whose message is gone comes back to the composer, beside
-  // whatever is typed there.
-  useEffect(() => {
-    if (returnedEdit) {
-      chatInputRef.current?.giveBack(returnedEdit);
-      clearReturnedEdit();
-    }
-  }, [returnedEdit, clearReturnedEdit]);
+  useComposerGiveBack(chatInputRef, chat);
+  // A thread the server has named, so a failed turn's banner can offer "Report this".
+  const reportThreadId = threadId && threadId !== '__default__' ? threadId : undefined;
   const stableThumbUp = useStableHandler(handleThumbUp);
   const stableThumbDown = useStableHandler(handleThumbDown);
+  const stableThumbDownFollowUp = useStableHandler(handleThumbDownFollowUp);
   const stableWidgetSendPrompt = useStableHandler((text: string) => {
     handleSendMessage(text, null, null, {});
   });
 
+  const { onPublishFile, dialog: publishDialog } = usePublishFile(activeWorkspaceId);
   const messageActions = useMemo<MessageActions>(() => ({
     onOpenSubagentTask: stableOpenSubagentTask,
     onToolCallDetailClick: stableToolCallDetail,
@@ -715,8 +670,11 @@ function ChatBody(props: ChatBodyProps): React.ReactElement {
     editDrafts,
     onThumbUp: stableThumbUp,
     onThumbDown: stableThumbDown,
+    onThumbDownFollowUp: stableThumbDownFollowUp,
     onWidgetSendPrompt: stableWidgetSendPrompt,
     onRevealMessage: follow.reveal,
+    onPublishFile,
+    reportThreadId,
   }), [
     stableOpenSubagentTask, stableToolCallDetail,
     stableAnswerQuestion, stableSkipQuestion, stableApproveCreateWorkspace,
@@ -724,7 +682,7 @@ function ChatBody(props: ChatBodyProps): React.ReactElement {
     stableApprovePTCAgent, stableRejectPTCAgent, stableApproveSecretaryAction,
     stableRejectSecretaryAction, stableResumeCreditPause, stableApproveToolCall, stableRejectToolCall,
     stableEditMessage, stableRegenerate, stableRetry, editDrafts,
-    stableThumbUp, stableThumbDown, stableWidgetSendPrompt, follow.reveal,
+    stableThumbUp, stableThumbDown, stableThumbDownFollowUp, stableWidgetSendPrompt, follow.reveal, onPublishFile, reportThreadId,
   ]);
 
   // In the Chief of Staff, carry the source thread/workspace into a PTC-agent
@@ -854,7 +812,7 @@ function ChatBody(props: ChatBodyProps): React.ReactElement {
             </p>
             {messageError && (
               <div style={{ margin: '16px 24px 0', maxWidth: '100%', width: '100%' }}>
-                <ErrorBanner error={messageError} />
+                <ErrorBanner error={messageError} reportThreadId={reportThreadId} />
               </div>
             )}
           </div>
@@ -873,11 +831,12 @@ function ChatBody(props: ChatBodyProps): React.ReactElement {
                     />
                   </DispatchStatusProvider>
                 </MessageActionsProvider>
+                {publishDialog}
               </SubagentTelemetryContext>
             </ChartSurfaceContext>
             {messageError && (
               <div style={{ margin: '8px 0' }}>
-                <ErrorBanner error={messageError} />
+                <ErrorBanner error={messageError} reportThreadId={reportThreadId} />
               </div>
             )}
           </div>
@@ -906,11 +865,9 @@ function ChatBody(props: ChatBodyProps): React.ReactElement {
           compaction. Mirrors the indicators ChatView shows above its input. */}
       {((hasActiveSubagents && !isLoading)
         || workspaceStarting
+        || cliQueue
         || isCompacting
-        || threadModel.retired
-        || threadModel.lapsed
-        || threadModel.offer
-        || threadSubagents.offer !== null) && (
+        || threadModel.retired) && (
         <div style={{ padding: '0 12px', display: 'flex', flexDirection: 'column', gap: 6 }}>
           {hasActiveSubagents && !isLoading && (
             <div style={bannerStyle('transparent')}>
@@ -929,6 +886,7 @@ function ChatBody(props: ChatBodyProps): React.ReactElement {
               <span>{t(workspaceStarting === 'archived' ? 'chat.workspaceRestoring' : 'chat.workspaceStarting')}</span>
             </div>
           )}
+          {cliQueue && <CliQueueLine wait={cliQueue} />}
           {isCompacting && (
             <div style={bannerStyle('transparent')}>
               <span aria-hidden="true" style={{ flexShrink: 0 }}>
@@ -942,7 +900,9 @@ function ChatBody(props: ChatBodyProps): React.ReactElement {
               )}
             </div>
           )}
-          <ThreadNotices model={threadModel} subagents={threadSubagents} />
+          {/* Inset like the banners beside it. What else the thread says
+              about the next send is on the composer's controls. */}
+          {threadModel.retired && <RetiredModelNotice {...threadModel.retired} className="px-3" />}
         </div>
       )}
 
@@ -952,7 +912,7 @@ function ChatBody(props: ChatBodyProps): React.ReactElement {
       {/* Input */}
       <ChatInput
         ref={chatInputRef}
-        onSend={handleSend as never}
+        onSend={handleSend}
         disabled={isLoadingHistory || !!pendingInterrupt}
         onStop={handleStop}
         onAction={handleAction}
@@ -960,6 +920,7 @@ function ChatBody(props: ChatBodyProps): React.ReactElement {
         scope={scope}
         onScopeChange={onScopeChange}
         model={threadModel.model}
+        sendModel={threadModel.sendModel}
         onPickModel={threadModel.pickModel}
         subagentsAllowed={threadSubagents.allowed}
         onToggleSubagents={threadSubagents.setAllowed}
@@ -983,6 +944,9 @@ function ChatBody(props: ChatBodyProps): React.ReactElement {
         }
         threadModels={threadModels}
         tokenUsage={tokenUsage}
+        tokenUsagePending={isLoadingHistory}
+        threadId={threadId}
+        notices={notices}
       />
 
       <MarketDetailDialog payload={dialogPayload} onClose={handleCloseDialog} getToolCallProcess={getToolCallProcess} />

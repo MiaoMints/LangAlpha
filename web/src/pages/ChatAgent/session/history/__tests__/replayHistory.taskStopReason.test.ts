@@ -32,7 +32,6 @@ function buildRuntime() {
     workspaceId: 'ws-1',
     threadId: 'thread-1',
     t: (key: string) => key,
-    updateTodoListCard: null,
     setMessages: ((updater: (prev: ChatMessage[]) => ChatMessage[]) => {
       messages = updater(messages);
     }) as HistoryRuntime['setMessages'],
@@ -43,6 +42,7 @@ function buildRuntime() {
     setFallbackSuggestion: vi.fn(),
     setThreadModels: vi.fn(),
     setTokenUsage: vi.fn(),
+    setNextSummary: vi.fn(),
     setReloadTrigger: vi.fn(),
     setThreadId: vi.fn(),
     historyLoadingRef: ref(false),

@@ -45,16 +45,28 @@ export const CONTAINER_BORDER = 2;
 export interface FoldResult {
   inline: Set<string>;
   folded: string[];
+  /** The model pill has no room for its reasoning level beside the name. */
+  levelHidden: boolean;
+  /** Even with every item in ⋯ the row cannot keep the model name at its
+   *  floor, so the pill shows its logo alone rather than a sliver of name. */
+  nameHidden: boolean;
 }
 
 /**
- * Which toolbar items keep their inline slot at `containerWidth`.
+ * Which toolbar items keep their inline slot at `containerWidth`, and how
+ * much of the model pill shows.
  *
  * Items are consumed in declaration order and the loop STOPS at the first one
  * that doesn't fit: priority is a real ordering, not a best-effort packing, so
  * a wide high-priority item can never be skipped over in favour of a narrow
  * low-priority one. With no measurements (jsdom, ResizeObserver unavailable)
  * everything stays inline.
+ *
+ * The pill gives way last, and in steps: every item folds before it loses
+ * anything, then its level goes, then the name truncates to its floor, and
+ * past that the name itself goes. The level goes before the name shrinks,
+ * since a cut name stops saying which model runs while the picker it opens
+ * names the level anyway.
  */
 export function computeFold({
   containerWidth,
@@ -62,6 +74,8 @@ export function computeFold({
   items,
   fixedLeft,
   rightReserve,
+  rightFloor = rightReserve,
+  status = 0,
   gap = TOOLBAR_GAP,
   overflowWidth = ICON_BUTTON_W,
 }: {
@@ -70,30 +84,51 @@ export function computeFold({
   items: readonly { id: string; visible: boolean }[];
   /** Left chrome + container padding/border consumed before the first item. */
   fixedLeft: number;
-  /** Right group (model pill, mic, send) + the gap between the two groups. */
+  /** Right group (model pill with its level, mic, send) + the gap between
+   *  the two groups. */
   rightReserve: number;
+  /** The same with the level gone and the model name cut to its floor. */
+  rightFloor?: number;
+  /** The host's status at the end of the left group. The model pill gives
+   *  up the room for it, so items don't hop into ⋯ as it comes and goes;
+   *  only past the name's floor does it cost them their slot. */
+  status?: number;
   gap?: number;
   overflowWidth?: number;
 }): FoldResult {
   const candidates = items.filter((i) => i.visible).map((i) => i.id);
   const measured = widths && Object.values(widths).some((w) => w > 0) ? widths : null;
   if (!containerWidth || !measured) {
-    return { inline: new Set(candidates), folded: [] };
+    return { inline: new Set(candidates), folded: [], levelHidden: false, nameHidden: false };
   }
 
-  let budget = containerWidth - fixedLeft - rightReserve;
-  const needAll = candidates.reduce((sum, id) => sum + (measured[id] ?? 0) + gap, 0);
-  if (needAll <= budget) return { inline: new Set(candidates), folded: [] };
+  const cost = (ids: readonly string[]) => ids.reduce((sum, id) => sum + (measured[id] ?? 0) + gap, 0);
+  const trigger = gap + overflowWidth; // the ⋯ trigger itself
+  const nameHidden = fixedLeft + status + rightFloor + (candidates.length > 0 ? trigger : 0) > containerWidth;
+  // The row as it paints with the pill whole: whatever it lacks, the level
+  // gives up first.
+  const levelHidden = (inline: readonly string[]) =>
+    fixedLeft + cost(inline) + (inline.length < candidates.length ? trigger : 0) + status + rightReserve > containerWidth;
 
-  budget -= gap + overflowWidth; // the ⋯ trigger itself
-  const inline = new Set<string>();
+  let budget = containerWidth - fixedLeft - Math.max(rightReserve, rightFloor + status);
+  if (cost(candidates) <= budget) {
+    return { inline: new Set(candidates), folded: [], levelHidden: levelHidden(candidates), nameHidden };
+  }
+
+  budget -= trigger;
+  const inline: string[] = [];
   for (const id of candidates) {
-    const w = (measured[id] ?? 0) + gap;
+    const w = cost([id]);
     if (w > budget) break;
-    inline.add(id);
+    inline.push(id);
     budget -= w;
   }
-  return { inline, folded: candidates.filter((id) => !inline.has(id)) };
+  return {
+    inline: new Set(inline),
+    folded: candidates.filter((id) => !inline.includes(id)),
+    levelHidden: levelHidden(inline),
+    nameHidden,
+  };
 }
 
 const sameWidths = (a: Record<string, number>, b: Record<string, number>) =>
@@ -106,6 +141,7 @@ export function useToolbarFold({
   measureKey,
   fixedLeft,
   rightReserve,
+  rightFloor,
 }: {
   containerRef: RefObject<HTMLElement | null>;
   /** Priority order, memoized — its identity also drives re-measurement. */
@@ -116,12 +152,23 @@ export function useToolbarFold({
   fixedLeft: number;
   /** Takes the measured widths: the model pill's width is measured, not fixed. */
   rightReserve: (widths: Readonly<Record<string, number>>) => number;
-}): { measureRowRef: RefObject<HTMLDivElement | null>; fold: FoldResult } {
+  /** `rightReserve` with no level and the model name at its floor. */
+  rightFloor?: (widths: Readonly<Record<string, number>>) => number;
+}): {
+  measureRowRef: RefObject<HTMLDivElement | null>;
+  statusRef: RefObject<HTMLSpanElement | null>;
+  fold: FoldResult;
+} {
   const measureRowRef = useRef<HTMLDivElement>(null);
+  const statusRef = useRef<HTMLSpanElement>(null);
   const [widths, setWidths] = useState<Record<string, number> | null>(null);
   // Floor-quantized: a budget must never be spent against width the container
   // doesn't have (rounding up by 8px is exactly how pills end up overlapping).
   const containerWidth = useContainerWidth(containerRef, 16, { round: 'floor' });
+  // Measured where it paints: a host's status is live, so it has no twin in
+  // the measure row. The element `statusRef` names holds the gap before it,
+  // so its width is the whole cost.
+  const statusWidth = useContainerWidth(statusRef, 1);
 
   useLayoutEffect(() => {
     const row = measureRowRef.current;
@@ -135,12 +182,15 @@ export function useToolbarFold({
 
   return {
     measureRowRef,
+    statusRef,
     fold: computeFold({
       containerWidth,
       widths,
       items,
       fixedLeft,
       rightReserve: rightReserve(widths ?? {}),
+      rightFloor: rightFloor?.(widths ?? {}),
+      status: statusWidth,
     }),
   };
 }

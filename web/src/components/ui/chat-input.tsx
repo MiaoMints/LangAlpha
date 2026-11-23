@@ -1,33 +1,48 @@
 import React, { useState, useRef, useEffect, useCallback, useImperativeHandle, useMemo } from 'react';
 import { Plus, ChartCandlestick } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
+import { useNavigate } from 'react-router';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
-import { TokenUsageRing, type TokenUsageData } from './token-usage-ring';
+import { TokenUsageRing } from './token-usage-ring';
+import type { TokenUsage } from '@/pages/ChatAgent/session/tokenUsage';
 import { usePreferences } from '@/hooks/usePreferences';
-import { useDefaultModel } from '@/hooks/useSlotDefaultModels';
+import { useTurnModels } from '@/hooks/useTurnModels';
 import { useEffectiveTuning, useModelProfileWriter } from '@/hooks/useModelProfile';
 import { useFeatureEnabled } from '@/hooks/useFeatures';
+import { useWorkspaceCapabilities } from '@/hooks/useSharedWorkspaces';
 import { homeWorkspaceQuery } from '@/hooks/useHomeWorkspace';
 import { useAllModels } from '@/hooks/useAllModels';
 import { useProviderCatalog } from '@/hooks/useProviderCatalog';
 import { useLapsedSignIn } from '@/hooks/useLapsedSignIn';
 import { useIsMobile } from '@/hooks/useIsMobile';
+import { useLatestRef } from '@/hooks/useLatestRef';
+import { onKeyboardFit, onScreenKeyboardUp, roomAboveKeyboard } from '@/lib/visualViewport';
 import { useFavoriteModels } from '@/hooks/useFavoriteModels';
 import { useSeededModel } from '@/hooks/useSeededModel';
 import { ChatInputRegistry, ContextBus } from '@/lib/contextBus';
 import { AnimatePresence } from '@/lib/framer';
 import { isImeComposing } from '@/lib/ime';
+import { focusWithoutRing } from '@/lib/inputModality';
 import { cn } from '@/lib/utils';
 import type { WidgetContextSnapshot } from '@/pages/Dashboard/widgets/framework/contextSnapshot';
 import './chat-input.css';
-import type { ComposerScope, ModelOptions, ReadyAttachment, SlashCommand, ThreadTuning, Workspace } from './chat-input.types';
+import type { ComposerDraft, ComposerScope, ComposerSend, ContextPayload, ModelOptions, ReadyAttachment, SlashCommand, ThreadTuning, Workspace } from './chat-input.types';
 import { isLargePaste, getModelDisplayName } from './chat-input.helpers';
-import { effortLabelFor, hasTuningMenu, resolveEffort } from '@/lib/modelTuning';
+import { isCodexModel, resolveEffort } from '@/lib/modelTuning';
 import { ChatInputWidgetDeck, MentionAutocompleteList, SlashCommandList } from './chat-input.parts';
 import {
-  ComposerAttachments, ComposerPills, DropOverlay, SendStopButton, ToolbarOverflowMenu, VoiceButton, VoiceOverlay,
+  ComposerAttachments, ComposerChips, DraftTokenLayer, DropOverlay, FilesHoldHint, SendStopButton, ToolbarOverflowMenu, VoiceButton, VoiceOverlay,
 } from './chat-input.composerParts';
-import { ChatInputEffortMenu, ChatInputModelMenu, ModelTriggerMeasure } from './chat-input.modelMenu';
+import { ChatInputModelMenu, ModelTriggerMeasure } from './chat-input.modelMenu';
+import type { ModelTuning } from './chat-input.modelTuning';
+import { NoticePopover, type ComposerNotices } from './chat-input.notices';
+import type { ModelRowStatus } from './chat-input.modelPicker';
+import { claudeCodeHold, isClaudeCodeModel } from '@/lib/claudeCode';
+import { useStepsHold } from '@/hooks/useClaudeCodeSteps';
+import { followErrorLink } from '@/lib/desktop';
+import { useMediumHold } from '@/pages/ChatAgent/hooks/useMediumAction';
+import { usePlanReader } from '@/hooks/useClaudeCodePlan';
+import { creditsRefused, pickerPlanHold, planOutOf } from '@/lib/claudeCodePlan';
 import { deriveRecentModels } from './chat-input.models';
 import { modelGroups } from '@/lib/modelGroups';
 import { useToolbarItems } from './chat-input.toolbar';
@@ -35,22 +50,38 @@ import {
   useToolbarFold, CONTAINER_BORDER, CONTAINER_PX, GROUP_GAP, ICON_BUTTON_W, TOOLBAR_GAP,
 } from './chat-input.useToolbarFold';
 import { useMentions } from './chat-input.useMentions';
+import { useQuoteTokens } from './chat-input.useQuoteTokens';
 import { useSlashCommands } from './chat-input.useSlashCommands';
 import { speechSupported, useVoiceInput } from './chat-input.useVoiceInput';
 import { useFileAttachments } from './chat-input.useFileAttachments';
 import { useDeviceTuningLift } from './chat-input.useDeviceTuningLift';
 import { readSubagentsDefault } from '@/lib/subagentsDefault';
-import { formatContextBlock } from './chat-input.contextBlocks';
+import { readGivenBack, spellOutQuotes } from './chat-input.quoteTokens';
+import { formatContextBlock } from './chat-input.wire';
+import { useAccount } from '@/hooks/useAccount';
+import { modelRefusedBy, modelRuleRowKey } from '@/lib/accountRules';
 
 /** Autosize cap for the composer textarea; past this the box scrolls. */
 const MAX_TEXTAREA_HEIGHT = 200;
 
+/** What the textarea keeps, two lines of the phone's text, however little room the keyboard leaves. */
+const MIN_TEXTAREA_HEIGHT_OVER_KEYBOARD = 52;
+
 /** A thread that follows Settings for both. */
 const FOLLOWS_SETTINGS = { reasoningEffort: null, fastMode: null } as const;
 
+/** The box with `text` put back: into it when empty, else after what is
+ *  typed, a blank line between, and never twice. */
+function withGivenBack(typed: string, text: string): string {
+  const kept = typed.trimEnd();
+  if (!kept) return text;
+  if (kept === text || kept.endsWith(`\n\n${text}`)) return typed;
+  return `${kept}\n\n${text}`;
+}
+
 export interface ChatInputHandle {
   getModelOptions: () => ModelOptions;
-  addContext: (ctx: { path?: string; snippet?: string; label?: string; locator?: string; lineStart?: number; lineEnd?: number; lineCount?: number; source?: string }) => void;
+  addContext: (ctx: ContextPayload) => void;
   /**
    * Imperatively add a widget context snapshot to the deck. Local-only —
    * this does NOT publish to ContextBus. Use this when re-seeding the deck
@@ -59,20 +90,37 @@ export interface ChatInputHandle {
    * mounted chat input sees it.
    */
   addWidgetSnapshot: (snapshot: WidgetContextSnapshot) => void;
-  setValue: (text: string) => void;
-  /** Puts back text the user wrote elsewhere without losing what is typed
-   *  here: into an empty box, else after it, a blank line between. Files a
-   *  send took come back beside what is attached now. */
-  giveBack: (text: string, files?: ReadyAttachment[]) => void;
-  /** Sends what is written, as Enter does. Returns whether there was
-   *  anything to send. */
+  /** Replaces the text: pills it no longer names drop, and `commands` are picked beside it. */
+  setValue: (text: string, commands?: SlashCommand[]) => void;
+  /**
+   * Puts back what was written elsewhere, or sent and handed back, without
+   * losing what is typed here: the text into an empty box, else after it, a
+   * blank line between, and the files and pills beside what is there now.
+   * `focus: false` leaves focus where it is, for a draft that comes back
+   * while the person may have moved on to something else.
+   */
+  giveBack: (
+    text: string,
+    files?: ReadyAttachment[],
+    rest?: Partial<Pick<ComposerDraft, 'mentions' | 'commands'>> & { focus?: boolean },
+  ) => void;
+  /** Sends what is written, as Enter does. Returns whether it went: false
+   *  when there was nothing to send, or files hold it (`holdsSend`). */
   send: () => boolean;
+  /** Whether files still uploading, or failed, hold the send. The hint
+   *  beside Send says which; the draft waits in the box. */
+  holdsSend: () => boolean;
+  focus: () => void;
 }
 
 
 export interface ChatInputProps {
-  onSend: (message: string, attachments: ReadyAttachment[], slashCommands: SlashCommand[], modelOptions: ModelOptions) => void;
+  /** The send is also the box as the person wrote it, for `giveBack` should it fail. */
+  onSend: (send: ComposerSend) => void;
   disabled?: boolean;
+  /** The draft may be written but not sent yet: another person's turn is
+   *  running in the thread. The box keeps what is in it. */
+  sendHeld?: boolean;
   isLoading?: boolean;
   /**
    * A compaction is in progress with no streaming turn (manual /compact|/offload
@@ -90,6 +138,10 @@ export interface ChatInputProps {
   onScopeChange?: ((scope: ComposerScope) => void) | null;
   /** Shown in the scope picker while there is no workspace to pick. */
   emptyWorkspacesHint?: string | null;
+  /** The send goes to Home with no scope picker to say so: a Home thread's,
+   *  or the welcome's, whose first message opens one there. Its turns are the
+   *  Chief of Staff's, as a send scoped to all workspaces is. */
+  inHome?: boolean;
   /**
    * The Subagents switch, owned by a thread host (`useThreadSubagents`),
    * which also receives each flip through `onToggleSubagents`. Null while the
@@ -114,7 +166,13 @@ export interface ChatInputProps {
    * sendable — the selection carries its own instruction.
    */
   hasExternalContext?: boolean;
-  tokenUsage?: TokenUsageData | null;
+  tokenUsage?: TokenUsage | null;
+  /** The thread's history is loading, so its usage is still to come: the
+   *  ring holds its slot as an empty track until then. */
+  tokenUsagePending?: boolean;
+  /** The thread the context panel breaks down; absent for a chat with no
+   *  thread yet. */
+  threadId?: string | null;
   onAction?: ((cmd: SlashCommand) => void) | null;
   /**
    * The model the pill shows and a send names, owned by the host's thread
@@ -125,6 +183,9 @@ export interface ChatInputProps {
    */
   model?: string | null;
   onPickModel?: ((model: string) => void) | null;
+  /** The model a send names where the host's thread names another than the
+   *  pill shows (`useThreadModel`'s `sendModel`); unset, the pill's. */
+  sendModel?: string | null;
   /**
    * The thread's own reasoning effort and fast mode, over what Settings gives
    * its model, owned by a thread host (`useThreadTuning`), which also receives
@@ -144,15 +205,41 @@ export interface ChatInputProps {
    * docks its folded tray here). Outside the fold budget on purpose: a host's
    * status comes and goes on its own clock, and the toggles must not hop into
    * the overflow menu with it, so the model label gives up the room instead.
+   * Only once the label is down to its floor does the status cost a slot.
    */
   toolbarStatus?: React.ReactNode;
+  /** A strip the host draws across the top of the box, ruled off from the
+   *  rest (the chat view's tray, for a reader who keeps it inside). */
+  header?: React.ReactNode;
+  /**
+   * Context the host gathers above the text box, ruled off from it (the chat
+   * view's queued file comments). The host owns what it holds and what a send
+   * does with it; pair it with `hasExternalContext` when it makes an empty box
+   * sendable. A press on it is its own and does not focus the text box.
+   */
+  deck?: React.ReactNode;
+  /**
+   * What a thread host says about the next send, each on the control it is
+   * about: the model's notices on its pill, the subagents offer on its
+   * toggle, a due summary on the context ring (`useComposerNotices`). Keep
+   * its identity while nothing in it changes, as the memo below relies on.
+   */
+  notices?: ComposerNotices | null;
 }
 
 /* --- MAIN COMPONENT --- */
 
+function settleAfterSend(field: HTMLTextAreaElement | null): void {
+  if (!field) return;
+  field.style.height = 'auto';
+  // The answer lands where the on-screen keyboard is.
+  if (onScreenKeyboardUp()) field.blur();
+}
+
 function ChatInput({
   onSend,
   disabled = false,
+  sendHeld = false,
   isLoading = false,
   isCompacting = false,
   onStop,
@@ -162,6 +249,7 @@ function ChatInput({
   scope,
   onScopeChange = null,
   emptyWorkspacesHint = null,
+  inHome = false,
   // Subagents switch
   subagentsAllowed: hostSubagents,
   onToggleSubagents = null,
@@ -180,11 +268,14 @@ function ChatInput({
   hasExternalContext = false,
   // Token usage (context window progress)
   tokenUsage = null,
+  tokenUsagePending = false,
+  threadId,
   // Action commands (e.g. /compact) — dispatched on send, not on selection
   onAction = null,
   // Model selector
   model: hostModel,
   onPickModel = null,
+  sendModel: hostSendModel,
   // Thread effort and fast mode
   tuning: hostTuning,
   onPickReasoningEffort = null,
@@ -196,17 +287,39 @@ function ChatInput({
   // Minimum visible rows for the textarea (default 1 = compact; pass 2 for roomier non-ChatView callsites)
   minRows = 1,
   toolbarStatus = null,
+  header = null,
+  deck = null,
+  notices = null,
   ref,
 }: ChatInputProps & { ref?: React.Ref<ChatInputHandle> }) {
   const { t } = useTranslation();
+  const navigate = useNavigate();
   const isMobile = useIsMobile();
   const { preferences, isLoaded: preferencesRead } = usePreferences();
   const marketWatchEnabled = useFeatureEnabled('market_watch');
-  const { models: visibleModels, validModelNames, metadata: modelMetadata, payers, isLoading: modelsLoading } = useAllModels();
+  const {
+    models: visibleModels, validModelNames, metadata: modelMetadata, payers, isLoading: modelsLoading, taskCostBaseline,
+  } = useAllModels();
   const lapsedSignIn = useLapsedSignIn();
   const otherPref = (preferences as Record<string, Record<string, unknown>> | null)?.other_preference;
   const [message, setMessage] = useState('');
-  const { attachedFiles, setAttachedFiles, isDragging, handleFiles, restoreFiles, removeFile, onDragEnter, onDragOver, onDragLeave, onDrop, handlePaste } = useFileAttachments({ disabled });
+  // Where the message is going: Home for the Chief of Staff, else the
+  // selected workspace. File uploads and the slash menu both aim at it.
+  const queryClient = useQueryClient();
+  const { data: homeWorkspaceId = null } = useQuery({
+    ...homeWorkspaceQuery(queryClient),
+    enabled: scope === 'all',
+    select: (workspace) => workspace.workspace_id,
+  });
+  const slashWorkspaceId = scope === 'all' ? homeWorkspaceId : selectedWorkspaceId;
+  const capabilities = useWorkspaceCapabilities(slashWorkspaceId);
+  // Read when a file starts uploading, which is outside any render.
+  const targetWorkspaceRef = useRef<string | null>(null);
+  const {
+    attachedFiles, uploadingCount, failedCount, isDragging,
+    handleFiles, retryFile, restoreFiles, removeFile, discardFiles, takeFiles, holdsStale,
+    onDragEnter, onDragOver, onDragLeave, onDrop, handlePaste,
+  } = useFileAttachments({ disabled, workspaceIdRef: targetWorkspaceRef, workspaceId: slashWorkspaceId ?? null });
   const [watchMode, setWatchMode] = useState(false);
   // The toggle state survives the feature going off (the pill just hides), so
   // every payload derives from this gated value.
@@ -215,10 +328,14 @@ function ChatInput({
   // The model a send names. A thread host owns it. Without one the composer
   // holds it, starting on the account default, which with nothing saved is
   // the deployment's (see useSlotDefaultModels for why it waits on the
-  // preference), and following the default when it changes.
-  const defaultModel = useDefaultModel();
-  const [ownModel, setOwnModel] = useSeededModel(defaultModel);
+  // preference), and following the default when it changes. A turn in Home
+  // starts on the deployment's over a Claude Code one the server does not
+  // run there (see useTurnDefaultModel).
+  const chiefOfStaff = inHome || scope === 'all';
+  const turn = useTurnModels(chiefOfStaff, selectedWorkspaceId);
+  const [ownModel, setOwnModel] = useSeededModel(turn.defaultModel);
   const pillModel = hostModel === undefined ? ownModel : hostModel;
+  const sentModel = hostSendModel === undefined ? pillModel : hostSendModel;
 
   // Per-model tuning is an account preference, not a device one: the server
   // resolves ``profiles[<model>]`` for turns this input never starts (schedules,
@@ -292,7 +409,7 @@ function ChatInput({
     else onPickModel?.(model);
   }, [pillModel, hostModel, setOwnModel, onPickModel]);
 
-  const isCodexModel = pillModel ? modelMetadata[pillModel]?.sdk === 'codex' : false;
+  const codexModel = isCodexModel(pillModel ? modelMetadata[pillModel] : undefined);
 
   // Widget context deck state. Snapshots arrive via ContextBus.attach (when
   // the user clicks "+" on any widget on the page) or via addWidgetSnapshot
@@ -324,34 +441,47 @@ function ChatInput({
   // skills included, its disables applied). The Chief of Staff runs in Home,
   // which loads its skills as any workspace does, so the menu lists Home's
   // rather than those of the workspace the picker remembers.
-  const queryClient = useQueryClient();
-  const { data: homeWorkspaceId = null } = useQuery({
-    ...homeWorkspaceQuery(queryClient),
-    enabled: scope === 'all',
-    select: (workspace) => workspace.workspace_id,
-  });
-  const slashWorkspaceId = scope === 'all' ? homeWorkspaceId : selectedWorkspaceId;
-  const slash = useSlashCommands({ textareaRef, message, setMessage, workspaceId: slashWorkspaceId });
+  useEffect(() => {
+    targetWorkspaceRef.current = slashWorkspaceId ?? null;
+  }, [slashWorkspaceId]);
+  const slash = useSlashCommands({ textareaRef, message, setMessage, workspaceId: slashWorkspaceId, skillsAllowed: capabilities.skills });
   const {
     mentionedFiles, setMentionedFiles, pruneRemoved: pruneMentions, detectTrigger: detectMention,
-    close: closeMentions, reset: resetMentions, handleKeyDown: mentionKeyDown, open: mentionsOpen,
+    close: closeMentions, reset: resetMentions, handleKeyDown: mentionKeyDown, open: mentionsOpen, addMention, removeMention,
   } = mentions;
   const {
     slashCommands, pruneRemoved: pruneSlash, detectTrigger: detectSlash,
-    close: closeSlash, reset: resetSlash, handleKeyDown: slashKeyDown,
+    close: closeSlash, reset: resetSlash, restore: restoreSlash, handleKeyDown: slashKeyDown,
   } = slash;
 
+  // Pills whose /{command} or @mention text was deleted go with it
+  const pruneDraft = useCallback((draft: string) => {
+    pruneSlash(draft);
+    pruneMentions(draft);
+  }, [pruneSlash, pruneMentions]);
+  // The words of the draft that stand for a skill or a file.
+  const draftTokens = useMemo(() => [
+    ...slashCommands.map((c) => `/${c.name}`),
+    ...mentionedFiles.filter((f) => f.kind === 'file').map((f) => `@${f.path}`),
+  ], [slashCommands, mentionedFiles]);
+  const {
+    heldMentions, quotes, chips, addQuote, handleSelect, handleQuotePress, handleKeyDown: tokenKeyDown, keepWhole,
+  } = useQuoteTokens({ textareaRef, message, setMessage, mentions, draftTokens, pruneDraft });
+
   // Voice input (speech recognition) — see chat-input.useVoiceInput.
-  const { isListening, toggleListening, stopListening } = useVoiceInput({ message, setMessage, isLoading });
+  const { isListening, toggleListening, stopListening, abandonListening } = useVoiceInput({ message, setMessage, isLoading });
+
+  const givenBackBesideRef = useLatestRef(mentionedFiles);
 
   // The handle is built before the send below, so it reaches it through here.
   const sendRef = useRef<() => boolean>(() => false);
+  const holdsRef = useRef(false);
 
   // Expose addContext method for external callers (e.g. FilePanel, message selection)
   useImperativeHandle(ref, () => ({
     getModelOptions() {
       return {
-        model: pillModel,
+        model: sentModel,
         reasoningEffort: sentEffort,
         fastMode: resolvedFastMode,
         marketWatch: effectiveMarketWatch,
@@ -359,29 +489,34 @@ function ChatInput({
         ...ownOverrides,
       };
     },
-    addContext({ path, snippet, label, locator, lineStart, lineEnd, lineCount, source }) {
-      if (snippet) {
-        // Snippet context — add pill with snippet data, don't modify textarea
-        setMentionedFiles((prev) => {
-          // Deduplicate by exact snippet content (handles multiple selections)
-          if (prev.some((f) => f.snippet === snippet && f.path === (path || '') && f.locator === locator && f.source === (source || undefined))) return prev;
-          return [...prev, { path: path || '', snippet, label, locator, lineStart, lineEnd, lineCount, source }];
-        });
-      } else if (path) {
-        // Whole file context — same behavior as selectFile via @mention
-        setMentionedFiles((prev) => {
-          if (prev.some((f) => f.path === path && !f.snippet)) return prev;
-          return [...prev, { path }];
-        });
-        // Insert @path into message text
-        setMessage((prev) => {
-          if (prev.includes('@' + path)) return prev;
-          const prefix = prev && !prev.endsWith(' ') ? prev + ' ' : prev;
-          return prefix + '@' + path + ' ';
-        });
+    addContext(ctx) {
+      // Dictation rewrites the draft from what it held when it started.
+      if (ctx.kind !== 'chip') abandonListening();
+      switch (ctx.kind) {
+        case 'file':
+          // Same behavior as selectFile via @mention
+          addMention(ctx);
+          setMessage((prev) => {
+            if (prev.includes('@' + ctx.path)) return prev;
+            const prefix = prev && !prev.endsWith(' ') ? prev + ' ' : prev;
+            return prefix + '@' + ctx.path + ' ';
+          });
+          break;
+        case 'quote':
+          addQuote(ctx);
+          break;
+        case 'chip':
+          addMention(ctx);
+          break;
+        case 'attachment': {
+          const { files, text } = ctx;
+          if (files.length) handleFiles(files);
+          if (text) setMessage((prev) => (prev.trim() ? `${prev.trimEnd()}\n${text}` : text));
+          break;
+        }
       }
       // Focus the textarea
-      setTimeout(() => textareaRef.current?.focus(), 0);
+      setTimeout(() => focusWithoutRing(textareaRef.current), 0);
     },
     addWidgetSnapshot(snapshot) {
       setWidgetSnapshots((prev) => {
@@ -389,26 +524,39 @@ function ChatInput({
         return [...prev, snapshot];
       });
     },
-    setValue(text) {
+    setValue(text, commands = []) {
+      // Dictation rewrites the draft from what it held when it started.
+      abandonListening();
       setMessage(text);
-      setTimeout(() => textareaRef.current?.focus(), 0);
+      // Pills follow the text, as typing prunes them: one the new text no
+      // longer names would otherwise ride the next send unseen.
+      pruneDraft(text);
+      restoreSlash(commands);
+      // A draft handed in by another surface (a palette's Enter, a starter's
+      // click) carries on that action, so it draws no keyboard ring.
+      setTimeout(() => focusWithoutRing(textareaRef.current), 0);
     },
-    giveBack(text, files = []) {
-      if (text) {
-        setMessage((prev) => {
-          const typed = prev.trimEnd();
-          if (!typed) return text;
-          if (typed === text || typed.endsWith(`\n\n${text}`)) return prev;
-          return `${typed}\n\n${text}`;
-        });
-      }
+    giveBack(text, files = [], { mentions = [], commands = [], focus = true } = {}) {
+      // Through a ref, for what else comes back in the same commit to number against.
+      const back = readGivenBack(text, mentions, givenBackBesideRef.current);
+      givenBackBesideRef.current = [...givenBackBesideRef.current, ...back.mentions];
+      if (back.text) setMessage((prev) => withGivenBack(prev, back.text));
       restoreFiles(files);
-      setTimeout(() => textareaRef.current?.focus(), 0);
+      if (back.mentions.length > 0) setMentionedFiles((prev) => [...prev, ...back.mentions]);
+      restoreSlash(commands);
+      // Handed back by the app, not reached by a key: no keyboard ring.
+      if (focus) setTimeout(() => focusWithoutRing(textareaRef.current), 0);
     },
     send() {
       return sendRef.current();
     },
-  }), [pillModel, sentEffort, resolvedFastMode, effectiveMarketWatch, draftSubagents, ownOverrides, setMentionedFiles, restoreFiles]);
+    holdsSend() {
+      return holdsRef.current || holdsStale();
+    },
+    focus() {
+      textareaRef.current?.focus();
+    },
+  }), [sentModel, sentEffort, resolvedFastMode, effectiveMarketWatch, draftSubagents, ownOverrides, mentionedFiles, setMentionedFiles, addMention, addQuote, restoreFiles, holdsStale, restoreSlash, pruneDraft, handleFiles, abandonListening]);
 
   // Subscribe to ContextBus so this input mirrors the global widget-context
   // deck. Multiple chat inputs can be visible simultaneously (hero card +
@@ -471,21 +619,95 @@ function ChatInput({
     else onPickFastMode?.(next);
   }, [settingsFast, tuning.fastMode, hostTuning, onPickFastMode]);
 
-  // Auto-resize textarea; past the cap the box scrolls (overflow-y-auto).
+  const tokenLayerRef = useRef<HTMLDivElement>(null);
+  const sizeTokenLayer = useCallback(() => {
+    if (!textareaRef.current || !tokenLayerRef.current) return;
+    tokenLayerRef.current.style.width = `${textareaRef.current.clientWidth}px`;
+    tokenLayerRef.current.style.height = `${textareaRef.current.clientHeight}px`;
+    tokenLayerRef.current.scrollTop = textareaRef.current.scrollTop;
+  }, []);
+
+  // Auto-resize textarea; past the cap the box scrolls (overflow-y-auto). A
+  // chip beside it changes its width, and so where the text wraps, and the
+  // layer has to wrap with it, a scrollbar taken out of the width included.
+  const fitTextarea = useCallback(() => {
+    if (textareaRef.current) {
+      textareaRef.current.style.height = 'auto';
+      // Rounded up: `scrollHeight` rounds a fractional line height down as often as
+      // not, and what fits exactly then comes up short and shows a scrollbar.
+      textareaRef.current.style.height = Math.min(textareaRef.current.scrollHeight + 1, MAX_TEXTAREA_HEIGHT) + 'px';
+      sizeTokenLayer();
+    }
+  }, [sizeTokenLayer]);
+  useEffect(fitTextarea, [fitTextarea, message, chips.length, draftTokens.length]);
+  // A narrower window wraps the text too. Fitted a frame on, since the fit itself
+  // resizes what is being observed.
   useEffect(() => {
-    const el = textareaRef.current;
-    if (!el) return;
-    // `field-sizing: content` grows the box from its content natively
-    // (Chromium 123+); only run the JS scrollHeight measurement when the
-    // engine lacks it. The 200px cap holds either way, then overflow scrolls.
-    if (typeof CSS !== 'undefined' && typeof CSS.supports === 'function' && CSS.supports('field-sizing', 'content')) {
-      el.style.setProperty('field-sizing', 'content');
-      el.style.maxHeight = MAX_TEXTAREA_HEIGHT + 'px';
+    const textarea = textareaRef.current;
+    if (!textarea) return;
+    let width = textarea.clientWidth;
+    let frame = 0;
+    const observer = new ResizeObserver(() => {
+      if (textarea.clientWidth === width) return;
+      width = textarea.clientWidth;
+      cancelAnimationFrame(frame);
+      frame = requestAnimationFrame(fitTextarea);
+    });
+    observer.observe(textarea);
+    return () => {
+      observer.disconnect();
+      cancelAnimationFrame(frame);
+    };
+  }, [fitTextarea]);
+
+  // A composer in a scrolling route grows downward, so with a keyboard up the
+  // text gives up what would push the send row under it. A limit apart from the
+  // height above, measured from the box as it stands: nothing collapses, so the
+  // text keeps its scroll, and a composer hidden with its cached thread keeps its size.
+  const fitToKeyboard = useCallback(() => {
+    const textarea = textareaRef.current;
+    const box = chatContainerRef.current;
+    if (!textarea || !box) return;
+    const active = document.activeElement;
+    // Its picker is anchored to the box as it stands.
+    if (active?.closest('[data-composer-panel]')) return;
+    const room = active === textarea ? roomAboveKeyboard(box) : null;
+    if (room === null) {
+      textarea.style.maxHeight = '';
+      sizeTokenLayer();
       return;
     }
-    el.style.height = 'auto';
-    el.style.height = Math.min(el.scrollHeight, MAX_TEXTAREA_HEIGHT) + 'px';
-  }, [message]);
+    const shownBefore = textarea.clientHeight;
+    // Not `offsetHeight`: rounded, the limit never settles and the observer below
+    // refits it every frame.
+    textarea.style.maxHeight = Math.max(textarea.getBoundingClientRect().height + room, MIN_TEXTAREA_HEIGHT_OVER_KEYBOARD) + 'px';
+    // The box gives up its foot, and a caret at the end of the text is there.
+    if (textarea.clientHeight < shownBefore && textarea.selectionEnd === textarea.value.length) {
+      textarea.scrollTop = textarea.scrollHeight;
+    }
+    sizeTokenLayer();
+    if ((roomAboveKeyboard(box) ?? 0) < 0) box.scrollIntoView({ block: 'nearest' });
+  }, [sizeTokenLayer]);
+
+  useEffect(fitToKeyboard, [message, fitToKeyboard]);
+  useEffect(() => {
+    if (!chatContainer) return;
+    // Whatever else sizes the box: a pill, an attachment leaving, a deck folding,
+    // with or without motion. A frame later, since changing the box inside its
+    // own callback is a ResizeObserver loop error.
+    let frame = 0;
+    const observer = new ResizeObserver(() => {
+      cancelAnimationFrame(frame);
+      frame = requestAnimationFrame(fitToKeyboard);
+    });
+    observer.observe(chatContainer);
+    const stopListening = onKeyboardFit(fitToKeyboard);
+    return () => {
+      observer.disconnect();
+      cancelAnimationFrame(frame);
+      stopListening();
+    };
+  }, [chatContainer, fitToKeyboard]);
 
   // Large text pastes condense into a pill (snippet-mention mechanics) instead
   // of flooding the draft. File pastes keep priority — handlePaste prevents
@@ -496,27 +718,21 @@ function ChatInput({
     const text = e.clipboardData.getData('text/plain');
     if (!isLargePaste(text)) return;
     e.preventDefault();
-    const lineCount = text.split('\n').length;
-    setMentionedFiles((prev) => {
-      if (prev.some((f) => f.source === 'paste' && f.snippet === text)) return prev;
-      return [...prev, { path: '', snippet: text, label: t('context.pastedLines', { count: lineCount }), lineCount, source: 'paste' }];
-    });
-  }, [handlePaste, setMentionedFiles, t]);
+    addMention({ kind: 'chip', source: 'paste', snippet: text, label: t('context.pastedLines', { count: text.split('\n').length }) });
+  }, [handlePaste, addMention, t]);
 
   // Detect @ and / triggers on input change
   const handleChange = useCallback((e: React.ChangeEvent<HTMLTextAreaElement>) => {
-    const val = e.target.value;
+    const val = keepWhole(e.target.value, e.target.selectionStart);
     setMessage(val);
     const cursorPos = e.target.selectionStart;
 
-    // Pills whose /{command} or @mention text was deleted go with it
-    pruneSlash(val);
-    pruneMentions(val);
+    pruneDraft(val);
 
     // A live /slash trigger wins: the two menus never show at once.
     if (detectSlash(val, cursorPos)) closeMentions();
     else detectMention(val, cursorPos);
-  }, [pruneSlash, pruneMentions, detectSlash, detectMention, closeMentions]);
+  }, [keepWhole, pruneDraft, detectSlash, detectMention, closeMentions]);
 
   // Close both autocompletes on blur
   const handleBlur = useCallback(() => {
@@ -527,10 +743,14 @@ function ChatInput({
   }, [closeMentions, closeSlash]);
 
   // --- Send ---
-  const hasContent = message.trim() || attachedFiles.length > 0 || !!chartImage || mentionedFiles.some((f) => f.snippet) || widgetSnapshots.length > 0 || hasExternalContext;
+  const hasContent = message.trim() || attachedFiles.length > 0 || !!chartImage || chips.length > 0 || widgetSnapshots.length > 0 || hasExternalContext;
+  // A file still uploading has nothing to send yet, and a failed one is never
+  // dropped unseen: either holds the send until it is ready or removed.
+  const filesHold = uploadingCount > 0 || failedCount > 0;
 
-  const handleSend = useCallback(() => {
-    if (!hasContent || disabled) return;
+  /** Whether it sent. */
+  const handleSend = useCallback((): boolean => {
+    if (!hasContent || disabled || sendHeld || filesHold) return false;
 
     // System action commands (/compact, /offload) are standalone: they run on
     // send rather than starting a chat turn. If any are present, fire them and
@@ -542,46 +762,46 @@ function ChatInput({
       // staged attachments / mentions / widget context behind for the next turn.
       setMessage('');
       resetSlash();
-      attachedFiles.forEach((f) => { if (f.preview) URL.revokeObjectURL(f.preview); });
-      setAttachedFiles([]);
+      discardFiles();
       resetMentions();
       if (widgetSnapshots.length > 0) {
         ContextBus.clear();
       }
       setDeckFanned(false);
-      if (textareaRef.current) {
-        textareaRef.current.style.height = 'auto';
-      }
-      return;
+      settleAfterSend(textareaRef.current);
+      return true;
     }
 
-    const readyAttachments = attachedFiles
-      .filter((f) => f.dataUrl)
-      .map((f) => ({
-        file: f.file,
-        dataUrl: f.dataUrl,
-        type: f.type,
-        preview: f.preview,
-      }));
-    // Append snippet blocks to message for mentions that have snippets
-    let finalMessage = message;
-    const snippetMentions = mentionedFiles.filter((f) => f.snippet);
-    if (snippetMentions.length > 0) {
-      const blocks = snippetMentions.map((f) => formatContextBlock(f, t));
+    const readyAttachments = takeFiles();
+    // A file too old to name uploads again, and the send waits for it as for
+    // any upload; the hold shows before the render that counts it.
+    if (!readyAttachments) {
+      holdsRef.current = true;
+      return false;
+    }
+    // Quotes go where they sit among the typed words. Chips' blocks trail.
+    let finalMessage = spellOutQuotes(message, quotes);
+    if (chips.length > 0) {
+      const blocks = chips.map((f) => formatContextBlock(f, t));
       finalMessage = finalMessage.trimEnd() + '\n' + blocks.join('\n');
     }
-    onSend(finalMessage, readyAttachments, slashCommands, {
-      model: pillModel,
-      reasoningEffort: sentEffort,
-      fastMode: resolvedFastMode,
-      marketWatch: effectiveMarketWatch,
-      subagentsAllowed: draftSubagents,
-      ...ownOverrides,
-      widgetSnapshots: widgetSnapshots.length ? widgetSnapshots : undefined,
+    onSend({
+      text: message,
+      files: readyAttachments,
+      mentions: heldMentions,
+      commands: slashCommands,
+      message: finalMessage,
+      modelOptions: {
+        model: sentModel,
+        reasoningEffort: sentEffort,
+        fastMode: resolvedFastMode,
+        marketWatch: effectiveMarketWatch,
+        subagentsAllowed: draftSubagents,
+        ...ownOverrides,
+        widgetSnapshots: widgetSnapshots.length ? widgetSnapshots : undefined,
+      },
     });
     setMessage('');
-    attachedFiles.forEach(f => { if (f.preview) URL.revokeObjectURL(f.preview); });
-    setAttachedFiles([]);
     resetMentions();
     resetSlash();
     // Clear widget deck on send. Other mounted chat inputs hear the same
@@ -591,19 +811,20 @@ function ChatInput({
       ContextBus.clear();
     }
     setDeckFanned(false);
-    if (textareaRef.current) {
-      textareaRef.current.style.height = 'auto';
-    }
-  }, [hasContent, disabled, message, effectiveMarketWatch, draftSubagents, attachedFiles, setAttachedFiles, onSend, onAction,
-    mentionedFiles, resetMentions, slashCommands, resetSlash,
-    pillModel, sentEffort, resolvedFastMode, ownOverrides, widgetSnapshots, t]);
+    settleAfterSend(textareaRef.current);
+    return true;
+  }, [hasContent, disabled, sendHeld, filesHold, message, effectiveMarketWatch, draftSubagents, discardFiles, takeFiles, onSend, onAction,
+    heldMentions, quotes, chips, resetMentions, slashCommands, resetSlash,
+    sentModel, sentEffort, resolvedFastMode, ownOverrides, widgetSnapshots, t]);
   useEffect(() => {
+    holdsRef.current = filesHold;
     sendRef.current = () => {
-      if (!hasContent || disabled) return false;
-      handleSend();
-      return true;
+      // Held by its files, the draft is still there to send, and the hint
+      // beside Send says what it waits on; nothing went.
+      if (!hasContent || disabled || sendHeld || filesHold) return false;
+      return handleSend();
     };
-  }, [hasContent, disabled, handleSend]);
+  }, [hasContent, disabled, sendHeld, filesHold, handleSend]);
 
   // --- Keyboard & Language Detection ---
   const handleKeyDown = useCallback((e: React.KeyboardEvent<HTMLTextAreaElement>) => {
@@ -619,6 +840,7 @@ function ChatInput({
     // suppresses the mention menu while active).
     if (slashKeyDown(e)) return;
     if (mentionKeyDown(e)) return;
+    if (tokenKeyDown(e)) return;
 
     if (e.key === 'Enter' && !mentionsOpen) {
       // Cmd/Ctrl+Enter inserts a newline at the cursor (browsers suppress this by default)
@@ -636,12 +858,12 @@ function ChatInput({
         }
         return;
       }
-      if (!e.shiftKey) {
+      if (!e.shiftKey && !onScreenKeyboardUp()) {
         e.preventDefault();
         handleSend();
       }
     }
-  }, [slashKeyDown, mentionKeyDown, mentionsOpen, handleSend, isListening, stopListening, message]);
+  }, [slashKeyDown, mentionKeyDown, tokenKeyDown, mentionsOpen, handleSend, isListening, stopListening, message]);
 
   /* --- Progressive toolbar folding ---
    *
@@ -650,6 +872,8 @@ function ChatInput({
    * declaration (priority) order. Widths come from a hidden measure row that
    * renders the SAME components, so any locale / workspace name / model label
    * is measured, never guessed. */
+  const subagentsRef = useRef<HTMLButtonElement>(null);
+  const overflowRef = useRef<HTMLButtonElement>(null);
   const toolbarItems = useToolbarItems({
     scope, onScopeChange, emptyWorkspacesHint,
     subagentsAllowed: shownSubagents, onToggleSubagents: handleToggleSubagents,
@@ -658,35 +882,76 @@ function ChatInput({
     menuDirection: dropdownDirection,
     menuContainer: chatContainer,
     draftRef: textareaRef,
+    subagentsRef,
   });
+  // The model pill names the level and the picker sets it; the level is the
+  // first of the pill to go when the toolbar is short of room.
+  const modelTuning = useMemo<ModelTuning>(() => ({
+    reasoningEffort: resolvedEffort,
+    defaultEffort: settingsEffort,
+    onReasoningEffortChange: handleReasoningEffortChange,
+    fastMode: resolvedFastMode,
+    onFastModeChange: handleFastModeChange,
+  }), [resolvedEffort, settingsEffort, handleReasoningEffortChange, resolvedFastMode, handleFastModeChange]);
 
-  const ringVisible = !!(tokenUsage && tokenUsage.threshold > 0 && tokenUsage.total > 0);
+  const usageCounted = !!(tokenUsage && tokenUsage.threshold > 0 && tokenUsage.total > 0);
+  // A due summary keeps the ring up where the window is not counted yet (a
+  // thread loaded with no call replayed, say), since the ring is where it is said.
+  const summary = notices?.summary ?? null;
+  const ringVisible = usageCounted || !!summary;
+  const ringSlot = ringVisible || tokenUsagePending;
   const micReserved = speechSupported && !!otherPref?.voice_input_enabled;
-  const { measureRowRef, fold } = useToolbarFold({
+  // Right group: the model pill (measured), the mic, and send/stop. A turn
+  // hides the mic but keeps its room, so the fold set holds through it.
+  const rightGroup = (model: number) => GROUP_GAP + model
+    + (micReserved ? TOOLBAR_GAP + ICON_BUTTON_W : 0)
+    + TOOLBAR_GAP + ICON_BUTTON_W;
+  const { measureRowRef, statusRef, fold } = useToolbarFold({
     containerRef: chatContainerRef,
     items: toolbarItems,
     // The model pill is measured too, but it isn't foldable. Its label joins
     // the key because an authored display_name comes with the models request,
     // which can land after the pill was first measured under the key's label.
-    measureKey: `${pillModel}|${getModelDisplayName(pillModel, modelMetadata)}|${resolvedEffort}|${resolvedFastMode && isCodexModel}`,
+    measureKey: `${pillModel}|${getModelDisplayName(pillModel, modelMetadata)}|${reasoningEfforts.join(',')}|${resolvedEffort}|${codexModel}`,
     // Left of the first pill: container border + px-3, the attach button, and
     // the optional ring / chart-capture button (see the action bar below).
     fixedLeft: CONTAINER_BORDER + CONTAINER_PX + ICON_BUTTON_W
-      + (ringVisible ? TOOLBAR_GAP + ICON_BUTTON_W : 0)
+      + (ringSlot ? TOOLBAR_GAP + ICON_BUTTON_W : 0)
       + (onCaptureChart ? TOOLBAR_GAP + ICON_BUTTON_W : 0),
-    // Right group: the model pill (measured), the mic, and send/stop. A turn
-    // hides the mic but keeps its room, so the fold set holds through it.
-    rightReserve: (widths) => GROUP_GAP + (widths.model ?? 0)
-      + (micReserved ? TOOLBAR_GAP + ICON_BUTTON_W : 0)
-      + TOOLBAR_GAP + ICON_BUTTON_W,
+    rightReserve: (widths) => rightGroup(widths.model ?? 0),
+    rightFloor: (widths) => rightGroup(widths.modelFloor ?? 0),
   });
   const inlineItems = toolbarItems.filter((i) => fold.inline.has(i.id));
   const foldedItems = toolbarItems.filter((i) => fold.folded.includes(i.id));
+  // Folded into ⋯, the toggle's offer points at ⋯, where the toggle now is.
+  const subagentsAnchor = fold.folded.includes('subagents') ? overflowRef : subagentsRef;
+  // The subagents offer waits while ⋯ is open: its toggle there keeps the
+  // menu open, and the offer would open over it. A menu gone with the last
+  // folded item never says it closed.
+  const [overflowOpen, setOverflowOpen] = useState(false);
+  if (overflowOpen && foldedItems.length === 0) setOverflowOpen(false);
 
   const favorites = useFavoriteModels();
+  const account = useAccount();
   const { entryFor } = useProviderCatalog();
+  // A Claude Code model runs a turn while the token where the turn's
+  // workspace (Home's for the Chief of Staff) runs it works or could not be
+  // checked, as admission lets it;
+  // otherwise its row says why, and where the user can fix it: that
+  // computer's token, or the saved one. One whose Claude plan is used up for
+  // it waits for the reset, unless usage credits carry it, told by the
+  // picker's own minute clock (`now`), so the composer does not turn with the
+  // minute.
+  const { claudeCode } = turn;
+  // A computer too small for Claude Code holds its models back with what gets
+  // it to Medium, which picking one of them does.
+  const mediumHold = useMediumHold(claudeCode.state === 'needs_bigger_computer' ? claudeCode.smallComputerId : null);
+  // For a user with no computer of their own, a hold the cloud steps clear
+  // says the step to take and opens the steps instead.
+  const stepsHold = useStepsHold(claudeCode, chiefOfStaff, selectedWorkspaceId, capabilities.claudeCode);
+  const planReader = usePlanReader();
   const modelGroupList = useMemo(() => modelGroups({
-    models: visibleModels,
+    models: turn.models,
     payers,
     brandOf: (group) => {
       const entry = entryFor(group);
@@ -696,10 +961,46 @@ function ChatInput({
         label: visibleModels[entry.group]?.display_name ?? entry.group_display_name ?? entry.display_name,
       };
     },
-  }), [visibleModels, payers, entryFor]);
+  }), [turn.models, visibleModels, payers, entryFor]);
   const recentModels = deriveRecentModels({ selectedModel: pillModel, threadModels: threadModelsProp, validModelNames })
     .filter((m) => !favorites.models.includes(m));
-  const showEffort = hasTuningMenu(reasoningEfforts, isCodexModel);
+  const modelRowStatus = (m: string, now: number): ModelRowStatus => {
+    // A favorite or a thread's model a rule keeps a turn off stays listed and
+    // says which rule; nothing the user does here frees it.
+    const refusedBy = modelRefusedBy(account.policy, modelMetadata, m);
+    if (refusedBy) {
+      const who = account.setterName(refusedBy);
+      return { unavailable: t(modelRuleRowKey(refusedBy, modelMetadata[m]), { who: who.start, whoMid: who.mid }) };
+    }
+    if (isClaudeCodeModel(modelMetadata[m])) {
+      if (!capabilities.claudeCode) return { unavailable: t('sharedWorkspace.unavailable') };
+      if (stepsHold) return stepsHold;
+      if (mediumHold) return mediumHold;
+      const hold = claudeCodeHold(claudeCode.state, turn.workspaceId, {
+        home: chiefOfStaff, cliComputerName: claudeCode.cliComputerName,
+      });
+      if (hold) {
+        const { link } = hold;
+        return {
+          unavailable: t(hold.messageKey, hold.messageValues),
+          fix: link ? () => followErrorLink(link, navigate) : undefined,
+        };
+      }
+      const planOut = planOutOf(preferences?.other_preference);
+      const planHold = pickerPlanHold(t, claudeCode.plan, planOut, m, { ...planReader, now });
+      const credential = claudeCode.meter?.credential;
+      if (planHold && credential && creditsRefused(claudeCode.plan, planOut, m, now)) {
+        return { unavailable: planHold, check: { credential, checkAfter: claudeCode.meter?.checkAfter ?? null } };
+      }
+      if (planHold) return { unavailable: planHold };
+    }
+    const signIn = lapsedSignIn(m)?.reason;
+    return {
+      tag: signIn === 'expired' ? t('modelAccess.status.needsReauth')
+        : signIn === 'missing' ? t('modelAccess.status.notConnected')
+        : undefined,
+    };
+  };
 
   return (
     <div
@@ -709,16 +1010,33 @@ function ChatInput({
       onDragLeave={onDragLeave}
       onDrop={onDrop}
     >
-      {/* Main Container. 22px is concentric with the 12px send button 10px in
-          from the bottom edge (DESIGN.md, Radius); the drag and recording
-          overlays repeat it. */}
+      {/* Main Container. 16px, concentric with the 8px send button set 8px
+          into the corner (DESIGN.md, Radius). Terminal and Soft state
+          their own corners for the composer, its send button and the rows
+          stacked on it (--cs-composer-*, styles/cardStyle.css); the drag and
+          recording overlays repeat the corner, and the open styles draw the
+          edge in theirs. */}
       <div
         ref={attachChatContainer}
-        className={cn('chat-input-container owns-its-edge flex flex-col items-stretch relative z-10 rounded-[22px] cursor-text border border-(--color-border-input) bg-(--color-bg-card)', isListening && 'recording')}
-        onClick={() => textareaRef.current?.focus()}
+        data-composer-box
+        className={cn('chat-input-container owns-its-edge scroll-mb-2 flex flex-col items-stretch relative z-10 rounded-[var(--cs-composer-radius,16px)] cursor-text border border-[color:var(--color-shell-edge,var(--color-border-input))] bg-(--color-bg-card)', isListening && 'recording')}
+        onClick={(event) => {
+          // A press on a control in the box is that control's, and the deck
+          // above the text is its own surface: focusing the text there would
+          // raise a phone's keyboard over the page the press was about.
+          if (event.target instanceof Element && event.target.closest('button, a, input, select, [role="button"], [data-composer-deck]')) return;
+          textareaRef.current?.focus();
+        }}
       >
         {isListening && <VoiceOverlay />}
+        {header}
         <div className="flex flex-col px-3 pt-3 pb-2 gap-2">
+
+          {/* The deck folds, and the column's gap below it cannot: a gap lands
+              whole the frame the deck mounts and vanishes the frame it hides.
+              The deck carries the gap as its own bottom margin, inside the
+              fold, and this cancels the column's. */}
+          {deck && <div data-composer-deck className="-mb-2">{deck}</div>}
 
           {/* Widget context deck — top card visible, others peek behind */}
           {widgetSnapshots.length > 0 && (
@@ -741,18 +1059,12 @@ function ChatInput({
             />
           )}
 
-          <ComposerPills
-            slashCommands={slashCommands}
-            onRemoveCommand={slash.removeCommand}
-            mentionedFiles={mentionedFiles}
-            onRemoveMention={mentions.removeMention}
-          />
-
           <ComposerAttachments
             chartImage={chartImage}
             onRemoveChartImage={onRemoveChartImage}
             files={attachedFiles}
             onRemoveFile={removeFile}
+            onRetryFile={retryFile}
             isMobile={isMobile}
           />
 
@@ -783,27 +1095,49 @@ function ChatInput({
             )}
           </AnimatePresence>
 
-          {/* Textarea */}
-          <div className="relative">
+          {/* Textarea, starting on the line the chips end on while it fits
+              there: its basis grows with the draft until it takes a line of
+              its own, where the text has the whole width to wrap in. */}
+          <div className="relative flex flex-wrap items-start gap-x-2">
+            <ComposerChips chips={chips} onRemove={removeMention} />
+            <div
+              className="relative min-w-0 flex-[1_1_5rem]"
+              style={chips.length > 0 ? { flexBasis: message.includes('\n') ? '100%' : `max(5rem, ${message.length + 1}ch)` } : undefined}
+            >
+            <DraftTokenLayer
+              text={message}
+              tokens={draftTokens}
+              quotes={quotes}
+              layerRef={tokenLayerRef}
+              onQuotePress={handleQuotePress}
+              onWheel={(e) => { if (textareaRef.current) textareaRef.current.scrollTop += e.deltaY; }}
+              className={`font-content ${isMobile ? 'text-base' : 'text-sm'} leading-relaxed transition-opacity ${isListening ? 'opacity-20' : 'opacity-100'}`}
+            />
             <textarea
               ref={textareaRef}
               value={message}
               onChange={handleChange}
               onPaste={handleTextareaPaste}
               onKeyDown={handleKeyDown}
+              onSelect={handleSelect}
               onBlur={handleBlur}
+              onScroll={(e) => { if (tokenLayerRef.current) tokenLayerRef.current.scrollTop = e.currentTarget.scrollTop; }}
               onCompositionStart={() => {
                 // Terminate voice input if IME starts
                 if (isListening) {
                   stopListening();
                 }
               }}
-              placeholder={isListening ? "" : (placeholder ?? t("chat.placeholderDefault"))}
-              className={`font-content w-full bg-transparent border-0 text-(--color-text-primary) ${isMobile ? 'text-base' : 'text-sm'} placeholder:text-(--color-text-tertiary) resize-none overflow-y-auto leading-relaxed block transition-opacity ${isListening ? 'opacity-20' : 'opacity-100'}`}
+              // Named apart from the placeholder, which says what state the
+              // thread is in and is empty while listening.
+              aria-label={t("chat.composer.messageLabel")}
+              placeholder={isListening || chips.length > 0 ? "" : (placeholder ?? t(capabilities.placeholderKey))}
+              className={`relative font-content w-full bg-transparent border-0 text-(--color-text-primary) ${isMobile ? 'text-base' : 'text-sm'} placeholder:text-(--color-text-tertiary) resize-none overflow-y-auto leading-relaxed block transition-opacity ${isListening ? 'opacity-20' : 'opacity-100'}`}
               rows={minRows}
               disabled={disabled}
               style={{ minHeight: `${minRows * 1.5}em` }}
             />
+            </div>
           </div>
 
           {/* Action Bar */}
@@ -824,8 +1158,8 @@ function ChatInput({
               </button>
 
               {/* Token Usage Ring */}
-              {ringVisible && tokenUsage && (
-                <TokenUsageRing tokenUsage={tokenUsage} />
+              {ringSlot && (
+                <TokenUsageRing tokenUsage={usageCounted ? tokenUsage : null} threadId={threadId} summary={summary} />
               )}
 
               {/* Chart Capture (trading only) */}
@@ -851,10 +1185,23 @@ function ChatInput({
                   items={foldedItems}
                   side={dropdownDirection === 'down' ? 'bottom' : 'top'}
                   container={isMobile ? chatContainer : undefined}
+                  triggerRef={overflowRef}
+                  onOpenChange={setOverflowOpen}
                 />
               )}
+              <NoticePopover
+                notice={notices?.subagents ?? null}
+                anchorRef={subagentsAnchor}
+                blocked={overflowOpen}
+                align="start"
+                side={dropdownDirection === 'down' ? 'bottom' : 'top'}
+              />
 
-              {toolbarStatus}
+              {/* Measured where it paints, for the fold's last resort. The
+                  gap before it moves inside (its own cancelled, its child's
+                  margin in its place), so an absent or hidden status takes
+                  no room and the measured width is the whole cost. */}
+              <span ref={statusRef} className="-ml-1 flex flex-none items-center *:ml-1">{toolbarStatus}</span>
 
               {/* Hidden measure row — the SAME components rendered geometry-only
                   (no handlers, menus, or aria state), so the fold budget can
@@ -868,7 +1215,10 @@ function ChatInput({
                   <span key={item.id} data-measure={item.id}>{item.inline({ measureOnly: true })}</span>
                 ))}
                 <span data-measure="model">
-                  <ModelTriggerMeasure selectedModel={pillModel} metadata={modelMetadata} effortLabel={effortLabelFor(t, resolvedEffort)} fast={resolvedFastMode === true && isCodexModel} showEffort={showEffort} />
+                  <ModelTriggerMeasure selectedModel={pillModel} metadata={modelMetadata} reasoningEffort={resolvedEffort} />
+                </span>
+                <span data-measure="modelFloor">
+                  <ModelTriggerMeasure selectedModel={pillModel} metadata={modelMetadata} floor />
                 </span>
               </div>
             </div>
@@ -884,25 +1234,17 @@ function ChatInput({
                 recent={recentModels}
                 onToggleFavorite={(m, on) => (on ? favorites.add(m) : favorites.remove(m))}
                 onSelectModel={handlePickModel}
-                needsSignIn={(m) => lapsedSignIn(m) !== null}
+                rowStatus={modelRowStatus}
+                planMeter={claudeCode.meter}
                 dropdownDirection={dropdownDirection}
                 container={chatContainer}
                 draftRef={textareaRef}
                 disabled={modelsLoading}
-              />
-              <ChatInputEffortMenu
-                effortLabel={effortLabelFor(t, resolvedEffort)}
-                reasoningEffort={resolvedEffort}
-                defaultEffort={settingsEffort}
-                reasoningEfforts={reasoningEfforts}
-                onReasoningEffortChange={handleReasoningEffortChange}
-                fastMode={resolvedFastMode}
-                onFastModeChange={handleFastModeChange}
-                isCodexModel={isCodexModel}
-                dropdownDirection={dropdownDirection}
-                container={chatContainer}
-                taskCost={pillModel ? modelMetadata[pillModel]?.task_cost : undefined}
-                disabled={modelsLoading}
+                nameHidden={fold.nameHidden}
+                levelHidden={fold.levelHidden}
+                notice={notices?.model ?? null}
+                tuning={modelTuning}
+                taskCostBaseline={taskCostBaseline}
               />
               {/* Voice input, when enabled in settings. */}
               {micReserved && (
@@ -913,9 +1255,11 @@ function ChatInput({
                   onToggle={toggleListening}
                 />
               )}
+              {/* Also beside Stop: Enter steering a running turn waits on the files too. */}
+              {filesHold && <FilesHoldHint uploading={uploadingCount} failed={failedCount} />}
               <SendStopButton
                 running={isLoading || isCompacting}
-                canSend={!!hasContent && !disabled}
+                canSend={!!hasContent && !disabled && !sendHeld && !filesHold}
                 onSend={handleSend}
                 onStop={onStop}
               />

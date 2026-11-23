@@ -14,9 +14,10 @@ import {
   integer,
   relativeTime,
 } from '@/lib/format';
+import { signedPercent } from '@/lib/priceMove';
 import { cronToHuman } from '@/pages/Automations/utils/cron';
 import { formatPriceTrigger } from '@/pages/Automations/utils/price';
-import type { Automation, MarketMovers, OptionsChain } from './cardReaders';
+import type { Automation, MarketMovers, OptionRow, OptionsChain } from './cardReaders';
 
 // ─── The market's session ───────────────────────────────────────────
 
@@ -108,6 +109,12 @@ export function optionsEdge(
   };
 }
 
+/** A stale contract's tooltip: no trade this session, and when the feed showed its last one. */
+export function staleOptionTitle(t: TFunction, row: OptionRow): string | undefined {
+  if (!row.stale) return undefined;
+  return t('toolArtifact.staleOption', { time: (row.updated ?? '').slice(0, 16) });
+}
+
 /** A row's expiry in its column: the day alone when every expiry shares a year, since the edge names it. */
 export function expiryLabeler(expiries: readonly string[], locale: string): (day: string | undefined) => string {
   const format = new Set(expiries.map((e) => e.slice(0, 4))).size <= 1 ? formatCalendarMonthDay : formatCalendarDay;
@@ -133,11 +140,9 @@ export function performancePoints(performance: Record<string, number> | undefine
     .map(([key, name]) => ({ name, value: performance[key] }));
 }
 
-/** A period's move, signed: `+1.25%`. */
+/** A period's move as every card prints one (`signedPercent`): `+1.25%`, `0.00%`. */
 export function formatPct(val: number | null | undefined): string {
-  if (val == null) return 'N/A';
-  const sign = val >= 0 ? '+' : '';
-  return `${sign}${val.toFixed(2)}%`;
+  return val == null ? 'N/A' : signedPercent(val);
 }
 
 // ─── Filings ────────────────────────────────────────────────────────

@@ -17,6 +17,9 @@ from datetime import datetime, timezone
 from typing import Any, Awaitable, Callable, Coroutine, Dict, Optional
 from uuid import uuid4
 
+from src.server.contracts.status import SUSPENSION_STOPPER, is_suspension_stop
+from src.server.contracts.status import unreachable_facts
+from src.server.contracts.turn_kinds import RUN_ORIGIN_META, classify_origin
 from src.server.database.runs import lifecycle as tl_db
 from src.server.database.runs.lifecycle import (  # re-exported for callers
     AttemptConflictError,
@@ -111,7 +114,10 @@ class RunHandle:
     turn_index: int
     attempt_no: int
     workspace_id: Optional[str] = None
+    #: The sender, whom the run's row names.
     user_id: Optional[str] = None
+    #: The account its usage rows name (``TurnIdentity.recorded_as``).
+    recorded_as: Optional[str] = None
     is_byok: bool = False
     started_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
     finalized: bool = False
@@ -122,6 +128,8 @@ class RunHandle:
     # The ``pending_input`` stamp a failure or a stop before the graph took
     # this attempt's input records on its row; empty when /retry should replay.
     pending_input: Dict[str, Any] = field(default_factory=dict)
+    # Where the run came from (``turn_kinds.RunOrigin``), as START classified it.
+    origin: Optional[str] = None
 
     @property
     def checkpointer(self) -> Optional[Any]:
@@ -161,6 +169,10 @@ def _with_detached_failure_kind(outcome: RunOutcome) -> RunOutcome:
     kind = sent.get("error_kind") if sent else "internal"
     if kind:
         outcome.metadata = {**(outcome.metadata or {}), "error_kind": kind}
+        # An unreachable machine's code and name, which the row's own replay
+        # words it by.
+        if kind == "computer_unreachable" and sent:
+            outcome.metadata.update(unreachable_facts(sent))
     return outcome
 
 
@@ -185,6 +197,7 @@ class RunCoordinator:
         request_key: Optional[str] = None,
         workspace_id: Optional[str] = None,
         user_id: Optional[str] = None,
+        recorded_as: Optional[str] = None,
         is_byok: bool = False,
         query: Optional[QuerySpec] = None,
         fork: Optional[ForkSpec] = None,
@@ -237,6 +250,12 @@ class RunCoordinator:
             metadata["user_id"] = user_id
         if workspace_id:
             metadata["workspace_id"] = workspace_id
+        # Classified here, the one place that knows whether the run asks a
+        # query of its own; the settle reads the stamp back (``run_origin``).
+        origin = classify_origin(
+            metadata, query.query_type if query is not None else None
+        )
+        metadata[RUN_ORIGIN_META] = origin
 
         guard = None
         handle = None
@@ -268,10 +287,12 @@ class RunCoordinator:
                 attempt_no=row["attempt_no"],
                 workspace_id=workspace_id,
                 user_id=user_id,
+                recorded_as=recorded_as,
                 is_byok=is_byok,
                 started_at=row["created_at"],
                 guard=guard,
                 pending_input=pending_input or {},
+                origin=origin,
             )
             if guard is not None:
                 guard.bind_owner(handle)
@@ -286,6 +307,8 @@ class RunCoordinator:
             #   (unlike run_settled, which rides the outbox). Time-bounded, and
             #   a timeout is swallowed HERE so it can't reach the guard-release
             #   below and fail the turn over a hint.
+            from src.server.database.runs.hook_jobs import SHARED_ORG_META
+            from src.server.services.notices import compose_started
             from src.server.services.thread_control_stream import (
                 announce_run_started,
             )
@@ -302,6 +325,13 @@ class RunCoordinator:
                             workspace_id=metadata.get("workspace_id"),
                             run_id=run_id,
                             run_seq=row.get("run_seq"),
+                            origin=origin,
+                            notification=compose_started(
+                                origin,
+                                row.get("thread_title"),
+                                metadata.get("automation_name"),
+                            ),
+                            shared_org=metadata.get(SHARED_ORG_META),
                         ),
                         timeout=1.0,
                     )
@@ -456,21 +486,27 @@ class RunCoordinator:
         """
         if handle.finalized:
             return None
+        outcome = RunOutcome(
+            status=status,
+            metadata=metadata or {},
+            errors=[error_message],
+            execution_time=(datetime.now(timezone.utc) - handle.started_at).total_seconds(),
+        )
+
+        async def _finalize() -> Optional[FinalizeResult]:
+            try:
+                return await self.finalize_run(handle, outcome)
+            except tl_db.RunNotFoundError:
+                # The row is gone (its thread or turn was deleted), so nothing
+                # holds the thread's slot.
+                logger.info(
+                    f"[RunCoordinator] fail_open_run: run={handle.run_id} has "
+                    f"no row; nothing to settle"
+                )
+                return None
+
         try:
-            return await protected_finalize(
-                self.finalize_run(
-                    handle,
-                    RunOutcome(
-                        status=status,
-                        metadata=metadata or {},
-                        errors=[error_message],
-                        execution_time=(
-                            datetime.now(timezone.utc) - handle.started_at
-                        ).total_seconds(),
-                    ),
-                ),
-                label=handle.run_id,
-            )
+            return await protected_finalize(_finalize(), label=handle.run_id)
         except Exception:
             logger.error(
                 f"[RunCoordinator] fail_open_run could not finalize "
@@ -524,6 +560,7 @@ class RunCoordinator:
                 run_id,
                 final_status,
                 error_frame=error_frame if final_status == "error" else None,
+                stopped_by=SUSPENSION_STOPPER if is_suspension_stop(result.run) else None,
             )
         return result
 
@@ -695,7 +732,7 @@ class RunCoordinator:
             usage = UsagePersistenceService(
                 thread_id=handle.thread_id,
                 workspace_id=handle.workspace_id,
-                user_id=handle.user_id,
+                user_id=handle.recorded_as,
             )
             if outcome.per_call_records:
                 await usage.track_llm_usage(outcome.per_call_records)
@@ -740,13 +777,17 @@ class RunCoordinator:
         self, thread_id: str, run: Optional[Dict[str, Any]]
     ) -> None:
         """The uniform after-a-won-CAS tail: every site that applies a
-        terminal transition schedules the replay refresh and the
-        transcript export and nudges the drainer, so they never drift apart
+        terminal transition schedules the replay refresh, the search index
+        and the transcript export and nudges the drainer, so they never drift apart
         per call site. The export runs at every terminal status, since each
         stamps the checkpoint and another thread may read this one's
-        transcript."""
+        transcript, and so does the check on artifacts kept updated, since a
+        failed or cancelled turn may have changed their files too."""
         self._schedule_replay_refresh(thread_id)
+        self._schedule_search_index(thread_id)
         self._schedule_transcript_export(thread_id, run)
+        self._schedule_keep_updated(run)
+        self._schedule_activity_stamp(run)
         self._schedule_archive_prune(thread_id)
         self._nudge_hook_drainer()
 
@@ -774,6 +815,19 @@ class RunCoordinator:
                 exc_info=True,
             )
 
+    def _schedule_search_index(self, thread_id: str) -> None:
+        # After the replay refresh, which the indexer waits out to read the
+        # turns it projects.
+        try:
+            from src.server.services.search.index import schedule_search_index
+
+            schedule_search_index(thread_id)
+        except Exception:
+            logger.warning(
+                f"[RunCoordinator] search index scheduling failed for {thread_id}",
+                exc_info=True,
+            )
+
     def _schedule_archive_prune(self, thread_id: str) -> None:
         # An archived thread keeps its scratchpad while a run writes to it,
         # and nothing else asks for the prune once that run ends.
@@ -784,6 +838,57 @@ class RunCoordinator:
         except Exception:
             logger.warning(
                 f"[RunCoordinator] archive prune scheduling failed for {thread_id}",
+                exc_info=True,
+            )
+
+    def _schedule_keep_updated(self, run: Optional[Dict[str, Any]]) -> None:
+        # From the row's START stamp, as the export's workspace is.
+        meta = (run or {}).get("metadata") or {}
+        workspace_id, user_id = meta.get("workspace_id"), meta.get("user_id")
+        if not workspace_id or not user_id:
+            return
+        try:
+            from src.server.services.artifacts.snapshot import keep_updated_after_turn
+
+            spawn_protected(
+                keep_updated_after_turn(
+                    workspace_id=str(workspace_id), user_id=str(user_id)
+                ),
+                f"artifacts-keep-updated-{workspace_id}",
+            )
+        except Exception:
+            logger.warning(
+                f"[RunCoordinator] keep-updated scheduling failed for "
+                f"workspace {workspace_id}",
+                exc_info=True,
+            )
+
+    def _schedule_activity_stamp(self, run: Optional[Dict[str, Any]]) -> None:
+        # Only a turn's start stamps the idle clock otherwise, so a turn longer
+        # than the idle timeout ends on a machine the next sweep stops. A Home
+        # turn in Home's stand-in ran in the stand-in, on its computer.
+        from src.server.database.home_workspace import (
+            STAND_IN_COMPUTER,
+            get_home_stand_in_id,
+        )
+
+        meta = (run or {}).get("metadata") or {}
+        workspace_id = meta.get("workspace_id")
+        if meta.get(STAND_IN_COMPUTER) and meta.get("user_id"):
+            workspace_id = get_home_stand_in_id(str(meta["user_id"]))
+        if not workspace_id:
+            return
+        try:
+            from src.server.database.workspace import update_workspace_activity
+
+            spawn_protected(
+                update_workspace_activity(str(workspace_id)),
+                f"turn-end-activity-{workspace_id}",
+            )
+        except Exception:
+            logger.warning(
+                f"[RunCoordinator] activity stamp scheduling failed for "
+                f"workspace {workspace_id}",
                 exc_info=True,
             )
 

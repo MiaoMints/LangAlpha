@@ -20,6 +20,10 @@ BLOB_KEY_PREFIX = "blobs/"
 # ``blobs/`` like any other.
 UPLOAD_KEY_PREFIX = "uploads/"
 
+# Where a chat attachment waits for the turn that sends it, and stays after:
+# the object is the copy the thread's history shows.
+ATTACHMENT_KEY_PREFIX = "attachments/"
+
 # One blob backs files with different names and MIME types, so any per-file
 # content type would be write-order-dependent and wrong for some referrer.
 # Serving derives Content-Type from the file's extension instead.
@@ -100,6 +104,22 @@ def upload_key(user_id: str, upload_id: str) -> str:
     return f"{UPLOAD_KEY_PREFIX}{user_id}/{upload_id}"
 
 
+def attachment_key(attachment_id: str, name: str) -> str:
+    """Return the object key a chat attachment is stored under.
+
+    Not scoped per user, unlike the keys above: the thread's history links to
+    the object directly, and the unguessable id is what keeps that link
+    private. The name is kept so the link downloads under it, made one safe
+    path segment.
+    """
+    if not _UUID_RE.match(attachment_id or ""):
+        msg = f"Refusing to build an attachment key for a non-UUID: {attachment_id!r}"
+        raise BlobError(msg)
+    lines = name.splitlines()
+    segment = (lines[0].strip()[:120] if lines else "").replace("/", "_") or "file"
+    return f"{ATTACHMENT_KEY_PREFIX}{attachment_id}/{segment}"
+
+
 # --- registry SQL -------------------------------------------------------------
 #
 # The statements a writer and the sweep have to agree on, character for
@@ -128,7 +148,8 @@ CLAIM_SQL = """
 """
 
 # Every column a row can reference a blob through: a manifest row's own object
-# or the pack chunk it is a member of, and a stored thread transcript file.
+# or the pack chunk it is a member of, a stored thread transcript file, and a
+# file of a published artifact version.
 # Written against a ``workspace_file_blobs b``; the condemn pass, the reap
 # re-check and the orphan report must agree on it exactly. A row references a
 # registry entry only under the same user, since that user's object is the
@@ -142,7 +163,9 @@ REFERENCED_SQL = (
     " JOIN workspaces w ON w.workspace_id = f.workspace_id"
     " WHERE f.pack_sha256 = b.sha256 AND w.user_id = b.user_id)"
     " OR EXISTS (SELECT 1 FROM thread_transcript_files t"
-    " WHERE t.sha256 = b.sha256 AND t.user_id = b.user_id))"
+    " WHERE t.sha256 = b.sha256 AND t.user_id = b.user_id)"
+    " OR EXISTS (SELECT 1 FROM artifact_version_files a"
+    " WHERE a.sha256 = b.sha256 AND a.user_id = b.user_id))"
 )
 
 # The manifest side of the same relation: an unaliased ``workspace_files``

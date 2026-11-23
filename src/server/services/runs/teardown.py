@@ -13,6 +13,9 @@ from contextlib import suppress
 from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable
 
+from langgraph.channels import DeltaChannel
+
+from ptc_agent.agent.middleware.background_subagent.registry import CANCEL_UNWIND_TIMEOUT
 from src.config.settings import (
     get_checkpoint_flush_timeout,
     get_stop_drain_timeout,
@@ -61,13 +64,14 @@ async def flush_checkpoint(graph: Any, thread_id: str) -> None:
         if not values:
             return
 
-        # Exclude `messages` from the re-write. The committed messages are
-        # already in this snapshot and carry forward on the DeltaChannel, so
-        # re-writing the full list only re-applies every message as a delta —
-        # and any still-id-less tail message appends as a duplicate (the
+        # Exclude every DeltaChannel key (`messages` among them) from the
+        # re-write. What they hold is already in this snapshot and carries
+        # forward on the channel, so re-writing it only re-applies it as a
+        # delta — and any still-id-less tail entry appends as a duplicate (the
         # reducer keys dedup on id). The remaining keys (private compaction /
         # offload state) are last-write-wins, so re-writing them is idempotent.
-        flush_values = {k: v for k, v in values.items() if k != "messages"}
+        deltas = {k for k, ch in graph_any.channels.items() if isinstance(ch, DeltaChannel)}
+        flush_values = {k: v for k, v in values.items() if k not in deltas}
         if not flush_values:
             return
 
@@ -93,8 +97,13 @@ async def teardown_subagents_on_stop(
     *,
     orphan_collectors: dict[asyncio.Task, str],
     drain: Callable[[str, list], Awaitable[list[dict]]],
+    restart: bool = False,
 ) -> None:
     """Single-owner subagent teardown on a stop, scoped to the stopped run.
+    On a graceful restart's stop the run's subagents are stopped as the
+    restart stops them, resumable, before the kill: ones the turn launched or
+    resumed after the drain stopped the rest would otherwise end as a stop
+    nothing resumes.
 
     Order (decision 1A, amended): list this run's tasks, cancel this run's
     orphan collectors, kill and claim its subagents
@@ -138,6 +147,12 @@ async def teardown_subagents_on_stop(
             await asyncio.gather(*collectors, return_exceptions=True)
         for collector in collectors:
             orphan_collectors.pop(collector, None)
+
+    if restart:
+        with suppress(Exception):
+            writers = await registry_store.stop_run_writers_for_restart(thread_id, run_id)
+            if writers:
+                await asyncio.wait(writers, timeout=CANCEL_UNWIND_TIMEOUT)
 
     # --- 4. Kill and claim this run's subagents; the registry and prior-turn
     # tasks survive for their own collectors. cancel_run_tasks awaits the

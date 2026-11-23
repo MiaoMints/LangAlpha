@@ -20,6 +20,7 @@ never touch this module.
 
 from __future__ import annotations
 
+import functools
 import json
 import logging
 from dataclasses import dataclass
@@ -28,7 +29,7 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, Field
 
-from ptc_agent.config.core import MCPServerConfig, VaultBlueprint
+from ptc_agent.config.core import MCPServerConfig, ServerAuth, VaultBlueprint
 from ptc_agent.config.file_utils import substitute_env_vars
 
 logger = logging.getLogger(__name__)
@@ -61,6 +62,9 @@ class ServerMeta(BaseModel):
     # The mark this server wears when it is a different brand from its
     # package's, as a site or the https address of the image itself.
     icon: str | None = None
+    # Bundles only, like ``vault_blueprints``: see MCPServerConfig.
+    auth: ServerAuth | None = None
+    tools: list[str] | None = None
 
     model_config = {"extra": "forbid"}
 
@@ -191,20 +195,28 @@ def _expand(value: Any) -> Any:
     return value
 
 
-def _server_metas(block: dict[str, Any], bundle: str) -> dict[str, ServerMeta]:
+def _server_metas(block: dict[str, Any], bundle: str) -> dict[str, ServerMeta | None]:
+    """Each declared server's meta, None for one whose block does not validate.
+
+    None rather than a blank meta: the block can carry the server's ``auth``
+    and its ``tools`` allowlist, and a server read without them would run as a
+    plain built-in exposing every tool its vendor lists, on a credential it
+    was never meant to have.
+    """
     declared = block.get("servers")
     if not isinstance(declared, dict):
         return {}
-    metas: dict[str, ServerMeta] = {}
+    metas: dict[str, ServerMeta | None] = {}
     for key, payload in declared.items():
         try:
             metas[key] = ServerMeta(**payload)
         except (TypeError, ValueError) as e:
-            # The server still runs; it just reaches the prompt undescribed.
             logger.warning(
-                "bundled plugin %s: server %r has an unusable meta block: %s",
+                "bundled plugin %s: server %r has an unusable meta block, so it "
+                "is not loaded: %s",
                 bundle, key, e,
             )
+            metas[key] = None
     return metas
 
 
@@ -221,6 +233,8 @@ def _server(
         "instruction": meta.instruction,
         "tool_exposure_mode": meta.tool_exposure_mode,
         "vault_blueprints": list(meta.vault_blueprints),
+        "tools": meta.tools,
+        "auth": meta.auth,
     }
     if transport == "stdio":
         return MCPServerConfig(
@@ -265,8 +279,11 @@ def bundled_mcp_servers() -> list[MCPServerConfig]:
         for key, entry in bundle.servers.items():
             if not isinstance(key, str) or not isinstance(entry, dict):
                 continue
+            meta = metas.get(key, ServerMeta())
+            if meta is None:
+                continue
             try:
-                server = _server(key, entry, metas.get(key) or ServerMeta())
+                server = _server(key, entry, meta)
             except (TypeError, ValueError) as e:
                 logger.warning(
                     "bundled plugin %s: server %r is unusable: %s",
@@ -318,6 +335,31 @@ def bundled_skill_dirs() -> list[Path]:
 
     A bundle carries its skills as directories rather than as a list, so a
     package that ships one is read the same way whether it arrived in the
-    image or as an upload. Nothing reads the manifest's ``skills`` key.
+    image or as an upload. The manifest's ``skills`` key never says which
+    skills there are; it only describes ones the bundle carries.
     """
     return [d for p in _bundle_dirs() if (d := p / "skills").is_dir()]
+
+
+@functools.lru_cache(maxsize=1)
+def skills_needing_own_data() -> frozenset[str]:
+    """Shipped skills whose work is the sender's own data (their profile,
+    portfolio, dashboard or vault), declared in the bundle's namespace block
+    as ``"skills": {"<name>": {"needs_own_data": true}}``.
+
+    A turn that may not use that data, as in a shared workspace, cannot do
+    what these skills are for, so it is not offered them. Read once per
+    process: ``plugins/`` is not written while the server runs, and every
+    turn asks.
+    """
+    names: set[str] = set()
+    for bundle in bundles():
+        declared = bundle.namespace.get("skills")
+        if not isinstance(declared, dict):
+            continue
+        names.update(
+            name
+            for name, meta in declared.items()
+            if isinstance(meta, dict) and meta.get("needs_own_data") is True
+        )
+    return frozenset(names)

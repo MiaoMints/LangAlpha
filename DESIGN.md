@@ -8,19 +8,25 @@ be declared there (enforced by `web/src/styles/__tests__/tokenRefs.test.ts`).
 
 ## Identity
 
-- **Temperature**: dark charcoal layers / light warm paper. No decorative
+- **Temperature**: dark charcoal layers / light plain gray, no tint. No decorative
   gradients anywhere (`--color-accent-gradient` is intentionally flat).
 - **Accent**: burnished amber — `#E9954A` (dark) / `#D07D33` (light). It is an
   **annotation color, not a brand fill** (see Accent discipline).
 - **Radius**: soft, growing with the element. Pick from the scale, never a new value:
   4px inline code · 6px thumbnails · 8px (`--radius`) the default for rows, tables
-  and most surfaces, and the user's avatar up to 36px · 12px transcript file cards,
-  the composer's send button and the 48px settings avatar · pills (half the height)
-  for chips, tags and agent avatars.
-  - **One exception, the chat composer at 22px**: concentric with its 12px send
-    button, which sits 10px from the bottom edge (12 + 10). The todo tab tucked
-    behind it takes 16px, about 0.7× the composer. Change the composer's radius
-    and the send button's radius or inset together, or the corner pinches.
+  and most surfaces, and the user's avatar up to 36px · 12px transcript file cards
+  and the 48px settings avatar · 16px the chat composer and the rows stacked on it ·
+  pills (half the height) for chips, tags and agent avatars. A corner nested in
+  another is the outer one less the gap between them.
+  - **The composer stack follows the card style** (`--cs-composer-*` in
+    `web/src/styles/cardStyle.css`): the composer, the todo tab tucked behind it
+    and the rows with a surface above it (the error, the restore offer, the disk
+    warning) share one corner. Balanced: 16, with an 8px send button 8px in from the
+    right and bottom edges (16 - 8). Terminal: 6, with a 3px send button.
+    Soft: 22, off the scale because its buttons are pills, so the send button
+    is round and the rows' text sits 14px in to clear the corner. Change the
+    composer's radius and the send button's radius or inset together, or the
+    corner pinches.
 - **Depth**: borders first, shadows second (`--shadow-card` is the only card
   shadow); never glows.
 
@@ -29,14 +35,16 @@ be declared there (enforced by `web/src/styles/__tests__/tokenRefs.test.ts`).
 | Role | Dark | Light |
 |---|---|---|
 | Page ground | `hsl(var(--background))` charcoal ~#191919 | white |
-| Canvas under filled cards (orders; the dashboard's frames sit on the page) | = page | `#F5F4F1` warm paper |
-| Cards | `hsl(var(--card))` ~#202020 | white + `#E8E8E6` hairline |
-| Elevated (menus, tooltips) | `#2A2B2E` | `#F7F7F6` |
+| Canvas for recessed wells (the PDF viewer); every page sits on the page ground | = page | `#F4F4F4` plain gray |
+| Cards | `hsl(var(--card))` ~#202020 | white + `#E6E6E6` hairline |
+| Elevated (menus, tooltips) | `#2A2B2E` | `#F6F6F6` |
 | Primary text | `#E6E6E4` | `#1F1F1E` |
+| Secondary, tertiary, quaternary text (each holds 4.5:1) | `#9B9FA6`, 62%, 55% of primary | `#5F5E5A`, `#716F6B`, `#767571` |
 | Focus ring | = primary text | = primary text |
 | Accent (annotation) | `#E9954A` | `#D07D33` |
 | Primary button | `#ECECEA` bg / `#1A1B1D` text | `#1F1D1A` bg / `#FAF9F7` text |
 | Profit / loss | `#3FB950` / `#F85149` | `#1A7F37` / `#CF222E` |
+| Pick, in a page's comment layer (`--color-info`) | `#6E9EF7` | `#4477D4` |
 | Warning | `#D8B04C` | `#B45309` |
 
 Background roles (`bg-page` → `bg-canvas` → `bg-card`/`bg-tool-card` →
@@ -87,6 +95,14 @@ serves the app from that route once someone is signed in.
 Semantic color (profit/loss/warning/danger) is separate from the accent and
 never substitutes for it.
 
+**Blue is the comment layer's pick color**, and only that: on an HTML file in
+comment mode, the outline and the word box showing what a click would
+pick. It is a question, not a mark, so it never stays on anything; once a
+comment exists, what it marks is amber. A neutral grey cannot do the job,
+because the page under the layer keeps its own colors: a grey suited to the
+app's theme vanishes over a page in the other, and passes for one of the
+page's own borders in either.
+
 ## Status & liveness vocabulary
 
 - **Live work** renders an amber liveness glyph beside text that says what is
@@ -126,25 +142,26 @@ never substitutes for it.
 A tool call that returns data (a quote, a chart, a filing, an order) lands in
 the transcript as a card and opens a detail panel in the same language
 (`web/src/pages/ChatAgent/components/charts/TermCard.tsx`, `TermPanel.tsx`).
-The reader picks one of three styles in Settings, per device
+The reader picks one of three styles in Settings, saved to the account with
+the theme, a copy in the browser painting the first frame
 (`web/src/lib/cardStyle.ts`, stamped on `<html>` as `data-card-style`); the
-dashboard's widgets and windows follow it too:
+dashboard's widgets and windows, and the rest of the app, follow it too:
 
-- **Balanced**: Terminal's frame, its title set into the top edge,
+- **Soft**: Terminal's frame, its title set into the top edge,
   with words in the text face, figures in mono and tags as pills. Data reads as
   data beside the filled cards a reply opens (files, dashboards).
-- **Quiet**, the default: the same type and marks in the platform's own card,
-  filled, its title inside, on the warm grays, so cards change the app least.
+- **Balanced**, the default: the same type and marks in the platform's own card,
+  filled, its title inside, on the platform's grays, so cards change the app least.
 - **Terminal**: the unfilled frame with mono throughout, bracket tags, dashed
   rules and dotted leaders, on a cool palette (the `--color-term-*` tokens) so
-  a figure reads as data against the warm page.
+  a figure reads as data against the gray page.
 
-Terminal is the cards' own stylesheets. Balanced and Quiet live in
+Terminal is the cards' own stylesheets. Soft and Balanced live in
 `charts/termCardStyles.css` and only take marks away, so all three share one
 layout and one set of components. A new card takes its words from the kit's
 classes (`term-label`, `term-caps`, `term-fill`; `term-code` for an identifier
-that stays mono), never from an inline `text-transform`, or the quieter styles
-cannot reach it.
+that stays mono), never from an inline `text-transform`, or the two styles that drop the
+brackets cannot reach it.
 
 ## Motion
 
@@ -193,6 +210,14 @@ critical, so nothing overshoots. Tailwind's bare `transition` and
   over content already showing drew every glyph top first, cut off at the
   bottom. A row opening from rest is launched at its spring's own rate, so the
   space is nearly open in 160ms and the content comes in that much sooner.
+- **A count the reader opens is one fold.** The rows a toggle of the count
+  brings or sends away move together as one panel, the way `Disclosure` does:
+  open on `SPRING_FOLD` with the content standing where it will rest and the
+  edge passing down over it, shut on `EASE_COLLAPSE` with the content dimming
+  as it goes (`countToggle.ts`). The step on the status line is on screen
+  open or shut, so it changes rows with no fade and rides the panel's edge.
+  Rows each opening on their own left a hole as tall as the list, filled a
+  beat later.
 - **Press, not hover.** A committing button scales to 0.97 (`PRESS_SCALE`,
   `--press-scale`) over `press`, through the shared `Button` or the `press`
   class, which carries its own transition list and so never sits beside a

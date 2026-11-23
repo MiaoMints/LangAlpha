@@ -143,6 +143,11 @@ describe('why an automation needs attention', () => {
     ['paused', null, 'usage_limit', null, 'statePaused'],
     // A one-shot price alert a limit ended: the report is still owed.
     ['completed', null, 'usage_limit', 'usage_limit', 'stateUsageLimit'],
+    // The Claude plan's limit leaves the schedule on too, and says whose limit it was.
+    ['active', null, 'claude_plan', 'claude_plan', 'stateClaudePlan'],
+    // So does another subscription's.
+    ['active', null, 'plan_limit', 'plan_limit', 'statePlanLimit'],
+    ['completed', null, 'plan_limit', 'plan_limit', 'statePlanLimit'],
   ];
 
   it.each(cases)('%s, switched off for %s, failed with %s', (status, disable, reason, kind, label) => {
@@ -202,7 +207,14 @@ describe('describeRun', () => {
 
   it('notes why a run waits or was skipped, unless the reader skipped it', () => {
     expect(describeRun(run('waiting')).noteKey).toBe('automation.waitingNote');
+    expect(describeRun(run('waiting', { wait_reason: 'thread_busy' })).noteKey).toBe('automation.waitingNote');
+    expect(describeRun(run('waiting', { wait_reason: 'computer_unreachable' })).noteKey).toBe(
+      'automation.waitingForComputerNote',
+    );
     expect(describeRun(run('skipped', { skip_reason: 'thread_busy' })).noteKey).toBe('automation.skippedThreadBusy');
+    expect(describeRun(run('skipped', { skip_reason: 'computer_unreachable' })).noteKey).toBe(
+      'automation.skippedComputerUnreachable',
+    );
     expect(describeRun(run('skipped', { skip_reason: 'user' })).noteKey).toBeNull();
     expect(describeRun(run('completed')).noteKey).toBeNull();
   });
@@ -212,6 +224,7 @@ describe('describeRun', () => {
     expect(describeRun(run('timeout', { failure_reason: 'interrupted' })).noteKey).toBe('automation.failedInterrupted');
     expect(describeRun(run('failed', { failure_reason: 'usage_limit' })).noteKey).toBeNull();
     expect(describeRun(run('failed', { failure_reason: 'provider_auth' })).noteKey).toBeNull();
+    expect(describeRun(run('failed', { failure_reason: 'plan_limit' })).noteKey).toBeNull();
     // A newer server's reason has no word here yet.
     expect(describeRun(run('failed', { failure_reason: 'quota_v2' as FailureReason })).noteKey).toBeNull();
   });

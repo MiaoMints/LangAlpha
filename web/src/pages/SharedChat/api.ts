@@ -7,8 +7,10 @@
  */
 
 import { getAuthHeaders } from '@/lib/authToken';
+import type { SharedArtifactVisitorMetadata } from '@/types/api';
 import { buildServeUrl } from '../ChatAgent/components/viewers/html/wsfilesUrl';
 import type { BodyReaders } from '../ChatAgent/components/filePanel/fileBody';
+import { LIVE } from '../ChatAgent/utils/api/readFrom';
 import type { FileRefResolution } from '../ChatAgent/components/filePanel/types';
 
 const baseURL: string = import.meta.env.VITE_API_BASE_URL ?? '';
@@ -33,6 +35,12 @@ export interface SharedThreadMetadata {
    *  the move spells its paths under. */
   previous_root_dirs?: string[] | null;
   permissions: Record<string, unknown>;
+  /** `organization` for a link that opens to members only. */
+  audience?: 'organization';
+  /** A member's grant, which stands in for the token on the replay and file
+   *  routes; renewed through this read before `expires_in` runs out. */
+  grant?: string;
+  expires_in?: number;
 }
 
 interface SharedFileFields {
@@ -44,14 +52,16 @@ interface SharedFileFields {
   frame_base: string;
 }
 
-/** What everyone but a private link's owner is answered: a share's prefix, which does not lapse. */
-export interface SharedPublicFileMetadata extends SharedFileFields {
-  access: 'public';
-}
+/** What everyone but the owner is answered: the latest version, read only. */
+export type SharedPublicFileMetadata = SharedArtifactVisitorMetadata;
 
 /** The owner's answer, whose prefix is a grant. */
 export interface SharedOwnerFileMetadata extends SharedFileFields {
   access: 'owner';
+  artifact_id: string;
+  workspace_id: string;
+  shared: boolean;
+  latest_seq: number;
   /** Seconds the grant behind `frame_base` has left when it is answered. */
   expires_in: number;
 }
@@ -63,6 +73,8 @@ export interface SharedAppMetadata {
   kind: 'app';
   title: string;
   url: string;
+  /** The fingerprint of the command behind `url`, which the owner's grant is kept under beside the code. */
+  command_key?: string | null;
   /** Seconds the signed `url` has left when it is answered. */
   expires_in: number;
 }
@@ -106,8 +118,8 @@ export type SSEEvent = Record<string, unknown>;
  * panel read a real 404 as a successful landing, so the reference never fell
  * through to the resolve the owner path takes.
  */
-function sharedFileError(status: number, message: string): Error {
-  return Object.assign(new Error(message), { response: { status } });
+function sharedFileError(status: number, message: string, data?: unknown): Error {
+  return Object.assign(new Error(message), { response: { status, data } });
 }
 
 /**
@@ -115,6 +127,14 @@ function sharedFileError(status: number, message: string): Error {
  * code, a private link asked for by anyone but its owner, and a link whose
  * sharing was stopped; the page reads it off `response.status`.
  */
+async function errorBody(res: Response): Promise<unknown> {
+  try {
+    return await res.json();
+  } catch {
+    return null;
+  }
+}
+
 export async function getSharedMetadata(
   code: string,
   { asVisitor = false, path = null }: { asVisitor?: boolean; path?: string | null } = {},
@@ -125,7 +145,9 @@ export async function getSharedMetadata(
   if (path) params.set('path', path);
   const query = params.toString() ? `?${params}` : '';
   const res = await fetch(`${baseURL}/api/v1/public/shared/${encodeURIComponent(code)}${query}`, { headers });
-  if (!res.ok) throw sharedFileError(res.status, `Shared link not found (${res.status})`);
+  // The body goes with the status: an app that cannot be opened says why
+  // (the owner's machine not answering, say), which its page shows.
+  if (!res.ok) throw sharedFileError(res.status, `Shared link not found (${res.status})`, await errorBody(res));
   const data = (await res.json()) as Partial<ShareMetadata> & Record<string, unknown>;
   // An answer with no kind predates file links and can only be a chat.
   return (data.kind ? data : { ...data, kind: 'thread' }) as ShareMetadata;
@@ -182,11 +204,12 @@ export async function servedObjectUrl(prefix: string, path: string): Promise<str
 export function servedReaders(prefix: string): BodyReaders {
   const text = async (_workspaceId: string, path: string) => ({
     content: await (await served(buildServeUrl(prefix, path))).text(),
+    from: LIVE,
   });
   return {
     readFile: text,
     readFileFull: text,
-    downloadFileAsArrayBuffer: (_workspaceId, path) => servedBytes(prefix, path),
+    downloadFileAsArrayBuffer: async (_workspaceId, path) => ({ buffer: await servedBytes(prefix, path), from: LIVE }),
   };
 }
 

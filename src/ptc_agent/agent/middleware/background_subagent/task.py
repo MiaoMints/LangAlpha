@@ -13,6 +13,7 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Literal
 
 if TYPE_CHECKING:
+    from ptc_agent.config.agent import TaskModel
     from src.utils.cache.stream_quota import StreamQuota
     from src.utils.stream_coalescing import DeltaCoalescer
 
@@ -101,6 +102,15 @@ class BackgroundTask:
 
     handler_task: asyncio.Task | None = None
     """The underlying tool handler task executing the subagent."""
+
+    stragglers: set[asyncio.Task] = field(default_factory=set)
+    """Work the writer left running past a bounded close: a graph step or a
+    stream close that would not stop in time. It can still checkpoint, so it
+    counts among the live writers."""
+
+    stop_at: float | None = None
+    """Wall-clock time the current round's own clock stops it, stop grace
+    included, when it runs on one."""
 
     created_at: float = field(default_factory=time.time)
     """Timestamp when the task was created."""
@@ -198,6 +208,16 @@ class BackgroundTask:
     ``registry.current_run_id`` at register time. Collectors filter by this
     so subagents from prior turns can't get claimed by a later turn's
     collector after the registry is reused across turns."""
+
+    runs_on: TaskModel | None = None
+    """The model this round's Task named, resolved and gated before it is
+    admitted; None on its subagent's own. Admission records it and the Task
+    tool runs the graph built for it, so both read the one value."""
+
+    named_own: str | None = None
+    """The subagent's own model when this round's Task named it: the run
+    keeps its subagent's graph, and admission records the name, so a resume
+    naming none stays on it once the subagent's model moves."""
 
     task_run_id: str | None = None
     """This execution's ledger identity (subagent_runs row). Stamped by the
@@ -355,13 +375,17 @@ class BackgroundTask:
         Both count: a cancelled wrapper can return while its shielded handler
         keeps checkpointing, and a kill stamps ``terminal_status`` before
         either has unwound, so neither the status nor one handle says the task
-        has stopped writing.
+        has stopped writing. So do its stragglers.
         """
         return [
             writer
-            for writer in (self.asyncio_task, self.handler_task)
+            for writer in (self.asyncio_task, self.handler_task, *self.stragglers)
             if writer is not None and not writer.done()
         ]
+
+    def keep_straggler(self, work: asyncio.Task) -> None:
+        self.stragglers.add(work)
+        work.add_done_callback(self.stragglers.discard)
 
     @property
     def is_turn_visible(self) -> bool:

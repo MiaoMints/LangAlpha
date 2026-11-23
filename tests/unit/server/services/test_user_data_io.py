@@ -139,6 +139,29 @@ class TestPortfolioParseAndDiff:
         diff = _diff_portfolio(payload, [])
         assert diff.inserts[0]["currency"] == "CNY"
 
+    def test_a_new_holding_on_an_unknown_venue_must_name_its_currency(self):
+        payload = self._make_payload("v1", [
+            {"symbol": "AAPL", "instrument_type": "stock", "quantity": "1"},
+            {"symbol": "PETR4.SA", "instrument_type": "stock", "quantity": "100"},
+        ])
+        with pytest.raises(UserDataValidationError) as exc:
+            _diff_portfolio(payload, [])
+        assert exc.value.error_type == "constraint_error"
+        assert exc.value.field_path == "holdings[1].currency"
+        assert exc.value.hint.startswith("PETR4.SA is listed on a venue whose currency is not known")
+        named = self._make_payload("v1", [
+            {"symbol": "PETR4.SA", "instrument_type": "stock", "quantity": "100", "currency": "BRL"},
+        ])
+        assert _diff_portfolio(named, []).inserts[0]["currency"] == "BRL"
+
+    def test_a_held_row_on_an_unknown_venue_with_no_currency_does_not_block_a_save(self):
+        existing = _portfolio_row(symbol="PETR4.SA", currency=None, exchange=None, name=None)
+        payload = self._make_payload("v1", [{
+            "symbol": "PETR4.SA", "instrument_type": "stock", "quantity": "200", "account_name": "Main",
+        }])
+        diff = _diff_portfolio(payload, [existing])
+        assert diff.updates[0]["currency"] is None
+
     def test_a_held_row_without_a_currency_keeps_the_one_it_is_held_in(self):
         existing = _portfolio_row(symbol="600519.SH", currency="CNY", exchange=None, name=None)
         payload = self._make_payload("v1", [{
@@ -160,6 +183,18 @@ class TestPortfolioParseAndDiff:
             "account_name": "Main", "currency": "",
         }])
         assert _diff_portfolio(payload, [existing]).updates[0]["currency"] == "CNY"
+
+    def test_a_pence_row_is_parsed_in_pounds(self):
+        payload = self._make_payload("v1", [
+            {"symbol": "VOD.L", "instrument_type": "stock", "quantity": "10",
+             "average_cost": "205", "currency": "GBp"},
+            {"symbol": "AAPL", "instrument_type": "stock", "quantity": "1",
+             "average_cost": "150", "currency": " usd "},
+        ])
+        parsed = io.parse_portfolio(payload)
+        assert [(h["currency"], h["average_cost"]) for h in parsed] == [
+            ("GBP", Decimal("2.05")), ("USD", Decimal("150")),
+        ]
 
     def test_a_held_row_with_no_currency_on_record_takes_its_listings(self):
         existing = _portfolio_row(symbol="600519.SH", currency=None, exchange=None, name=None)

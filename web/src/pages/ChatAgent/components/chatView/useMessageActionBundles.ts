@@ -10,14 +10,18 @@ type Action<K extends keyof MessageActions> = NonNullable<MessageActions[K]>;
 
 /** ChatView's raw handlers, before their identities are pinned. */
 export interface MessageActionSources {
+  reportThreadId?: string;
+  feedbackLoading?: boolean;
   onOpenFile: Action<'onOpenFile'>;
   onDownloadFile: Action<'onDownloadFile'>;
+  onPublishFile: Action<'onPublishFile'>;
   downloadKeyFor: Action<'downloadKeyFor'>;
   onRevealFiles: Action<'onRevealFiles'>;
   onRevealMessage: Action<'onRevealMessage'>;
   onOpenSources: Action<'onOpenSources'>;
   onToolCallDetailClick: Action<'onToolCallDetailClick'>;
   onOpenChart: Action<'onOpenChart'>;
+  onOpenArtifactComment: Action<'onOpenArtifactComment'>;
   onOpenSubagentTask: Action<'onOpenSubagentTask'>;
   onOpenDispatcher: Action<'onOpenDispatcher'>;
   onAnswerQuestion: Action<'onAnswerQuestion'>;
@@ -35,12 +39,14 @@ export interface MessageActionSources {
   onRejectToolCall: Action<'onRejectToolCall'>;
   onThumbUp: Action<'onThumbUp'>;
   onThumbDown: Action<'onThumbDown'>;
+  onThumbDownFollowUp: Action<'onThumbDownFollowUp'>;
   /** Already identity-stable in ChatView; reused here as `onWidgetSendPrompt`. */
   onWidgetSendPrompt: Action<'onWidgetSendPrompt'>;
   /** These three read the composer's current model options at call time. */
   onEditMessage: (messageId: string, content: string, modelOptions?: ModelOptions) => unknown;
   onRegenerate: (messageId: string, modelOptions?: ModelOptions) => unknown;
   onRetry: (modelOptions?: ModelOptions) => unknown;
+  onForkFromTurn: Action<'onForkFromTurn'>;
   /** Created once by the session, so already identity-stable. */
   editDrafts: EditDraftStore;
   onSendMessage: (text: string) => unknown;
@@ -62,12 +68,14 @@ export function useMessageActionBundles(src: MessageActionSources): {
 } {
   const stableOpenFile = useStableHandler(src.onOpenFile);
   const stableDownloadFile = useStableHandler(src.onDownloadFile);
+  const stablePublishFile = useStableHandler(src.onPublishFile);
   const stableDownloadKeyFor = useStableHandler(src.downloadKeyFor);
   const stableRevealFiles = useStableHandler(src.onRevealFiles);
   const stableRevealMessage = useStableHandler(src.onRevealMessage);
   const stableOpenSources = useStableHandler(src.onOpenSources);
   const stableToolCallDetail = useStableHandler(src.onToolCallDetailClick);
   const stableOpenChart = useStableHandler(src.onOpenChart);
+  const stableOpenArtifactComment = useStableHandler(src.onOpenArtifactComment);
   const stableOpenSubagentTask = useStableHandler(src.onOpenSubagentTask);
   const stableOpenDispatcher = useStableHandler(src.onOpenDispatcher);
   const stableAnswerQuestion = useStableHandler(src.onAnswerQuestion);
@@ -88,12 +96,14 @@ export function useMessageActionBundles(src: MessageActionSources): {
   const stableRegenerate = useStableHandler((id: string) =>
     src.onRegenerate(id, src.chatInputRef.current?.getModelOptions?.()));
   const stableRetry = useStableHandler(() => src.onRetry(src.chatInputRef.current?.getModelOptions?.()));
+  const stableForkFromTurn = useStableHandler(src.onForkFromTurn);
   const editDrafts = src.editDrafts;
   // Feedback handlers close over the stored ratings, so their raw identity
   // churns on every load/submit; wrap them or a single thumbs click would
   // re-render the whole transcript through the context value.
   const stableThumbUp = useStableHandler(src.onThumbUp);
   const stableThumbDown = useStableHandler(src.onThumbDown);
+  const stableThumbDownFollowUp = useStableHandler(src.onThumbDownFollowUp);
   const stableSendMessage = src.onWidgetSendPrompt;
 
   // The main transcript's action surface. Every member is identity-stable, so
@@ -101,12 +111,14 @@ export function useMessageActionBundles(src: MessageActionSources): {
   const messageActions = useMemo<MessageActions>(() => ({
     onOpenFile: stableOpenFile,
     onDownloadFile: stableDownloadFile,
+    onPublishFile: stablePublishFile,
     downloadKeyFor: stableDownloadKeyFor,
     onRevealFiles: stableRevealFiles,
     onRevealMessage: stableRevealMessage,
     onOpenSources: stableOpenSources,
     onToolCallDetailClick: stableToolCallDetail,
     onOpenChart: stableOpenChart,
+    onOpenArtifactComment: stableOpenArtifactComment,
     onOpenSubagentTask: stableOpenSubagentTask,
     onOpenDispatcher: stableOpenDispatcher,
     onAnswerQuestion: stableAnswerQuestion,
@@ -125,18 +137,23 @@ export function useMessageActionBundles(src: MessageActionSources): {
     onEditMessage: stableEditMessage,
     onRegenerate: stableRegenerate,
     onRetry: stableRetry,
+    onForkFromTurn: stableForkFromTurn,
     editDrafts,
     onThumbUp: stableThumbUp,
     onThumbDown: stableThumbDown,
+    onThumbDownFollowUp: stableThumbDownFollowUp,
     onWidgetSendPrompt: stableSendMessage,
+    reportThreadId: src.reportThreadId,
+    feedbackLoading: src.feedbackLoading,
   }), [
-    stableOpenFile, stableDownloadFile, stableDownloadKeyFor, stableRevealFiles, stableRevealMessage, stableOpenSources, stableToolCallDetail,
-    stableOpenChart, stableOpenSubagentTask, stableOpenDispatcher, stableAnswerQuestion, stableSkipQuestion, stableApproveCreateWorkspace,
+    stableOpenFile, stableDownloadFile, stablePublishFile, stableDownloadKeyFor, stableRevealFiles, stableRevealMessage, stableOpenSources, stableToolCallDetail,
+    stableOpenChart, stableOpenArtifactComment, stableOpenSubagentTask, stableOpenDispatcher, stableAnswerQuestion, stableSkipQuestion, stableApproveCreateWorkspace,
     stableRejectCreateWorkspace, stableApproveStartQuestion, stableRejectStartQuestion,
     stableApprovePTCAgent, stableRejectPTCAgent, stableApproveSecretaryAction,
     stableRejectSecretaryAction, stableResumeCreditPause, stableApproveToolCall, stableRejectToolCall,
-    stableEditMessage, stableRegenerate, stableRetry, editDrafts,
-    stableThumbUp, stableThumbDown, stableSendMessage,
+    stableEditMessage, stableRegenerate, stableRetry, stableForkFromTurn, editDrafts,
+    stableThumbUp, stableThumbDown, stableThumbDownFollowUp, stableSendMessage, src.reportThreadId,
+    src.feedbackLoading,
   ]);
 
   // The subagent transcript is a DIFFERENT surface: its cards belong to a task,
@@ -147,10 +164,11 @@ export function useMessageActionBundles(src: MessageActionSources): {
   const subagentMessageActions = useMemo<MessageActions>(() => ({
     onOpenFile: stableOpenFile,
     onDownloadFile: stableDownloadFile,
+    onPublishFile: stablePublishFile,
     downloadKeyFor: stableDownloadKeyFor,
     onToolCallDetailClick: stableToolCallDetail,
     onOpenChart: stableOpenChart,
-  }), [stableOpenFile, stableDownloadFile, stableDownloadKeyFor, stableToolCallDetail, stableOpenChart]);
+  }), [stableOpenFile, stableDownloadFile, stablePublishFile, stableDownloadKeyFor, stableToolCallDetail, stableOpenChart]);
 
   return { messageActions, subagentMessageActions };
 }

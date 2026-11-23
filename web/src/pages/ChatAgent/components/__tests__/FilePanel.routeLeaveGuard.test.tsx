@@ -13,15 +13,21 @@ vi.mock('@/pages/ChatAgent/utils/api', async (importOriginal) => {
   const orig = await importOriginal<Record<string, unknown>>();
   return {
     ...orig,
-    readWorkspaceFile: vi.fn(async () => ({ content: '# Notes', mime: 'text/markdown', truncated: false })),
-    readWorkspaceFileFull: vi.fn(async () => ({ content: '# Notes' })),
-    writeWorkspaceFile: vi.fn(async () => ({})),
+    readWorkspaceFile: vi.fn(async () => ({ content: '# Notes', mime: 'text/markdown', truncated: false, from: { kind: 'live' } })),
+    readWorkspaceFileFull: vi.fn(async () => ({ content: '# Notes', version: null, rewriting: false, from: { kind: 'live' } })),
+    writeWorkspaceFile: vi.fn(async () => ({ version: null })),
     downloadWorkspaceFileAsArrayBuffer: vi.fn(),
     triggerFileDownload: vi.fn(),
     resolveWorkspaceFile: vi.fn(),
     getPreviewUrl: vi.fn(),
   };
 });
+// The reader has turned the browser on.
+vi.mock('@/pages/ChatAgent/hooks/useBrowserHere', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('@/pages/ChatAgent/hooks/useBrowserHere')>()),
+  useBrowserHere: (computer: object | null | undefined, shared = false) => computer != null || shared,
+  useBrowserGone: () => false,
+}));
 vi.mock('@/hooks/useWorkspace', () => ({ useWorkspace: () => ({ data: { status: 'running', name: 'ws' } }) }));
 vi.mock('@/contexts/ThemeContext', () => ({ useTheme: () => ({ theme: 'dark' }) }));
 vi.mock('@/pages/ChatAgent/components/FilePanelMemo', () => ({

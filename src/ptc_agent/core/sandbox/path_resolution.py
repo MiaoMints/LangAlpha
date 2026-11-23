@@ -9,11 +9,14 @@ root, its allow list, and the turn's workspace folder.
 
 from __future__ import annotations
 
+from collections.abc import Iterable
+
 import structlog
 
 from ptc_agent.core.paths import (
     lexical_path,
     machine_path,
+    name_fold,
     resolve_agent_path,
     virtual_agent_path,
 )
@@ -97,6 +100,43 @@ def _denied_directories(
     return configured
 
 
+_GLOB_META = str.maketrans({c: f"\\{c}" for c in "\\*?[]{}"})
+
+
+def held_back() -> tuple[str, ...]:
+    """The folders a machine reached from Home holds back from the file
+    tools though its home opens the rest (``MachinePaths.denied``), which a
+    search of a folder above one must step over too."""
+    ctx = current_project()
+    return ctx.machine.denied if ctx is not None and ctx.machine is not None else ()
+
+
+def rg_excluded(held: tuple[str, ...], cwd: str) -> list[str]:
+    """rg arguments leaving each of ``held`` out of a search run from ``cwd``.
+
+    rg matches a filter against a path relative to the directory it runs
+    in when the path is below it, else against the whole path, so a held
+    folder below ``cwd`` is named from it and any other by its whole path.
+    Case-insensitive, as a Mac's disk matches names.
+    """
+    base = cwd.rstrip("/")
+    args: list[str] = []
+    for path in held:
+        below = path.casefold().startswith(f"{base}/".casefold())
+        spelled = path[len(base) :] if below else path
+        args.extend(["--iglob", ("!" if below else "!**") + spelled.translate(_GLOB_META)])
+    return args
+
+
+def _under_any(folded: str, folders: Iterable[str]) -> bool:
+    """Whether *folded*, a path through ``name_fold``, is one of *folders* or
+    inside one, compared under the same fold."""
+    return any(
+        folded == held or folded.startswith(held + "/")
+        for held in map(name_fold, folders)
+    )
+
+
 def validate_path(
     sandbox: "PTCSandbox", filepath: str, project: ProjectContext | None = None
 ) -> bool:
@@ -113,12 +153,11 @@ def validate_path(
     # Normalize the path first (handles virtual paths like /work/task/...)
     normalized_path = sandbox.normalize_path(filepath, project)
 
-    # Denylist takes priority over allowlist
-    for denied_dir in _denied_directories(sandbox, project):
-        if normalized_path == denied_dir or normalized_path.startswith(
-            denied_dir + "/"
-        ):
-            return False
+    # Denylist takes priority over allowlist. Matched as a Mac's disk matches
+    # names, or a sibling's tools folder spelled in another case slips past.
+    folded = name_fold(normalized_path)
+    if _under_any(folded, _denied_directories(sandbox, project)):
+        return False
 
     # A computer reached from Home whose file calls run as its commands do:
     # the whole machine, as a command there reaches it. An unexpanded
@@ -126,7 +165,10 @@ def validate_path(
     ctx = _ambient_project(project)
     machine = ctx.machine if ctx is not None else None
     if machine is not None and machine.home and normalized_path.startswith("/"):
-        return True
+        # Except what the machine lists as denied, matched as a Mac's disk
+        # matches names. Best effort: a command runs as the same login and
+        # can read it, so this only keeps the file tools' reach off it.
+        return not _under_any(folded, machine.denied)
 
     # Check against allowed directories
     for allowed_dir in sandbox.config.filesystem.allowed_directories:

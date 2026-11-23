@@ -1,7 +1,7 @@
 /**
  * One exchange-suffix table for the chart layer — the single source for
- * "what currency does this ticker list in", "is this a US equity", and
- * "what timezone does its venue trade in".
+ * "what currency does this ticker list in", "is this a US equity", "what
+ * timezone does its venue trade in", and "what are its regular hours".
  *
  * Keyed by the ticker's exchange suffix (the part after the last dot,
  * uppercased). `foreign` is true for any non-US listing; `currency` is its
@@ -20,6 +20,8 @@ export interface ExchangeInfo {
   foreign: boolean;
   /** IANA timezone of the listing venue (drives market-local chart display). */
   tz: string;
+  /** Regular trading hours; absent where none are listed, so every bar counts. */
+  hours?: SessionHours;
   /** Short venue name prefixed to a status badge (`HK Closed`); index
    *  families carry none. */
   label?: string;
@@ -27,6 +29,9 @@ export interface ExchangeInfo {
    *  accepted, but `.SH` is the one stored, compared and shown (the backend's
    *  `display_spelling`). */
   displayAs?: string;
+  /** Places between the venue's quote unit and its currency's major unit:
+   *  London quotes in pence, which the backend serves in pounds. */
+  minorUnitPlaces?: number;
   /** Code prefix that marks an index on this venue. CN code ranges are
    *  partitioned by instrument type, so the code alone names the class
    *  (the backend's `_CN_INDEX_PREFIXES`). */
@@ -37,30 +42,50 @@ export interface ExchangeInfo {
   codeWidth?: number;
 }
 
+/**
+ * Regular hours as minute-of-day spans in the venue's wall clock, the close
+ * being the time stamped on the closing print. A lunch break is the gap
+ * between two spans.
+ */
+export type SessionHours = readonly (readonly [open: number, close: number])[];
+
 /** Venue timezone for US listings and the fallback for anything unknown. */
 export const US_MARKET_TZ = 'America/New_York';
+/** Regular hours for US listings and the fallback for anything unknown, like {@link US_MARKET_TZ}. */
+export const US_MARKET_HOURS: SessionHours = [[570, 960]];
+
+const TORONTO_HOURS: SessionHours = [[570, 960]];
+const CN_HOURS: SessionHours = [[570, 690], [780, 900]];
+const HK_HOURS: SessionHours = [[570, 720], [780, 960]];
+const TOKYO_HOURS: SessionHours = [[540, 690], [750, 930]];
+const LONDON_HOURS: SessionHours = [[480, 990]];
+/** Xetra and Euronext (Paris, Amsterdam, Milan), and Madrid: 09:00 to the 17:30 closing auction. */
+const EU_HOURS: SessionHours = [[540, 1050]];
+const KOREA_HOURS: SessionHours = [[540, 930]];
+const TAIWAN_HOURS: SessionHours = [[540, 810]];
+const INDIA_HOURS: SessionHours = [[555, 930]];
 
 const EXCHANGE_SUFFIXES: Record<string, ExchangeInfo> = {
-  L: { currency: 'GBP', foreign: true, tz: 'Europe/London', label: 'LON' }, // London
-  HK: { currency: 'HKD', foreign: true, tz: 'Asia/Hong_Kong', label: 'HK', codeWidth: 4 }, // Hong Kong
-  T: { currency: 'JPY', foreign: true, tz: 'Asia/Tokyo', label: 'TYO' }, // Tokyo
-  TO: { currency: 'CAD', foreign: true, tz: 'America/Toronto', label: 'TSX' }, // Toronto
-  PA: { currency: 'EUR', foreign: true, tz: 'Europe/Paris', label: 'PAR' }, // Paris
-  DE: { currency: 'EUR', foreign: true, tz: 'Europe/Berlin', label: 'XETRA' }, // Xetra / Frankfurt
-  AS: { currency: 'EUR', foreign: true, tz: 'Europe/Amsterdam', label: 'AMS' }, // Amsterdam
-  MI: { currency: 'EUR', foreign: true, tz: 'Europe/Rome', label: 'MIL' }, // Milan
-  MC: { currency: 'EUR', foreign: true, tz: 'Europe/Madrid', label: 'BME' }, // Madrid
+  L: { currency: 'GBP', foreign: true, tz: 'Europe/London', hours: LONDON_HOURS, label: 'LON', minorUnitPlaces: 2 }, // London
+  HK: { currency: 'HKD', foreign: true, tz: 'Asia/Hong_Kong', hours: HK_HOURS, label: 'HK', codeWidth: 4 }, // Hong Kong
+  T: { currency: 'JPY', foreign: true, tz: 'Asia/Tokyo', hours: TOKYO_HOURS, label: 'TYO' }, // Tokyo
+  TO: { currency: 'CAD', foreign: true, tz: 'America/Toronto', hours: TORONTO_HOURS, label: 'TSX' }, // Toronto
+  PA: { currency: 'EUR', foreign: true, tz: 'Europe/Paris', hours: EU_HOURS, label: 'PAR' }, // Paris
+  DE: { currency: 'EUR', foreign: true, tz: 'Europe/Berlin', hours: EU_HOURS, label: 'XETRA' }, // Xetra / Frankfurt
+  AS: { currency: 'EUR', foreign: true, tz: 'Europe/Amsterdam', hours: EU_HOURS, label: 'AMS' }, // Amsterdam
+  MI: { currency: 'EUR', foreign: true, tz: 'Europe/Rome', hours: EU_HOURS, label: 'MIL' }, // Milan
+  MC: { currency: 'EUR', foreign: true, tz: 'Europe/Madrid', hours: EU_HOURS, label: 'BME' }, // Madrid
   SW: { currency: 'CHF', foreign: true, tz: 'Europe/Zurich', label: 'SIX' }, // Switzerland (SIX)
-  SS: { currency: 'CNY', foreign: true, tz: 'Asia/Shanghai', label: 'SH', displayAs: 'SH', indexCodePrefix: '000' }, // Shanghai (vendor spelling, still accepted)
-  SH: { currency: 'CNY', foreign: true, tz: 'Asia/Shanghai', label: 'SH', indexCodePrefix: '000' }, // Shanghai
-  SZ: { currency: 'CNY', foreign: true, tz: 'Asia/Shanghai', label: 'SZ', indexCodePrefix: '399' }, // Shenzhen
-  BJ: { currency: 'CNY', foreign: true, tz: 'Asia/Shanghai', label: 'BJ', indexCodePrefix: '899' }, // Beijing (BSE)
-  KS: { currency: 'KRW', foreign: true, tz: 'Asia/Seoul', label: 'KRX' }, // Korea (KOSPI)
-  KQ: { currency: 'KRW', foreign: true, tz: 'Asia/Seoul', label: 'KOSDAQ' }, // Korea (KOSDAQ)
-  TW: { currency: 'TWD', foreign: true, tz: 'Asia/Taipei', label: 'TWSE' }, // Taiwan
+  SS: { currency: 'CNY', foreign: true, tz: 'Asia/Shanghai', hours: CN_HOURS, label: 'SH', displayAs: 'SH', indexCodePrefix: '000' }, // Shanghai (vendor spelling, still accepted)
+  SH: { currency: 'CNY', foreign: true, tz: 'Asia/Shanghai', hours: CN_HOURS, label: 'SH', indexCodePrefix: '000' }, // Shanghai
+  SZ: { currency: 'CNY', foreign: true, tz: 'Asia/Shanghai', hours: CN_HOURS, label: 'SZ', indexCodePrefix: '399' }, // Shenzhen
+  BJ: { currency: 'CNY', foreign: true, tz: 'Asia/Shanghai', hours: CN_HOURS, label: 'BJ', indexCodePrefix: '899' }, // Beijing (BSE)
+  KS: { currency: 'KRW', foreign: true, tz: 'Asia/Seoul', hours: KOREA_HOURS, label: 'KRX' }, // Korea (KOSPI)
+  KQ: { currency: 'KRW', foreign: true, tz: 'Asia/Seoul', hours: KOREA_HOURS, label: 'KOSDAQ' }, // Korea (KOSDAQ)
+  TW: { currency: 'TWD', foreign: true, tz: 'Asia/Taipei', hours: TAIWAN_HOURS, label: 'TWSE' }, // Taiwan
   SI: { currency: 'SGD', foreign: true, tz: 'Asia/Singapore', label: 'SGX' }, // Singapore
-  BO: { currency: 'INR', foreign: true, tz: 'Asia/Kolkata', label: 'BSE' }, // Bombay (BSE)
-  NS: { currency: 'INR', foreign: true, tz: 'Asia/Kolkata', label: 'NSE' }, // India (NSE)
+  BO: { currency: 'INR', foreign: true, tz: 'Asia/Kolkata', hours: INDIA_HOURS, label: 'BSE' }, // Bombay (BSE)
+  NS: { currency: 'INR', foreign: true, tz: 'Asia/Kolkata', hours: INDIA_HOURS, label: 'NSE' }, // India (NSE)
   AX: { currency: 'AUD', foreign: true, tz: 'Australia/Sydney', label: 'ASX' }, // Australia (ASX)
 };
 
@@ -71,13 +96,18 @@ const EXCHANGE_SUFFIXES: Record<string, ExchangeInfo> = {
  * (`000001.SH`) resolve through the suffix table like any other listing.
  */
 const INDEX_FAMILIES: Record<string, ExchangeInfo> = {
-  HSI: { currency: 'HKD', foreign: true, tz: 'Asia/Hong_Kong' },
-  HSCE: { currency: 'HKD', foreign: true, tz: 'Asia/Hong_Kong' },
-  N225: { currency: 'JPY', foreign: true, tz: 'Asia/Tokyo' },
-  FTSE: { currency: 'GBP', foreign: true, tz: 'Europe/London' },
-  GDAXI: { currency: 'EUR', foreign: true, tz: 'Europe/Berlin' },
+  HSI: { currency: 'HKD', foreign: true, tz: 'Asia/Hong_Kong', hours: HK_HOURS },
+  HSCE: { currency: 'HKD', foreign: true, tz: 'Asia/Hong_Kong', hours: HK_HOURS },
+  N225: { currency: 'JPY', foreign: true, tz: 'Asia/Tokyo', hours: TOKYO_HOURS },
+  FTSE: { currency: 'GBP', foreign: true, tz: 'Europe/London', hours: LONDON_HOURS },
+  GDAXI: { currency: 'EUR', foreign: true, tz: 'Europe/Berlin', hours: EU_HOURS },
   STOXX50E: { currency: 'EUR', foreign: true, tz: 'Europe/Berlin' },
-  FCHI: { currency: 'EUR', foreign: true, tz: 'Europe/Paris' },
+  FCHI: { currency: 'EUR', foreign: true, tz: 'Europe/Paris', hours: EU_HOURS },
+  TWII: { currency: 'TWD', foreign: true, tz: 'Asia/Taipei', hours: TAIWAN_HOURS },
+  KS11: { currency: 'KRW', foreign: true, tz: 'Asia/Seoul', hours: KOREA_HOURS },
+  NSEI: { currency: 'INR', foreign: true, tz: 'Asia/Kolkata', hours: INDIA_HOURS },
+  BSESN: { currency: 'INR', foreign: true, tz: 'Asia/Kolkata', hours: INDIA_HOURS },
+  AXJO: { currency: 'AUD', foreign: true, tz: 'Australia/Sydney' },
 };
 
 /**
@@ -107,9 +137,19 @@ function exchangeInfoForSymbol(symbol: string): ExchangeInfo | null {
 }
 
 /**
+ * A US class share's stem and class in either spelling (`BRK.B`, `BRK-B`),
+ * or null. Only these classes read so: a lone letter after a dot names a venue
+ * elsewhere (`SAP.F` is Frankfurt).
+ */
+export function usClassShare(symbol: string): [string, string] | null {
+  const share = /^([A-Z]+)[.-]([ABC])$/.exec(symbol);
+  return share ? [share[1], share[2]] : null;
+}
+
+/**
  * The spelling a symbol is stored, compared and shown in: trimmed, uppercased,
  * and with its venue suffix and code in our form (`600519.ss` becomes
- * `600519.SH`, `700.HK` becomes `0700.HK`). Mirrors the backend's
+ * `600519.SH`, `700.HK` becomes `0700.HK`, `BRK.B` becomes `BRK-B`). Mirrors the backend's
  * `display_spelling`, so applying it where a symbol enters the page means
  * every key built from it matches the server's. A Chinese IME's full-width
  * forms fold first, and its ideographic full stop reads as a dot.
@@ -117,7 +157,10 @@ function exchangeInfoForSymbol(symbol: string): ExchangeInfo | null {
 export function displaySpelling(symbol: string): string {
   const s = symbol.normalize('NFKC').replace(/。/g, '.').trim().toUpperCase();
   const venue = splitVenueSuffix(s);
-  if (!venue) return s;
+  if (!venue) {
+    const share = usClassShare(s);
+    return share ? share.join('-') : s;
+  }
   const { stem, info } = venue;
   const code =
     info.codeWidth && /^\d+$/.test(stem)
@@ -141,10 +184,25 @@ export function isIndexListing(symbol: string | null | undefined, assetClass?: s
   return !!venue && !!prefix && /^\d+$/.test(venue.stem) && venue.stem.startsWith(prefix);
 }
 
-/** Infer listing currency from a ticker's exchange suffix; defaults to USD. */
-export function currencyForSymbol(symbol?: string | null): string {
+/**
+ * Infer listing currency from a ticker's exchange suffix: USD for a US
+ * listing (`.US` names the US venue, as the backend reads it), null for a
+ * suffix no venue here names (`PETR4.SA`). That listing is
+ * on the backend's unknown venue, whose currency is unknown, so its figures
+ * print with none rather than as dollars.
+ */
+export function currencyForSymbol(symbol?: string | null): string | null {
   if (!symbol) return 'USD';
-  return exchangeInfoForSymbol(symbol)?.currency ?? 'USD';
+  const info = exchangeInfoForSymbol(symbol);
+  if (info) return info.currency;
+  const s = symbol.trim().toUpperCase().replace(/\.US$/, '');
+  return s.includes('.') && !isIndexFamilySpelling(s) && !usClassShare(s) ? null : 'USD';
+}
+
+/** Places a GBP price from a pence-quoted venue carries past the penny. */
+export function minorUnitPlacesForSymbol(symbol?: string | null): number {
+  if (!symbol) return 0;
+  return exchangeInfoForSymbol(symbol)?.minorUnitPlaces ?? 0;
 }
 
 /** Short venue name for a ticker's listing (`HK`, `SH`, `LON`), or null for
@@ -166,9 +224,20 @@ export function timezoneForSymbol(symbol?: string | null): string {
   return exchangeInfoForSymbol(symbol)?.tz ?? US_MARKET_TZ;
 }
 
+/**
+ * A ticker's venue's regular hours, resolved as {@link timezoneForSymbol}
+ * resolves its clock: US listings, indexes, and anything unrecognized read
+ * {@link US_MARKET_HOURS}. Null for a listed venue with no hours here, whose
+ * every bar counts.
+ */
+export function regularHoursForSymbol(symbol?: string | null): SessionHours | null {
+  const info = symbol ? exchangeInfoForSymbol(symbol) : null;
+  return info ? (info.hours ?? null) : US_MARKET_HOURS;
+}
+
 /** The currency a row is quoted in: its own code when the wire carried one,
  *  else the listing currency its symbol's venue implies. */
-export function resolveCurrency(code: string | null | undefined, symbol: string | null | undefined): string {
+export function resolveCurrency(code: string | null | undefined, symbol: string | null | undefined): string | null {
   return code || currencyForSymbol(symbol);
 }
 

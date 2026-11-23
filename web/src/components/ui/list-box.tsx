@@ -24,6 +24,7 @@ function ListBox<T extends object>({
 }: AriaListBoxProps<T>) {
   return (
     <AriaListBox
+      data-slot="listbox"
       className={composeRenderProps(className, (className) =>
         cn(
           className,
@@ -44,17 +45,20 @@ const ListBoxItem = <T extends object>({
 }: AriaListBoxItemProps<T>) => {
   return (
     <AriaListBoxItem
+      data-slot="menu-item"
       textValue={
         props.textValue || (typeof children === "string" ? children : undefined)
       }
       className={composeRenderProps(className, (className) =>
         cn(
-          "relative flex w-full cursor-default select-none items-center rounded-sm px-2 py-1.5 text-sm",
+          "relative flex w-full cursor-default select-none items-center rounded-sm px-2 row-inset text-sm",
           /* Disabled */
           "data-disabled:pointer-events-none data-disabled:opacity-50",
-          /* Focused and hovered: the tint a menu item takes (dropdown-menu's
-             ITEM_HIGHLIGHT), so every floating list marks its row alike */
-          "data-focused:bg-accent/15 data-hovered:bg-accent/15",
+          /* Hovered, or focused from the keyboard: the tint a menu item takes
+             (dropdown-menu's ITEM_HIGHLIGHT), so every floating list marks its
+             row alike. Not on any focus: a pressed row keeps focus, and lit by
+             it, it would stay lit beside the hovered one */
+          "data-focus-visible:bg-accent/15 data-hovered:bg-accent/15",
           /* Keyboard focus: the inward ring tokens.css draws on a focused
              option. Colored here as well because a list driven from a search
              field moves a virtual focus, which :focus-visible never sees, and
@@ -87,6 +91,7 @@ function ListBoxHeader({
 }: React.ComponentProps<typeof AriaHeader>) {
   return (
     <AriaHeader
+      data-slot="menu-label"
       className={cn("py-1.5 pl-8 pr-2 text-sm font-semibold", className)}
       {...props}
     />

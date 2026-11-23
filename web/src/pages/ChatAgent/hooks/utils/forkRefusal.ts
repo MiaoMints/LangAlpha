@@ -7,10 +7,14 @@
  * thread. An answer to a pause a fork elsewhere replaced is refused as
  * `stale_fork` too, and recovers the same way, as does a Retry refused because
  * the chat changed, its reply never failed, or its input has to be sent again.
+ * In a shared workspace's thread a rewrite that would replace another
+ * member's turn is refused (`another_members_turn`, a 403) and recovers the
+ * same way, in the view's own words.
  */
 import type { ChatMessage } from '@/types/chat';
 import type { StructuredError } from '@/utils/rateLimitError';
 import type { EditDraft } from './editDrafts';
+import { OTHERS_TURN_REWRITE } from '@/lib/turnRefusal';
 
 /**
  * The codes a request is refused with before the server kept anything of it,
@@ -40,6 +44,10 @@ function readForkRefusal(source: unknown): { code: unknown; message: string } | 
     error?: unknown;
     code?: unknown;
   };
+  // A shared thread's rule names itself as the detail's type, not a code.
+  if (errorInfo?.type === OTHERS_TURN_REWRITE) {
+    return { code: OTHERS_TURN_REWRITE, message: typeof errorInfo.message === 'string' ? errorInfo.message : '' };
+  }
   if (typeof errorInfo?.code === 'string' && REFUSAL_CODES.has(errorInfo.code)) {
     return typeof errorInfo.message === 'string' ? { code: errorInfo.code, message: errorInfo.message } : null;
   }
@@ -86,17 +94,41 @@ export const BUSY_REPLY_KEYS: Readonly<Record<BusyCode, string>> = {
 export const isBusyCode = (code: unknown): code is BusyCode =>
   typeof code === 'string' && Object.hasOwn(BUSY_REFUSAL_KEYS, code);
 
+type Words = string | StructuredError;
+
+/** A refusal in the view's words where it has its own (a busy chat), else the server's. */
+function refusalWords(refusal: { code: unknown; message: string }, busyMessage: (code: BusyCode) => Words): Words {
+  return isBusyCode(refusal.code) ? busyMessage(refusal.code) : refusal.message;
+}
+
+/**
+ * The words for `source` when it refuses a send that cuts nothing, so none of
+ * a fork's own cases (stale, resend, not retryable) apply; null when it is
+ * not an admission refusal.
+ */
+export function admissionRefusalWords(source: unknown, busyMessage: (code: BusyCode) => Words): Words | null {
+  const refusal = readForkRefusal(source);
+  return refusal === null ? null : refusalWords(refusal, busyMessage);
+}
+
 /** Whether `source` refuses its request because the chat changed after this
  *  view read it. */
 export function isStaleForkRefusal(source: unknown): boolean {
   return isStaleCode(readForkRefusal(source)?.code);
 }
 
+/** Whether `source` refuses a rewrite because it would replace another
+ *  member's turn in a shared workspace's thread. */
+export function isOthersTurnRefusal(source: unknown): boolean {
+  return readForkRefusal(source)?.code === OTHERS_TURN_REWRITE;
+}
+
 /** Whether `source` refuses a Retry in a way the view recovers from: the chat
- *  changed, the reply was never failed, or only the user can send its input. */
+ *  changed, the reply was never failed, only the user can send its input, or
+ *  the turn is another member's. */
 export function isRecoverableRetryRefusal(source: unknown): boolean {
   const code = readForkRefusal(source)?.code;
-  return isStaleCode(code) || code === 'not_retryable' || code === 'resend_required';
+  return isStaleCode(code) || code === 'not_retryable' || code === 'resend_required' || code === OTHERS_TURN_REWRITE;
 }
 
 /** What the user did that cut the transcript, and what a refusal gives back. */
@@ -144,6 +176,9 @@ export function createForkRefusalRecovery(deps: {
   /** The view's own words for a turn whose input the user has to send again;
    *  `givenBack` when its question went back to the composer. */
   resendMessage: (givenBack: boolean) => string | StructuredError;
+  /** The view's own words for a rewrite that would replace another member's
+   *  turn. */
+  othersTurnMessage: (kind: ForkCut['kind']) => string | StructuredError;
   /** Puts text in the composer, beside what is typed there. */
   giveBack: (text: string) => void;
   /** Marks every bubble on screen as one the server holds, which a reload
@@ -175,6 +210,11 @@ export function createForkRefusalRecovery(deps: {
       if (refusal === null) return false;
       if (isStaleCode(refusal.code)) {
         refuse(deps.staleMessage(cut.kind), cut);
+      } else if (refusal.code === OTHERS_TURN_REWRITE) {
+        // The box would only be refused again: what was typed goes to the
+        // composer, to send as a new message.
+        if (cut.draft) deps.giveBack(cut.draft.text);
+        refuse(deps.othersTurnMessage(cut.kind), { ...cut, draft: null });
       } else if (refusal.code === 'not_retryable' && cut.kind === 'retry') {
         // The latest run did not fail, so the reply this view marked failed is
         // not the server's: the reload shows the one it holds in its place.
@@ -185,10 +225,8 @@ export function createForkRefusalRecovery(deps: {
         // sits right under it; a reply to an answered pause has none to give.
         if (cut.asked) deps.giveBack(cut.asked);
         refuse(deps.resendMessage(Boolean(cut.asked)), cut);
-      } else if (isBusyCode(refusal.code)) {
-        refuse(deps.busyMessage(refusal.code), cut, { busy: true });
       } else {
-        refuse(refusal.message, cut);
+        refuse(refusalWords(refusal, deps.busyMessage), cut, { busy: isBusyCode(refusal.code) });
       }
       return true;
     },

@@ -39,6 +39,7 @@ from src.server.services.persistence.sync_result import (
     UnsavedFile,
 )
 from src.server.services.user_skills.reconcile import ReconcileStats
+from src.server.services.spec_change import SIZED_BY_OWNER
 from src.server.services.workspace_manager import WorkspaceManager
 from tests.computer_manager_patch import cm_patch
 from tests.unit.server.services.conftest import (
@@ -83,6 +84,23 @@ _STUB_COMPUTER = {
 
 
 @pytest.fixture(autouse=True)
+def _no_stand_in():
+    """Home's stand-in is on no computer here; the cases it keeps a computer
+    for are pinned in test_home_handback and the removals below."""
+    with (
+        patch(
+            "src.server.services.computer_manager._retirement.stand_in_on",
+            AsyncMock(return_value=None),
+        ),
+        patch(
+            "src.server.services.workspace_manager.stand_in_on",
+            AsyncMock(return_value=None),
+        ),
+    ):
+        yield
+
+
+@pytest.fixture(autouse=True)
 def _stub_computer_minting():
     """Creating a project resolves the user's machine and reads it back.
 
@@ -99,6 +117,8 @@ def _stub_computer_minting():
             f"{_MACHINES}.create_computer",
             new=AsyncMock(return_value=dict(_STUB_COMPUTER)),
         ),
+        patch(f"{_MACHINES}.promote_primary_computer", new=AsyncMock(return_value=None)),
+        patch(f"{_MACHINES}.get_user", new=AsyncMock(return_value=None)),
         patch(
             "src.server.services.computer_manager._sessions.get_computer_for_workspace",
             new=AsyncMock(return_value=dict(_STUB_COMPUTER)),
@@ -820,12 +840,15 @@ class TestStopWorkspace:
         async def detached(*_args, **_kwargs):
             yield runtime
         manager._detached_runtime = detached
-        with patch(f"{_LIFECYCLE}.update_computer_activity", AsyncMock()):
+        with patch(f"{_LIFECYCLE}.update_computer_activity", AsyncMock()), \
+                patch(f"{_LIFECYCLE}.note_stop_phases") as phases:
             with pytest.raises(RuntimeError, match="stop failed"):
                 await manager._finish_claimed_stop(
                     _binding("ws-1"), workspace_id="ws-1",
                     durable_sandbox_id="sandbox-abc",
                 )
+        # The refused stop is still timed: the failing stops are worth measuring.
+        phases.assert_called_once_with(_STUB_COMPUTER_ID, backup_ms=ANY, provider_ms=ANY)
         if state == "unreachable":
             manager._settle_machine_stop.assert_not_awaited()
         else:
@@ -1892,6 +1915,7 @@ class TestDeleteOnASharedMachine:
         wm._remove_workspace_folder.assert_not_awaited()
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize("owner_removing", [False, True], ids=["delete", "owners-remove"])
     @patch(
         "src.server.services.workspace_manager.db_delete_workspace",
         new_callable=AsyncMock,
@@ -1900,9 +1924,15 @@ class TestDeleteOnASharedMachine:
     @patch(f"{_RETIREMENT}.get_computer", new_callable=AsyncMock)
     @cm_patch("db_get_workspace", new_callable=AsyncMock)
     async def test_the_last_project_on_a_non_primary_ends_the_machine(
-        self, mock_db_get, mock_get_computer, mock_status, mock_db_delete
+        self, mock_db_get, mock_get_computer, mock_status, mock_db_delete, owner_removing
     ):
-        computer = _make_computer(computer_id=_STUB_COMPUTER_ID, is_primary=False)
+        """Ended by a delete or its owner's remove, the tombstone takes the
+        stand-in mark off unless the row's marker says by then that this is
+        its owner's remove, whose mark refuses Home's stand-in another."""
+        marker = {"retire_when_empty": True, "retire_by_owner": owner_removing}
+        computer = _make_computer(
+            computer_id=_STUB_COMPUTER_ID, is_primary=False, config=marker
+        )
         computer_id = _STUB_COMPUTER_ID
         ws_id = str(uuid.uuid4())
         workspace = _make_workspace(
@@ -1918,12 +1948,16 @@ class TestDeleteOnASharedMachine:
         wm = self._manager()
 
         with _patch_live_ids():
-            assert await wm.delete_workspace(ws_id) is True
+            assert await wm.delete_workspace(ws_id, owner_removing=owner_removing) is True
 
         wm._teardown_machine.assert_awaited_once_with(_binding(ws_id, computer))
         assert [item.kwargs for item in mock_status.await_args_list] == [
             {"expected": "running"},
-            {"expected": "stopping"},
+            {
+                "expected": "stopping",
+                "drop_config_key": "stand_in_host",
+                "unless_config_key": "retire_by_owner",
+            },
         ]
         # Nothing is unlinked from a disk that has just been destroyed.
         wm._remove_workspace_folder.assert_not_awaited()
@@ -2006,7 +2040,11 @@ class TestDeleteOnASharedMachine:
         assert mock_status.await_count == 2
         assert [item.kwargs for item in mock_status.await_args_list] == [
             {"expected": "running"},
-            {"expected": "stopping"},
+            {
+                "expected": "stopping",
+                "drop_config_key": "stand_in_host",
+                "unless_config_key": "retire_by_owner",
+            },
         ]
 
 
@@ -2060,6 +2098,33 @@ class TestDeleteKeepsTheFolderOnTheOwnersMachine:
         ):
             assert await wm.delete_workspace(ws_id, **kwargs) is True
         return ws_id, db_delete, wm._remove_workspace_folder
+
+    @pytest.mark.asyncio
+    async def test_homes_stand_in_goes_only_with_its_computer(self):
+        """An agent's tool and the routes delete through here too; the
+        stand-in goes only with its computer's teardown."""
+        computer = _make_computer(computer_id=_STUB_COMPUTER_ID, kind="daytona")
+        ws_id = str(uuid.uuid4())
+        wm = WorkspaceManager(_make_config())
+        with (
+            patch(
+                f"{_WORKSPACE_MANAGER}.db_delete_workspace", new_callable=AsyncMock
+            ) as db_delete,
+            cm_patch(
+                "db_get_workspace",
+                AsyncMock(
+                    return_value=_make_workspace(
+                        workspace_id=ws_id,
+                        computer_id=_STUB_COMPUTER_ID,
+                        config={"home_stand_in": True},
+                    )
+                ),
+            ),
+            _patch_resolve(computer),
+        ):
+            with pytest.raises(ValueError, match="Cannot delete Home"):
+                await wm.delete_workspace(ws_id)
+        db_delete.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_a_delete_leaves_the_folder_by_default(self):
@@ -2128,15 +2193,17 @@ class TestRemoveComputerWithWorkspaces:
         self, named, *, primary=False, moving=(), working=(), on=("ws-a", "ws-b")
     ):
         computer = _make_computer(computer_id=_STUB_COMPUTER_ID, is_primary=primary)
+        other = _make_computer(computer_id="22222222-2222-2222-2222-222222222222")
         with (
             patch(
                 f"{_WORKSPACE_MANAGER}.get_computer",
                 AsyncMock(side_effect=lambda _id: None if self.retired else computer),
             ),
+            patch(f"{_RETIREMENT}.primary_candidate", AsyncMock(return_value=other)),
             patch(
                 f"{_WORKSPACE_MANAGER}.get_live_workspace_ids_for_computer",
                 AsyncMock(return_value=list(on)),
-            ),
+            ) as self.listed,
             patch(
                 f"{_WORKSPACE_MANAGER}.workspace_is_moving",
                 AsyncMock(side_effect=lambda ws_id: ws_id in moving),
@@ -2157,9 +2224,9 @@ class TestRemoveComputerWithWorkspaces:
         assert await self._remove(["ws-a", "ws-b", "ws-gone"]) == ["ws-a", "ws-b"]
 
         assert [
-            (c.args, c.kwargs["on_computer"])
+            (c.args, c.kwargs["on_computer"], c.kwargs["owner_removing"])
             for c in self.wm.delete_workspace.await_args_list
-        ] == [(("ws-a",), _STUB_COMPUTER_ID), (("ws-b",), _STUB_COMPUTER_ID)]
+        ] == [(("ws-a",), _STUB_COMPUTER_ID, True), (("ws-b",), _STUB_COMPUTER_ID, True)]
         self.wm.remove_computer.assert_awaited_once_with(_STUB_COMPUTER_ID)
 
     @pytest.mark.asyncio
@@ -2240,6 +2307,35 @@ class TestRemoveComputerWithWorkspaces:
         self.wm.delete_workspace.assert_not_awaited()
         self.wm.remove_computer.assert_not_awaited()
 
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(("owed", "code"), [(False, None), (True, "handback_owed")])
+    async def test_homes_stand_in_goes_with_it_unless_home_is_owed_its_files(
+        self, owed, code
+    ):
+        """Never shown to the owner, so never named or deleted on its own: it
+        goes with its computer (pinned in test_home_handback). What it wrote
+        while their own computer was away is nowhere else until handed back,
+        so that refuses before anything is deleted."""
+        from src.server.database.home_stand_in import StandIn
+        from src.server.services.computer_errors import ComputerRemovalRefused
+
+        stand_in = StandIn(
+            row={}, computer={}, kept=True, runs=True, owed=owed, left=False
+        )
+        with patch(f"{_WORKSPACE_MANAGER}.stand_in_on", AsyncMock(return_value=stand_in)):
+            if code:
+                with pytest.raises(ComputerRemovalRefused) as refused:
+                    await self._remove(["ws-a"], on=("ws-a",))
+                assert refused.value.code == code
+                self.wm.delete_workspace.assert_not_awaited()
+            else:
+                await self._remove(["ws-a"], on=("ws-a",))
+                assert [c.args for c in self.wm.delete_workspace.await_args_list] == [
+                    ("ws-a",)
+                ]
+                self.wm.remove_computer.assert_awaited_once()
+        assert self.listed.await_args.kwargs == {"exclude_stand_in": True}
+
 
 # ---------------------------------------------------------------------------
 # cleanup_idle_workspaces
@@ -2304,6 +2400,52 @@ class TestCleanupIdle:
             computer_id, unchanged_since=row["updated_at"], reason="idle"
         )
         mock_computers.assert_awaited_once_with("running", limit=1000, offset=0)
+
+    @pytest.mark.asyncio
+    @patch(
+        "src.server.services.workspace_manager.get_computers_by_status",
+        new_callable=AsyncMock,
+    )
+    @pytest.mark.parametrize(
+        ("active", "command", "retired"),
+        [(False, False, True), (False, True, False), (True, False, False)],
+        ids=["quiet", "command-running", "turn-running"],
+    )
+    async def test_an_idle_own_machine_is_never_stopped_only_its_session_goes(
+        self, mock_computers, active, command, retired
+    ):
+        """Stopping a machine of the user's own saves the deployment nothing
+        and ends the user's own work there; the sweep drops only this worker's
+        session, and keeps even that while a turn or a command runs."""
+        computer_id = str(uuid.uuid4())
+        row = _make_computer(
+            computer_id=computer_id,
+            kind="ssh",
+            last_activity_at=datetime.now(timezone.utc) - timedelta(hours=3),
+        )
+        mock_computers.return_value = [row]
+        config = _make_config()
+        config.to_core_config.return_value.sandbox.ssh.auto_stop_interval = 7200
+        wm = WorkspaceManager(config)
+        wm._machine(computer_id).session = MagicMock()
+        with (
+            patch.object(wm, "_stop_machine", new_callable=AsyncMock) as mock_stop,
+            patch.object(
+                wm, "retire_computer_session_if_present", new_callable=AsyncMock
+            ) as retire,
+            patch.object(
+                wm, "_machine_has_active_tasks", new=AsyncMock(return_value=active)
+            ),
+            patch(
+                "src.server.database.runs.command_runs.computer_has_running_command",
+                new=AsyncMock(return_value=command),
+            ),
+        ):
+            assert await wm.cleanup_idle_workspaces() == 0
+
+        mock_stop.assert_not_awaited()
+        assert retire.await_count == (1 if retired else 0)
+        assert wm.idle_stop_window(row) is None
 
     @pytest.mark.asyncio
     @patch(
@@ -3219,7 +3361,7 @@ class TestSeedAgentMd:
         sandbox.awrite_file_text.assert_awaited_once()
         call_args = sandbox.awrite_file_text.call_args
         assert call_args[0][0] == "agent.md"
-        assert "## Thread Index" in call_args[0][1]
+        assert "## Deliverables" in call_args[0][1]
 
     @pytest.mark.asyncio
     async def test_an_existing_agent_md_is_never_overwritten(self):
@@ -5072,7 +5214,7 @@ class TestStatusRoutesToDbFallback:
     def test_the_warm_handle_is_fenced_on_the_rows_computer_root(self):
         """The file and share routes fence on the computer columns the
         workspace row already joins, with no read of their own."""
-        from src.server.app.workspace_files.serve import warm_sandbox
+        from src.server.services.warm_files import warm_sandbox
 
         wm = WorkspaceManager.get_instance(config=_make_config())
         session = self._ssh_session()
@@ -5100,7 +5242,7 @@ class TestStatusRoutesToDbFallback:
         "File not found", and a row whose sandbox auto-stopped serves nothing
         while reading 'running'.
         """
-        from src.server.app.workspace_files.serve import warm_sandbox
+        from src.server.services.warm_files import warm_sandbox
 
         wm = WorkspaceManager.get_instance(config=_make_config())
         session = _make_mock_session()  # on 'sandbox-abc'
@@ -5573,6 +5715,225 @@ class TestEntitledAlwaysOn:
         mock_set_ao.assert_not_awaited()
 
 
+class TestFirstBuildTier:
+    """Home's computer, or the stand-in's while Home is on the user's own
+    machine, takes the plan's size at its first build and never after."""
+
+    def setup_method(self):
+        WorkspaceManager.reset_instance()
+
+    def teardown_method(self):
+        WorkspaceManager.reset_instance()
+
+    @pytest.fixture(autouse=True)
+    def _plan(self):
+        self.locks = 0
+        self.conn = object()
+        self.row = _make_computer(
+            computer_id=_STUB_COMPUTER_ID, provider_ref=None, status="starting"
+        )
+        self.home = self.row
+        self.home_under_lock = None
+        self.host = None
+
+        @asynccontextmanager
+        async def lock(_user_id):
+            self.locks += 1
+            yield self.conn
+
+        def home(*_a, **kwargs):
+            if kwargs.get("conn") is self.conn and self.home_under_lock is not None:
+                return self.home_under_lock
+            return self.home
+
+        with (
+            patch(
+                "src.server.services.platform_client.platform_gating_active",
+                return_value=True,
+            ) as self.gating,
+            patch(f"{_ENTITLEMENTS}.computer_capacity_lock", lock),
+            patch(
+                f"{_ENTITLEMENTS}.get_computer",
+                AsyncMock(side_effect=lambda *_a, **_k: self.row),
+            ),
+            patch(f"{_ENTITLEMENTS}.get_home_computer", AsyncMock(side_effect=home)),
+            patch(
+                f"{_ENTITLEMENTS}.marked_stand_in_host",
+                AsyncMock(side_effect=lambda *_a, **_k: self.host),
+            ),
+            patch(
+                f"{_ENTITLEMENTS}.db_set_computer_resource_tier",
+                AsyncMock(return_value={"computer_id": _STUB_COMPUTER_ID}),
+            ) as self.write,
+            patch(
+                "src.server.dependencies.usage_limits.spec_entitlement_lost",
+                AsyncMock(return_value=False),
+            ) as self.lost,
+        ):
+            self.manager = WorkspaceManager.get_instance(config=_make_config_with_tiers())
+            self.manager.plan_tier = AsyncMock(return_value="performance")
+            self.manager._assert_machine_disk_fits = AsyncMock()
+            yield
+
+    async def _tier(self, **binding):
+        return await self.manager._entitled_tier(
+            _binding("ws-1", **{"provider_ref": None, **binding}), "user-1"
+        )
+
+    def _fitted(self):
+        return [c for c in self.write.await_args_list if c.kwargs.get("conn") is self.conn]
+
+    @pytest.mark.asyncio
+    async def test_homes_computer_is_first_built_at_its_plans_size(self):
+        """The write is fenced on the row still unbuilt in the status read
+        under the lock."""
+        assert await self._tier() == "performance"
+        self.write.assert_awaited_once_with(
+            _STUB_COMPUTER_ID,
+            "performance",
+            expected_status="starting",
+            expected_provider_ref=None,
+            conn=self.conn,
+        )
+
+    @pytest.mark.asyncio
+    async def test_a_fit_whose_fenced_write_misses_leaves_the_size(self):
+        self.write.return_value = None
+        assert await self._tier() == "standard"
+
+    @pytest.mark.asyncio
+    async def test_the_stand_ins_computer_follows_the_plan_while_home_is_on_the_users_machine(
+        self,
+    ):
+        self.home = _make_computer(computer_id="c-own", kind="ssh")
+        self.host = self.row
+        assert await self._tier() == "performance"
+        assert len(self._fitted()) == 1
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("home", ["another", "own-machine-without-host"])
+    async def test_any_other_computer_keeps_its_size_without_taking_the_lock(self, home):
+        if home == "another":
+            self.home = _make_computer(computer_id="c-home")
+        else:
+            self.home = _make_computer(computer_id="c-own", kind="ssh")
+        assert await self._tier() == "standard"
+        assert self.locks == 0
+        self.manager.plan_tier.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_a_primary_that_moved_while_the_start_waited_for_the_lock_keeps_its_size(self):
+        """Made primary elsewhere meanwhile, it no longer follows the plan."""
+        self.home_under_lock = _make_computer(computer_id="c-new-home")
+        assert await self._tier() == "standard"
+        assert self._fitted() == []
+        self.manager.plan_tier.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("seen", ["in-the-binding", "under-the-lock"])
+    async def test_a_computer_built_before_keeps_its_size(self, seen):
+        """Built once, a bigger size would replace its sandbox, which only
+        its owner asks for."""
+        self.row = {**self.row, "provider_ref": "sandbox-old"}
+        self.home = self.row
+        binding = {"provider_ref": "sandbox-old"} if seen == "in-the-binding" else {}
+        assert await self._tier(**binding) == "standard"
+        assert self._fitted() == []
+        assert self.locks == (0 if seen == "in-the-binding" else 1)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("row", ["owner-sized", "changing-spec"])
+    async def test_a_size_its_owner_chose_or_is_changing_stays(self, row):
+        if row == "owner-sized":
+            self.row = {**self.row, "config": {SIZED_BY_OWNER: True}}
+        else:
+            self.row = {**self.row, "spec_change": {
+                "target_tier": "max",
+                "from_tier": "standard",
+                "state": "in_progress",
+                "started_at": "2026-01-01T00:00:00Z",
+            }}
+        self.home = self.row
+        assert await self._tier() == "standard"
+        assert self._fitted() == []
+        self.manager.plan_tier.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("planned", [None, "standard"], ids=["unread", "no-bigger"])
+    async def test_a_plan_that_gives_nothing_bigger_builds_it_at_its_own_size(self, planned):
+        self.manager.plan_tier.return_value = planned
+        assert await self._tier() == "standard"
+        assert self._fitted() == []
+
+    @pytest.mark.asyncio
+    async def test_an_unbuilt_follower_holding_a_lapsed_tier_is_reclaimed_on_an_unread_plan(self):
+        """A first build that failed left a bigger tier and no sandbox; with
+        no plan read to size it by, the lapse check reclaims it rather than
+        the fit keeping it."""
+        self.row = {**self.row, "resource_tier": "max"}
+        self.home = self.row
+        self.manager.plan_tier.return_value = None
+        self.lost.return_value = True
+        assert await self._tier(resource_tier="max") == "standard"
+        self.write.assert_awaited_with(_STUB_COMPUTER_ID, "standard")
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("planned", ["performance", "standard"])
+    async def test_an_unbuilt_follower_holding_a_bigger_tier_takes_its_plans_smaller_one(
+        self, planned
+    ):
+        """A first build that failed at max retries at what the plan gives
+        now, fenced as any fit is, rather than the lapse check taking it all
+        the way to standard."""
+        self.row = {**self.row, "resource_tier": "max"}
+        self.home = self.row
+        self.manager.plan_tier.return_value = planned
+        self.lost.return_value = True
+        assert await self._tier(resource_tier="max") == planned
+        self.write.assert_awaited_once_with(
+            _STUB_COMPUTER_ID,
+            planned,
+            expected_status="starting",
+            expected_provider_ref=None,
+            conn=self.conn,
+        )
+        self.lost.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_without_a_platform_no_plan_is_read(self):
+        self.gating.return_value = False
+        assert await self._tier() == "standard"
+        assert self.locks == 0
+        self.manager.plan_tier.assert_not_awaited()
+
+
+class TestReconcileAlwaysOnSize:
+    @pytest.mark.asyncio
+    async def test_a_size_the_plan_no_longer_grants_keeps_it_exempt_until_its_next_start(self):
+        """Always-on is what the plan still grants, so the sweep leaves it up;
+        its next start reclaims the size."""
+        manager = WorkspaceManager(_make_config())
+        big = _make_computer(computer_id="c-big", is_always_on=True, resource_tier="max")
+        with (
+            patch(
+                "src.server.dependencies.usage_limits.always_on_entitlement_lost",
+                new_callable=AsyncMock,
+                return_value=False,
+            ),
+            patch(
+                "src.server.dependencies.usage_limits.spec_entitlement_lost",
+                new_callable=AsyncMock,
+                return_value=True,
+            ),
+            patch(
+                "src.server.database.runs.command_runs.computer_has_running_command",
+                new_callable=AsyncMock,
+                return_value=False,
+            ),
+        ):
+            assert await manager._reconcile_always_on_entitlements([big]) == {"c-big"}
+
+
 class TestReconcileAlwaysOnUnmetered:
     @pytest.mark.asyncio
     async def test_unmetered_exempt_unprobed_metered_reclaimed(self):
@@ -5699,7 +6060,7 @@ class TestSetComputerAlwaysOn:
             patch(f"{_ENTITLEMENTS}.get_computer", AsyncMock(return_value=computer)),
             patch(f"{_ENTITLEMENTS}.computer_capacity_lock", capacity),
             patch(
-                "src.server.dependencies.usage_limits.platform_gating_active",
+                "src.server.services.platform_client.platform_gating_active",
                 return_value=True,
             ),
             patch(
@@ -5742,7 +6103,7 @@ class TestSetComputerAlwaysOn:
             patch(f"{_ENTITLEMENTS}.get_computer", AsyncMock(return_value=computer)),
             patch(f"{_ENTITLEMENTS}.computer_capacity_lock", capacity),
             patch(
-                "src.server.dependencies.usage_limits.platform_gating_active",
+                "src.server.services.platform_client.platform_gating_active",
                 return_value=True,
             ),
             patch("src.server.dependencies.usage_limits.assert_always_on_allowed", gate),
@@ -6407,7 +6768,7 @@ class TestSetWorkspaceSpec:
             patch(f"{_SPEC}.get_computer", AsyncMock(return_value=computer)),
             patch(f"{_SPEC}.computer_capacity_lock", capacity),
             patch(
-                "src.server.dependencies.usage_limits.platform_gating_active",
+                "src.server.services.platform_client.platform_gating_active",
                 return_value=True,
             ),
             patch(
@@ -8384,6 +8745,23 @@ class TestGeneratedContentGoesToTheHeldFolder:
         assert (("ws-1", "sandbox-abc") in manager._projects_attached) is not link_failed
 
     @pytest.mark.asyncio
+    async def test_a_refresh_syncs_as_the_computers_owner(self):
+        """Whoever asks for a refresh, the machine is given its owner's vault
+        and skills. On a shared computer the one asking is another member,
+        whose own secrets must never land where every member's code runs."""
+        manager, sandbox = self._asset_sync([])
+        binding = _binding("ws-1", dir_name="Research")
+        manager.resolve_binding = AsyncMock(return_value=binding)
+        manager._sync_project_assets = AsyncMock(return_value="synced")
+
+        assert await manager.refresh_project_assets("ws-1", sandbox) == "synced"
+
+        assert manager._sync_project_assets.await_args.args[:3] == (
+            binding, binding.user_id, sandbox,
+        )
+        assert binding.user_id
+
+    @pytest.mark.asyncio
     async def test_unheld_helpers_still_take_their_own_hold(self):
         """The refresh route, provisioning's restore and the discovery task's
         sync run under no caller's hold, so each holds the folder it writes into
@@ -8401,7 +8779,7 @@ class TestGeneratedContentGoesToTheHeldFolder:
             stack.enter_context(
                 patch(f"{_PROVISIONING}.FilePersistenceService.maybe_restore", restore)
             )
-            assert await manager.refresh_project_assets("ws-1", "user-1", sandbox)
+            assert await manager.refresh_project_assets("ws-1", sandbox)
             assert await manager._maybe_restore_files(
                 _binding("ws-1", dir_name="Research"), sandbox
             )
@@ -8473,4 +8851,28 @@ class TestSupersededResolve:
 @pytest.fixture(autouse=True)
 def _local_lifecycle_capacity(monkeypatch):
     # Lifecycle fakes have no platform or database; admission is tested separately.
-    monkeypatch.setattr("src.server.dependencies.usage_limits.platform_gating_active", lambda: False)
+    monkeypatch.setattr("src.server.services.platform_client.platform_gating_active", lambda: False)
+
+
+@pytest.mark.parametrize(
+    "kind, interval, stops_at",
+    [
+        # The provider stops these itself, so the sweep runs ten minutes ahead.
+        ("daytona", 1800, 1200),
+        ("e2b", 1500, 900),
+        # No provider stop to run ahead of: the setting is the sweep's.
+        ("ssh", 7200, 7200),
+        ("docker", 3600, 3600),
+        # Never under five minutes.
+        ("daytona", 600, 300),
+    ],
+)
+def test_the_idle_sweep_runs_ahead_only_of_a_provider_that_stops_itself(
+    kind, interval, stops_at
+):
+    manager = SimpleNamespace(
+        _provider_settings=lambda kind, overrides: SimpleNamespace(
+            auto_stop_interval=interval
+        )
+    )
+    assert WorkspaceManager._idle_timeout_for(manager, {"kind": kind}) == stops_at

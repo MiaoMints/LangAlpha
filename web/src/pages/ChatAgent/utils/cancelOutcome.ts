@@ -27,6 +27,11 @@ export interface HeldSteer {
   request_key: string | null;
   /** Epoch seconds. */
   timestamp?: number;
+  /** A send carrying file comments: `content` is its note, this its comments. */
+  artifact_comments?: unknown;
+  /** In a shared workspace's thread, the member who queued it
+   *  (`{user_id, name}`, as replay names a turn's sender). */
+  sender?: unknown;
 }
 
 export interface CancelOutcome {

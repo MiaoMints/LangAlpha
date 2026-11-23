@@ -10,6 +10,7 @@ macOS run and a Linux run cover both starts.
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import os
 import secrets
 import shlex
@@ -26,6 +27,7 @@ import pytest
 
 from ptc_agent.core.paths import SandboxLayout
 from ptc_agent.core.sandbox import execution, jobs
+from chartkit.protocol import CHART_FILE_ENV
 from ptc_agent.core.sandbox.providers._ssh_shell import stop_script
 from ptc_agent.core.sandbox.runtime import ExecResult
 
@@ -309,8 +311,9 @@ async def test_a_trace_read_to_record_stays_for_the_discard(shell, computer):
             break
         await asyncio.sleep(0.05)
     await jobs.stop_job(shell, spec.ref)
-    assert await jobs.collect_job_trace(shell, spec.ref, delete=False) == [{"server": "s"}]
-    assert await jobs.collect_job_trace(shell, spec.ref, delete=False) == [{"server": "s"}]
+    read = await jobs.read_job_end(shell, spec.ref, trace=True)
+    assert read == ([{"server": "s"}], jobs.Outbox())
+    assert await jobs.read_job_end(shell, spec.ref, trace=True) == read
     await jobs.discard_jobs(shell, [spec.ref])
     assert not os.path.exists(spec.ref.trace_path)
 
@@ -325,7 +328,7 @@ async def test_a_trace_read_with_no_answer_raises_rather_than_reading_as_no_call
         return ExecResult("", "", 0)
 
     with pytest.raises(jobs.JobReplyError):
-        await jobs.collect_job_trace(silent, spec.ref, delete=False)
+        await jobs.read_job_end(silent, spec.ref, trace=True)
 
 
 @pytest.mark.asyncio
@@ -335,8 +338,84 @@ async def test_a_trace_too_large_to_read_is_skipped_and_reads_as_none(
     spec = computer.spec("true")
     Path(spec.ref.trace_path).write_text('{"server":"s"}\n' * 4)
     monkeypatch.setattr(jobs.protocol, "_TRACE_READ_MAX", 16)
-    assert await jobs.collect_job_trace(shell, spec.ref, delete=False) == []
+    assert await jobs.read_job_end(shell, spec.ref, trace=True) == ([], jobs.Outbox())
     assert os.path.exists(spec.ref.trace_path)
+
+
+def _charting(computer: Computer, command: str) -> jobs.JobSpec:
+    """A job whose environment names its outbox, as every job's does."""
+    spec = computer.spec(command)
+    outbox = f"{spec.ref.state_dir}/{jobs.OUTBOX_FILE}"
+    return dataclasses.replace(spec, env={**spec.env, CHART_FILE_ENV: outbox})
+
+
+def test_wait_reply_reads_the_outbox_after_the_raised_record():
+    stdout = '\nn H done 1 2 0\nhi\nn T\n\nn R\nnumpy\nn O 24\n{"id":"a"}\n{"id":"b"}\n'
+    reply = jobs.protocol.parse_wait_reply(_reply(stdout), "n")
+    assert reply.raised == "numpy"
+    assert reply.outbox == jobs.Outbox(('{"id":"a"}', '{"id":"b"}'))
+
+
+def test_a_reply_with_no_outbox_section_reads_none():
+    """A job that wrote nothing to its outbox has no section: no records,
+    nothing cut."""
+    reply = jobs.protocol.parse_wait_reply(_reply("\nn H done 0 0 0\n\nn T\n"), "n")
+    assert reply.outbox == jobs.Outbox() and not reply.outbox
+
+
+def test_the_outbox_splits_on_newlines_only_and_a_cut_file_drops_its_partial_line():
+    text = '{"note":"a\u2028b"}\n\n{"id":"x"}\n{"id":"cu'
+
+    def read(size: int) -> jobs.Outbox:
+        reply = _reply(f"\nn H done 0 0 0\n\nn O {size}\n{text}")
+        return jobs.protocol.parse_wait_reply(reply, "n").outbox
+
+    assert read(len(text)) == jobs.Outbox(('{"note":"a\u2028b"}', '{"id":"x"}', '{"id":"cu'))
+    cut = read(jobs.OUTBOX_READ_MAX + 1)
+    assert cut == jobs.Outbox(('{"note":"a\u2028b"}', '{"id":"x"}'), truncated=True)
+    assert jobs.Outbox(truncated=True)
+
+
+@pytest.mark.asyncio
+async def test_the_outbox_returns_with_the_jobs_end_even_a_failed_one(shell, computer):
+    spec = _charting(
+        computer,
+        """echo working; printf '{"id":"a"}\\n' >> "$PTC_CHART_FILE"; """
+        """printf '{"id":"b"}\\n' >> "$PTC_CHART_FILE"; echo boom >&2; exit 1""",
+    )
+    outcome = await jobs.run_job(shell, spec, 30)
+    assert isinstance(outcome, jobs.Ended)
+    assert (outcome.exit_code, outcome.output) == (1, "working\nboom\n")
+    assert outcome.outbox == jobs.Outbox(('{"id":"a"}', '{"id":"b"}'))
+    # A retried wait finds the job reaped and reports the same records, and
+    # so does the end read the watcher makes, with the trace when asked.
+    again = await jobs.continue_job(shell, _held(spec), 0)
+    assert again.outbox == outcome.outbox
+    assert await jobs.read_job_end(shell, spec.ref, trace=False) == (None, outcome.outbox)
+    assert await jobs.read_job_end(shell, spec.ref, trace=True) == ([], outcome.outbox)
+
+
+@pytest.mark.asyncio
+async def test_a_job_that_wrote_nothing_carries_no_outbox(shell, computer):
+    spec = _charting(computer, "echo hi")
+    outcome = await jobs.run_job(shell, spec, 30)
+    assert not outcome.outbox
+    assert await jobs.read_job_end(shell, spec.ref, trace=False) == (None, jobs.Outbox())
+
+
+@pytest.mark.asyncio
+async def test_an_outbox_past_the_cap_is_cut_and_says_so(shell, computer):
+    line = '{"id":"layer","pad":"' + "x" * 1000 + '"}'
+    count = jobs.OUTBOX_READ_MAX // (len(line) + 1) + 50
+    spec = _charting(
+        computer,
+        f"yes {shlex.quote(line)} | head -n {count} >> \"$PTC_CHART_FILE\"; echo done",
+    )
+    outcome = await jobs.run_job(shell, spec, 60)
+    assert outcome.output == "done\n"
+    assert outcome.outbox.truncated
+    assert 0 < len(outcome.outbox.lines) < count
+    assert set(outcome.outbox.lines) == {line}
 
 
 @pytest.mark.asyncio
@@ -574,7 +653,12 @@ async def test_a_wrapper_killed_in_the_wait_reads_137_and_vanished(shell, comput
 @pytest.mark.asyncio
 async def test_hand_off_then_wait_across_chunks(shell, computer, monkeypatch):
     monkeypatch.setattr(jobs, "WAIT_CHUNK_S", 1)
-    spec = computer.spec("echo start; sleep 2.2; echo end")
+    # The job ends only once a second chunk has begun, so a wait that gave up
+    # after one chunk would hang here, however slow the machine.
+    gate = os.path.join(computer.root, "gate")
+    spec = computer.spec(
+        f"echo start; while [ ! -e {shlex.quote(gate)} ]; do sleep 0.05; done; echo end"
+    )
     outcome = await jobs.run_job(shell, spec, 0)
     assert isinstance(outcome, jobs.Running)
     assert shell.calls == 1
@@ -583,10 +667,16 @@ async def test_hand_off_then_wait_across_chunks(shell, computer, monkeypatch):
     assert state.running and not state.stopped
 
     shell.calls = 0
-    outcome = await jobs.continue_job(shell, outcome, None)
+
+    async def open_gate_in_second_chunk() -> None:
+        await _until(lambda: shell.calls >= 2, timeout=30)
+        Path(gate).touch()
+
+    opener = asyncio.create_task(open_gate_in_second_chunk())
+    outcome = await asyncio.wait_for(jobs.continue_job(shell, outcome, None), 60)
+    await opener
     assert isinstance(outcome, jobs.Ended) and outcome.exit_code == 0
     assert outcome.output == "start\nend\n"
-    assert shell.calls >= 2
 
 
 @pytest.mark.asyncio
@@ -647,6 +737,33 @@ async def test_stop_ends_the_whole_group(shell, computer):
     state = (await jobs.read_job_states(shell, [spec.ref]))[spec.ref.command_id]
     assert state.found and not state.running and state.stopped
     assert await jobs.stop_job(shell, spec.ref) is False
+
+
+@pytest.mark.skipif(
+    not (sys.platform == "darwin" and os.access("/usr/bin/caffeinate", os.X_OK)),
+    reason="only a Mac holds itself awake",
+)
+@pytest.mark.asyncio
+@pytest.mark.parametrize("end", ["exit", "stop"])
+async def test_a_job_on_a_mac_holds_it_awake_until_it_ends(shell, computer, end):
+    mark = _marker()
+    spec = computer.spec(f"sleep {mark}")
+    await jobs.run_job(shell, spec, 0)
+    pid = Path(spec.ref.state_dir, "pid")
+    # The wrapper makes the file before it writes the record.
+    await _until(lambda: pid.exists() and bool(pid.read_text().split()))
+    wrapper = pid.read_text().split()[0]
+    hold = f"/usr/bin/caffeinate -i -w {wrapper}"
+    await _until(lambda: bool(_processes(hold)))
+
+    if end == "stop":
+        assert await jobs.stop_job(shell, spec.ref) is True
+    else:
+        # The hold can start before the command does.
+        await _until(lambda: bool(_processes(f"sleep {mark}")))
+        for line in _processes(f"sleep {mark}"):
+            subprocess.run(["pkill", "-f", line], env={"PATH": _PATH}, check=False)
+    await _until(lambda: not _processes(hold))
 
 
 @pytest.mark.asyncio

@@ -1,9 +1,17 @@
 import type { StructuredError } from '@/utils/rateLimitError';
+import type { TurnStop } from '@/types/chat';
 import { failAssistantMessage, finalizeAssistantMessage } from './finalizeMessage';
 import { continuationChain, holdsContent } from './continuedBubbles';
 import { withoutPending } from './toolCallChunks';
 import type { MessageRecord, SetMessages } from '../../hooks/utils/types';
 import type { StreamRefs } from '../streamRefs';
+import type { SSEEvent } from '../types';
+
+/** How the turn a frame closes was stopped: only the account's suspension
+ *  is told apart from its user. */
+export function readStop(event: SSEEvent): TurnStop {
+  return event.stopped_by === 'suspension' ? 'suspension' : true;
+}
 
 // Always-live tools (TaskOutput, WebFetch) spin off `isInProgress` whatever
 // `isStreaming` says, so their rows fold here too.
@@ -81,8 +89,11 @@ function settleTurnEnd(
  * `run_end`, which after a drop reaches a reconnect's bubble that may hold
  * none of the reply.
  */
-export function settleStoppedBubble(at: { assistantMessageId: string; refs: StreamRefs; setMessages: SetMessages }): void {
-  settleTurnEnd(at, (msg) => finalizeAssistantMessage(msg, 'stopped'));
+export function settleStoppedBubble(
+  at: { assistantMessageId: string; refs: StreamRefs; setMessages: SetMessages },
+  stop: TurnStop = true,
+): void {
+  settleTurnEnd(at, (msg) => ({ ...finalizeAssistantMessage(msg, 'stopped'), stopped: stop }));
 }
 
 /**
@@ -94,16 +105,19 @@ export function settleStoppedBubble(at: { assistantMessageId: string; refs: Stre
  * with no Retry and no message to send again, so it fails with the card a
  * reload of the failed turn draws.
  */
-export function settleFailedBubble({ failure, internal = false, ...at }: {
+export function settleFailedBubble({ failure, internal = false, runId, ...at }: {
   assistantMessageId: string;
   refs: StreamRefs;
   setMessages: SetMessages;
   failure?: StructuredError;
   internal?: boolean;
+  /** The internal failure's run, which the hidden opener's card names for a
+   *  report once the banner is gone. */
+  runId?: string;
 }): void {
   settleTurnEnd(at, (msg) => {
     if (!internal || holdsContent(msg)) return failAssistantMessage(msg, failure);
-    if (msg.hiddenOpener === true) return failAssistantMessage(msg, { message: '', kind: 'internal' });
+    if (msg.hiddenOpener === true) return failAssistantMessage(msg, { message: '', kind: 'internal', runId });
     return finalizeAssistantMessage(msg, 'disconnected');
   });
 }

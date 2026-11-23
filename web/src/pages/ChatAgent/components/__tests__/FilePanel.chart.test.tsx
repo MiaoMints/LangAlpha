@@ -7,9 +7,9 @@ vi.mock('@/pages/ChatAgent/utils/api', async (importOriginal) => {
   const orig = await importOriginal<Record<string, unknown>>();
   return {
     ...orig,
-    readWorkspaceFile: vi.fn(async () => ({ content: '# Notes', mime: 'text/markdown', truncated: false })),
-    readWorkspaceFileFull: vi.fn(async () => ({ content: '# Notes' })),
-    writeWorkspaceFile: vi.fn(async () => ({})),
+    readWorkspaceFile: vi.fn(async () => ({ content: '# Notes', mime: 'text/markdown', truncated: false, from: { kind: 'live' } })),
+    readWorkspaceFileFull: vi.fn(async () => ({ content: '# Notes', version: null, rewriting: false, from: { kind: 'live' } })),
+    writeWorkspaceFile: vi.fn(async () => ({ version: null })),
     downloadWorkspaceFileAsArrayBuffer: vi.fn(),
     triggerFileDownload: vi.fn(),
     resolveWorkspaceFile: vi.fn(),
@@ -52,7 +52,7 @@ vi.mock('@/pages/MarketView/components/MarketChartSurface', () => ({
 
 import FilePanel from '@/pages/ChatAgent/components/FilePanel';
 import { createTranscriptStore } from '@/pages/ChatAgent/components/filePanel/transcriptStore';
-import { lastChartStorageKey, tabsStorageKey } from '@/pages/ChatAgent/components/filePanel/useFileTabs';
+import { lastChartStorageKey, tabsStorageKey, threadTabsStorageKey } from '@/pages/ChatAgent/components/filePanel/useFileTabs';
 import { userLocalStorage } from '@/lib/userStorage';
 
 const FILES = ['notes.md'];
@@ -229,15 +229,14 @@ describe('FilePanel chart tabs', () => {
     expect(mounts).toHaveBeenCalledTimes(1);
   });
 
-  it('keeps a non-persisting strip out of the workspace seed', async () => {
-    userLocalStorage.setItem(tabsStorageKey('ws'), JSON.stringify({ tabs: [{ kind: 'file', path: 'notes.md', preview: false }], active: 0 }));
-    renderWithProviders(panel({ target: GOOGL, persistTabs: false }));
+  it('keeps a non-persisting strip out of storage, thread or not', async () => {
+    renderWithProviders(panel({ target: GOOGL, persistTabs: false, threadId: 't1' }));
     await screen.findByTestId('chart-surface');
 
-    // A gallery browsing beside the threads opened a chart; the seed the
-    // threads start from still names the file, not the chart.
-    const seed = JSON.parse(userLocalStorage.getItem(tabsStorageKey('ws'))!);
-    expect(seed.tabs).toEqual([{ kind: 'file', path: 'notes.md', preview: false }]);
+    // A gallery browsing beside the threads opened a chart; neither the
+    // thread's strip nor the symbol a new chart tab opens on may name it.
+    expect(userLocalStorage.getItem(threadTabsStorageKey('ws', 't1'))).toBeNull();
+    expect(userLocalStorage.getItem(tabsStorageKey('ws'))).toBeNull();
     expect(userLocalStorage.getItem(lastChartStorageKey('ws'))).toBeNull();
   });
 

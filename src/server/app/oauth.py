@@ -15,7 +15,6 @@ import logging
 import secrets
 from datetime import datetime, timedelta, timezone
 
-import httpx
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
@@ -30,9 +29,19 @@ from src.server.services.oauth_protocol import (
     DevicePollFailed,
     DeviceUpstreamUnavailable,
     TokenSet,
-    upstream_error_code,
 )
+from src.server.services.features import user_feature_enabled
+from src.server.services import activity
+from src.server.services.activity import Action
+from src.server.services.policy import OWN_SUBSCRIPTIONS
+from src.server.services.account import require_policy
 from src.server.services.oauth_providers import SUBSCRIPTIONS
+from src.server.services.oauth_signin import (
+    OAuthRefusal,
+    PendingSignIn,
+    exchange_failure,
+    require_cache,
+)
 from src.server.utils.api import CurrentUserId
 from src.utils.cache.throttle import throttle
 
@@ -41,56 +50,7 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/v1/oauth", tags=["OAuth"])
 
 
-class OAuthRefusal(HTTPException):
-    """A failure from these routes: ``detail`` the sentence, ``error`` its
-    ``{code, message, retryable}``, where ``retryable`` says whether asking
-    again (the same poll, the same pasted code) can succeed or the user has to
-    start over. Provider text never reaches the client, only its code.
-
-    The code rides beside ``detail`` rather than in it because pages loaded
-    before it existed render ``detail`` as text; ``setup.py`` writes the body.
-    """
-
-    def __init__(self, status_code: int, code: str, message: str, **extra):
-        super().__init__(status_code=status_code, detail=message)
-        self.error = {"code": code, "message": message, **extra}
-
-
 _fail = OAuthRefusal
-
-
-def _require_cache():
-    # Where a sign-in's pending state lives.
-    from src.utils.cache.redis_cache import get_cache_client
-
-    cache = get_cache_client()
-    if not cache.enabled or not cache.client:
-        raise _fail(
-            503, "redis_unavailable",
-            "Connecting an account is unavailable right now. Try again shortly.",
-            retryable=True,
-        )
-    return cache
-
-
-def _exchange_failure(upstream: str, e: Exception) -> OAuthRefusal:
-    """The token exchange's failure, by whether trying again can help."""
-    if isinstance(e, httpx.HTTPStatusError):
-        status = e.response.status_code
-        if status != 429 and status < 500:
-            return _fail(
-                400, "exchange_failed", f"{upstream} did not accept the authorization. Start again.",
-                retryable=False, upstream_code=upstream_error_code(e.response),
-            )
-    if isinstance(e, (httpx.HTTPStatusError, httpx.TransportError, TimeoutError)):
-        return _fail(
-            502, "upstream_unavailable", f"{upstream} could not be reached. Try again.",
-            retryable=True,
-        )
-    return _fail(
-        502, "exchange_failed", f"{upstream} sent an unexpected answer. Start again.",
-        retryable=False,
-    )
 
 
 _SAVE_DEADLINE_S = 10
@@ -118,6 +78,10 @@ async def _save(cache, key: str, raw, user_id: str, provider: str, tokens: Token
         logger.exception(f"[oauth] Saving {provider} tokens failed for user_id={user_id}")
         raise _fail(500, "save_failed", "The account could not be saved. Start again.", retryable=False)
     await connection_changed(user_id)
+    activity.record(
+        user_id, Action.MODEL_SIGN_IN_CONNECTED, resource=("model_provider", provider),
+        detail={"provider": provider},
+    )
     return True
 
 
@@ -165,7 +129,9 @@ async def device_initiate(key: str, user_id: CurrentUserId):
     verification_url_has_code, interval, expires_at}``, where
     ``verification_url_has_code`` says the page already carries the code. Poll
     every ``interval`` seconds until ``status`` is no longer ``pending``."""
-    return await _device_initiate(_device_flow(key), user_id)
+    flow = _device_flow(key)
+    (await require_policy(user_id)).require(OWN_SUBSCRIPTIONS, "Connecting a model sign-in")
+    return await _device_initiate(flow, user_id)
 
 
 @router.post("/{key}/device/poll")
@@ -175,7 +141,9 @@ async def device_poll(key: str, user_id: CurrentUserId):
     account_id}), ``denied`` or ``expired`` (``code`` says whether the code
     expired or no flow is pending); the last two mean start again. A retryable
     error (``upstream_unavailable``) means poll again."""
-    return await _device_poll(_device_flow(key), user_id)
+    flow = _device_flow(key)
+    (await require_policy(user_id)).require(OWN_SUBSCRIPTIONS, "Connecting a model sign-in")
+    return await _device_poll(flow, user_id)
 
 
 # Each start asks the provider for a code from the deployment's one address,
@@ -187,7 +155,7 @@ _INITIATE_DEADLINE_S = 30
 
 
 async def _device_initiate(flow: DeviceFlow, user_id: str) -> dict:
-    cache = _require_cache()
+    cache = require_cache()
     if not await throttle(f"oauth_device_init:{flow.provider}:{user_id}", _INITIATES_PER_MINUTE, 60):
         # Worded as the provider being busy, which asking again shortly fixes.
         raise _fail(
@@ -229,7 +197,7 @@ async def _device_initiate(flow: DeviceFlow, user_id: str) -> dict:
 
 
 async def _device_poll(flow: DeviceFlow, user_id: str) -> dict:
-    cache = _require_cache()
+    cache = require_cache()
     lock_key = f"{flow.redis_key}:poll:{user_id}"
     lock_token = secrets.token_hex(16)
     acquired = await cache.acquire_lock(lock_key, lock_token, _POLL_LOCK_TTL_MS)
@@ -296,7 +264,7 @@ async def _poll_once(cache, flow: DeviceFlow, user_id: str) -> dict:
             f"[oauth] {flow.provider} device token exchange failed for user_id={user_id}: "
             f"{type(e).__name__}"
         )
-        failure = _exchange_failure(flow.upstream, e)
+        failure = exchange_failure(flow.upstream, e)
         if not failure.error["retryable"]:
             await cache.claim(key, raw)
         raise failure
@@ -329,9 +297,6 @@ async def _poll_once(cache, flow: DeviceFlow, user_id: str) -> dict:
 
 # ─── Claude: PKCE authorization code flow ────────────────────────────────────
 
-CLAUDE_FLOW_TTL = 600
-
-
 class ClaudeCallbackRequest(BaseModel):
     callback_input: str
 
@@ -340,11 +305,20 @@ def _claude_key(user_id: str) -> str:
     return f"oauth:claude:{user_id}"
 
 
-def _no_claude_flow() -> OAuthRefusal:
-    return _fail(
-        400, "no_pending_flow", "This sign-in has expired or was already used. Start again.",
-        retryable=False,
-    )
+async def _sign_in_feature_allows(user_id: str, provider: str) -> bool:
+    """Whether the provider's ``sign_in_feature``, where it has one, lets the
+    user start a new sign-in. A stored connection may always sign in again as
+    it lapses, whatever became of the grant, so every caller ORs that in."""
+    feature = SUBSCRIPTIONS[provider].sign_in_feature
+    return feature is None or await user_feature_enabled(user_id, feature)
+
+
+async def _require_claude_sign_in(user_id: str) -> None:
+    (await require_policy(user_id)).require(OWN_SUBSCRIPTIONS, "Connecting a model sign-in")
+    provider = claude_oauth.CLAUDE_PROVIDER
+    if await _sign_in_feature_allows(user_id, provider) or await get_oauth_connection(user_id, provider) is not None:
+        return
+    raise _fail(403, "unavailable", "Signing in with Claude isn't available for this account.")
 
 
 @router.post("/claude/initiate")
@@ -354,15 +328,10 @@ async def claude_initiate(user_id: CurrentUserId):
     The frontend opens it in a new tab; once the user authorizes, Anthropic's
     page shows a code they paste back via POST /claude/callback.
     """
-    cache = _require_cache()
-    authorize_url, verifier = claude_oauth.generate_authorize_url()
-    # The verifier is the flow: once it expires, a pasted code has nothing
-    # to match, so the page counts down to the same moment.
-    await cache.client.set(_claude_key(user_id), verifier, ex=CLAUDE_FLOW_TTL)
-
+    await _require_claude_sign_in(user_id)
+    started = await PendingSignIn(_claude_key(user_id)).start(claude_oauth.generate_authorize_url)
     logger.info(f"[oauth] Claude OAuth initiated for user_id={user_id}")
-    expires_at = datetime.now(timezone.utc) + timedelta(seconds=CLAUDE_FLOW_TTL)
-    return {"authorize_url": authorize_url, "expires_at": expires_at.isoformat()}
+    return started
 
 
 @router.post("/claude/callback")
@@ -377,8 +346,10 @@ async def claude_callback(user_id: CurrentUserId, body: ClaudeCallbackRequest):
     second waits instead, and answers as the first did when that one connected
     this same sign-in.
     """
-    cache = _require_cache()
-    lock_key = f"{_claude_key(user_id)}:callback"
+    await _require_claude_sign_in(user_id)
+    flow = PendingSignIn(_claude_key(user_id))
+    cache = flow.cache
+    lock_key = f"{flow.key}:callback"
     lock_token = secrets.token_hex(16)
     deadline = asyncio.get_running_loop().time() + _CALLBACK_WAIT_S
     waited = False
@@ -395,27 +366,11 @@ async def claude_callback(user_id: CurrentUserId, body: ClaudeCallbackRequest):
             retryable=True,
         )
     try:
-        key = _claude_key(user_id)
-        if waited and await _claude_saved(cache, key, body):
+        if waited and await flow.saved(body.callback_input):
             return {"success": True}
-        return await _claude_exchange(cache, key, user_id, body)
+        return await _claude_exchange(flow, user_id, body)
     finally:
         await cache.release_lock(lock_key, lock_token)
-
-
-async def _claude_saved(cache, key: str, body: ClaudeCallbackRequest) -> bool:
-    """Whether the callback just ahead connected the sign-in this paste is for.
-
-    Read from the marker that save leaves, which names its sign-in (the state
-    is the verifier), rather than from the stored connection: on a reconnect
-    whose save failed the old connection still stands, and it is not this one.
-    """
-    try:
-        _, state = claude_oauth.parse_callback_input(body.callback_input)
-    except ValueError:
-        return False
-    saved = await cache.client.get(f"{key}:saved")
-    return (saved.decode() if isinstance(saved, bytes) else saved) == state
 
 
 # The exchange gets one deadline for the whole of it (httpx's timeout bounds
@@ -426,38 +381,21 @@ _CALLBACK_LOCK_TTL_MS = 45_000
 _CALLBACK_WAIT_S = 40.0
 
 
-async def _claude_exchange(cache, key: str, user_id: str, body: ClaudeCallbackRequest) -> dict:
-    stored = await cache.client.get(key)
-    if not stored:
-        raise _no_claude_flow()
-    verifier = stored.decode() if isinstance(stored, bytes) else stored
-
-    try:
-        code, state = claude_oauth.parse_callback_input(body.callback_input)
-    except ValueError:
-        raise _fail(
-            400, "invalid_callback_input",
-            "That doesn't look like the code from Claude's page. Paste the whole code.", retryable=True,
-        )
-    # Anthropic's PKCE convention: state is the verifier.
-    if state != verifier:
-        raise _fail(
-            400, "state_mismatch", "That code belongs to a different sign-in. Start again.",
-            retryable=False,
-        )
+async def _claude_exchange(flow: PendingSignIn, user_id: str, body: ClaudeCallbackRequest) -> dict:
+    stored, verifier, state = await flow.read()
+    code = flow.code(body.callback_input, state)
 
     try:
         async with asyncio.timeout(_CALLBACK_DEADLINE_S):
             tokens = await claude_oauth.exchange_code(code, state, verifier)
     except Exception as e:
         logger.error(f"[oauth] Claude token exchange failed for user_id={user_id}: {type(e).__name__}")
-        raise _exchange_failure("Claude", e)
+        raise exchange_failure("Claude", e)
 
-    # The verifier is the sign-in's id: starting again writes a new one.
-    if not await _save(cache, key, stored, user_id, claude_oauth.CLAUDE_PROVIDER, tokens):
-        raise _no_claude_flow()
-    # For a second paste of this code waiting on this one (``_claude_saved``).
-    await cache.client.set(f"{key}:saved", verifier, ex=int(_CALLBACK_WAIT_S * 2))
+    if not await _save(flow.cache, flow.key, stored, user_id, claude_oauth.CLAUDE_PROVIDER, tokens):
+        raise PendingSignIn.expired()
+    # For a second paste of this code waiting on this one (``PendingSignIn.saved``).
+    await flow.mark_saved(state, int(_CALLBACK_WAIT_S * 2))
     logger.info(f"[oauth] Claude connected for user_id={user_id}")
     return {"success": True}
 
@@ -466,8 +404,16 @@ async def _claude_exchange(cache, key: str, user_id: str, body: ClaudeCallbackRe
 
 @router.get("/{key}/status", response_model=OAuthStatus)
 async def oauth_status(key: str, user_id: CurrentUserId) -> OAuthStatus:
-    """The connection's status, read without decrypting its tokens."""
-    return OAuthStatus.from_row(await get_oauth_connection(user_id, _subscription(key)))
+    """The connection's status, read without decrypting its tokens. It says
+    whether the user may start a sign-in, so the web never guesses from a
+    flags read that can fail or lag."""
+    provider = _subscription(key)
+    row = await get_oauth_connection(user_id, provider)
+    return OAuthStatus.from_row(
+        row,
+        can_sign_in=row is not None or await _sign_in_feature_allows(user_id, provider),
+        ends_on=SUBSCRIPTIONS[provider].ends_on(),
+    )
 
 
 def _pending_flow_key(key: str, user_id: str) -> str | None:
@@ -492,5 +438,9 @@ async def oauth_disconnect(key: str, user_id: CurrentUserId):
             await cache.client.delete(flow_key)
         await delete_oauth_tokens(user_id, provider, conn=conn)
     await connection_changed(user_id)
+    activity.record(
+        user_id, Action.MODEL_SIGN_IN_DISCONNECTED, resource=("model_provider", provider),
+        detail={"provider": provider},
+    )
     logger.info(f"[oauth] {provider} disconnected for user_id={user_id}")
     return {"success": True}

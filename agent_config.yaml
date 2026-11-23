@@ -13,7 +13,7 @@ llm:
   fetch: ""         # blank → the background model
   fallback:
     - "deepseek-flash"
-    - "glm-5.2"
+    - "glm-5.3"
 
 sandbox:
   # Provider selection: "daytona" or "e2b" (cloud), or "docker" (local).
@@ -24,8 +24,9 @@ sandbox:
   #   kept) and start resumes it in about a second. Each resource tier has its own
   #   template, built from the same image recipe as the Daytona snapshot.
   # - docker: Local Docker containers using Dockerfile.sandbox. Useful for development.
-  # Override at runtime with SANDBOX_PROVIDER env var.
-  provider: "daytona"
+  # Left unset it auto-detects from the keys: DAYTONA_API_KEY, else E2B_API_KEY, else docker.
+  # SANDBOX_PROVIDER overrides whatever is set here.
+  # provider: "daytona"
   # Other providers a user may pick when creating a computer; `provider` stays
   # the default. Each needs its credentials, and a computer keeps its provider.
   # "ssh" is offered only this way: it lets users add their own Linux or macOS machine.
@@ -34,10 +35,11 @@ sandbox:
   # Daytona cloud sandbox configuration
   daytona:
     base_url: "https://app.daytona.io/api"
-    auto_stop_interval: 3600 # 1 hour in seconds
+    auto_stop_interval: 1800 # seconds idle before Daytona stops the sandbox; the server stops it 10 minutes earlier (20 min), so a return pays a ~2 s start
     auto_archive_interval: 604800 # 7 days in seconds — keep workspaces "stopped" (fast restart) longer before moving to cold storage
     auto_delete_interval: 7776000 # 90 days in seconds — total lifetime before a dormant sandbox is garbage-collected
-    host_unavailable_rebuild_after_minutes: 60 # rebuild a computer from its backup once its sandbox's host has refused starts this long (the old sandbox is kept); 0 always waits
+    host_unavailable_rebuild_after_minutes: 60 # rebuild a computer from its backup once its sandbox's host has refused starts, or left it mid-start or mid-stop, this long (the old sandbox is kept); 0 always waits
+    create_timeout_seconds: 180 # how long a new sandbox may take to come up; one given up on is found by name and deleted
     python_version: "3.12"
 
     # Hash will be automatically appended based on dependencies
@@ -48,7 +50,7 @@ sandbox:
   # E2B cloud sandbox configuration. Needs E2B_API_KEY; archive is not
   # supported on this provider.
   e2b:
-    auto_stop_interval: 3600 # seconds idle before the sandbox pauses
+    auto_stop_interval: 1500 # seconds idle before E2B pauses the sandbox; the server pauses it 10 minutes earlier (15 min). A pause keeps memory and processes, and resumes in about a second
     max_timeout: 3600 # longest continuous run your plan allows (Hobby 3600, Pro 86400); caps every timeout
     template_name: "langalpha" # prefix of the per-tier templates: <template_name>-<tier>-<hash>
     template_auto_create: true # build a tier's template on first use if missing (takes minutes); false requires `make e2b-templates`
@@ -72,7 +74,7 @@ sandbox:
   # HTTP with `auth: data_token`, and not over stdio. Removing the computer
   # takes those credentials off the machine; the folder stays the owner's.
   ssh:
-    auto_stop_interval: 3600 # seconds idle before the computer's processes are stopped; the machine keeps running
+    auto_stop_interval: 7200 # seconds idle before each server worker drops its connection to the machine (2 h); the server never stops the computer for being idle, only its owner does
     allow_private_addresses: false # true lets users add machines at private, loopback or link-local addresses
     # true sends SSH machines what any computer gets from this server: the
     # built-in data servers' keys (FMP_API_KEY and the rest) and the GitHub
@@ -258,13 +260,32 @@ compaction:
   truncate_args_idle_minutes: null
   truncate_args_keep_messages: 10 # Protect last N messages from Tier 1
   truncate_args_max_length: 2000 # Per-arg-value max chars before truncation
+  # A thread whose system prompt a deploy changed takes the new one through a
+  # summary that keeps no turns. At a turn start under token_threshold, with
+  # the prompt cache expired, that summary runs anyway from this many tokens
+  # of context. 0: only when the threshold or an overflow fires one.
+  rebuild_floor_tokens: 150000
+  # At a turn start under token_threshold, with the prompt cache expired, a
+  # Claude thread of this many tokens is summarized too, keeping the tail
+  # unless its prompt is due, rather than written to the cache whole again.
+  # Reached only where token_threshold is higher. 0: off.
+  cold_compact_tokens: 300000
+  # For a user who opted in to idle compaction (Settings > Experiments), on a
+  # route whose cache entries live an hour (the Claude sign-in), the two
+  # summaries above run while the thread is idle after a completed turn
+  # instead, lead_seconds before the cache entry they read expires, so they
+  # read the history at the cached rate and the next turn does not wait.
+  # threshold_tokens: the least context the one keeping the tail runs at;
+  # unset takes cold_compact_tokens.
+  idle_compact:
+    lead_seconds: 900
 
 # =============================================================================
 # TOOL CONFIGURATION
 # =============================================================================
 
 # Search API Configuration
-# Options: tavily, bocha, serper, exa, parallel
+# Options: tavily, bocha, serper, exa, parallel, deepseek, auto
 search_api: auto
 # Crawler Configuration
 # Web crawling with SafeCrawlerWrapper for circuit breaker and fault tolerance.

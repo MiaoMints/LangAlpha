@@ -12,6 +12,7 @@ import pytest
 from ptc_agent.config.core import E2BConfig, SandboxConfig
 from src.config import env
 from src.server.services.preview_base import (
+    artifact_base,
     PreviewBase,
     PreviewProxyConfigurationError,
     check_preview_proxy_config,
@@ -97,6 +98,64 @@ class TestBase:
         assert base.claims("junk.preview.example.com:443")
         assert not base.claims("evilpreview.example.com")
         assert not base.claims("app.example.com")
+
+
+_ARTIFACT = "5f577948-dc99-4827-a35f-a8ebfbdfa0ff"
+
+
+class TestArtifactHost:
+    def test_an_artifact_url_parses_back_to_its_id(self):
+        base = PreviewBase("http", "preview.localhost", 8000)
+
+        assert base.artifact_url(_ARTIFACT, "v1.x") == (
+            f"http://artifact-{_ARTIFACT}.preview.localhost:8000/g/v1.x/"
+        )
+        for host in (
+            f"artifact-{_ARTIFACT}.preview.localhost:8000",
+            f"ARTIFACT-{_ARTIFACT.upper()}.PREVIEW.LOCALHOST.",
+        ):
+            assert base.parse_artifact(host) == _ARTIFACT
+
+    @pytest.mark.parametrize(
+        "host",
+        [
+            None,
+            "preview.example.com",
+            f"x.artifact-{_ARTIFACT}.preview.example.com",
+            f"artifact-{_ARTIFACT}.evilpreview.example.com",
+            f"artifact-{_ARTIFACT[:-1]}.preview.example.com",
+            f"artifact-{_ARTIFACT.replace('-', '')}.preview.example.com",
+            f"page-{_ARTIFACT}.preview.example.com",
+            f"8080-{_TOKEN}.preview.example.com",
+        ],
+    )
+    def test_no_other_host_names_an_artifact(self, host):
+        assert PreviewBase("https", "preview.example.com").parse_artifact(host) is None
+
+    def test_an_artifact_host_is_no_capability(self):
+        host = f"artifact-{_ARTIFACT}.preview.example.com"
+        assert PreviewBase("https", "preview.example.com").parse(host) is None
+
+
+class TestArtifactBase:
+    @pytest.mark.parametrize(
+        ("base", "app", "own_hosts"),
+        [
+            ("https://preview.example.net", "https://app.example.com", True),
+            ("http://preview.localhost:8000", "http://localhost:5173", True),
+            # A local placeholder beside a real app opens for no visitor, so
+            # versions are served sandboxed on the API origin instead.
+            ("http://preview.localhost", "https://app.example.com", False),
+            ("", "https://app.example.com", False),
+        ],
+    )
+    def test_versions_get_hosts_only_where_a_visitor_can_reach_them(
+        self, monkeypatch, base, app, own_hosts
+    ):
+        monkeypatch.setattr(env, "PREVIEW_PROXY_BASE_URL", base)
+        monkeypatch.setattr(env, "PUBLIC_APP_URL", app)
+
+        assert (artifact_base() is not None) is own_hosts
 
 
 class TestBootCheck:

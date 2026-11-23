@@ -27,6 +27,7 @@ from langgraph.types import Command
 
 from ptc_agent.agent.middleware.background_subagent.middleware import current_background_tool_call_id
 from ptc_agent.agent.middleware.background_subagent.registry import BackgroundTaskRegistry
+from src.llms.reasoning_payload import is_unfinished_reply
 from src.server.utils.content_normalizer import normalize_text_content
 
 logger = structlog.get_logger(__name__)
@@ -136,13 +137,19 @@ class SubagentEventCaptureMiddleware(AgentMiddleware):
         # of the task: a tool call it returns is never run.
         if TAG_NOSTREAM in ((var_child_runnable_config.get() or {}).get("tags") or ()):
             return response
+        await self.capture(response.result[0] if response.result else None)
+        return response
 
-        # Capture events for post-interrupt persistence
+    async def capture(self, ai_msg: Any) -> None:
+        """Capture a reply's tool calls into the per-task event stream, for
+        post-interrupt persistence. A runtime that makes no model call
+        (Claude Code) hands each reply it commits here."""
         tool_call_id = current_background_tool_call_id.get()
         if tool_call_id and self.registry:
             try:
-                ai_msg = response.result[0] if response.result else None
-                if ai_msg:
+                # Model resilience, outside this middleware, retries a reply
+                # cut off before its response finished, so its calls never run.
+                if ai_msg and not is_unfinished_reply(ai_msg):
                     tool_calls = getattr(ai_msg, "tool_calls", None) or []
                     agent_id = _agent_id(self.registry, tool_call_id)
                     msg_id = getattr(ai_msg, "id", f"msg-{tool_call_id}")
@@ -183,8 +190,6 @@ class SubagentEventCaptureMiddleware(AgentMiddleware):
                     tool_call_id=tool_call_id,
                     error=str(e),
                 )
-
-        return response
 
     def wrap_tool_call(
         self,

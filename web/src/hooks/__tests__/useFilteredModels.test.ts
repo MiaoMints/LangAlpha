@@ -12,6 +12,7 @@ import {
   withCustomModels,
 } from '../useFilteredModels';
 import type { ModelMetadataEntry } from '../useFilteredModels';
+import { CLAUDE_CODE_CONNECTION } from '@/lib/claudeCode';
 import type { ConfiguredProvider } from '../useConfiguredProviders';
 import type { ProviderModelsData } from '@/components/model/types';
 import type { PlatformModelsResponse } from '@/types/platform';
@@ -563,6 +564,51 @@ describe('buildVisibleModels', () => {
     expect(result.metadata['model-shared'].prompt_guidance).toBe('lean');
   });
 
+  it("keeps a shadowed model's list price only on the provider it is the price of", () => {
+    const rawMetadata: Record<string, ModelMetadataEntry> = {
+      'model-shared': { provider: 'parent-prov', pricing: { input: 2, output: 10 }, task_cost_estimate: 1 },
+    };
+    const on = (provider: string) =>
+      withCustomModels(rawMetadata, [{ name: 'model-shared', model_id: 'model-shared', provider }], () => undefined)['model-shared'];
+
+    expect(on('byok-variant').pricing).toBeUndefined();
+    expect(on('byok-variant').task_cost_estimate).toBeUndefined();
+    expect(on('parent-prov').pricing).toEqual({ input: 2, output: 10 });
+    expect(on('parent-prov').task_cost_estimate).toBe(1);
+  });
+
+  it("keeps a shadowed model's measured cost per task only on the provider it was measured on", () => {
+    const measured = { medium: { value: 1.4, measured: true } };
+    const rawMetadata: Record<string, ModelMetadataEntry> = {
+      'model-shared': { provider: 'parent-prov', task_cost: measured },
+    };
+    const on = (provider: string) =>
+      withCustomModels(rawMetadata, [{ name: 'model-shared', model_id: 'model-shared', provider }], () => undefined)['model-shared'];
+
+    expect(on('byok-variant').task_cost).toBeUndefined();
+    expect(on('parent-prov').task_cost).toEqual(measured);
+  });
+
+  it("keeps no cost of a shadowed model for another model id on its provider", () => {
+    const rawMetadata: Record<string, ModelMetadataEntry> = {
+      'model-shared': {
+        provider: 'parent-prov',
+        pricing: { input: 2, output: 10 },
+        task_cost: { medium: { value: 1.4, measured: true } },
+        task_cost_estimate: 1,
+      },
+    };
+    const entry = withCustomModels(
+      rawMetadata,
+      [{ name: 'model-shared', model_id: 'another-model', provider: 'parent-prov' }],
+      () => undefined,
+    )['model-shared'];
+
+    expect(entry.pricing).toBeUndefined();
+    expect(entry.task_cost).toBeUndefined();
+    expect(entry.task_cost_estimate).toBeUndefined();
+  });
+
   it('platform mode: filters by tier, custom models pass', () => {
     const rawApiModels = {
       openai: { models: ['gpt-4o', 'gpt-4o-mini'], display_name: 'OpenAI' },
@@ -746,6 +792,46 @@ describe('oauth_plans gate', () => {
     } as unknown as PlatformModelsResponse;
     const result = buildVisibleModels(rawApiModels, rawMetadata, [], {}, platform, codexConnected('team'));
     expect(result.models.openai?.models).toEqual(['gpt-5.6-sol-oauth']);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Claude Code — listed only while the server runs it for the user
+// ---------------------------------------------------------------------------
+
+describe('Claude Code models', () => {
+  const rawApiModels = {
+    anthropic: { models: ['claude-x'], display_name: 'Anthropic' },
+    'claude-code': { models: ['claude-x-code'], display_name: 'Claude Code' },
+  };
+  const rawMetadata: Record<string, ModelMetadataEntry> = {
+    'claude-x': { provider: 'anthropic', access_type: 'api_key', tier: 0 },
+    'claude-x-code': { provider: 'claude-code', sdk: 'claude-code', access_type: 'oauth' },
+  };
+  const anthropicKey: ConfiguredProvider = { provider: 'anthropic', display_name: 'Anthropic', access_type: 'api_key' };
+  const platform = { tier: 0, model_tier: 0, byok_providers: [], oauth_providers: [] } as unknown as PlatformModelsResponse;
+
+  // Listed or not, each stays in the catalog: a thread may hold one, and only
+  // the server says whether it can run now.
+  it('lists none while the server does not run Claude Code for the user, but keeps them in the catalog', () => {
+    for (const plan of [null, platform]) {
+      const result = buildVisibleModels(rawApiModels, rawMetadata, [], {}, plan, [anthropicKey]);
+      expect(result.models.anthropic?.models).toEqual(['claude-x']);
+      expect(result.models['claude-code']?.models ?? []).toEqual([]);
+      expect(result.validModelNames.has('claude-x-code')).toBe(false);
+      expect(result.rawModels['claude-code']?.models).toEqual(['claude-x-code']);
+    }
+  });
+
+  // Listed, it counts as a connection of its own: no key or sign-in of the
+  // user's is asked for.
+  it('lists them as a provider of their own while it does, through either access filter', () => {
+    for (const plan of [null, platform]) {
+      const access = [anthropicKey, CLAUDE_CODE_CONNECTION];
+      const result = buildVisibleModels(rawApiModels, rawMetadata, [], {}, plan && augmentPlatformWithLocal(plan, access, false), access);
+      expect(result.models.anthropic?.models).toEqual(['claude-x']);
+      expect(result.models['claude-code']?.models).toEqual(['claude-x-code']);
+    }
   });
 });
 

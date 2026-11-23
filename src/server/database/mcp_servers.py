@@ -586,8 +586,8 @@ async def list_workspace_servers(workspace_id: str) -> list[dict[str, Any]]:
 
 
 async def list_scope_markers_for_user(user_id: str) -> list[dict[str, Any]]:
-    """Disable-marker rows (inherited tombstones + builtin markers) across ALL
-    of a user's workspaces.
+    """Disable-marker rows (inherited tombstones, builtin and organization
+    connector markers) across ALL of a user's workspaces.
 
     Feeds the all-scopes catalog view's per-name "active in" checklist; one
     query instead of one per workspace. Soft-deleted workspaces are excluded:
@@ -598,7 +598,7 @@ async def list_scope_markers_for_user(user_id: str) -> list[dict[str, Any]]:
             await cur.execute(
                 """
                 SELECT workspace_id, name, source FROM workspace_mcp_servers
-                WHERE source IN ('user', 'builtin') AND enabled = FALSE
+                WHERE source IN ('user', 'builtin', 'org') AND enabled = FALSE
                   AND workspace_id IN
                     (SELECT w.workspace_id FROM workspaces w
                       WHERE w.user_id = %s AND w.status <> 'deleted')
@@ -617,6 +617,8 @@ async def list_scope_markers_for_user(user_id: str) -> list[dict[str, Any]]:
 
 async def get_workspace_servers_and_version(
     workspace_id: str,
+    *,
+    rows_of: str | None = None,
 ) -> tuple[list[dict[str, Any]], int]:
     """Read a workspace's mcp_config_version then its MCP rows. Order matters.
 
@@ -627,6 +629,9 @@ async def get_workspace_servers_and_version(
     caller caches, so its next acquire re-resolves and self-corrects. The reverse
     order would cache stale rows under the new version, and the matching version
     would short-circuit re-resolve, making the drift stick.
+
+    ``rows_of`` reads another workspace's rows under this one's version: Home's
+    stand-in runs with Home's selection, whose writes bump both.
     """
     async with get_db_connection() as conn:
         async with conn.transaction():
@@ -644,7 +649,7 @@ async def get_workspace_servers_and_version(
                     WHERE workspace_id = %s
                     ORDER BY name
                     """,
-                    (workspace_id,),
+                    (rows_of or workspace_id,),
                 )
                 rows = [_workspace_row_to_dict(r) for r in await cur.fetchall()]
     version = int((ws or {}).get("mcp_config_version") or 0)
@@ -847,8 +852,9 @@ async def start_new_workspace_selection(
     added from inside a workspace has ``enabled_in_new_workspaces`` off, and
     its tombstone lands whether the row is live or inert, so the choice holds
     if it is switched live later. A duplicate (``like_workspace_id``) starts
-    with its source's selection instead: every user server and built-in
-    switched off there, whatever the new-workspace default says.
+    with its source's selection instead: every user server, built-in and
+    organization connector switched off there, whatever the new-workspace
+    default says. A new workspace starts with every organization connector on.
 
     Runs in the workspace's INSERT transaction, after ``lock_user_writes``.
     No version bump: nothing can have resolved an uncommitted workspace.
@@ -899,7 +905,7 @@ async def start_new_workspace_selection(
         SELECT %(workspace_id)s::uuid, l.name, l.source, FALSE, NULL, NOW(), NOW()
         FROM workspace_mcp_servers l
         WHERE l.workspace_id = %(like)s::uuid AND NOT l.enabled
-          AND (l.source = 'builtin' OR (l.source = 'user' AND EXISTS (
+          AND (l.source IN ('builtin', 'org') OR (l.source = 'user' AND EXISTS (
               SELECT 1 FROM user_mcp_servers s
               WHERE s.user_id = %(user_id)s AND s.name = l.name
           )))

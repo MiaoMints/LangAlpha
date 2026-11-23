@@ -27,17 +27,29 @@ from ptc_agent.agent.provenance.types import hash_args
 from src.config.env import EGRESS_RELAY_SECRET
 from src.server.database.egress_grants import (
     GRANT_KIND_HEADER_MCP,
+    GRANT_KIND_OAUTH_MCP,
+    GRANT_KIND_ORG_MCP,
+    GRANT_KIND_PLATFORM_MCP,
     fetch_grant_for_relay,
 )
 from src.server.database.order_attempts import claim_dispatch, fetch_attempt_status
+from src.server.services.activity import host_of
 from src.server.services.brokerage_capabilities import order_tool
 from src.server.services.brokerage_orders import AttemptStatus
 from src.server.services.brokerages import brokerage_for_url
-from src.server.services.egress import RelayError, RelayRejection, folded_contains
+from src.server.services.egress import (
+    Dispatch,
+    RelayError,
+    RelayRejection,
+    folded_contains,
+    header,
+)
 from src.server.services.egress.credentials import (
     VendorCredential,
+    platform_server,
     resolve_vendor_credential,
 )
+from src.server.services.egress.policy_gate import PolicyGate
 from src.server.services.egress.execution_token import (
     EXECUTION_HEADER,
     ExecutionTokenError,
@@ -49,6 +61,7 @@ from src.server.services.egress.jsonrpc import (
     JsonRpcRejected,
     canonicalize_request,
 )
+from src.server.services.egress.platform_accounts import PlatformServer
 from src.server.services.egress.relay_jwt import (
     CALLER_HOST,
     RelayClaims,
@@ -61,7 +74,11 @@ from src.server.services.mcp_oauth.lifecycle import (
     current_access_token,
     mark_connection_needs_reauth,
 )
-from src.server.utils.egress_guard import EgressBlockedError, pin_public_url
+from src.server.utils.egress_guard import (
+    EgressBlockedError,
+    PinnedTarget,
+    pin_public_url,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -133,7 +150,12 @@ class PreparedRelay:
     grant: dict
     canonical: CanonicalRequest
     credential: VendorCredential
+    #: The destination as pinned before the credential was read; what
+    #: ``open_upstream`` dials.
+    target: PinnedTarget
     order: OrderFrame | None = None
+    #: The built-in a platform grant names, resolved once for the request.
+    platform: PlatformServer | None = None
 
 
 _client: httpx.AsyncClient | None = None
@@ -200,13 +222,6 @@ def authenticate_relay(authorization: str | None) -> RelayClaims:
         raise RelayRejection(401, RelayError.RELAY_AUTH)
 
 
-def _execution_header(headers: Mapping[str, str] | None) -> str:
-    for key, value in (headers or {}).items():
-        if key.lower() == EXECUTION_HEADER.lower():
-            return value or ""
-    return ""
-
-
 async def _authorize_order(
     canonical: CanonicalRequest,
     *,
@@ -229,7 +244,7 @@ async def _authorize_order(
     for a 403 with no reason beside it.
     """
     tool = canonical.tool_name or ""
-    token = _execution_header(headers)
+    token = header(headers, EXECUTION_HEADER) or ""
     if not token:
         logger.warning(
             "[egress_relay] order frame refused: tool=%r vendor=%r user=%s "
@@ -294,6 +309,10 @@ async def _authorize_order(
     )
 
 
+# The grants that reach a server the user added themselves.
+_OWN_SERVER_GRANTS = frozenset({GRANT_KIND_OAUTH_MCP, GRANT_KIND_HEADER_MCP})
+
+
 def log_order_frame(prepared: PreparedRelay, status: int) -> None:
     """The relay's one audit line, written where the vendor's answer is known.
 
@@ -308,6 +327,26 @@ def log_order_frame(prepared: PreparedRelay, status: int) -> None:
         "[egress_relay] order attempt=%s vendor=%s tool=%s user=%s machine=%s status=%s",
         order.attempt_id, order.vendor, order.tool, order.user_id,
         prepared.claims.identity or "-", status,
+    )
+
+
+def log_org_frame(prepared: PreparedRelay, status: int) -> None:
+    """Who used an organization connector, as the vendor answered.
+
+    The organization is accountable for these calls, so each one is written
+    down where it can be attributed; the line names the call and never its
+    credential.
+    """
+    grant = prepared.grant
+    if grant.get("kind") != GRANT_KIND_ORG_MCP:
+        return
+    logger.info(
+        "[egress_relay] org_connector id=%s user=%s workspace=%s tool=%s status=%s",
+        (grant.get("resolver_config") or {}).get("connector_id") or "-",
+        grant["user_id"],
+        prepared.claims.workspace_id or "-",
+        prepared.canonical.tool_name or prepared.canonical.method or "-",
+        status,
     )
 
 
@@ -360,11 +399,38 @@ async def prepare_relay(
     ):
         raise RelayRejection(404, RelayError.NOT_FOUND)
 
-    # A header grant has no connection to be servable: what stands in for this
-    # check is the credential resolution below, which finds no headers to send
-    # the moment the row is deleted, switched off or repointed.
-    if grant["kind"] != GRANT_KIND_HEADER_MCP and grant["connection_status"] not in SERVABLE:
+    # Read on every frame, so a sandbox left running from before a
+    # suspension or a policy reaches nothing either now withholds.
+    gate = PolicyGate(
+        str(grant["user_id"]), via="relay", caller=claims.caller,
+        workspace_id=grant.get("workspace_id"),
+    )
+    # A grant to a connection names no server, so the connection stands for it.
+    server = grant.get("server_name") or _grant_label(grant)
+    if await gate.suspended():
+        raise RelayRejection(
+            403, RelayError.ACCOUNT_SUSPENDED, "this account's access has ended"
+        )
+    if grant["kind"] in _OWN_SERVER_GRANTS and (
+        withheld := await gate.own_server(
+            grant["destination_url"], server=server, tool=canonical.tool_name,
+            host=host_of(grant.get("destination_url")),
+        )
+    ):
+        raise RelayRejection(403, RelayError.POLICY_WITHHELD, withheld)
+
+    # Only an OAuth grant has a connection to be servable. For a header grant
+    # what stands in for this check is the credential resolution below, which
+    # finds nothing to send the moment the row is gone, and an organization
+    # grant is judged there alone too: a connector switched to shared ignores
+    # the connection a member grant still names, and one members sign in to
+    # checks its own. A platform grant's built-in is resolved here, before any
+    # check reads it.
+    if grant["kind"] == GRANT_KIND_OAUTH_MCP and grant["connection_status"] not in SERVABLE:
         raise RelayRejection(401, RelayError.NEEDS_REAUTH)
+    platform = (
+        await platform_server(grant) if grant["kind"] == GRANT_KIND_PLATFORM_MCP else None
+    )
 
     # HTTP-verb grant policy (defaults to ["POST"]). The route is POST-only
     # today, so this bites only when a grant is deliberately narrowed to [].
@@ -418,6 +484,18 @@ async def prepare_relay(
                 RelayError.TOOL_BLOCKED,
                 "tool is bound directly to the model and is not callable from the sandbox",
             )
+        # A built-in's declared tools are enforced here as well as in the
+        # generated wrappers: the sandbox can write a frame by hand, and every
+        # tool on a platform account bills the deployment. Exact, not folded:
+        # the meter prices exact names, so a respelling the vendor still runs
+        # would otherwise be priced as an unknown tool.
+        offered = platform.config.tools if platform is not None else None
+        if offered is not None and canonical.tool_name not in offered:
+            raise RelayRejection(
+                403, RelayError.TOOL_BLOCKED, "tool is not offered on this server"
+            )
+    if platform is not None:
+        _check_platform_frame(canonical)
 
     order: OrderFrame | None = None
     if canonical.method == "tools/call":
@@ -426,18 +504,76 @@ async def prepare_relay(
         # address is about to be dialled.
         brokerage = brokerage_for_url(grant["destination_url"])
         vendor = brokerage.name if brokerage else None
+        # Whatever bound the tool or approved the order, a frame that reaches
+        # the vendor passes here.
+        if withheld := await gate.live_order(
+            vendor, canonical.tool_name or "", server=server
+        ):
+            raise RelayRejection(403, RelayError.POLICY_WITHHELD, withheld)
         if order_tool(vendor, canonical.tool_name or "") is not None:
             order = await _authorize_order(
                 canonical, claims=claims, vendor=vendor or "", headers=headers
             )
 
+    # Pinned before the credential is read, so a destination the relay will
+    # not dial costs no credential request (an organization's shared one is
+    # asked of the auth service on every call), and the address pinned here
+    # is the one ``open_upstream`` dials.
+    target = await _pin_destination(grant)
     return PreparedRelay(
         claims=claims,
         grant=grant,
         canonical=canonical,
-        credential=await resolve_vendor_credential(grant),
+        credential=await resolve_vendor_credential(
+            grant, canonical, platform=platform
+        ),
+        target=target,
         order=order,
+        platform=platform,
     )
+
+
+async def _pin_destination(grant: Mapping[str, Any]) -> PinnedTarget:
+    try:
+        return await pin_public_url(grant["destination_url"], require_https=True)
+    except EgressBlockedError as e:
+        # The destination was validated at grant creation; a failure here is
+        # DNS trouble or a rebinding attempt, or an organization connector's
+        # address, which no grant write checks: refuse, never resolve
+        # privately. The reason (which names the vendor host and is a
+        # DNS-resolution oracle) stays host-side; the sandbox gets only the
+        # X-Relay-Error code.
+        logger.warning(
+            "[egress_relay] destination pin failed for grant %s: %s",
+            _grant_label(grant), e,
+        )
+        raise RelayRejection(502, RelayError.DESTINATION_BLOCKED)
+
+
+# What a platform grant forwards: the handshake, the tool list and tool
+# calls. Any other method reaches the deployment's paid account with nothing
+# that meters it. ``server/discover`` is the sandbox client's first probe.
+_PLATFORM_METHODS = frozenset(
+    {
+        "initialize",
+        "notifications/initialized",
+        "server/discover",
+        "ping",
+        "tools/list",
+        "tools/call",
+    }
+)
+
+
+def _check_platform_frame(canonical: CanonicalRequest) -> None:
+    if canonical.method not in _PLATFORM_METHODS:
+        raise RelayRejection(
+            403, RelayError.METHOD_BLOCKED, "JSON-RPC method not offered on this server"
+        )
+    # A notification is answered 202 with no result, which settles free,
+    # while the vendor may still have run and billed the tool.
+    if canonical.method == "tools/call" and canonical.is_notification:
+        raise RelayRejection(400, RelayError.BAD_REQUEST, "tools/call needs an id")
 
 
 def _grant_label(grant: Mapping[str, Any]) -> str:
@@ -541,29 +677,21 @@ def _schedule_credential_recheck(grant: Mapping[str, Any]) -> None:
 
 
 async def open_upstream(
-    prepared: PreparedRelay, incoming_headers: dict[str, str]
+    prepared: PreparedRelay,
+    incoming_headers: dict[str, str],
+    dispatch: Dispatch | None = None,
 ) -> httpx.Response:
     """Send the canonical body to the pinned destination; one 401 retry when
     the stored bundle has visibly rotated since we read it. A vendor redirect
-    is refused rather than followed or relayed on."""
-    destination = prepared.grant["destination_url"]
-    try:
-        target = await pin_public_url(destination, require_https=True)
-    except EgressBlockedError as e:
-        # The destination was validated at grant creation; a failure here is
-        # DNS trouble or a rebinding attempt — refuse, never resolve privately.
-        # The reason (which names the vendor host and is a DNS-resolution
-        # oracle) stays host-side; the sandbox gets only the X-Relay-Error code.
-        logger.warning(
-            "[egress_relay] destination pin failed for grant %s: %s",
-            _grant_label(prepared.grant), e,
-        )
-        raise RelayRejection(502, RelayError.DESTINATION_BLOCKED)
-
+    is refused rather than followed or relayed on. The destination is the one
+    ``prepare_relay`` pinned. ``dispatch`` records how far the request got,
+    which a paid call's charge depends on when this raises."""
     client = get_relay_client()
-    url, headers, extensions = target.pinned_kwargs(
+    url, headers, extensions = prepared.target.pinned_kwargs(
         _vendor_headers(prepared, incoming_headers)
     )
+    if dispatch is not None:
+        extensions = {**extensions, "trace": dispatch.trace}
     connection_id = prepared.grant["connection_id"]
 
     async def _send(hdrs: dict[str, str]) -> httpx.Response:
@@ -582,6 +710,8 @@ async def open_upstream(
                 _grant_label(prepared.grant), _upstream_reason(e),
             )
             raise RelayRejection(502, RelayError.UPSTREAM_UNREACHABLE)
+        if dispatch is not None:
+            dispatch.status = response.status_code
         if _is_vendor_redirect(response.status_code):
             # Following the hop would carry the vendor bearer to whatever host
             # the redirect names, but relaying the 3xx on is worse than useless:
@@ -635,7 +765,14 @@ async def open_upstream(
     await mark_connection_needs_reauth(
         connection_id, seen_token_generation=rejected.generation
     )
-    raise RelayRejection(401, RelayError.NEEDS_REAUTH, "vendor rejected the token")
+    # A member's sign-in to an organization connector is repaired differently
+    # from a connection of the user's own, so the sandbox is told which.
+    code = (
+        RelayError.ORG_SIGN_IN_REQUIRED
+        if prepared.grant.get("kind") == GRANT_KIND_ORG_MCP
+        else RelayError.NEEDS_REAUTH
+    )
+    raise RelayRejection(401, code, "vendor rejected the token")
 
 
 def sandbox_response_headers(upstream: httpx.Response) -> dict[str, str]:

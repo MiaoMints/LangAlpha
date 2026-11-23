@@ -3,11 +3,12 @@ import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { useTranslation } from 'react-i18next';
 import { toast } from '@/components/ui/use-toast';
 import { resolveComposerModel } from '@/components/ui/chat-input.models';
-import type { SubscriptionProvider } from '@/api/oauth';
 import { useAllModels } from '@/hooks/useAllModels';
-import { useLapsedSignIn } from '@/hooks/useLapsedSignIn';
+import { useLapsedSignIn, type SignInGap } from '@/hooks/useLapsedSignIn';
 import { useDefaultModel } from '@/hooks/useSlotDefaultModels';
 import { useSeededModel } from '@/hooks/useSeededModel';
+import { useTurnDefaultModel } from '@/hooks/useTurnModels';
+import { isClaudeCodeModel } from '@/lib/claudeCode';
 import { modelLabel } from '@/lib/modelLabel';
 import { queryKeys } from '@/lib/queryKeys';
 import { threadFieldMutationKey } from '@/lib/threadFieldMutations';
@@ -25,10 +26,16 @@ export interface RetiredModel {
   fallback: string;
 }
 
-/** The composer's model, on a subscription whose sign-in has to be renewed. */
-export interface LapsedSignIn {
+/** The composer's model, on a subscription whose sign-in cannot run it. */
+export interface LapsedSignIn extends SignInGap {
   model: string;
-  provider: SubscriptionProvider;
+}
+
+/** The account's Default, a Claude Code model a Chief of Staff turn cannot
+ *  run yet, and the model the composer starts on instead. */
+export interface HeldDefault {
+  model: string;
+  fallback: string;
 }
 
 /** A pick the user may make the account default. */
@@ -45,6 +52,9 @@ interface UseThreadModelOptions {
   /** The model a navigation's first message went out with, which the thread
    *  row does not carry until that send has stored it. */
   initialModel?: string | null;
+  /** Whether the thread is the Chief of Staff's, whose turn may start on
+   *  another Default than the account's (`useTurnDefaultModel`). */
+  chiefOfStaff?: boolean;
 }
 
 /**
@@ -52,10 +62,15 @@ interface UseThreadModelOptions {
  * next send names, and the one place a pick on it is saved.
  *
  * The thread row is the source. The model starts on the row's model while it
- * is reachable (else the account default) and follows the row when it moves; a
+ * is reachable (else the Default its turn starts on, the Chief of Staff's
+ * for a thread in Home) and follows the row when it moves; a
  * pick holds in between and is saved on the row (`useThreadFieldSave`). A
  * thread not created yet has no row to write, so its pick is held here and
  * goes out with the first send, which stores it.
+ *
+ * A thread whose row names no model, or one that left the catalog, shows the
+ * Default it would start on but sends none until a pick (`sendModel`), so
+ * the server clears the model that left and resolves the Default itself.
  *
  * A pick also raises the offer to make that model the account default, shown
  * while the composer still shows the pick and it differs from the default.
@@ -64,6 +79,7 @@ export function useThreadModel({
   threadId,
   isLoading,
   initialModel = null,
+  chiefOfStaff = false,
 }: UseThreadModelOptions) {
   const { t } = useTranslation();
   const queryClient = useQueryClient();
@@ -81,13 +97,11 @@ export function useThreadModel({
   // and the send would store the default over the model the thread holds.
   // With no model named, the server runs the thread's own.
   const unread = !!liveThreadId && !thread && !initialModel;
+  const own = thread?.llm_model || initialModel || null;
+  const startsOn = useTurnDefaultModel(chiefOfStaff);
   const { seed, retired: retiredName } = unread
     ? { seed: null, retired: null }
-    : resolveComposerModel(
-      thread?.llm_model || initialModel || null,
-      defaultModel,
-      catalogModelNames,
-    );
+    : resolveComposerModel(own, startsOn, catalogModelNames);
   const [model, setModel] = useSeededModel(seed);
 
   // A thread started from another page's composer opens with the pick made
@@ -122,13 +136,17 @@ export function useThreadModel({
       setModel((current) => (current === value ? before : current));
       setOffered(null);
     },
-    // A switch away from a model whose provider compacted the thread into a
-    // summary only it can read: that model writes it out for the new one
-    // first, which the next send waits for.
+    // A switch the model the thread was on writes something for first,
+    // which the next send waits for: a summary only its provider could read,
+    // written out for the new model, or a brief of the whole thread for a
+    // Claude Code model, which has seen none of it.
     onSaved: (saved) => {
-      const to = saved.llm_model || defaultModel;
-      if (!saved.summary_handoff || !to) return;
-      toast({ description: t('chat.threadModel.handoff', { model: modelLabel(to, metadata) }) });
+      // What the next call sends is the new model's.
+      if (liveThreadId) void queryClient.invalidateQueries({ queryKey: queryKeys.threads.context(liveThreadId) });
+      const to = saved.llm_model || startsOn;
+      const key = saved.brief_handoff ? 'chat.threadModel.brief' : saved.summary_handoff ? 'chat.threadModel.handoff' : null;
+      if (!key || !to) return;
+      toast({ description: t(key, { model: modelLabel(to, metadata) }) });
     },
   });
 
@@ -159,6 +177,8 @@ export function useThreadModel({
       queryKey: queryKeys.threads.detail(liveThreadId),
       ...(saving ? { refetchType: 'none' as const } : {}),
     });
+    // A turn can change what its next call sends ahead of the messages.
+    void queryClient.invalidateQueries({ queryKey: queryKeys.threads.context(liveThreadId) });
   }, [isLoading, liveThreadId, queryClient]);
 
   const dismissOffer = useCallback(() => {
@@ -166,18 +186,30 @@ export function useThreadModel({
     setOffered(null);
     if (liveThreadId) userSessionStorage.setItem(OFFER_DISMISSED_PREFIX + liveThreadId, '1');
   }, [liveThreadId]);
+  // Running out answers nothing, so the next pick on the thread offers again.
+  const expireOffer = useCallback(() => setOffered(null), []);
 
   // Named only once there is a default to name beside it, and never when the
   // default is the retired model too: the row would promise a move that the
   // composer cannot make.
-  const retired: RetiredModel | null = retiredName && defaultModel && retiredName !== defaultModel
-    ? { model: retiredName, fallback: defaultModel }
+  const retired: RetiredModel | null = retiredName && startsOn && retiredName !== startsOn
+    ? { model: retiredName, fallback: startsOn }
     : null;
-  const lapsedProvider = lapsedOf(model);
-  const lapsed: LapsedSignIn | null = model && lapsedProvider ? { model, provider: lapsedProvider } : null;
+  const gap = lapsedOf(model);
+  const lapsed: LapsedSignIn | null = model && gap ? { model, ...gap } : null;
   const offer: DefaultModelOffer | null = offered && offered === model && defaultModel && offered !== defaultModel
     ? { model: offered, defaultModel }
     : null;
 
-  return { model, retired, lapsed, offer, pickModel, dismissOffer };
+  // Said while the composer shows the Default it fell back to in its place,
+  // only on a thread that follows the Default: one with a model of its own,
+  // even one that left the catalog (`retired` says that), follows none.
+  const heldDefault: HeldDefault | null = chiefOfStaff && defaultModel && startsOn && defaultModel !== startsOn
+    && model === startsOn && !own && isClaudeCodeModel(metadata?.[defaultModel])
+    ? { model: defaultModel, fallback: startsOn }
+    : null;
+
+  const sendModel = thread && seed !== own && model === seed ? null : model;
+
+  return { model, sendModel, retired, lapsed, offer, heldDefault, pickModel, dismissOffer, expireOffer };
 }

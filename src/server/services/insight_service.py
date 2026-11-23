@@ -217,6 +217,48 @@ async def _llm_extract_fallback(raw_text: str, user_id: str | None) -> dict:
     return result.model_dump() if hasattr(result, "model_dump") else dict(result)
 
 
+async def _no_key_serves(user_id: str) -> bool:
+    """Whether a scheduled brief on this user's credentials has nothing to run on.
+
+    A self-hosted deployment sits like this from first boot until its user
+    connects a model. That is no failure, so a job finding it skips before
+    claiming a row, and asks again at the next job, which sees a key added since.
+    Answered from the models' payers, building no client: a client built without
+    a key is what logs the failure this is here to avoid.
+    """
+    from src.server.services.llm import user_models
+    from src.server.services.llm.config import (
+        deployment_llm,
+        saved_default_model,
+        slot_model,
+    )
+    from src.server.services.llm.payers import model_payers
+
+    llm = deployment_llm()
+    deployment_model = slot_model(llm, "background") if llm else None
+    try:
+        saved = saved_default_model(await user_models.get_model_preference(user_id), "background")
+        model = saved or deployment_model
+        if not model:
+            return True
+        payers = {r.name: r for r in await model_payers(user_id)}
+    except Exception as exc:
+        # Asking must not be what stops a brief: the run reports its own failure.
+        logger.warning(f"[MARKET_INSIGHT] Could not read the model's payer: {exc}")
+        return False
+
+    def unpaid(name: str) -> bool:
+        # A name the list leaves out is for the run itself to refuse.
+        row = payers.get(name)
+        return row is not None and (row.payer is None or row.signed_in is False)
+
+    if not unpaid(model):
+        return False
+    # ``_research`` falls back to the deployment's model when the saved one
+    # cannot resolve, so the brief has nothing only if that has nothing too.
+    return not deployment_model or unpaid(deployment_model)
+
+
 async def _research(
     prompt: str,
     user_id: str | None = None,
@@ -244,6 +286,9 @@ async def _research(
 
     config = agent_config
     if user_id:
+        from src.server.services.policy import is_policy_refusal
+        from src.server.services.account import policy_for
+
         try:
             from src.server.services.llm.config import resolve_llm_config
 
@@ -252,6 +297,19 @@ async def _research(
                 user_facing=False,
             )
         except Exception as exc:
+            # The user's policy, or an account it cannot be read for, holds
+            # this run too: the deployment's models were never held to it, so
+            # they stand in only for a user nothing restricts.
+            if is_policy_refusal(exc):
+                # The run's own failure is only logged, so the refusal is
+                # recorded here or nowhere.
+                from src.server.services.activity import record_refusal
+
+                record_refusal(exc, user_id)
+                raise
+            policy = await policy_for(user_id)
+            if policy is None or not policy.unrestricted:
+                raise
             logger.warning(f"[MARKET_INSIGHT] Could not resolve user LLM, falling back to system: {exc}")
 
     if config.llm is None:
@@ -527,6 +585,7 @@ class InsightService:
     async def _build_user_context(self, user_id: str) -> str:
         """Build symbols context from user's watchlists and portfolio, capped."""
         from src.server.database.portfolio import get_user_portfolio
+        from src.tools.secretary.activity import holding_position
         from src.server.database.watchlist import (
             get_user_watchlists,
             get_watchlist_items,
@@ -560,18 +619,10 @@ class InsightService:
                 if sym and sym not in seen_symbols and len(seen_symbols) < self._max_symbols:
                     seen_symbols.add(sym)
                     name = h.get("name", "")
-                    qty = h.get("quantity", "")
-                    avg_cost = h.get("average_cost", "")
-                    lines.append(
-                        f"- {sym} ({name}) [portfolio: {qty} shares @ ${avg_cost}]"
-                    )
+                    lines.append(f"- {sym} ({name}) [portfolio: {holding_position(h)}]")
                 elif sym in seen_symbols:
                     # Symbol already from watchlist — add portfolio info
-                    qty = h.get("quantity", "")
-                    avg_cost = h.get("average_cost", "")
-                    lines.append(
-                        f"  ^ also in portfolio: {qty} shares @ ${avg_cost}"
-                    )
+                    lines.append(f"  ^ also in portfolio: {holding_position(h)}")
         except Exception as e:
             logger.warning(f"[MARKET_INSIGHT] Failed to fetch portfolio for {user_id}: {e}")
 
@@ -727,6 +778,15 @@ class InsightService:
     ) -> None:
         """Generate a single market insight, unless another worker has the slot
         or a recent insight of this type already covers it."""
+        # When auth is off (local dev / self-hosted), use the local dev user's
+        # credentials so insights work without a system API key.
+        from src.config.settings import HOST_MODE, LOCAL_DEV_USER_ID
+        system_user_id = None if HOST_MODE == "platform" else LOCAL_DEV_USER_ID
+
+        if system_user_id and await _no_key_serves(system_user_id):
+            logger.info(f"[MARKET_INSIGHT] Skipping {job_type}: no model has a key yet")
+            return
+
         instruction = _build_instruction(job_type, now_et)
         claim = await self._claim(job_type, instruction)
         if claim.holder_in_flight:
@@ -741,11 +801,6 @@ class InsightService:
 
         logger.info(f"[MARKET_INSIGHT] Starting {job_type}: id={insight_id}")
         start_time = time.monotonic()
-
-        # When auth is off (local dev / self-hosted), use the local dev user's
-        # credentials so insights work without a system API key.
-        from src.config.settings import HOST_MODE, LOCAL_DEV_USER_ID
-        system_user_id = None if HOST_MODE == "platform" else LOCAL_DEV_USER_ID
 
         async def run_research(prompt: str) -> dict:
             raw_text = await _research(

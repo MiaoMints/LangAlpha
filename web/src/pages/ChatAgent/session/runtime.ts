@@ -29,13 +29,18 @@
  */
 
 import type React from 'react';
+import type { QueryClient } from '@tanstack/react-query';
+import type { BrowserUse } from './stream/browserUse';
 import type {
-  SetMessages, TokenUsage, PendingInterrupt, OffloadBatch, SSEEvent,
-  TaskRefs, HistoryInterruptInfo, FallbackSuggestion,
+  SetMessages, TokenUsage, OffloadBatch, SSEEvent,
+  TaskRefs, HistoryInterruptInfo, FallbackSuggestion, TurnStatus,
 } from './types';
 import type { CardUpdater } from './streamRefs';
+import type { PauseSlot } from './interrupts/pauseSlot';
 import type { SubagentHistoryStore } from './subagents/historyStore';
+import type { ThreadMuxSlot } from './stream/threadStreamMux';
 import type { SubagentTokenUsage } from '../utils/tokenUsage';
+import type { NextSummary } from '../utils/api/messages';
 import type { RecentlySentTracker } from '../hooks/utils/recentlySentTracker';
 import type { RequestKeyTracker } from '../hooks/utils/requestKey';
 import type { PreviewData } from '../hooks/utils/types';
@@ -64,6 +69,7 @@ export interface SubagentRuntime {
   // stable containers, ref-current reads — owned by this lane
   subagentStateRefsRef: Ref<Record<string, TaskRefs>>;
   subagentHistory: SubagentHistoryStore;
+  muxSlot: ThreadMuxSlot;
   subagentProcessEventRef: Ref<((event: SSEEvent) => void) | null>;
   subagentTokenUsageRef: Ref<Record<string, SubagentTokenUsage>>;
   terminalTaskOutcomesRef: Ref<Map<string, 'completed' | 'cancelled' | 'error'>>;
@@ -84,7 +90,6 @@ export interface HistoryRuntime {
   workspaceId: string;
   threadId: string;
   t: Translate;
-  updateTodoListCard: ((todoData: Record<string, unknown>, isNew?: boolean) => void) | null;
   // stable (setters)
   setMessages: SetMessages;
   setIsLoadingHistory: React.Dispatch<React.SetStateAction<boolean>>;
@@ -136,6 +141,11 @@ export interface StreamRuntime {
   onWorkspaceCreated: ((info: { workspaceId: string; question: string }) => void) | null;
   onFileArtifact: ((event: SSEEvent) => void) | null;
   onPreviewUrl: ((data: PreviewData) => void) | null;
+  /** A shell command drove the computer's browser. */
+  onBrowserUse: ((use: BrowserUse) => void) | null;
+  // stable
+  /** The app's query cache, which a stored chart layer is written to. */
+  queryClient: QueryClient;
   // stable (setters)
   setMessages: SetMessages;
   /** Per-token writes, applied on the next frame (`frameQueue.ts`). */
@@ -143,15 +153,19 @@ export interface StreamRuntime {
   /** Apply the queued per-token writes now. */
   flushMessages: () => void;
   setIsLoading: React.Dispatch<React.SetStateAction<boolean>>;
-  setPendingInterrupt: React.Dispatch<React.SetStateAction<PendingInterrupt | null>>;
+  /** The pause the view shows (`pauseSlot.ts`). */
+  pause: PauseSlot;
   setTokenUsage: React.Dispatch<React.SetStateAction<TokenUsage | null>>;
+  setNextSummary: React.Dispatch<React.SetStateAction<NextSummary | null>>;
   setMessageError: React.Dispatch<React.SetStateAction<string | StructuredError | null>>;
   setIsCompacting: (value: string | false) => void;
   setCompactionTokens: (tokens: number | null) => void;
   setFallbackSuggestion: React.Dispatch<React.SetStateAction<FallbackSuggestion | null>>;
   setThreadId: React.Dispatch<React.SetStateAction<string>>;
-  setWorkspaceStarting: React.Dispatch<React.SetStateAction<false | 'starting' | 'archived'>>;
-  setTurnHeld: React.Dispatch<React.SetStateAction<string | null>>;
+  /** Sets the fields of the turn's status it names and keeps the rest. */
+  setTurnStatus: (patch: Partial<TurnStatus>) => void;
+  /** Clears the turn's status, every field at once. */
+  clearTurnStatus: () => void;
   // stable containers, ref-current reads — owned by this lane (per-turn cursors)
   contentOrderCounterRef: Ref<number>;
   currentReasoningIdRef: Ref<string | null>;
@@ -165,7 +179,6 @@ export interface StreamRuntime {
   // stable containers, ref-current reads — shared with other lanes
   threadIdRef: Ref<string>;
   lastEventIdRef: Ref<number | string | null>;
-  pendingInterruptIdsRef: Ref<Set<string>>;
   renderedInterruptIdsRef: Ref<Set<string>>;
   unresolvedHistoryInterruptRef: Ref<HistoryInterruptInfo[]>;
   terminalTaskOutcomesRef: Ref<Map<string, 'completed' | 'cancelled' | 'error'>>;
@@ -174,6 +187,9 @@ export interface StreamRuntime {
   /** A delivery of a steer this view sent settles its key. */
   requestKeyRef: Ref<RequestKeyTracker>;
   offloadBatchRef: Ref<OffloadBatch>;
+  /** The stream left the next send's summary unsaid: a run started (which
+   *  clears it) and no closing frame has told it since. */
+  nextSummaryOwedRef: Ref<boolean>;
 }
 
 /**
@@ -192,11 +208,15 @@ export interface RecoveryRuntime {
   setIsLoading: React.Dispatch<React.SetStateAction<boolean>>;
   setIsReconnecting: React.Dispatch<React.SetStateAction<boolean>>;
   setMessageError: React.Dispatch<React.SetStateAction<string | StructuredError | null>>;
-  setWorkspaceStarting: React.Dispatch<React.SetStateAction<false | 'starting' | 'archived'>>;
-  setTurnHeld: React.Dispatch<React.SetStateAction<string | null>>;
+  /** Sets the fields of the turn's status it names and keeps the rest. */
+  setTurnStatus: (patch: Partial<TurnStatus>) => void;
+  /** Clears the turn's status, every field at once. */
+  clearTurnStatus: () => void;
   setIsCompacting: (value: string | false) => void;
   setHasActiveSubagents: React.Dispatch<React.SetStateAction<boolean>>;
   setReloadTrigger: React.Dispatch<React.SetStateAction<number>>;
+  setNextSummary: React.Dispatch<React.SetStateAction<NextSummary | null>>;
+  pause: PauseSlot;
   // stable containers, ref-current reads — owned by this lane
   isStreamingRef: Ref<boolean>;
   streamingThreadIdRef: Ref<string | null>;
@@ -221,6 +241,7 @@ export interface RecoveryRuntime {
   renderedInterruptIdsRef: Ref<Set<string>>;
   subagentHistory: SubagentHistoryStore;
   subagentTokenUsageRef: Ref<Record<string, SubagentTokenUsage>>;
+  nextSummaryOwedRef: Ref<boolean>;
 }
 
 /**

@@ -9,13 +9,17 @@ agent_config.yaml via AgentConfig (ptc_agent.config).
 import logging
 import math
 import os
+from datetime import timedelta
 from typing import Any, Dict, List, Optional
 
 from src.config.core import get_infrastructure_config
 from src.config.models import (
+    ClaudeCodeConfig,
+    CliApprovalsConfig,
     McpDescriptionsConfig,
     NewsPollConfig,
     OrderReconcileConfig,
+    ThreadSearchConfig,
     WorkflowOrchestrationConfig,
 )
 
@@ -25,6 +29,7 @@ from src.config.env import (  # noqa: F401
     AUTOMATION_WEBHOOK_SECRET,
     AUTOMATION_WEBHOOK_URL,
     GINLIX_DATA_ENABLED,
+    GINLIX_DATA_SEC_ENABLED,
     GINLIX_DATA_URL,
     GINLIX_DATA_WS_URL,
     HOST_MODE,
@@ -112,6 +117,10 @@ def is_brokerage_marks_warm_on_startup_enabled() -> bool:
 
 def is_langsmith_tracing_enabled() -> bool:
     return get_infrastructure_config().langsmith_tracing
+
+
+def is_langsmith_full_payloads_enabled() -> bool:
+    return get_infrastructure_config().langsmith_full_payloads
 
 
 # =============================================================================
@@ -208,6 +217,11 @@ def get_mcp_descriptions_config() -> McpDescriptionsConfig:
 def get_order_reconcile_config() -> OrderReconcileConfig:
     """Order reconciliation sweep config (enabled / cadence / windows / batch)."""
     return get_infrastructure_config().order_reconcile
+
+
+def get_thread_search_config() -> ThreadSearchConfig:
+    """Conversation search index sweep config (enabled / cadence / batch)."""
+    return get_infrastructure_config().thread_search
 
 
 def get_redis_max_connections() -> int:
@@ -376,6 +390,30 @@ def get_market_watch_target_warning_minutes() -> int:
     return get_infrastructure_config().market_watch.target_warning_minutes
 
 
+def get_claude_code_config() -> ClaudeCodeConfig:
+    return get_infrastructure_config().claude_code
+
+
+def get_cli_approvals_config() -> CliApprovalsConfig:
+    return get_infrastructure_config().cli_approvals
+
+
+def get_cli_approval_hold_seconds() -> float:
+    return get_cli_approvals_config().hold_seconds
+
+
+def get_cli_approval_pending_ttl() -> timedelta:
+    return timedelta(minutes=get_cli_approvals_config().pending_minutes)
+
+
+def get_cli_approval_approved_ttl() -> timedelta:
+    return timedelta(minutes=get_cli_approvals_config().approved_minutes)
+
+
+def get_cli_approval_max_pending() -> int:
+    return get_cli_approvals_config().max_pending
+
+
 def get_redis_ttl_market_watch() -> int:
     return get_infrastructure_config().redis.ttl.market_watch
 
@@ -388,10 +426,6 @@ def get_redis_ttl_memo_metadata_inflight() -> int:
 def get_redis_ttl_memo_metadata_cancel() -> int:
     """Cooperative cross-worker memo metadata cancel flag TTL (seconds)."""
     return get_infrastructure_config().redis.ttl.memo_metadata_cancel
-
-
-def is_cache_invalidate_on_write_enabled() -> bool:
-    return get_infrastructure_config().redis.cache_invalidate_on_write
 
 
 # Fallback TTLs matching config.yaml defaults (interval_seconds × 1.5)

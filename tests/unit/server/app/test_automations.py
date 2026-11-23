@@ -16,6 +16,7 @@ import pytest_asyncio
 from httpx import ASGITransport, AsyncClient
 
 from tests.conftest import create_test_app
+from tests.unit.server.dependencies.reach_world import THREAD, USER, WORKSPACE
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -24,8 +25,10 @@ from tests.conftest import create_test_app
 NOW = datetime.now(timezone.utc)
 # A one-time run's time, a month out.
 LATER = NOW + timedelta(days=30)
-AUTO_ID = str(uuid.uuid4())
-EXEC_ID = str(uuid.uuid4())
+# Fixed, not uuid4(): EXEC_ID feeds parametrize ids, which must match across
+# xdist workers.
+AUTO_ID = "6f1c2a9e-3b4d-4e8f-9a1b-2c3d4e5f6a7b"
+EXEC_ID = "0d9e8f7a-6b5c-4d3e-8f2a-1b0c9d8e7f6a"
 
 
 def _automation(automation_id=None, user_id="test-user-123", **overrides):
@@ -120,6 +123,89 @@ async def test_create_automation(client):
     body = resp.json()
     assert body["name"] == "Daily Briefing"
     assert body["trigger_type"] == "cron"
+
+
+_CRON = {
+    "name": "Daily Briefing",
+    "trigger_type": "cron",
+    "cron_expression": "0 8 * * *",
+    "instruction": "Give me a market summary",
+}
+
+
+@pytest_asyncio.fixture
+async def computer_client(monkeypatch):
+    """A client whose calls come from a computer's token, run in ``THREAD``."""
+    from src.server.app.automations import router
+    from tests.unit.server.dependencies.reach_world import ReachWorld, act_as_computer
+
+    app = create_test_app(router)
+    act_as_computer(app, call_thread=THREAD)
+    ReachWorld(monkeypatch)
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+        yield c
+
+
+@pytest.mark.asyncio
+async def test_a_computer_token_cannot_point_an_automation_at_its_own_thread(computer_client):
+    """Its runs would start turns in the conversation the call runs in."""
+    with patch(f"{HANDLER}.create_automation", new_callable=AsyncMock) as create:
+        resp = await computer_client.post(
+            "/api/v1/automations",
+            json={
+                **_CRON,
+                "workspace_id": WORKSPACE,
+                "thread_strategy": "continue",
+                "conversation_thread_id": THREAD,
+            },
+        )
+
+    assert resp.status_code == 403
+    assert "conversation it runs in" in resp.json()["detail"]["message"]
+    create.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_a_computer_tokens_automation_change_asks_the_gate_before_it_runs(
+    computer_client, monkeypatch
+):
+    """Whether it waits for the user is the gate's; the routes hand it the
+    request and what the change would run, before they act."""
+    from src.server.dependencies import cli_approval
+
+    order: list[str] = []
+    hold = AsyncMock(side_effect=lambda *a, **kw: order.append(f"hold:{a[2]}"))
+    monkeypatch.setattr(cli_approval, "automation_runs", hold)
+    auto = _automation(user_id=USER)
+
+    def acted(name):
+        return AsyncMock(side_effect=lambda *a, **kw: order.append(name) or auto)
+
+    with (
+        patch(f"{HANDLER}.create_automation", new=acted("create")),
+        patch(f"{HANDLER}.update_automation", new=acted("edit")),
+        patch(f"{HANDLER}.trigger_automation", new=acted("trigger")),
+        patch(f"{HANDLER}.resume_automation", new=acted("resume")),
+    ):
+        created = await computer_client.post(
+            "/api/v1/automations", json={**_CRON, "workspace_id": WORKSPACE}
+        )
+        edited = await computer_client.patch(
+            f"/api/v1/automations/{AUTO_ID}", json={"instruction": "Shorter"}
+        )
+        triggered = await computer_client.post(f"/api/v1/automations/{AUTO_ID}/trigger")
+        resumed = await computer_client.post(f"/api/v1/automations/{AUTO_ID}/resume")
+
+    assert (created.status_code, edited.status_code, triggered.status_code) == (201, 200, 200)
+    assert resumed.status_code == 200
+    assert order == [
+        "hold:create", "create", "hold:edit", "edit", "hold:trigger", "trigger",
+        "hold:resume", "resume",
+    ]
+    assert hold.await_args_list[0].kwargs["body"].instruction == _CRON["instruction"]
+    assert hold.await_args_list[1].kwargs["automation_id"] == AUTO_ID
+    assert hold.await_args_list[1].kwargs["body"].instruction == "Shorter"
+    assert hold.await_args_list[2].kwargs == {"automation_id": AUTO_ID}
 
 
 @pytest.mark.asyncio
@@ -654,9 +740,35 @@ async def test_run_feed_is_not_captured_by_the_automation_route(client):
     assert resp.json()["executions"][0]["automation_name"] == "Daily Briefing"
     assert resp.json()["has_more"] is False
     mock_list.assert_awaited_once_with(
-        "test-user-123", thread_id=None, status=None, limit=20, offset=0
+        "test-user-123", thread_id=None, status=None, wait_reason=None, limit=20, offset=0
     )
     mock_get.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_run_feed_narrows_by_wait_reason_before_paging(client):
+    with patch(
+        f"{EXEC_DB}.list_executions",
+        new_callable=AsyncMock,
+        return_value=([], False),
+    ) as mock_list:
+        resp = await client.get(
+            "/api/v1/automations/executions?status=waiting&wait_reason=thread_busy&limit=10"
+        )
+
+    assert resp.status_code == 200
+    mock_list.assert_awaited_once_with(
+        "test-user-123", thread_id=None, status="waiting", wait_reason="thread_busy", limit=10, offset=0
+    )
+
+
+@pytest.mark.asyncio
+async def test_run_feed_refuses_an_unknown_wait_reason(client):
+    with patch(f"{EXEC_DB}.list_executions", new_callable=AsyncMock) as mock_list:
+        resp = await client.get("/api/v1/automations/executions?wait_reason=bored")
+
+    assert resp.status_code == 422
+    mock_list.assert_not_awaited()
 
 
 # ---------------------------------------------------------------------------
@@ -1206,3 +1318,18 @@ async def test_update_with_an_overlong_delivery_entry_is_refused(client):
         {"entry": entry, "message": "longer than 256 characters"}
     ]
     update.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_a_run_now_starts_held_to_the_computer_the_gate_checked(
+    computer_client, monkeypatch
+):
+    from src.server.dependencies import cli_approval
+
+    monkeypatch.setattr(cli_approval, "automation_runs", AsyncMock(return_value="computer-1"))
+    trigger = AsyncMock(return_value={"execution_id": "e", "automation_id": AUTO_ID, "status": "triggered"})
+    with patch(f"{HANDLER}.trigger_automation", new=trigger):
+        resp = await computer_client.post(f"/api/v1/automations/{AUTO_ID}/trigger")
+
+    assert resp.status_code == 200
+    assert trigger.await_args.kwargs == {"checked_computer_id": "computer-1"}

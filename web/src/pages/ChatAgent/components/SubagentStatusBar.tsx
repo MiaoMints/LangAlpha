@@ -103,8 +103,9 @@ function SubagentStatusBar({ agent, onSendInstruction }: SubagentStatusBarProps)
   const isError = effectiveStatus === 'error';
   const isTerminal = isCompleted || isCancelled || isError;
 
-  // Can send: subagent is not terminal (running/initializing).
-  const canSend = !isTerminal;
+  // Can send: subagent is not terminal (running/initializing), and there is
+  // somewhere to send it (a shared workspace's member has not).
+  const canSend = !isTerminal && !!onSendInstruction;
 
   // Terminal outcome wins over the derived current tool: a task reaped
   // mid-tool-call leaves that call forever "in progress", but the run is
@@ -280,6 +281,7 @@ function SubagentStatusBar({ agent, onSendInstruction }: SubagentStatusBarProps)
             value={inputValue}
             onChange={(e: React.ChangeEvent<HTMLInputElement>) => setInputValue(e.target.value)}
             onKeyDown={handleKeyDown}
+            aria-label={t('chat.subagentBar.inputPlaceholder')}
             placeholder={t('chat.subagentBar.inputPlaceholder')}
             disabled={sending}
             className="flex-1 bg-transparent text-sm placeholder-foreground/30"
@@ -289,6 +291,7 @@ function SubagentStatusBar({ agent, onSendInstruction }: SubagentStatusBarProps)
             <button
               onClick={() => { setInputOpen(false); setInputValue(''); }}
               disabled={sending}
+              aria-label={t('common.cancel')}
               className="p-1 rounded transition-colors"
               style={{ color: 'var(--color-text-tertiary)' }}
               onMouseEnter={(e: React.MouseEvent<HTMLButtonElement>) => { e.currentTarget.style.color = 'var(--color-text-primary)'; }}
@@ -299,6 +302,7 @@ function SubagentStatusBar({ agent, onSendInstruction }: SubagentStatusBarProps)
             <button
               onClick={handleSend}
               disabled={!inputValue.trim() || sending}
+              aria-label={t('chat.composer.send')}
               className="p-1 rounded transition-colors"
               style={{
                 color: inputValue.trim() && !sending ? 'var(--color-accent-primary)' : 'var(--color-icon-muted)',

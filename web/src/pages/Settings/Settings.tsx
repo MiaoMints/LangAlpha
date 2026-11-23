@@ -1,4 +1,4 @@
-import { useEffect, useRef } from 'react';
+import { lazy, Suspense, useEffect, useRef } from 'react';
 import { useLocation, useSearchParams } from 'react-router';
 import { useScrollMemory } from '@/lib/scrollMemory';
 import { useUser } from '@/hooks/useUser';
@@ -11,15 +11,24 @@ import { InvestingProfilePanel } from './panels/InvestingProfilePanel';
 import { GeneralPanel } from './panels/GeneralPanel';
 import { AppearancePanel } from './panels/AppearancePanel';
 import { ChatPanel } from './panels/ChatPanel';
+import { ArtifactsPanel } from './panels/ArtifactsPanel';
+import { DesktopPanel } from './panels/DesktopPanel';
 import { AgentPanel } from './panels/AgentPanel';
+import { ComputersPanel } from './panels/ComputersPanel';
 import { ModelsPanel } from './panels/ModelsPanel';
 import { TradingPermissionSection } from './panels/TradingPermissionSection';
 import { ExperimentsPanel } from './panels/ExperimentsPanel';
 import { PlanPanel } from './panels/PlanPanel';
 import { IntegrationsPanel } from './panels/IntegrationsPanel';
 import { SettingsRail } from './components/SettingsRail';
+import ComputersDialogHost from '@/pages/ChatAgent/components/ComputersDialogHost';
+import { useCloseComputersOnLeave } from '@/pages/ChatAgent/hooks/computerPanelStore';
 import { readSection, SECTIONS, type Section } from './sections';
+import '@/styles/pageRail.css';
 import './Settings.css';
+
+// A self-hosted server's own settings, which a hosted build never opens.
+const ServerPanel = lazy(() => import('./panels/ServerPanel'));
 
 /** A section's rows while the account is read on a cold load: a name and a
  *  line under it on the left, the control on the right, as the rows lay theirs
@@ -50,8 +59,12 @@ function SectionBody({ section }: { section: Section }) {
     case 'general': return <GeneralPanel />;
     case 'appearance': return <AppearancePanel />;
     case 'chat': return <ChatPanel />;
+    case 'artifacts': return <ArtifactsPanel />;
+    case 'desktop': return <DesktopPanel />;
     case 'agent': return <AgentPanel />;
+    case 'computers': return <ComputersPanel />;
     case 'model': return <ModelsPanel />;
+    case 'server': return <Suspense fallback={<SettingsSkeleton />}><ServerPanel /></Suspense>;
     case 'integrations': return <IntegrationsPanel />;
     case 'trading': return <TradingPermissionSection />;
     case 'experiments': return <ExperimentsPanel />;
@@ -64,6 +77,7 @@ function SectionBody({ section }: { section: Section }) {
  * jumped to, which is brought into view and marked for a moment.
  */
 function Settings() {
+  useCloseComputersOnLeave('settings');
   const [searchParams] = useSearchParams();
   const location = useLocation();
   const { hash } = location;
@@ -89,11 +103,13 @@ function Settings() {
       marked = target;
       target.scrollIntoView?.({ block: 'center' });
       if (focusSetting) {
-        // The control a row names as its own, else in a group of choices the
-        // one picked now, else the first control. A body with none of its
+        // The row itself where it is the control, else the control it names
+        // as its own, else in a group of choices the one picked now, else
+        // the first control. A body with none of its
         // own, like the investing answers, hands focus to its group's action.
         const control = 'input, select, button, a[href], [tabindex]:not([tabindex="-1"])';
-        (target.querySelector<HTMLElement>('[data-search-focus]')
+        ((target.matches(control) ? target : null)
+          ?? target.querySelector<HTMLElement>('[data-search-focus]')
           ?? target.querySelector<HTMLElement>('input:checked')
           ?? target.querySelector<HTMLElement>(control)
           ?? target.closest('.settings-group')?.querySelector<HTMLElement>(control))
@@ -130,7 +146,7 @@ function Settings() {
         <div ref={pageRef} className="settings-scroll">
           <div className="settings-column">
             <header className="settings-head">
-              <h1 className="settings-head-title">{t(SECTIONS[section].labelKey)}</h1>
+              <h1 className="page-head-title">{t(SECTIONS[section].labelKey)}</h1>
               <p className="settings-head-def">{t(SECTIONS[section].descKey)}</p>
             </header>
             {/* Only a cold load waits here: the app shell has usually read
@@ -148,6 +164,10 @@ function Settings() {
           </div>
         </div>
       </div>
+      {/* The Computers panel, opened from the Computers section's rows, and
+          Change spec, opened over Claude Code's view in Model access, so the
+          user stays where they started while the computer changes. */}
+      <ComputersDialogHost overSheet planInPlace />
     </div>
   );
 }

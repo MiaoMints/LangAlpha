@@ -11,8 +11,12 @@ import './index.css'
 // first click, not from whichever overlay happens to load first.
 import './lib/inputModality'
 import { applyCardStyle, getCardStyle } from './lib/cardStyle'
+import { trackVisualViewport } from './lib/visualViewport'
 import { Toaster } from './components/ui/toaster'
 import { StaleBuildBoundary } from './components/StaleBuildBoundary'
+import { captureException, initSentry, reportAbsorbedDomError } from './lib/sentry'
+import { isStaleBuildError } from './lib/staleBuild'
+import { tolerateTranslatedDom } from './lib/translatedDom'
 
 // Initialize a global QueryClient for data fetching and caching
 const queryClient = new QueryClient({
@@ -25,7 +29,11 @@ const queryClient = new QueryClient({
   },
 })
 
+tolerateTranslatedDom(reportAbsorbedDomError)
 applyCardStyle(getCardStyle())
+trackVisualViewport()
+// This module is the entry chunk once built, so its URL names the release.
+initSentry(import.meta.url, isStaleBuildError)
 
 // Nothing renders until the active locale's catalog is in, or the first paint
 // shows raw keys. A catalog that fails leaves #root to index.html's pre-boot
@@ -33,7 +41,14 @@ applyCardStyle(getCardStyle())
 // its listeners miss some failures, such as a catalog on another origin.
 // Rendering anyway would run markBooted(), which resets that recovery's
 // attempt count and turns its bounded reload into a loop.
-void initI18n().then(() => ReactDOM.createRoot(document.getElementById('root')!).render(
+// A render error a boundary caught never reaches the global handlers, so the
+// root hands it to Sentry itself, and still logs it as React would.
+void initI18n().then(() => ReactDOM.createRoot(document.getElementById('root')!, {
+  onCaughtError: (error, info) => {
+    console.error(error, info.componentStack)
+    captureException(error)
+  },
+}).render(
   <QueryClientProvider client={queryClient}>
     <BrowserRouter>
       <ThemeProvider>

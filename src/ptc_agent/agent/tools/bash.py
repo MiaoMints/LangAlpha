@@ -29,13 +29,16 @@ from ptc_agent.core.paths import (
 )
 from ptc_agent.core.sandbox import livefs_mount
 from ptc_agent.core.sandbox.execution import JobExecFailed
-from ptc_agent.core.sandbox.jobs import Ended, Failed, JobHandle, JobNotLaunched, JobOutcome
+from ptc_agent.core.sandbox.jobs import (
+    Ended, Failed, JobContext, JobHandle, JobNotLaunched, JobOutcome
+)
 from src.observability import (
     TOOL_CHANNEL,
     TOOL_PROVIDER,
     mark_tool_failed,
     stamp_resource_tier,
 )
+from src.tools.turn_tool import input_schema
 
 logger = structlog.get_logger(__name__)
 
@@ -69,6 +72,17 @@ _FILE_TOOLS_ONLY_ERROR = (
     "ERROR: {dir}/ is reachable only through the file tools. Use Read, Edit and "
     "Write on the files in {dir}/. Bash can't see or change them."
 )
+
+#: A shared workspace member's memory, which Read and Glob alone reach and
+#: nothing writes.
+_MEMBER_MEMORY_ERROR = (
+    "ERROR: {dir}/ is reachable only through Read and Glob, and is read-only. Read "
+    "the file you need there; Bash can't see it."
+)
+
+#: The refusal of a command naming a folder only the file tools reach, where
+#: it is not ``_FILE_TOOLS_ONLY_ERROR``.
+_FILE_TOOLS_ONLY_ERRORS = {WorkspaceLayout.MEMBERS_DIR: _MEMBER_MEMORY_ERROR}
 
 
 _DEFAULT_TIMEOUT_S = command_handoff.HANDOFF_WAIT_S
@@ -249,6 +263,7 @@ def create_execute_bash_tool(
         call = CommandCall("Bash", command, description, config, tool_call_id, session)
         return await _guarded(
             command,
+            working_dir,
             lambda call_id: _run(
                 call,
                 working_dir,
@@ -271,18 +286,19 @@ def create_execute_bash_tool(
         if refused is not None:
             return refused, {"mcp_trace": []}
         call = CommandCall("Bash", command, description, config, None, session)
-        return await _guarded(command, lambda call_id: _run(call, working_dir, call_id))
+        return await _guarded(command, working_dir, lambda call_id: _run(call, working_dir, call_id))
 
-    async def _guarded(command: str, run: Any) -> tuple[str, dict[str, Any]]:
+    async def _guarded(command: str, working_dir: str | None, run: Any) -> tuple[str, dict[str, Any]]:
         return await run_guarded(
             backend,
-            command,
+            f"{working_dir}\n{command}" if working_dir else command,
             call_context,
             run,
             memory_error=_MEMORY_ROUTE_ERROR,
             files_error=_FILES_ROUTE_ERROR,
             file_tools_only=file_tools_only,
             file_tools_error=_FILE_TOOLS_ONLY_ERROR,
+            file_tools_errors=_FILE_TOOLS_ONLY_ERRORS,
             blocked_event="Blocked bash command touching a store-backed path",
             command_length=len(command),
         )
@@ -311,9 +327,12 @@ def create_execute_bash_tool(
                     call.command,
                     working_dir=working_dir,
                     wait_s=wait_s,
-                    thread_id=thread_id or None,
-                    call_id=call_id,
-                    allowed_servers=allowed_servers,
+                    context=JobContext(
+                        thread_id=thread_id or None,
+                        call_id=call_id,
+                        allowed_servers=allowed_servers,
+                        env=command_handoff.turn_job_env(call.config),
+                    ),
                 )
             except JobNotLaunched as e:
                 return await _not_launched(e, wait_s, call.config)
@@ -404,7 +423,7 @@ def create_execute_bash_tool(
         coroutine=Bash if hand_off is not None else SubagentBash,
         name="Bash",
         description=bash_description(hand_off),
-        args_schema=None if hand_off is not None else _SubagentBashArgs,
+        args_schema=input_schema("Bash", Bash) if hand_off is not None else _SubagentBashArgs,
         response_format="content_and_artifact",
     )
     # Every run, not only a failed one, so an error rate reads per provider.

@@ -362,13 +362,14 @@ def parse_portfolio(content: str) -> list[dict[str, Any]]:
         # agent and the UI agree on row identity (uppercase ticker, lowercase
         # instrument type). Without this, agent writes like "aapl"/"Stock"
         # bypass dedup against existing "AAPL"/"stock" rows.
-        symbol = normalize_symbol(
-            _require_nonempty_str(item.get("symbol"), file=file, path=f"holdings[{idx}].symbol")
-        )
         instrument_type = normalize_instrument_type(
             _require_nonempty_str(
                 item.get("instrument_type"), file=file, path=f"holdings[{idx}].instrument_type",
             )
+        )
+        symbol = normalize_symbol(
+            _require_nonempty_str(item.get("symbol"), file=file, path=f"holdings[{idx}].symbol"),
+            instrument_type,
         )
         quantity = _coerce_decimal(item.get("quantity"), file, f"holdings[{idx}].quantity")
         _reject_negative(quantity, file=file, path=f"holdings[{idx}].quantity")
@@ -376,6 +377,10 @@ def parse_portfolio(content: str) -> list[dict[str, Any]]:
         avg_cost_raw = item.get("average_cost")
         average_cost = _coerce_decimal(avg_cost_raw, file, f"holdings[{idx}].average_cost") if avg_cost_raw is not None else None
         _reject_negative(average_cost, file=file, path=f"holdings[{idx}].average_cost")
+        currency, average_cost = portfolio_db.canonical_holding_cost(
+            _coerce_str(item.get("currency"), file, f"holdings[{idx}].currency", required=False),
+            average_cost,
+        )
 
         # Reject duplicates within the payload — DB has UNIQUE (user, symbol,
         # instrument_type, account_name) and would error out asymmetrically
@@ -396,7 +401,7 @@ def parse_portfolio(content: str) -> list[dict[str, Any]]:
             "name": _coerce_str(item.get("name"), file, f"holdings[{idx}].name", required=False),
             "quantity": quantity,
             "average_cost": average_cost,
-            "currency": _coerce_str(item.get("currency"), file, f"holdings[{idx}].currency", required=False) or None,
+            "currency": currency,
             "account_name": account_name,
             "notes": _coerce_str(item.get("notes"), file, f"holdings[{idx}].notes", required=False),
             "first_purchased_at": _coerce_str(item.get("first_purchased_at"), file, f"holdings[{idx}].first_purchased_at", required=False),
@@ -423,18 +428,25 @@ def diff_portfolio(
 
     diff = PortfolioDiff()
     seen_ids: set[str] = set()
-    for normalized in holdings:
+    for idx, normalized in enumerate(holdings):
         existing = by_unique_key.get(
             (normalized["symbol"], normalized["instrument_type"], normalized["account_name"])
         )
 
         # A row without a currency keeps the one it is held in, else takes its
-        # listing's, as the holding upsert does.
+        # listing's, as the holding upsert does. A new row with neither is
+        # refused; a held one with neither stays as it is, so an old row never
+        # blocks a save that changes another.
         if normalized["currency"] is None:
             held_in = existing.get("currency") if existing else None
             normalized = {**normalized, "currency": held_in or portfolio_db.default_holding_currency(
                 normalized["symbol"], normalized["instrument_type"]
             )}
+            if normalized["currency"] is None and existing is None:
+                raise UserDataValidationError(
+                    "constraint_error", "portfolio.json", f"holdings[{idx}].currency",
+                    portfolio_db.unknown_currency_message(normalized["symbol"]),
+                )
         if existing is None:
             diff.inserts.append(normalized)
             continue
@@ -706,17 +718,18 @@ def parse_watchlist(content: str) -> list[dict[str, Any]]:
                 file=file, path=f"watchlists[{wl_idx}].items[{it_idx}]",
             )
 
-            symbol = normalize_symbol(
-                _require_nonempty_str(
-                    item.get("symbol"), file=file,
-                    path=f"watchlists[{wl_idx}].items[{it_idx}].symbol",
-                )
-            )
             instrument_type = normalize_instrument_type(
                 _require_nonempty_str(
                     item.get("instrument_type"), file=file,
                     path=f"watchlists[{wl_idx}].items[{it_idx}].instrument_type",
                 )
+            )
+            symbol = normalize_symbol(
+                _require_nonempty_str(
+                    item.get("symbol"), file=file,
+                    path=f"watchlists[{wl_idx}].items[{it_idx}].symbol",
+                ),
+                instrument_type,
             )
 
             dup_key = (symbol, instrument_type)

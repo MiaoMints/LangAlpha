@@ -3,6 +3,7 @@ import { describe, expect, it } from 'vitest';
 import {
   serializeInsightDayToMarkdown,
   serializeInsightToMarkdown,
+  serializeNewsArticleToMarkdown,
   serializeNewsItemToMarkdown,
   serializeNewsItemsToMarkdown,
   serializeOhlcvToMarkdown,
@@ -102,6 +103,36 @@ describe('news serializers', () => {
     expect(out).toContain('Earnings up.');
   });
 
+  it('attributes ticker sentiment to the vendor AI and marks unscored tickers', () => {
+    const out = serializeNewsArticleToMarkdown({
+      title: 'Sector roundup',
+      tickers: ['AAPL', 'MSFT', 'NVDA'],
+      sentiments: [
+        { ticker: 'AAPL', sentiment: 'negative', reasoning: 'Named as a holding.' },
+        { ticker: 'MSFT', sentiment: undefined },
+      ],
+    });
+    expect(out).toContain("**Ticker Sentiment** (inferred by the news vendor's AI model, not necessarily the article's own view)");
+    expect(out).toContain('- AAPL (negative) — Named as a holding.');
+    expect(out).toContain('- MSFT (unscored)');
+    expect(out).toContain('- NVDA (unscored)');
+  });
+
+  it('keeps the heading free of the AI claim when no ticker is scored', () => {
+    const out = serializeNewsArticleToMarkdown({
+      title: 'Unscored roundup',
+      tickers: ['AAPL', 'MSFT'],
+      sentiments: [{ ticker: 'AAPL', sentiment: undefined }],
+    });
+    expect(out).toContain('**Ticker Sentiment**\n- AAPL (unscored)\n- MSFT (unscored)');
+    expect(out).not.toContain('vendor');
+  });
+
+  it('omits the sentiment section when the feed scored nothing', () => {
+    const out = serializeNewsArticleToMarkdown({ title: 'Plain story', tickers: ['AAPL'], sentiments: [] });
+    expect(out).not.toContain('Ticker Sentiment');
+  });
+
   it('renders a list as markdown table', () => {
     const out = serializeNewsItemsToMarkdown([
       { title: 'A', source: 'r', publishedAt: 't1' },
@@ -124,16 +155,12 @@ describe('quote row serializers', () => {
       change: 0.76,
       changePercent: 0.42,
       preMarket: 182.1,
-      marketValue: 1234.5,
-      shares: 10,
       volume: 38000000,
     });
     expect(out).toContain('**AAPL**');
     expect(out).toContain('$182.31');
     expect(out).toContain('+0.76 (+0.42%)');
     expect(out).toContain('pre-market $182.10');
-    expect(out).toContain('shares 10');
-    expect(out).toContain('mkt val $1234.50');
     expect(out).toContain('vol 38000000');
   });
 

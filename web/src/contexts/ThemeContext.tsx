@@ -1,7 +1,7 @@
 import React, { createContext, useContext, useState, useEffect, useLayoutEffect, useMemo } from 'react';
 import { desktop } from '../lib/desktop';
 
-type ThemePreference = 'light' | 'dark' | 'auto';
+export type ThemePreference = 'light' | 'dark' | 'auto';
 export type ResolvedTheme = 'light' | 'dark';
 
 export interface ThemeContextValue {
@@ -47,16 +47,17 @@ export function ThemeProvider({ children }: { children: React.ReactNode }) {
     return () => mq.removeEventListener('change', handler);
   }, []);
 
-  // Cross-tab sync: another tab changing the preference writes localStorage and
-  // fires `storage` here (never in the tab that wrote it), so mirror it in.
+  // Another tab of this browser picked or followed a theme: shown here too.
+  // Storing it again below is the same value, which raises no event, so the
+  // tabs do not echo it back and forth. Removed means the default.
   useEffect(() => {
-    const onStorage = (e: StorageEvent) => {
-      if (e.key !== null && e.key !== 'theme') return;
-      const next = e.key === null ? localStorage.getItem('theme') : e.newValue;
-      setPreference(next === 'light' || next === 'dark' || next === 'auto' ? next : 'auto');
+    const handler = (e: StorageEvent) => {
+      if (e.key !== 'theme' && e.key !== null) return;
+      const next = e.newValue;
+      setPreference(next === 'light' || next === 'dark' ? next : 'auto');
     };
-    window.addEventListener('storage', onStorage);
-    return () => window.removeEventListener('storage', onStorage);
+    window.addEventListener('storage', handler);
+    return () => window.removeEventListener('storage', handler);
   }, []);
 
   // Resolved theme: what actually gets applied
@@ -75,7 +76,7 @@ export function ThemeProvider({ children }: { children: React.ReactNode }) {
     // live resize the frame outruns the paint and that colour fills the gap.
     // Optional call: an older shell predates this method and simply does not
     // get told, which is the browser's behaviour and costs nothing.
-    desktop?.setTheme?.(theme);
+    desktop?.setTheme?.(theme, preference);
   }, [theme, preference]);
 
   const setTheme = (value: ThemePreference) => setPreference(value);

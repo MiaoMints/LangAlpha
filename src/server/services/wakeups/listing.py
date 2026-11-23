@@ -5,9 +5,11 @@ past storage in two places. A price or an order past its window shows closed
 before the sweep gets to it, as the monitor and the cancel already treat it.
 And a fired wakeup whose notice the agent has not read shows ``held`` (or
 ``held_usage``, waiting on usage) rather than fired, since the agent has not
-acted on it yet and it can still be called back.
+acted on it yet and it can still be called back; ``held_plan`` where it
+waits for the Claude plan to reset.
 """
 
+import asyncio
 import logging
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List
@@ -16,7 +18,7 @@ from src.server.database import market_targets as targets_db
 from src.server.database.automation import get_user_timezone
 from src.server.database.wakeups import read as wakeups_read
 from src.server.database.wakeups.cancel import cancel_decision, past_window
-from src.server.database.wakeups.contract import as_float
+from src.server.database.wakeups.contract import as_float, plan_reset_of
 from src.server.models.wakeup import (
     WakeupOrderOut,
     WakeupOut,
@@ -25,11 +27,16 @@ from src.server.models.wakeup import (
 )
 from src.server.services.brokerage_orders.view import order_view
 from src.server.services.market_targets.listing import PCT_FROM_TOOL, shown_symbol
+from src.server.services.wakeups.price_reading import PriceReading, price_readings
 
 logger = logging.getLogger(__name__)
 
 # How long an ended wakeup stays in the listing.
 ENDED_WINDOW = timedelta(hours=24)
+# How long the listing waits on the market for its prices. They are optional,
+# and every read and every cancel's answer waits on them, so a slow vendor
+# lists the wakeups without prices rather than holding them.
+PRICE_READ_TIMEOUT_S = 2.0
 
 
 def _state(row: Dict[str, Any], now: datetime) -> str:
@@ -39,6 +46,8 @@ def _state(row: Dict[str, Any], now: datetime) -> str:
     if row["last_fired_seq"] > row["delivered_seq"]:
         # Held after its wake was refused, and not since taken by a turn.
         waiting = row.get("notice_waiting") and not row.get("notice_too_late")
+        if waiting and row.get("notice_plan_hold"):
+            return "held_plan"
         return "held_usage" if waiting else "held"
     if status == "armed" and past_window(row, now):
         status = "expired"
@@ -79,16 +88,19 @@ def _order_out(row: Dict[str, Any]) -> WakeupOrderOut:
     )
 
 
-def wakeup_out(row: Dict[str, Any], now: datetime) -> WakeupOut:
+def wakeup_out(
+    row: Dict[str, Any], now: datetime, reading: PriceReading = PriceReading()
+) -> WakeupOut:
     kind = row["kind"]
     schedule = row.get("schedule") or []
     timed = kind in ("at", "cron")
+    state = _state(row, now)
     return WakeupOut(
         wakeup_id=row["wakeup_id"],
         short_id=row["short_id"],
         label=row.get("label"),
         kind=kind,
-        state=_state(row, now),
+        state=state,
         timezone=row.get("timezone"),
         cron=row.get("cron"),
         at=schedule[0] if kind == "at" and schedule else None,
@@ -99,6 +111,7 @@ def wakeup_out(row: Dict[str, Any], now: datetime) -> WakeupOut:
         ends_at=(schedule[-1] if schedule else None) if timed else row.get("expires_at"),
         expires_at=row.get("expires_at"),
         fired_at=row.get("last_fired_at"),
+        plan_reset_at=plan_reset_of(row.get("notice_plan_hold")) if state == "held_plan" else None,
         price=(
             WakeupPriceOut(
                 symbol=shown_symbol(row),
@@ -107,6 +120,10 @@ def wakeup_out(row: Dict[str, Any], now: datetime) -> WakeupOut:
                 pct_from=PCT_FROM_TOOL.get(row.get("pct_from")),
                 armed_price=row.get("armed_price"),
                 fired_price=row.get("fired_price"),
+                last=reading.last,
+                # Only beside the price read, as ``WakeupPriceOut`` states:
+                # neither when none was.
+                level=reading.level if reading.last is not None else None,
             )
             if kind == "price"
             else None
@@ -146,15 +163,9 @@ def legacy_target_out(row: Dict[str, Any], now: datetime) -> WakeupOut:
     )
 
 
-async def thread_wakeups(thread_id: str) -> List[WakeupOut]:
-    """Open wakeups in the order they were set, then what ended in the last
-    day, newest first, each list with the legacy targets after the new."""
-    now = datetime.now(timezone.utc)
-    rows = await wakeups_read.list_thread_wakeups(
-        thread_id, ended_since=now - ENDED_WINDOW
-    )
+async def _legacy_targets(thread_id: str) -> List[Dict[str, Any]]:
     try:
-        legacy = await targets_db.list_thread_targets(
+        return await targets_db.list_thread_targets(
             thread_id, recent_seconds=int(ENDED_WINDOW.total_seconds())
         )
     except Exception:
@@ -163,8 +174,28 @@ async def thread_wakeups(thread_id: str) -> List[WakeupOut]:
         logger.warning(
             "[Wakeups] listing legacy targets failed thread_id=%s", thread_id, exc_info=True
         )
-        legacy = []
-    new_out = [wakeup_out(r, now) for r in rows]
+        return []
+
+
+async def thread_wakeups(thread_id: str, user_id: str) -> List[WakeupOut]:
+    """Open wakeups in the order they were set, then what ended in the last
+    day, newest first, each list with the legacy targets after the new. An
+    armed price wakeup carries the price the monitor reads and the level it
+    fires at, read as *user_id*; without a price it still lists, and still
+    cancels."""
+    now = datetime.now(timezone.utc)
+    rows = await wakeups_read.list_thread_wakeups(
+        thread_id, ended_since=now - ENDED_WINDOW
+    )
+    readings, legacy = await asyncio.gather(
+        price_readings(
+            [r for r in rows if r.get("status") == "armed"], user_id, now, within=PRICE_READ_TIMEOUT_S
+        ),
+        _legacy_targets(thread_id),
+    )
+    new_out = [
+        wakeup_out(r, now, readings.get(str(r["wakeup_id"]), PriceReading())) for r in rows
+    ]
     old_out = sorted(
         (legacy_target_out(r, now) for r in legacy), key=lambda w: w.created_at
     )
@@ -184,5 +215,5 @@ async def thread_wakeups_response(thread_id: str, user_id: str) -> WakeupsRespon
     return WakeupsResponse(
         thread_id=thread_id,
         user_timezone=user_tz,
-        wakeups=await thread_wakeups(thread_id),
+        wakeups=await thread_wakeups(thread_id, user_id),
     )

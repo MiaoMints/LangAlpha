@@ -442,9 +442,7 @@ async def _compute_sandbox_manifest(
     src_dir = (repo_root / "src").resolve()
     internal_files = {
         str(rel): _sha256_file(local)
-        for local, rel in _internal_package_files(
-            src_dir, livefs=sandbox.mounts_livefs
-        )
+        for local, rel in _internal_package_files(src_dir, type(sandbox.provider))
     }
     if internal_files:
         # The vault helper ships in the same upload but is generated rather
@@ -730,6 +728,7 @@ async def sync_sandbox_assets(
     disabled_skills: frozenset[str] = frozenset(),
     reusing_sandbox: bool = False,
     force_refresh: bool = False,
+    rebuild_overlay: bool = False,
     project: ProjectContext | None = None,
     root_owner_dir_name: str | None = None,
     workspace_dir_names: tuple[str, ...] = (),
@@ -761,6 +760,9 @@ async def sync_sandbox_assets(
             labels the sync's metrics: what is uploaded follows the sandbox's
             manifest, which on a new sandbox records what setup put there.
         force_refresh: Force re-upload of all modules regardless of manifest.
+        rebuild_overlay: Build this project's tool overlay again whatever the
+            ledger says of it, for one whose generated config is gone or
+            damaged. The computer-wide modules still follow the manifest.
         project: Which project this sync is for, carrying its id and its
             folder on the computer. None is a machine with no project on
             it yet, which still owns the root. The folder travels here and
@@ -848,11 +850,9 @@ async def sync_sandbox_assets(
         tool_version = local_manifest["modules"]["tool_modules"]["version"]
         # The shared manifest may describe a sibling that discovered identical
         # tools first. Only this project's completed install satisfies its sync.
-        overlay_missing = bool(
-            project.dir_name
-            and sandbox.mcp_registry is not None
-            and union_ledger.get("tool_versions", {}).get(project.claim)
-            != tool_version
+        claimed = union_ledger.get("tool_versions", {}).get(project.claim)
+        overlay_due = sandbox.mcp_registry is not None and (
+            rebuild_overlay or bool(project.dir_name and claimed != tool_version)
         )
         _mark_sync("manifest")
 
@@ -886,13 +886,17 @@ async def sync_sandbox_assets(
             for mod_name, mod_data in local_manifest["modules"].items():
                 remote_mod = remote_manifest.get("modules", {}).get(mod_name)
                 if mod_name == "tool_modules" and project.dir_name:
-                    if overlay_missing:
+                    if overlay_due:
                         changed_modules.add(mod_name)
                 elif (
                     remote_mod is None
                     or remote_mod.get("version") != mod_data["version"]
                 ):
                     changed_modules.add(mod_name)
+            if "skills" in changed_modules and await _carry_held_collisions(
+                sandbox, remote_manifest, local_manifest
+            ):
+                changed_modules.discard("skills")
 
         if not changed_modules:
             # `is None` guard (like the slow path): the cached manifest may
@@ -914,7 +918,7 @@ async def sync_sandbox_assets(
                         )
                 if sandbox._skills_manifest is None:
                     sandbox._skills_manifest = skills_mod
-            if not (layout_moved or overlay_missing):
+            if not (layout_moved or overlay_due):
                 return SyncResult(
                     refreshed_modules=[],
                     forced=False,
@@ -1004,7 +1008,8 @@ async def sync_sandbox_assets(
         _mark_sync("uploads")
 
         # Group 2: tool_modules AFTER mcp_servers (intent: derived from MCP definitions)
-        if "tool_modules" in changed_modules or overlay_missing:
+        install_tools = "tool_modules" in changed_modules or overlay_due
+        if install_tools:
             if on_progress:
                 on_progress("Regenerating tool modules...")
             await sandbox._install_tool_modules(
@@ -1012,8 +1017,20 @@ async def sync_sandbox_assets(
             )
             refreshed.append("tool_modules")
             _mark_sync("tool_modules")
+
+        # A daemon already listening (a reconnect starts one before this
+        # sync) keeps the client, servers and packages it imported until it
+        # stops, so it is replaced when this sync replaced any of them,
+        # whether or not it installed tools. Every install rewrites the
+        # client, so what tells of it is the version the last finished sync
+        # recorded. A replacement waits for the calls the daemon is running,
+        # a sibling workspace's included, so one on current code is left be.
+        runs_old_code = _client_codegen(remote_manifest) != _client_codegen(
+            local_manifest
+        ) or not {"mcp_servers", "internal_packages"}.isdisjoint(refreshed)
+        if install_tools or runs_old_code:
             try:
-                await sandbox._start_internal_mcp_servers()
+                await sandbox._start_internal_mcp_servers(replace=runs_old_code)
             except Exception as e:
                 logger.warning("Failed to refresh MCP servers", error=str(e))
             _mark_sync("mcp_start")
@@ -1040,6 +1057,7 @@ async def sync_sandbox_assets(
             mod = local_manifest["modules"]["skills"]
             collision_key = ",".join(sorted(skill_collisions))
             mod["collisions"] = sorted(skill_collisions)
+            mod["base_version"] = mod["version"]
             mod["version"] = hashlib.sha256(
                 f"{mod['version']}|collisions:{collision_key}".encode()
             ).hexdigest()
@@ -1172,6 +1190,67 @@ async def _collect_local_skill_names(
         return names
 
     return await asyncio.to_thread(build)
+
+
+def _held_by_another(lock: Mapping[str, Any], name: str) -> bool:
+    """Whether the asset sync may not write over ``name``: the agent installed
+    it, or the reconciler links it to a workspace's skill row."""
+    from ptc_agent.agent.middleware.skills.lock import is_agent_installed, is_linked
+
+    entry = lock.get(name)
+    # The lock sits where sandbox code can rewrite it.
+    return isinstance(entry, dict) and (is_agent_installed(entry) or is_linked(entry))
+
+
+def _client_codegen(manifest: dict[str, Any] | None) -> str | None:
+    """The generated client's version a manifest records, if it records one."""
+    tool_modules = (manifest or {}).get("modules", {}).get("tool_modules", {})
+    return tool_modules.get("source_versions", {}).get("client_codegen")
+
+
+async def _carry_held_collisions(
+    sandbox: "PTCSandbox",
+    remote_manifest: dict[str, Any] | None,
+    local_manifest: dict[str, Any],
+) -> bool:
+    """Carry the recorded collision stamp into ``local_manifest`` when the
+    skills differ from the recorded ones only by it and the names held now
+    are exactly the stamped ones; answers whether it did.
+
+    An upload would then skip the same names and write the same stamp, at a
+    full skills pass per start, forever. Carried, the delivered names still
+    leave those out, and the upload runs again once a name frees, another
+    is taken, or a skill changes. One lock read decides it.
+    """
+    remote = ((remote_manifest or {}).get("modules") or {}).get("skills") or {}
+    local = local_manifest["modules"]["skills"]
+    collisions = remote.get("collisions")
+    stamped = remote.get("version")
+    # The manifest sits where sandbox code can rewrite it, and anything this
+    # check cannot read means upload, never a failed sync.
+    if (
+        not isinstance(collisions, list)
+        or not collisions
+        or not all(isinstance(name, str) for name in collisions)
+        or not isinstance(stamped, str)
+        or remote.get("base_version") != local["version"]
+    ):
+        return False
+    try:
+        lock = await sandbox._download_skills_lock()
+    except Exception:
+        return False
+    if not lock:
+        return False
+    held = {name for name in local.get("skills", {}) if _held_by_another(lock, name)}
+    if held != set(collisions):
+        return False
+    local.update(version=stamped, base_version=local["version"], collisions=collisions)
+    if sandbox._skills_manifest is None:
+        # The upload this replaces folds the agent's own skills in from the
+        # lock; this read has them, so nothing reads it twice.
+        sandbox._build_complete_skills_cache(local, {"skills": lock})
+    return True
 
 
 async def _download_skills_lock(sandbox: "PTCSandbox") -> dict[str, Any] | None:
@@ -1321,7 +1400,6 @@ async def _upload_skills(
         folds these into the module version so the skipped upload retries).
     """
     from ptc_agent.agent.middleware.skills import skills_outside_sandbox
-    from ptc_agent.agent.middleware.skills.lock import is_agent_installed, is_linked
 
     disabled = _resolve_disabled_skills(disabled)
 
@@ -1401,13 +1479,7 @@ async def _upload_skills(
     # retries once the name frees up). Same predicate pair as the prune side.
     if existing_lock:
         collisions = {
-            name
-            for name in final_skills
-            if name in existing_lock
-            and (
-                is_agent_installed(existing_lock[name])
-                or is_linked(existing_lock[name])
-            )
+            name for name in final_skills if _held_by_another(existing_lock, name)
         }
     else:
         # No lock means either a fresh sandbox or a failed read, and the two

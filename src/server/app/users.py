@@ -1,25 +1,31 @@
 """User Management API Router — user profile and preferences endpoints."""
 
 import asyncio
+import json
 import logging
-from datetime import datetime
-from typing import Literal, Optional
+from datetime import datetime, timezone
+from typing import Any, Dict, Literal, Optional
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi import File, UploadFile
 from pydantic import BaseModel
 from src.llms.preferences import (
     MOVED_MODEL_KEYS,
-    TUNING_FIELDS,
+    PROFILE_FIELDS,
     TuningError,
     validate_tuning,
 )
 from src.utils.storage import get_public_url, upload_bytes
 
 from src.server.auth.jwt_bearer import get_current_auth_info, AuthInfo
+from src.server.database.onboarding_progress import (
+    get_onboarding_progress,
+    patch_onboarding_progress,
+)
 from src.server.database.pool import get_db_connection
-from src.server.dependencies.principal import CurrentPrincipal
+from src.server.dependencies.principal import CurrentPrincipal, ReadUserId
 from src.server.database.user import (
+    PreferenceChanged,
     create_user as db_create_user,
     create_user_from_auth,
     delete_user_preferences as db_delete_user_preferences,
@@ -40,15 +46,25 @@ from src.server.services.llm.custom_catalog import (
     validate_custom_models,
     validate_custom_providers,
 )
+from src.server.services.llm.payers import ModelPayer, model_payers
 from src.server.services.llm.thread_model import (
     DEFAULT_MODEL_KEYS,
     DEFAULT_MODEL_SCOPES,
     carry_default_change,
 )
 from src.server.services.llm.user_models import model_preference_of
+from src.server.services.claude_code.plan import credits_unknown
+from src.server.services.features import granted_override_keys
 from src.server.services.onboarding import maybe_complete_onboarding
+from src.server.models.onboarding import (
+    ACCOUNT_SETUP_KEY,
+    OnboardingProgressPatch,
+    OnboardingProgressResponse,
+)
 from src.server.models.profile_vocabulary import STRUCTURED_PREFERENCES, check_profile
 from src.server.models.user import (
+    OrganizationResponse,
+    PolicyResponse,
     UserBase,
     UserPreferencesResponse,
     UserPreferencesUpdate,
@@ -57,7 +73,13 @@ from src.server.models.user import (
     UserUpdate,
     UserWithPreferencesResponse,
 )
-from src.server.utils.api import CurrentUserId, handle_api_exceptions, raise_not_found
+from src.server.utils.api import (
+    AnyStateServiceUserId,
+    AnyStateUserId,
+    CurrentUserId,
+    handle_api_exceptions,
+    raise_not_found,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -77,22 +99,56 @@ class AuthSyncRequest(BaseModel):
 
 class AuthPrincipalResponse(BaseModel):
     user_id: str
-    auth: Literal["session", "oauth"]
+    auth: Literal["session", "service", "oauth", "pat", "computer"]
     client_id: Optional[str] = None
     scopes: list[str]
+    # The computer a computer's token belongs to.
+    computer_id: Optional[str] = None
 
 
 @router.get("/auth/principal", response_model=AuthPrincipalResponse)
 async def get_auth_principal(principal: CurrentPrincipal):
-    """Who is calling: a first-party session, or an outside app and what it may do.
-
-    The one route an outside app's token reaches until routes declare scopes.
-    """
+    """Who is calling and, for a token, what it may do. Every token reaches
+    it, whatever its scopes, so a client can show who it signed in as."""
     return AuthPrincipalResponse(
         user_id=principal.user_id,
         auth=principal.auth,
         client_id=principal.client_id,
         scopes=list(principal.scopes),
+        computer_id=principal.computer_id,
+    )
+
+
+class CliAuthResponse(BaseModel):
+    # False on a server that asks no credential (oss mode).
+    auth_required: bool
+    # Where `la login` signs in, the issuer's discovery document beside it;
+    # null when this server takes no sign-in from the CLI.
+    issuer: Optional[str] = None
+    client_id: Optional[str] = None
+    # What `la login` asks the issuer for besides who the user is: the API
+    # scopes where this server reads them from the token itself, none where
+    # the platform grants them from the user's consent and plan.
+    scopes: list[str]
+    personal_access_tokens: bool
+
+
+@router.get("/auth/cli", response_model=CliAuthResponse)
+async def get_cli_auth():
+    """How the ``la`` CLI signs in to this server. Public: the CLI asks before
+    it holds any credential."""
+    from src.config.env import AUTH_SERVICE_URL, OAUTH_CLI_CLIENT_ID, OAUTH_RESOURCE_ISSUER
+    from src.config.settings import HOST_MODE
+    from src.server.auth.oauth_resource import oauth_resource_enabled
+    from src.server.services.cli_tokens import SCOPES
+
+    signs_in = oauth_resource_enabled() and bool(OAUTH_CLI_CLIENT_ID)
+    return CliAuthResponse(
+        auth_required=HOST_MODE != "oss",
+        issuer=OAUTH_RESOURCE_ISSUER if signs_in else None,
+        client_id=OAUTH_CLI_CLIENT_ID if signs_in else None,
+        scopes=[] if AUTH_SERVICE_URL else list(SCOPES),
+        personal_access_tokens=bool(AUTH_SERVICE_URL),
     )
 
 
@@ -201,7 +257,7 @@ async def create_user(
 @router.get("/users/me", response_model=UserWithPreferencesResponse)
 @handle_api_exceptions("get user", logger)
 async def get_current_user(
-    user_id: CurrentUserId,
+    user_id: AnyStateUserId,
     refresh_tier: bool = Query(False, description="Bust cached platform tier (use after invitation redemption)"),
 ):
     """Get current user profile and preferences.
@@ -209,7 +265,9 @@ async def get_current_user(
     Set ``refresh_tier=true`` to bust the cached platform tier (e.g. after
     invitation redemption). Access tier and plan display name are cached 5 min.
     While the platform is unreachable they are its last answer, and 503 when
-    it has given none.
+    it has given none, unless the account is known to be suspended, which is
+    answered with no access. A suspended account still gets its answer, which
+    is how a client learns it is suspended (``organization.suspended``).
     """
     result = await get_user_with_preferences(user_id)
 
@@ -221,17 +279,35 @@ async def get_current_user(
     # Populate platform membership: access tier + plan display name.
     # Both fields share a single Redis cache entry (5 min TTL) so this never
     # costs more than one platform-service round-trip per user per 5 minutes.
-    from src.server.dependencies.usage_limits import (
-        _fetch_platform_membership,
-        quota_service_unavailable,
-    )
-    membership = await _fetch_platform_membership(user_id, refresh=refresh_tier)
-    if membership is None:
-        # Any tier written here is one the web acts on, and -1 sends the user
-        # to the setup wizard. A 503 leaves a client on what it already holds.
-        raise quota_service_unavailable()
-    user_response.access_tier = int(membership.get("access_tier", -1))
-    user_response.plan_display_name = membership.get("plan_display_name")
+    from src.server.services.platform_client import quota_service_unavailable
+    from src.server.services.membership import read_membership, plan_unknown
+    membership = await read_membership(user_id, refresh=refresh_tier)
+    # Read after the membership, so a refresh above is what it sees.
+    from src.server.services.account import read_standing
+
+    standing = await read_standing(user_id)
+    if plan_unknown(membership):
+        # A tier written here is one the web acts on, so with nothing on
+        # record a 503 leaves a client on what it already holds. A suspended
+        # account is answered all the same, with no access (-1): the web's
+        # setup gate then asks the routes the suspension refuses, and sends
+        # no one to setup on a refused read.
+        if not standing.suspended:
+            raise quota_service_unavailable()
+    else:
+        user_response.access_tier = int(membership.get("access_tier", -1))
+        user_response.plan_display_name = membership.get("plan_display_name")
+    account = standing.account
+    if account is not None and account.org is not None:
+        user_response.organization = OrganizationResponse(
+            id=account.org.id, name=account.org.name, suspended=account.org.suspended,
+            teams=[{"id": t.id, "name": t.name, "role": t.role} for t in account.teams],
+        )
+    elif standing.suspended:
+        # Only the hint is known: the organization is not, its suspension is.
+        user_response.organization = OrganizationResponse(suspended=True)
+    if standing.policy is not None:
+        user_response.policy = PolicyResponse.model_validate(standing.policy.for_client())
     from src.server.services.llm.config import deployment_serves_default
 
     user_response.deployment_serves = deployment_serves_default()
@@ -244,6 +320,51 @@ async def get_current_user(
         user=user_response,
         preferences=preferences_response,
     )
+
+
+@router.post("/users/me/membership-changed", status_code=204)
+async def membership_changed(
+    user_id: AnyStateServiceUserId, request: Request
+) -> None:
+    """The auth service's notice that the user's plan or organization changed.
+
+    Service token only. The user's next read asks the auth service again, so
+    someone removed from an organization does not keep it for the five
+    minutes the membership is cached. Send it once the change is visible to
+    ``/api/auth/validate``. An account the change suspended has what it runs
+    stopped, after the answer and never failing it, and so does someone the
+    change left unable to use a shared workspace, for what they run there.
+
+    The body may be ``{"suspended": true}`` or ``{"suspended": false}``, the
+    account's suspension after the change, which holds while the auth service
+    cannot be asked again; anything else says nothing about it.
+    """
+    from src.server.services.account import on_membership_changed
+    from src.server.services.membership import teams_door_open
+
+    suspended = await _notice_suspended(request) if teams_door_open() else None
+    await on_membership_changed(user_id, suspended)
+
+
+# The hint is a few bytes; a body past this is not one, and is not read on.
+_NOTICE_BODY_LIMIT = 1024
+
+
+async def _notice_suspended(request: Request) -> Optional[bool]:
+    # Nothing about the body may fail the notice: a body that cannot be read
+    # or parsed (cut off, too deep for the parser) carries no hint.
+    try:
+        raw = b""
+        async for chunk in request.stream():
+            raw += chunk
+            if len(raw) > _NOTICE_BODY_LIMIT:
+                return None
+        body = json.loads(raw or b"null")
+    except Exception:
+        return None
+    if isinstance(body, dict) and isinstance(body.get("suspended"), bool):
+        return body["suspended"]
+    return None
 
 
 @router.put("/users/me", response_model=UserWithPreferencesResponse)
@@ -266,7 +387,10 @@ async def update_current_user(
         locale=request.locale,
         onboarding_completed=request.onboarding_completed,
         personalization_completed=request.personalization_completed,
+        computer_choice=request.computer_choice,
     )
+    if request.computer_choice is not None:
+        logger.info(f"User {user_id} chose to work on {request.computer_choice}")
 
     await invalidate_user_profile_cache(user_id)
 
@@ -371,12 +495,12 @@ def _validate_model_tuning(model_pref: dict, effective: dict) -> None:
                 )
             # Anything outside the tuning set is a typo that would sit in the
             # row forever doing nothing, so it is rejected at the boundary.
-            unknown = set(profile) - set(TUNING_FIELDS)
+            unknown = set(profile) - set(PROFILE_FIELDS)
             if unknown:
                 raise HTTPException(
                     status_code=400,
                     detail=f"profiles[{model}]: unknown settings {sorted(unknown)}; "
-                           f"allowed: {sorted(TUNING_FIELDS)}",
+                           f"allowed: {sorted(PROFILE_FIELDS)}",
                 )
             # One entry, resolved the way the resolver resolves it: a custom
             # model shadows a built-in of the same name, so reading the
@@ -428,6 +552,19 @@ def _refuse_renamed_model_keys(*bags: dict | None) -> None:
                 )
 
 
+def _refuse_server_owned_keys(other_pref: dict | None) -> None:
+    """Refuse ``feature_overrides``, which only the server writes: a user sets
+    a feature through PUT /features, which refuses the gates they may not set
+    (a ``grant`` among them). Refuse the account setup stamp
+    (``ACCOUNT_SETUP_KEY``) too, set or cleared: /users/me/onboarding reads it
+    as the time the hosted onboarding finished, which a user's write could fake
+    or erase."""
+    if other_pref and "feature_overrides" in other_pref:
+        raise HTTPException(status_code=422, detail="feature_overrides is set through /api/v1/features.")
+    if other_pref and ACCOUNT_SETUP_KEY in other_pref:
+        raise HTTPException(status_code=422, detail=f"{ACCOUNT_SETUP_KEY} is not a user preference.")
+
+
 def _validate_default_model_choices(model_pref: dict) -> None:
     """Refuse a ``default_model_scope`` or ``background_follows`` no reader
     acts on. None = key deletion."""
@@ -451,6 +588,24 @@ def _validate_subagents_default(other_pref: dict) -> None:
         )
 
 
+async def _refuse_new_own_models(user_id: str, model_pref: dict, stored: dict) -> None:
+    """Refuse adding a custom model or custom provider the user's policy does
+    not allow. Removing one, or changing one already saved, stays open."""
+    def added(key: str) -> bool:
+        before = {e.get("name") for e in stored.get(key) or () if isinstance(e, dict)}
+        return any(
+            isinstance(e, dict) and e.get("name") not in before
+            for e in model_pref.get(key) or ()
+        )
+
+    if not (added("custom_models") or added("custom_providers")):
+        return
+    from src.server.services.policy import OWN_API_KEYS
+    from src.server.services.account import require_policy
+
+    (await require_policy(user_id)).require(OWN_API_KEYS, "Connecting a custom model or provider")
+
+
 def _sets_structured_key(patches: dict[str, dict | None]) -> bool:
     return any(
         (patch or {}).get(key) is not None
@@ -470,6 +625,10 @@ async def update_preferences(
     A write that changes the default model also moves the threads still on the
     old one when ``apply_default_to`` (or, without it, the saved
     ``default_model_scope``) says ``existing_threads``; the response counts them.
+
+    ``expect_other_preference`` makes the write conditional on the values its
+    client read, for a key written whole: a 409 ``preference_changed`` tells
+    the client to read again rather than overwrite another device's change.
     """
     user = await db_get_user(user_id)
     if not user:
@@ -485,6 +644,7 @@ async def update_preferences(
     model_pref = request.model_preference.model_dump(exclude_unset=True) if request.model_preference else None
 
     _refuse_renamed_model_keys(model_pref, other_pref)
+    _refuse_server_owned_keys(other_pref)
 
     # The model keys live in their own column now. A client still
     # sending them under other_preference is honored for one release so an old
@@ -521,6 +681,8 @@ async def update_preferences(
                 effective.get("custom_providers") or [],
                 stored_model_pref,
             )
+
+        await _refuse_new_own_models(user_id, model_pref, stored_model_pref)
 
         if model_pref.get("custom_models"):
             await refuse_custom_model_endpoints(
@@ -620,7 +782,10 @@ async def update_preferences(
                 other_preference=other_pref,
                 model_preference=model_pref,
                 conn=conn,
+                expect_other_preference=request.expect_other_preference,
             )
+            if (other_pref or {}).get("claude_code_plan_out") == "credits":
+                await credits_unknown(user_id, conn=conn)
             if changes_default:
                 threads_reassigned = await carry_default_change(
                     user_id,
@@ -631,6 +796,16 @@ async def update_preferences(
                 )
     except TuningError as exc:
         raise _tuning_400(exc) from exc
+    except PreferenceChanged as exc:
+        # The client reads the row again and rebuilds its write on it.
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "preference_changed",
+                "message": "Preferences changed since they were read",
+                "keys": exc.keys,
+            },
+        ) from None
 
     await invalidate_user_prefs_cache(user_id)
     await invalidate_user_profile_cache(user_id)
@@ -645,18 +820,78 @@ async def update_preferences(
 @router.delete("/users/me/preferences", status_code=200)
 @handle_api_exceptions("delete preferences", logger)
 async def delete_preferences(user_id: CurrentUserId):
-    """Delete all user preferences and reset onboarding_completed to false."""
+    """Delete all user preferences and reset onboarding_completed to false.
+    A feature the server granted (``granted_override_keys``) stays granted: the
+    user never set it, and a grant lost here could not be given back. The
+    account setup stamp stays for the same reason (``delete_user_preferences``)."""
     user = await db_get_user(user_id)
     if not user:
         raise_not_found("User")
 
-    await db_delete_user_preferences(user_id)
+    await db_delete_user_preferences(user_id, keep_overrides=granted_override_keys())
     await invalidate_user_prefs_cache(user_id)
     await invalidate_user_profile_cache(user_id)
     await db_update_user(user_id=user_id, onboarding_completed=False)
 
     logger.info(f"Cleared preferences and reset onboarding for user {user_id}")
     return {"success": True, "message": "Preferences cleared"}
+
+
+@router.get("/users/me/onboarding", response_model=OnboardingProgressResponse)
+@handle_api_exceptions("get onboarding progress", logger)
+async def get_onboarding(user_id: CurrentUserId):
+    """Every field null for a user who has not started: no row is written until one is."""
+    return await _onboarding_response(user_id, await get_onboarding_progress(user_id))
+
+
+@router.patch("/users/me/onboarding", response_model=OnboardingProgressResponse)
+@handle_api_exceptions("update onboarding progress", logger)
+async def patch_onboarding(request: OnboardingProgressPatch, user_id: CurrentUserId):
+    """Write only the keys sent; an explicit null clears one. Each onboarding
+    surface writes its own keys of one record, so none may overwrite what
+    another left out."""
+    row = await patch_onboarding_progress(
+        user_id, {key: getattr(request, key) for key in request.model_fields_set}
+    )
+    if row is None:
+        raise_not_found("User")
+    return await _onboarding_response(user_id, row)
+
+
+async def _onboarding_response(
+    user_id: str, row: Optional[Dict[str, Any]]
+) -> OnboardingProgressResponse:
+    """The record beside the stamp set when the account's hosted onboarding
+    finished, read from preferences without the cache, which could hide a
+    fresh stamp for a day from a gate that waits on it."""
+    preferences = await db_get_user_preferences(user_id, cached=False) or {}
+    stamp = (preferences.get("other_preference") or {}).get(ACCOUNT_SETUP_KEY)
+    try:
+        at = datetime.fromisoformat(stamp) if isinstance(stamp, str) else None
+    except ValueError:
+        at = None
+    if at is not None and at.tzinfo is None:
+        at = at.replace(tzinfo=timezone.utc)
+    return OnboardingProgressResponse.model_validate(
+        {**(row or {}), "account_setup_completed_at": at}
+    )
+
+
+class UserModelsResponse(BaseModel):
+    models: list[ModelPayer]
+
+
+@router.get(
+    "/users/me/models",
+    response_model=UserModelsResponse,
+    response_model_exclude_unset=True,
+)
+async def list_my_models(user_id: ReadUserId):
+    """The models this user can pick and who pays for each, for the ``la``
+    CLI's model list. ``/api/v1/models`` is the deployment's catalog, the same
+    for everyone, and cannot say whose key or plan a model runs on. A row
+    leaves out what it has no answer for (``plan``, ``signed_in``, ``needs``)."""
+    return UserModelsResponse(models=await model_payers(user_id))
 
 
 @router.post("/users/me/avatar", response_model=dict)

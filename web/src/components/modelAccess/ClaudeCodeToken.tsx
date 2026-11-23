@@ -1,0 +1,622 @@
+import { Fragment, useEffect, useId, useRef, useState, type ReactNode } from 'react';
+import { ChevronDown, ExternalLink, MoreHorizontal, Shield } from 'lucide-react';
+import { useTranslation } from 'react-i18next';
+import { Button } from '@/components/ui/button';
+import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuTrigger } from '@/components/ui/dropdown-menu';
+import { Input } from '@/components/ui/input';
+import { Loader } from '@/components/ui/loader';
+import { Disclosure } from '@/components/ui/Disclosure';
+import { ModalShell } from '@/components/ui/ModalShell';
+import { useNow } from '@/hooks/useNow';
+import { apiErrorStatus } from '@/api/errors';
+import { readOAuthError } from '@/api/oauth';
+import { useClaudeCodeComputers, useClaudeCodeStatus } from '@/hooks/useClaudeCode';
+import { CLAUDE_CODE, CLAUDE_CODE_CONNECTION, CLAUDE_CODE_DOCS, CLAUDE_CODE_UNRUNNABLE } from '@/lib/claudeCode';
+import { cn } from '@/lib/utils';
+import { countdown } from './countdown';
+import { ProviderTitle } from './KeyProviderPicker';
+import { CopyButton, OpenProviderLink, ROW_BUTTON, StepBadge } from './parts';
+import { ConsentForm } from './ClaudeCodeConsentDialog';
+import { TOKEN_ACTIONS, type TokenAction } from './tokenLine';
+import { SAVED_TOKEN, tokenCopy, tokenSheetTitle, useTokenRoutes, type SheetAction, type TokenRoutes, type TokenTarget } from './tokenTarget';
+import { useTokenConsent } from './useTokenConsent';
+
+/** Claude Code's install page, where step one sends anyone without it. */
+const INSTALL_URL = 'https://code.claude.com/docs/en/setup';
+const COMMAND = 'claude setup-token';
+
+/** The refusals each section words itself, by its copy's prefix; any other
+ *  code shows the server's sentence. A `<code>_spent` entry words the same
+ *  refusal once it is no longer retryable. */
+const WORDED = {
+  'modelAccess.claudeCode': new Set([
+    'token_missing', 'token_rejected', 'check_unavailable', 'check_in_progress', 'unavailable', 'redis_unavailable',
+    'computer_not_found', 'cli_unavailable', 'needs_perl', 'computer_unsupported', 'write_failed',
+  ]),
+  'modelAccess.claudeCode.signIn': new Set([
+    'unavailable', 'redis_unavailable', 'code_missing', 'invalid_callback_input', 'state_mismatch', 'no_pending_flow',
+    'code_rejected', 'check_unavailable', 'check_unavailable_spent', 'token_rejected', 'unexpected_grant', 'check_in_progress',
+    'computer_not_found', 'cli_unavailable', 'needs_perl', 'computer_unsupported', 'write_failed_spent',
+  ]),
+};
+
+type Refusal = { code: string; message: string; retryable: boolean };
+
+/** A token checked as the user stopped letting the server store theirs is
+ *  refused `unavailable` with a 409, whose own sentence says so; the
+ *  `unavailable` worded here is Claude Code being off for them. */
+const refusalOf = (err: unknown): Refusal => {
+  const detail = readOAuthError(err);
+  const storeEnded = detail?.code === 'unavailable' && apiErrorStatus(err) === 409;
+  return { code: storeEnded ? 'store_ended' : detail?.code ?? 'unknown', message: detail?.message ?? '', retryable: detail?.retryable ?? false };
+};
+
+function say(t: (key: string) => string, scope: keyof typeof WORDED, r: Refusal): string {
+  if (r.code === 'policy_blocked') return t('modelAccess.claudeCode.computer.policyBlocked');
+  const worded = WORDED[scope];
+  const code = !r.retryable && worded.has(`${r.code}_spent`) ? `${r.code}_spent` : r.code;
+  if (worded.has(code)) return t(`${scope}.fail.${code}`);
+  return r.message || t(`${scope}.fail.unknown`);
+}
+
+/** A removal's refusal: in the server's sentence for a computer it can't
+ *  reach, which says what that computer's owner can do, and in our words
+ *  for anything else, a token deleted whose turn did not stop included. */
+const sayRemoveFailed = (t: (key: string) => string, r: Refusal) => {
+  if (r.code === 'computer_unreachable' && r.message) return r.message;
+  return t(r.code === 'turns_running' ? 'modelAccess.claudeCode.turnsRunning' : 'modelAccess.claudeCode.removeFailed');
+};
+
+/** The server keeps a sign-in this long when its answer has no usable time. */
+const FALLBACK_LIFETIME_MS = 10 * 60_000;
+
+/**
+ * Adds or replaces the setup token Claude Code signs in with: one line on
+ * what the token is, with the rest in the docs, then each way to get one in:
+ * signing in to Claude, which makes the token here, or pasting one made
+ * with the CLI, folded every time the sheet opens until the user asks for it. Each way saves on its own and calls
+ * `onSaved`. For one of the user's own computers the token goes onto that
+ * computer, and the copy says so.
+ *
+ * Where storing the token needs the user's agreement (`askConsent`), what
+ * they agree to and the box they tick stand in place of the line on how the
+ * token is kept, and every way in, the sign-in's code included, waits on it
+ * (`useTokenConsent`).
+ */
+export function ClaudeCodeTokenSheet({ target = SAVED_TOKEN, onSaved, onCancel, onSavingChange, askConsent = false }: {
+  target?: TokenTarget;
+  onSaved: () => void;
+  /** Puts the sheet away: the paste form's Cancel, absent where there is nothing to go back to. */
+  onCancel?: () => void;
+  /** Told while a save is in flight, either way in, for a way out drawn outside the sheet. */
+  onSavingChange?: (saving: boolean) => void;
+  /** The user's agreement asked for before a token is stored. */
+  askConsent?: boolean;
+}) {
+  const { t } = useTranslation();
+  const { routes, form, waiting } = useTokenConsent(useTokenRoutes(target), askConsent);
+  const { keys, values } = tokenCopy(target);
+  const pasteId = useId();
+  const [pasting, setPasting] = useState(false);
+  const [pasteSaving, setPasteSaving] = useState(false);
+  const [signInSaving, setSignInSaving] = useState(false);
+  const saving = pasteSaving || signInSaving;
+  useEffect(() => {
+    if (!saving || !onSavingChange) return;
+    onSavingChange(true);
+    return () => onSavingChange(false);
+  }, [saving, onSavingChange]);
+  return (
+    <div className="flex flex-col gap-5">
+      {form ? <ConsentForm {...form} /> : (
+        <p className="flex items-start gap-1.5 text-xs" style={{ color: 'var(--color-text-tertiary)' }}>
+          <Shield aria-hidden="true" className="mt-0.5 h-3.5 w-3.5 shrink-0" />
+          <span>
+            {t(keys.separate, values)}{' '}
+            <a
+              href={CLAUDE_CODE_DOCS.setUp}
+              target="_blank"
+              rel="noopener noreferrer"
+              className="inline-flex items-center gap-0.5 underline underline-offset-2 hover:opacity-80"
+            >
+              {t('modelAccess.claudeCode.setup.learnMore')}
+              <ExternalLink aria-hidden="true" className="h-3 w-3" />
+            </a>
+          </span>
+        </p>
+      )}
+      <SignInSection
+        routes={routes}
+        intro={t(keys.signInIntro, values)}
+        onSaved={onSaved}
+        submitting={signInSaving}
+        setSubmitting={setSignInSaving}
+        waiting={waiting}
+      />
+      <section className="flex flex-col">
+        <button
+          type="button"
+          aria-expanded={pasting}
+          aria-controls={pasteId}
+          disabled={pasteSaving}
+          onClick={() => setPasting((v) => !v)}
+          className="tap-target inline-flex items-center gap-1 self-start text-sm font-medium hover:opacity-80"
+          style={{ color: 'var(--color-text-primary)' }}
+        >
+          <ChevronDown aria-hidden="true" className={cn('h-4 w-4 transition-transform', pasting && 'rotate-180')} />
+          {t('modelAccess.claudeCode.pasteHeading')}
+        </button>
+        <Disclosure open={pasting} id={pasteId}>
+          <div className="pt-3">
+            <PastedTokenForm routes={routes} onSaved={onSaved} onCancel={onCancel} saving={pasteSaving} setSaving={setPasteSaving} waiting={waiting} />
+          </div>
+        </Disclosure>
+      </section>
+    </div>
+  );
+}
+
+/** The token sheet's title beside Claude Code's mark, as its view's title is. */
+export function ClaudeCodeTokenTitle({ target, action }: { target: TokenTarget; action: SheetAction }) {
+  const { t } = useTranslation();
+  return <ProviderTitle name={CLAUDE_CODE_CONNECTION.display_name} markProvider={CLAUDE_CODE} title={tokenSheetTitle(t, target, action)} />;
+}
+
+/** The sheet in a dialog of its own, for a surface with no sheet to open it
+ *  in, stacked over the dialog it was opened from. */
+export function ClaudeCodeTokenModal({ target, action, onClose }: { target: TokenTarget; action: SheetAction; onClose: () => void }) {
+  const titleId = useId();
+  return (
+    <ModalShell labelId={titleId} title={<ClaudeCodeTokenTitle target={target} action={action} />} onClose={onClose} stacked>
+      <ClaudeCodeTokenSheet target={target} onSaved={onClose} onCancel={onClose} />
+    </ModalShell>
+  );
+}
+
+/** A token line's buttons, each as `TOKEN_ACTIONS` says: the first as a
+ *  button, any after it (Remove beside a Replace or an Add) in a menu of
+ *  their own, so a line's controls keep one width on one line. */
+export function TokenActions({ actions, onOpen, onRemove, menuItems }: {
+  actions: TokenAction[];
+  onOpen: (action: SheetAction) => void;
+  onRemove: () => void;
+  /** Items the More actions menu holds before the actions, which open it even beside one action. */
+  menuItems?: ReactNode;
+}) {
+  const { t } = useTranslation();
+  if (actions.length === 0) return null;
+  const run = (action: TokenAction) => {
+    const { sheet } = TOKEN_ACTIONS[action];
+    if (sheet) onOpen(sheet);
+    else onRemove();
+  };
+  const [first, ...more] = actions;
+  const hasMenu = more.length > 0 || !!menuItems;
+  // With a menu, the action and its More actions are one bordered control,
+  // the menu a square end of it: a bare icon beside a bordered button reads
+  // as loose, and the pair ends where a row's single button would.
+  return (
+    <div className="flex items-center">
+      <Button
+        type="button"
+        variant="outline"
+        size="sm"
+        className={cn(ROW_BUTTON, hasMenu && 'rounded-r-none')}
+        onClick={() => run(first)}
+      >
+        {t(TOKEN_ACTIONS[first].label)}
+      </Button>
+      {hasMenu && (
+        <DropdownMenu>
+          <DropdownMenuTrigger asChild>
+            <Button
+              type="button"
+              variant="outline"
+              size="sm"
+              // Its touch box starts at its own edge, off the action it joins.
+              className={cn(ROW_BUTTON, '-ml-px w-9 rounded-l-none px-0 focus-visible:z-10 [--tap-target-x:4px]')}
+              aria-label={t('modelAccess.claudeCode.moreActions')}
+            >
+              <MoreHorizontal aria-hidden="true" className="h-4 w-4" />
+            </Button>
+          </DropdownMenuTrigger>
+          <DropdownMenuContent align="end">
+            {menuItems}
+            {more.map((action) => (
+              <DropdownMenuItem key={action} variant={action === 'remove' ? 'destructive' : 'default'} onSelect={() => run(action)}>
+                {t(TOKEN_ACTIONS[action].label)}
+              </DropdownMenuItem>
+            ))}
+          </DropdownMenuContent>
+        </DropdownMenu>
+      )}
+    </div>
+  );
+}
+
+type SignIn =
+  | { kind: 'start'; failure: Refusal | null }
+  | { kind: 'starting' }
+  | { kind: 'code'; authorizeUrl: string; deadline: number; opened: boolean };
+
+/** A sign-in that ran out of time, read as the server words one it no longer holds. */
+const EXPIRED: Refusal = { code: 'no_pending_flow', message: '', retryable: false };
+
+/**
+ * Signs in to Claude in a tab the user opens from here, as ClaudeConnect
+ * does, so no popup blocker stands in the way, then takes the code Claude's
+ * page shows, which the server turns into a setup token of its own and
+ * checks before saving. A refusal the same code cannot get past starts the sign-in over,
+ * since the code is spent; any other leaves the code to fix or send again.
+ */
+function SignInSection({ routes, intro, onSaved, submitting, setSubmitting, waiting = false }: {
+  routes: TokenRoutes;
+  intro: string;
+  onSaved: () => void;
+  /** Whether the code is being saved, held by the sheet. */
+  submitting: boolean;
+  setSubmitting: (submitting: boolean) => void;
+  /** Held until the user agrees to the token being stored. */
+  waiting?: boolean;
+}) {
+  const { t } = useTranslation();
+  const fieldId = useId();
+  const errorId = useId();
+  const field = useRef<HTMLInputElement>(null);
+  const [phase, setPhase] = useState<SignIn>({ kind: 'start', failure: null });
+  const [code, setCode] = useState('');
+  const [refusal, setRefusal] = useState<Refusal | null>(null);
+  const run = useRef(0);
+  useEffect(() => () => { run.current += 1; }, []);
+
+  const pending = phase.kind === 'code' ? phase : null;
+  const now = useNow(1000, !!pending && !submitting);
+
+  // Coming back from claude.ai lands the cursor in the field.
+  const opened = !!pending?.opened;
+  useEffect(() => {
+    if (!opened) return;
+    const focus = () => field.current?.focus();
+    window.addEventListener('focus', focus);
+    return () => window.removeEventListener('focus', focus);
+  }, [opened]);
+  if (pending && !submitting && now >= pending.deadline) {
+    setPhase({ kind: 'start', failure: EXPIRED });
+    setCode('');
+    setRefusal(null);
+  }
+
+  const start = async () => {
+    const mine = ++run.current;
+    setPhase({ kind: 'starting' });
+    setCode('');
+    setRefusal(null);
+    let flow: { authorize_url: string; expires_at: string };
+    try {
+      flow = await routes.start();
+    } catch (err) {
+      if (run.current === mine) setPhase({ kind: 'start', failure: refusalOf(err) });
+      return;
+    }
+    if (run.current !== mine) return;
+    const deadline = Date.parse(flow.expires_at) || Date.now() + FALLBACK_LIFETIME_MS;
+    setPhase({ kind: 'code', authorizeUrl: flow.authorize_url, deadline, opened: false });
+  };
+
+  // A code copied off a narrow page can carry a line break.
+  const value = code.replace(/\s+/g, '');
+
+  const submit = async () => {
+    if (!value || submitting) return;
+    const mine = run.current;
+    setSubmitting(true);
+    setRefusal(null);
+    try {
+      // Kept whether or not the sheet is still open: the save landed.
+      await routes.submit(value);
+    } catch (err) {
+      if (run.current !== mine) return;
+      const r = refusalOf(err);
+      setSubmitting(false);
+      if (r.retryable) {
+        setRefusal(r);
+      } else {
+        setPhase({ kind: 'start', failure: r });
+        setCode('');
+      }
+      return;
+    }
+    if (run.current !== mine) return;
+    setCode('');
+    onSaved();
+  };
+
+  const card = { background: 'var(--color-bg-card)', border: '1px solid var(--color-border-muted)' };
+
+  if (!pending) {
+    const starting = phase.kind === 'starting';
+    const failure = phase.kind === 'start' ? phase.failure : null;
+    return (
+      <section className="flex flex-col items-start gap-3 rounded-lg p-4" style={card}>
+        <p className="text-sm" style={{ color: 'var(--color-text-secondary)' }}>{intro}</p>
+        {failure && (
+          <p role="alert" className="text-xs" style={{ color: 'var(--color-loss)' }}>{say(t, 'modelAccess.claudeCode.signIn', failure)}</p>
+        )}
+        <Button type="button" onClick={start} disabled={starting || waiting} aria-busy={starting} className="gap-1.5">
+          {starting && <Loader size={14} className="text-current" />}
+          {starting ? t('modelAccess.claude.starting') : t('modelAccess.claudeCode.signIn.start')}
+        </Button>
+      </section>
+    );
+  }
+
+  return (
+    <form
+      className="flex flex-col gap-3 rounded-lg p-4"
+      style={card}
+      onSubmit={(e) => {
+        e.preventDefault();
+        void submit();
+      }}
+    >
+      <p className="text-sm" style={{ color: 'var(--color-text-secondary)' }}>{t('modelAccess.claudeCode.signIn.codeHint')}</p>
+      <div className="flex flex-wrap items-center gap-3">
+        <OpenProviderLink
+          href={pending.authorizeUrl}
+          used={pending.opened}
+          onOpen={() => setPhase((p) => (p.kind === 'code' ? { ...p, opened: true } : p))}
+        >
+          {t(pending.opened ? 'modelAccess.claude.openAgain' : 'modelAccess.claude.open')}
+        </OpenProviderLink>
+        <span className="text-xs" style={{ color: 'var(--color-text-tertiary)', fontVariantNumeric: 'tabular-nums' }}>
+          {t('modelAccess.claude.expiresIn', { time: countdown(pending.deadline - now) })}
+        </span>
+      </div>
+      <div className="flex flex-col gap-1.5">
+        <label htmlFor={fieldId} className="text-sm font-medium" style={{ color: 'var(--color-text-primary)' }}>
+          {t('modelAccess.claudeCode.signIn.fieldLabel')}
+        </label>
+        <div className="flex gap-2">
+          <Input
+            ref={field}
+            id={fieldId}
+            type="password"
+            value={code}
+            onChange={(e) => {
+              setCode(e.target.value);
+              setRefusal(null);
+            }}
+            placeholder={t('modelAccess.claudeCode.signIn.fieldPlaceholder')}
+            aria-invalid={!!refusal || undefined}
+            aria-describedby={refusal ? errorId : undefined}
+            className="flex-1 font-mono text-sm"
+            autoComplete="off"
+            autoCapitalize="off"
+            autoCorrect="off"
+            spellCheck={false}
+            disabled={submitting}
+          />
+          <Button type="submit" disabled={!value || submitting || waiting} aria-busy={submitting} className="shrink-0 gap-1.5">
+            {submitting && <Loader size={14} className="text-current" />}
+            {submitting ? t('modelAccess.claudeCode.checking') : t('modelAccess.claude.submit')}
+          </Button>
+        </div>
+        {refusal && (
+          <p id={errorId} role="alert" className="text-xs" style={{ color: 'var(--color-loss)' }}>{say(t, 'modelAccess.claudeCode.signIn', refusal)}</p>
+        )}
+      </div>
+    </form>
+  );
+}
+
+/**
+ * A token the user made with `claude setup-token`, on this computer or any
+ * other: how to make one, then the field it is pasted into. Saving waits on
+ * Anthropic taking the token, so a refused one is never saved. The token
+ * lives in this form's field alone, and leaves with it.
+ */
+function PastedTokenForm({ routes, onSaved, onCancel, saving, setSaving, waiting = false }: {
+  routes: TokenRoutes;
+  onSaved: () => void;
+  onCancel?: () => void;
+  /** Whether a save is in flight, held by the sheet, which keeps the form
+   *  from folding away while one is. */
+  saving: boolean;
+  setSaving: (saving: boolean) => void;
+  /** Held until the user agrees to the token being stored. */
+  waiting?: boolean;
+}) {
+  const { t } = useTranslation();
+  const fieldId = useId();
+  const errorId = useId();
+  const [token, setToken] = useState('');
+  const [refusal, setRefusal] = useState<Refusal | null>(null);
+  const run = useRef(0);
+  useEffect(() => () => { run.current += 1; }, []);
+
+  // The command prints a token wide enough to wrap, and a copy of it can
+  // carry the line break.
+  const value = token.replace(/\s+/g, '');
+
+  const save = async () => {
+    if (!value || saving) return;
+    const mine = run.current;
+    setSaving(true);
+    setRefusal(null);
+    try {
+      // Kept whether or not the form is still open: the save landed.
+      await routes.save(value);
+    } catch (err) {
+      if (run.current !== mine) return;
+      const r = refusalOf(err);
+      setSaving(false);
+      // A refused token is no use to anyone, so it goes; one the check never
+      // reached stays for another try.
+      if (r.code === 'token_rejected') setToken('');
+      setRefusal(r);
+      return;
+    }
+    if (run.current !== mine) return;
+    setToken('');
+    onSaved();
+  };
+
+  const refusalText = refusal ? say(t, 'modelAccess.claudeCode', refusal) : null;
+
+  const steps = [
+    <Fragment key="install">
+      {t('modelAccess.claudeCode.stepInstall')}{' '}
+      <a
+        href={INSTALL_URL}
+        target="_blank"
+        rel="noopener noreferrer"
+        className="inline-flex items-center gap-1 underline underline-offset-2 hover:opacity-80"
+      >
+        {t('modelAccess.claudeCode.installLink')}
+        <ExternalLink aria-hidden="true" className="h-3 w-3" />
+      </a>
+    </Fragment>,
+    <span key="run" className="flex flex-col items-start gap-1.5">
+      {t('modelAccess.claudeCode.stepRun')}
+      <span className="flex items-center gap-2">
+        <code
+          className="rounded-md px-2 py-1 font-mono text-xs"
+          style={{ background: 'var(--color-bg-tag)', color: 'var(--color-text-primary)' }}
+        >
+          {COMMAND}
+        </code>
+        <CopyButton text={COMMAND} />
+      </span>
+    </span>,
+    t('modelAccess.claudeCode.stepSignIn'),
+    t('modelAccess.claudeCode.stepCopy'),
+    t('modelAccess.claudeCode.stepPaste'),
+  ];
+
+  return (
+    <form
+      className="flex flex-col gap-5"
+      onSubmit={(e) => {
+        e.preventDefault();
+        void save();
+      }}
+    >
+      <ol className="flex flex-col gap-3">
+        {steps.map((step, i) => (
+          <li key={i} className="flex items-start gap-2.5 text-sm" style={{ color: 'var(--color-text-primary)' }}>
+            <StepBadge>{i + 1}</StepBadge>
+            <span className="min-w-0 pt-px">{step}</span>
+          </li>
+        ))}
+      </ol>
+
+      <div className="flex flex-col gap-1.5">
+        <label htmlFor={fieldId} className="text-sm font-medium" style={{ color: 'var(--color-text-primary)' }}>
+          {t('modelAccess.claudeCode.fieldLabel')}
+        </label>
+        <Input
+          id={fieldId}
+          type="password"
+          value={token}
+          onChange={(e) => {
+            setToken(e.target.value);
+            setRefusal(null);
+          }}
+          placeholder={t('modelAccess.claudeCode.fieldPlaceholder')}
+          aria-invalid={!!refusal || undefined}
+          aria-describedby={refusal ? errorId : undefined}
+          className="font-mono text-sm"
+          autoComplete="off"
+          autoCapitalize="off"
+          autoCorrect="off"
+          spellCheck={false}
+          disabled={saving}
+        />
+        {refusalText && (
+          <p id={errorId} role="alert" className="text-xs" style={{ color: 'var(--color-loss)' }}>
+            {refusalText}
+          </p>
+        )}
+      </div>
+
+      <div className="flex items-center justify-end gap-2">
+        {onCancel && (
+          <Button type="button" variant="ghost" onClick={onCancel} disabled={saving}>
+            {t('common.cancel')}
+          </Button>
+        )}
+        <Button type="submit" disabled={!value || saving || waiting} aria-busy={saving} className="gap-1.5">
+          {saving && <Loader size={14} className="text-current" />}
+          {saving ? t('modelAccess.claudeCode.checking') : t('modelAccess.claudeCode.save')}
+        </Button>
+      </div>
+    </form>
+  );
+}
+
+/** Confirms removing the setup token, the saved one or a computer's, runs it,
+ *  and keeps the dialog open with the reason when it fails. Mounted only
+ *  while open; `stacked` over a dialog that opened it. */
+export function RemoveClaudeCodeTokenDialog({ target = SAVED_TOKEN, stacked = false, onClose }: {
+  target?: TokenTarget;
+  stacked?: boolean;
+  onClose: () => void;
+}) {
+  const { t } = useTranslation();
+  const titleId = useId();
+  const [busy, setBusy] = useState(false);
+  const [failure, setFailure] = useState<Refusal | null>(null);
+  const status = useClaudeCodeStatus();
+  const { computers } = useClaudeCodeComputers();
+  const routes = useTokenRoutes(target);
+  const { keys, values } = tokenCopy(target);
+  // A computer's own token gone, the computer runs on the saved one where
+  // this server relays it, and the body says so: never one Claude refused,
+  // nor to a computer where Claude Code cannot run (`CLAUDE_CODE_UNRUNNABLE`).
+  const relays = target.kind === 'computer' && status.runsHere && status.saved && status.state !== 'rejected'
+    && !CLAUDE_CODE_UNRUNNABLE.has(computers.find((c) => c.computer_id === target.computerId)?.state ?? '');
+  const body = relays ? 'modelAccess.claudeCode.computer.removeBodySaved' : keys.removeBody;
+
+  const confirm = async () => {
+    setBusy(true);
+    setFailure(null);
+    try {
+      await routes.remove();
+    } catch (err) {
+      setFailure(refusalOf(err));
+      setBusy(false);
+      return;
+    }
+    onClose();
+  };
+
+  return (
+    <ModalShell
+      labelId={titleId}
+      title={t(keys.removeTitle, values)}
+      onClose={onClose}
+      closeDisabled={busy}
+      width="narrow"
+      stacked={stacked}
+      footer={
+        <div className="flex items-center justify-end gap-2">
+          <Button type="button" variant="ghost" onClick={onClose} disabled={busy}>
+            {t('common.cancel')}
+          </Button>
+          <Button type="button" variant="destructive" onClick={confirm} disabled={busy} aria-busy={busy}>
+            {busy ? t('modelAccess.remove.removing') : t('modelAccess.claudeCode.removeConfirm')}
+          </Button>
+        </div>
+      }
+    >
+      <p className="text-sm" style={{ color: 'var(--color-text-secondary)' }}>
+        {t(body, values)}
+      </p>
+      {failure && !busy && (
+        <p role="alert" className="text-sm" style={{ color: 'var(--color-loss)' }}>
+          {sayRemoveFailed(t, failure)}
+        </p>
+      )}
+    </ModalShell>
+  );
+}

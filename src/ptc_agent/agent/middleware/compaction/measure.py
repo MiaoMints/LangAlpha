@@ -10,13 +10,16 @@ estimate is the model's where it is known to part from tiktoken (Claude).
 from __future__ import annotations
 
 import asyncio
+import json
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
-from langchain_core.messages import AIMessage, AnyMessage
+from langchain.agents.middleware.types import ModelRequest
+from langchain_anthropic.chat_models import convert_to_anthropic_tool
+from langchain_core.messages import AIMessage, AnyMessage, SystemMessage
 
-from ptc_agent.agent.middleware.compaction.summarize import model_label
+from src.llms.model_identity import api_model_id, is_claude
 from ptc_agent.agent.middleware.compaction.types import TokenCounter
 from ptc_agent.agent.middleware.compaction.utils import (
     attachment_tokens,
@@ -24,7 +27,7 @@ from ptc_agent.agent.middleware.compaction.utils import (
     find_group_safe_cutoff,
 )
 from ptc_agent.agent.middleware.model_resilience import FALLBACK_KEY
-from ptc_agent.agent.middleware.runtime_context.carrier import spent_stamps
+from ptc_agent.agent.middleware.runtime_context.carrier import sent_for_one_call
 
 
 @dataclass(frozen=True)
@@ -32,24 +35,17 @@ class Estimate:
     """What messages no call measured cost a model: their text by
     ``counter``, their attachments as the model is charged for them
     (``cost``, see ``attachment_tokens``). ``model`` names it
-    (``model_label``), so a growth measured on another is not taken for its
-    count (``context_growth``). A market-watch stamp a later user message
-    followed counts nothing (``spent_stamps``)."""
+    (``api_model_id``), so a growth measured on another is not taken for its
+    count (``context_growth``). A stamp no request carries counts nothing
+    (``sent_for_one_call``)."""
 
     counter: TokenCounter
     cost: Callable[[Any], int] | None = None
     model: str | None = None
 
     def __call__(self, messages: Sequence[Any]) -> int:
-        spent = spent_stamps(list(messages))
-        read = [m for m in messages if id(m) not in spent] if spent else messages
-        return self.counter(read) + attachment_tokens(read, self.cost)
-
-
-def is_claude(model: Any) -> bool:
-    """Whether ``model`` counts with Claude's tokenizer, on whichever route
-    serves it: the tokenizer goes with the model, not the host."""
-    return "claude" in (model_label(model) or "").lower()
+        sent = [m for m in messages if not sent_for_one_call(m)]
+        return self.counter(sent) + attachment_tokens(sent, self.cost)
 
 
 def counter_for(model: Any, default: TokenCounter) -> TokenCounter:
@@ -63,7 +59,7 @@ def estimate_for(
 ) -> Estimate:
     """How what no call to ``model`` measured is counted (``counter_for``),
     its attachments at ``cost``."""
-    return Estimate(counter_for(model, default), cost, model_label(model))
+    return Estimate(counter_for(model, default), cost, api_model_id(model))
 
 
 def keep_tokens_for(
@@ -78,6 +74,32 @@ def keep_tokens_for(
     fill the threshold again, and every call would summarize.
     """
     return min(claude_keep_tokens if is_claude(model) else keep_tokens, threshold // 3)
+
+
+def sent_ahead(request: ModelRequest, appended: str = "") -> list[Any]:
+    """What ``request`` sends its model ahead of the messages, as messages
+    an ``Estimate`` counts: the system message, the block ``appended`` to
+    it by a middleware further in (the thread's baseline), and the tool
+    schemas as one message of their JSON, in the shape Claude is sent them.
+    The provider counts all of it as input: on the main agent the schemas
+    measure about 18k to 27k tokens and the baseline about 7k, which an
+    estimate of the system prompt and messages alone fell short by."""
+    ahead = [request.system_message] if request.system_message is not None else []
+    if appended:
+        ahead.append(SystemMessage(appended))
+    schemas = tool_schemas(request.tools)
+    if schemas is not None:
+        ahead.append(schemas)
+    return ahead
+
+
+def tool_schemas(tools: Sequence[Any] | None) -> SystemMessage | None:
+    """``tools``' schemas as one message of their JSON, in the shape Claude
+    is sent them, or None without tools."""
+    if not tools:
+        return None
+    schemas = [tool if isinstance(tool, dict) else convert_to_anthropic_tool(tool) for tool in tools]
+    return SystemMessage(json.dumps(schemas, ensure_ascii=False, default=str))
 
 
 def measured_tokens(state: Mapping[str, Any]) -> int | None:
@@ -108,11 +130,13 @@ async def context_tokens(
     state: Mapping[str, Any],
     view: Sequence[AnyMessage],
     estimate: Estimate,
-    system: Sequence[Any] = (),
+    ahead: Callable[[], Sequence[Any]] | None = None,
 ) -> ContextReading:
     """The context ``view`` makes, as the summary trigger reads it: what the
     last call measured plus an estimate of what has been added since, else
-    an estimate of the whole of it.
+    an estimate of the whole of it, with what the call sends ahead of the
+    view, which the measurement counts too: ``ahead`` gives it
+    (``sent_ahead``), read only where nothing was measured.
 
     The measurement ends at the newest answer, which its output tokens
     count, so everything after it is new: the results of that answer's tool
@@ -123,14 +147,18 @@ async def context_tokens(
     Read before every model call, so only the added part is counted, on the
     loop. A whole history, read after a summary between turns or a cut after
     a pause, is tens of milliseconds of tokenizing, and its text goes to a
-    thread so the other turns on the loop do not wait on it; its attachments
-    are counted on the loop, which their parse cache is kept on.
+    thread so the other turns on the loop do not wait on it, with what is
+    sent ahead of it built there too: the tool schemas alone serialize to
+    tens of thousands of tokens. Its attachments are counted on the loop,
+    which their parse cache is kept on; nothing sent ahead holds any.
     """
     measured = measured_tokens(state)
     if measured is None:
-        whole = [*system, *view]
-        tokens = await asyncio.to_thread(estimate.counter, whole)
-        return ContextReading(tokens + attachment_tokens(whole, estimate.cost), estimate)
+        sent = [m for m in view if not sent_for_one_call(m)]
+        tokens = await asyncio.to_thread(
+            lambda: estimate.counter([*(ahead() if ahead is not None else ()), *sent])
+        )
+        return ContextReading(tokens + attachment_tokens(sent, estimate.cost), estimate)
     answered = next(
         (i for i in range(len(view) - 1, -1, -1) if isinstance(view[i], AIMessage)),
         None,
@@ -209,10 +237,8 @@ def message_sizes(messages: Sequence[AnyMessage], estimate: Estimate) -> Iterato
     another model, until a call to this one measures it again.
     """
 
-    spent = spent_stamps(list(messages))
-
     def one(message: AnyMessage) -> int:
-        return 0 if id(message) in spent else estimate([message])
+        return estimate([message])
 
     answers = [i for i, m in enumerate(messages) if isinstance(m, AIMessage)]
     if not answers:

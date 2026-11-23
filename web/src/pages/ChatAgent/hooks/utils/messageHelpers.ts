@@ -11,8 +11,10 @@ import type {
   NotificationVariant,
   WakeupArrival,
 } from '@/types/chat';
+import type { ArtifactCommentsShown } from '@/types/api';
 import type { WidgetContextSnapshot } from '@/pages/Dashboard/widgets/framework/contextSnapshot';
 import type { ChartSelectionSnapshot } from '@/pages/MarketView/stores/chartSelectionStore';
+import type { AttachmentMeta } from '../../utils/fileUpload';
 
 // Re-export types for consumers
 export type { ChatMessage, AssistantMessage, UserMessage, NotificationMessage, NotificationVariant };
@@ -20,12 +22,6 @@ export type { ChatMessage, AssistantMessage, UserMessage, NotificationMessage, N
 // Keeps ids made within the same millisecond apart: a message is updated by
 // id, so two sharing one are both updated.
 let _idSeq = 0;
-
-export interface AttachmentMeta {
-  file: File;
-  dataUrl: string;
-  type: string;
-}
 
 /**
  * `turnIndex` is the backend turn the bubble belongs to, or undefined for one
@@ -36,10 +32,11 @@ export interface AttachmentMeta {
 export function createUserMessage(
   message: string,
   turnIndex: number | undefined,
-  { attachments, widgetSnapshots, chartSelections, id }: {
+  { attachments, widgetSnapshots, chartSelections, artifactComments, id }: {
     attachments?: AttachmentMeta[] | null;
     widgetSnapshots?: WidgetContextSnapshot[] | null;
     chartSelections?: ChartSelectionSnapshot[] | null;
+    artifactComments?: ArtifactCommentsShown | null;
     id?: string;
   } = {},
 ): UserMessage {
@@ -55,10 +52,8 @@ export function createUserMessage(
     sentHere: true,
   };
   if (attachments && attachments.length > 0) {
-    // AttachmentMeta is the upload-time shape (file, dataUrl, type).
-    // Attachment from sse.ts has a different shape (name, size, url).
-    // At send time only AttachmentMeta fields are used, so store as-is.
-    msg.attachments = attachments as any;
+    // The send-time record; history's carries a url instead. The bubble reads either.
+    msg.attachments = attachments;
   }
   if (widgetSnapshots && widgetSnapshots.length > 0) {
     msg.widgetSnapshots = widgetSnapshots;
@@ -66,13 +61,18 @@ export function createUserMessage(
   if (chartSelections && chartSelections.length > 0) {
     msg.chartSelections = chartSelections;
   }
+  if (artifactComments && artifactComments.comments.length > 0) {
+    msg.artifactComments = artifactComments;
+  }
   return msg;
 }
 
 /** Whether a user message carried more than its text: an attachment, a chart
- *  selection or a widget, which a send of its text alone would drop. */
+ *  selection, a widget or file comments, which a send of its text alone
+ *  would drop. */
 export function carriesContext(message: UserMessage): boolean {
-  return !!(message.attachments?.length || message.chartSelections?.length || message.widgetSnapshots?.length);
+  return !!(message.attachments?.length || message.chartSelections?.length || message.widgetSnapshots?.length
+    || message.artifactComments?.comments.length);
 }
 
 /** `turnIndex` as for createUserMessage. */
@@ -87,7 +87,6 @@ export function createAssistantMessage(id: string, turnIndex: number | undefined
     contentSegments: [],
     reasoningProcesses: {},
     toolCallProcesses: {},
-    todoListProcesses: {},
     turnIndex,
   };
 }

@@ -71,10 +71,14 @@ export function localePreload(localesDir: string): Plugin {
       order: 'post',
       handler(html, ctx) {
         const dir = fs.realpathSync(localesDir);
+        // Module ids keep Vite's forward slashes while realpathSync answers in
+        // the platform's own separator (on Windows, `\\`), so the two never
+        // compare equal as-is. Normalize both sides before matching.
+        const sameDir = (id: string) => path.resolve(path.dirname(id)) === path.resolve(dir);
         const found = new Map<string, string>();
         for (const out of Object.values(ctx.bundle ?? {})) {
           const id = out.type === 'chunk' ? out.facadeModuleId : null;
-          if (id && path.dirname(id) === dir && id.endsWith('.json')) {
+          if (id && sameDir(id) && id.endsWith('.json')) {
             found.set(path.basename(id, '.json'), base + out.fileName);
           }
         }

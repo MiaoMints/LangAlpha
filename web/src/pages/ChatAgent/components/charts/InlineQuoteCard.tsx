@@ -1,4 +1,5 @@
 import React from 'react';
+import { TickerLabel } from '@/components/TickerLogo';
 import { useTranslation } from 'react-i18next';
 import { useLocale } from '@/hooks/useLocale';
 import { formatMoney } from '@/lib/bars';
@@ -9,7 +10,7 @@ import { extendedHoursLabel, marketStatusLabel } from './cardWords';
 import { FreshnessBadge } from './FreshnessBadge';
 import { DualName, PriceHero } from './PriceHero';
 import { TermCard, TermChange, TermRange, TermTag } from './TermCard';
-import { percentMove } from './termChange';
+import { percentMove } from '@/lib/priceMove';
 import { useCardNarrow } from './termContext';
 import { commonFreshness } from './termFreshness';
 import { TermTable, type TermColumn } from './TermTable';
@@ -73,7 +74,7 @@ function QuoteHero({
   const { t } = useTranslation();
   const locale = useLocale();
   const narrow = useCardNarrow();
-  const money = (n: number): string => formatMoney(n, d.currency, locale);
+  const money = (n: number): string => formatMoney(n, d.currency, locale, { upTo: d.places });
   const stamp = badgeCarriesStamp(d) ? undefined : (d.asOfLocal ?? asOf);
   const stampEl = stamp && <span title={localTitle(asOfTs, locale)}>{stamp}</span>;
   const status = offSession(d.status) ? d.status : undefined;
@@ -83,6 +84,7 @@ function QuoteHero({
   return (
     <TermCard
       title={d.symbol}
+      symbol={d.symbol}
       sub={d.name && <DualName first={d.name} second={narrow ? null : d.secondaryName} />}
       meta={[status && <TermTag key="status">{marketStatusLabel(t, status)}</TermTag>, !narrow && stampEl]}
       onClick={onClick}
@@ -146,7 +148,7 @@ function QuoteTable({
   const stampOf = (d: QuoteDisplay): string | undefined => (d.asOfLocal && !differs(d) ? d.asOfLocal : undefined);
   const showStamps = !narrow && displays.some(stampOf);
   const showName = displays.some((d) => d.name);
-  const money = (n: number, d: QuoteDisplay): string => formatMoney(n, d.currency, locale);
+  const money = (n: number, d: QuoteDisplay): string => formatMoney(n, d.currency, locale, { upTo: d.places });
 
   // The backend stamps a block in the clock its rows share; a mixed block has
   // none, so the reader's own clock stands in.
@@ -168,7 +170,7 @@ function QuoteTable({
         const status = rowStatus(d);
         return (
           <>
-            <span className="term-strong">{d.symbol}</span>
+            <TickerLabel symbol={d.symbol} className="term-strong" />
             {/* Only a row whose freshness differs from the header's keeps a
                 mark, or one whose venue time has no column to sit in: the
                 mark's tooltip carries it. */}

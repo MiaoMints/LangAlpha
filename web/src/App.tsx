@@ -12,10 +12,15 @@ import AuthConfirm from './pages/Login/AuthConfirm';
 import { useTranslation } from 'react-i18next';
 import { useAuth } from './contexts/AuthContext';
 import { useIsMobile } from './hooks/useIsMobile';
+import { useSyncAppearance } from './hooks/useAppearance';
 import { useLocale } from './hooks/useLocale';
-import { useSetupGate } from './hooks/useSetupGate';
+import { useOnboardingRoute } from './hooks/useOnboardingRoute';
+import { setupSkipped } from './hooks/useSetupGate';
+import { shellTarget } from './pages/Setup/answers/gate';
+import { canAddThisMac, isDesktopShell } from './lib/desktop';
+import { ExternalRedirect } from './components/ExternalRedirect';
 import { isPlatformMode, APP_ENTRY_PATH } from './config/hostMode';
-import { PRIVACY_URL } from './config/supportLinks';
+import { ONBOARDING_USE_URL, PRIVACY_URL } from './config/supportLinks';
 import { AUTH_BROADCAST_CHANNEL, type AuthBroadcastMessage } from './lib/oauthPopup';
 import { inAppPath } from './lib/inAppPath';
 import { clearSetupReturn } from './lib/setupReturn';
@@ -25,12 +30,20 @@ import { StaleBuildBoundary } from './components/StaleBuildBoundary';
 import { ConnectConsentHost } from './pages/Plugins/components/ConnectConsentHost';
 import { ConnectLandingHost } from './pages/Plugins/components/ConnectLandingHost';
 import { ThreadLifecycleFeed } from './lib/threadLifecycle/ThreadLifecycleFeed';
+import { CliApprovalHost } from './components/CliApproval/CliApprovalHost';
+import { VendorTermsHost } from './components/VendorTerms/VendorTermsHost';
 import { WarmHome } from './components/WarmHome';
+import { ThisMacFirstRunGate } from './pages/ThisMac/ThisMacFirstRunGate';
 import { HostedSignInGate } from './components/HostedSignInGate';
+import { SuspendedGate } from './components/organization/SuspendedAccount';
 import { forgetHostedSignIn, hostedSignInReturn, landAfterSignIn } from './lib/hostedSignIn';
 import { markBooted, reloadIfStale, watchStaleBuild } from './lib/staleBuild';
 import { appSectionOf } from './lib/appRoutes';
 import { lazyWithMotion } from './lib/lazyWithMotion';
+import { CommandPaletteProvider } from './components/CommandPalette/CommandPaletteProvider';
+import { CreateWorkspaceHost } from './components/CreateWorkspaceHost';
+import { DesktopMenuCommands } from './lib/desktopMenuCommands/DesktopMenuCommands';
+import { setSentryUser } from './lib/sentry';
 import './App.css';
 
 // Login carries the market-tape canvas subsystem (~2k lines that only a
@@ -48,6 +61,8 @@ const SetupWizard = lazyWithMotion(() => import('./pages/Setup/SetupWizard'));
 // shell's to load rather than one of Main's routes.
 const Welcome = lazyWithMotion(() => import('./pages/Onboarding/welcome/Welcome'));
 const Legal = React.lazy(() => import('./pages/Legal/Legal'));
+// The desktop shell's menu bar panel, loaded only in that window.
+const DesktopMenubar = React.lazy(() => import('./pages/DesktopMenubar/MenubarPage'));
 const ResetPassword = React.lazy(() => import('./pages/Login/ResetPassword'));
 
 /** How long a callback may sit holding neither a session nor a stated reason
@@ -203,11 +218,6 @@ function RootRedirect() {
 }
 
 /** Leaves the app for an address outside it, without a history entry to come back to. */
-function ExternalRedirect({ to }: { to: string }) {
-  window.location.replace(to);
-  return null;
-}
-
 /** Legacy shared-host entry path — sends stale /app links to the root entry. */
 function LegacyAppPathRedirect() {
   const { search } = useLocation();
@@ -230,7 +240,7 @@ function AuthenticatedShell() {
   const location = useLocation();
   const onWelcome = location.pathname === WELCOME_PATH;
   const hideTabBar = isMobile && location.pathname.startsWith('/chat/t/');
-  const { isLoading, needsSetup } = useSetupGate();
+  const onboarding = useOnboardingRoute();
 
   // A new build is taken on a switch between sections, never inside one: chat
   // keeps every thread it has opened mounted, with its unsent message, while
@@ -273,7 +283,7 @@ function AuthenticatedShell() {
   // this is free when the gate is already settled. Mount-only: later
   // navigations mount their lazy component directly.
   useEffect(() => {
-    if (window.location.pathname === WELCOME_PATH) void Welcome.preload().catch(() => {});
+    if (window.location.pathname === WELCOME_PATH) void Welcome.preload();
     else preloadRouteChunk(window.location.pathname);
   }, []);
 
@@ -343,18 +353,30 @@ function AuthenticatedShell() {
 
   // While the user profile is loading, show the loading state to avoid
   // flashing protected content before the gate check completes.
-  if (isLoading) {
+  if (onboarding.kind === 'loading') {
     return <PageLoading />;
   }
 
-  if (needsSetup) {
-    return <Navigate to="/setup/method" replace />;
+  // The hosted onboarding, the setup step to resume, the two questions
+  // or the provider setup come before any page of the app, /welcome and the
+  // first chat included.
+  const target = shellTarget(onboarding, { desktop: isDesktopShell(), skipped: setupSkipped(), canPair: canAddThisMac() });
+  if (target?.kind === 'platform' && ONBOARDING_USE_URL) {
+    return <ExternalRedirect to={ONBOARDING_USE_URL} />;
+  }
+  if (target?.kind === 'path') {
+    return <Navigate to={target.to} replace />;
   }
 
+  // The desktop app's first run on a Mac asks where the agents work before
+  // anything warms Home, which would build a cloud computer.
   return (
+    <ThisMacFirstRunGate>
     <OnboardingProvider>
       <ThreadLifecycleFeed />
-      <WarmHome />
+      {/* One prompt at a time: the agent's command requests first, then vendor terms. */}
+      <CliApprovalHost fallback={(held) => <VendorTermsHost held={held} />} />
+      <WarmHome setupRunning={onboarding.kind === 'answers'} />
       {onWelcome ? (
         // Full screen and none of the app's chrome: the flow is the page.
         // The hosts below stay, since a brokerage connect it starts asks for
@@ -365,27 +387,31 @@ function AuthenticatedShell() {
           </StaleBuildBoundary>
         </Suspense>
       ) : (
-        <>
-          <div className="app-layout">
-            {!isMobile && (
-              <AppSidebar
-                collapsed={sidebarCollapsed}
-                onToggleCollapse={toggleSidebar}
-                width={sidebarWidth}
-                onWidthChange={handleSidebarWidthChange}
-              />
-            )}
-            {isMobile && !hideTabBar && <BottomTabBar />}
-            <main ref={mainRef} className={`app-main${hideTabBar ? ' app-main--no-tab' : ''}`}>
-              <Main />
-            </main>
-          </div>
-          <OnboardingHostGate />
-        </>
+        <CreateWorkspaceHost>
+          <CommandPaletteProvider>
+            <div className="app-layout">
+              {!isMobile && (
+                <AppSidebar
+                  collapsed={sidebarCollapsed}
+                  onToggleCollapse={toggleSidebar}
+                  width={sidebarWidth}
+                  onWidthChange={handleSidebarWidthChange}
+                />
+              )}
+              {isMobile && !hideTabBar && <BottomTabBar />}
+              <main ref={mainRef} className={`app-main${hideTabBar ? ' app-main--no-tab' : ''}`}>
+                <Main />
+              </main>
+            </div>
+            <OnboardingHostGate />
+            <DesktopMenuCommands onToggleSidebar={isMobile ? undefined : toggleSidebar} />
+          </CommandPaletteProvider>
+        </CreateWorkspaceHost>
       )}
       <ConnectConsentHost />
       <ConnectLandingHost />
     </OnboardingProvider>
+    </ThisMacFirstRunGate>
   );
 }
 
@@ -397,8 +423,19 @@ function AriaLocale({ children }: { children: React.ReactNode }) {
   return <I18nProvider locale={locale}>{children}</I18nProvider>;
 }
 
+/** The account's look, applied on every signed-in page: the setup wizard and
+ *  the welcome flow render outside Main, and a fresh browser has to show the
+ *  account's look there too. Mounted only while signed in, so a sign-out ends
+ *  it and the next account's sign-in starts it afresh. */
+function AppearanceSync() {
+  useSyncAppearance();
+  return null;
+}
+
 function App() {
-  const { isLoggedIn, isInitialized } = useAuth();
+  const { isLoggedIn, isInitialized, userId } = useAuth();
+
+  useEffect(() => setSentryUser(isLoggedIn ? userId : null), [isLoggedIn, userId]);
 
   // App, not AuthenticatedShell: this has to cover the logged-out routes too,
   // and a stale /login chunk is just as fatal as a stale /dashboard one. Mount
@@ -432,6 +469,7 @@ function App() {
 
   return (
     <AriaLocale>
+    {isLoggedIn && <AppearanceSync />}
     <Routes>
       <Route path={APP_ENTRY_PATH} element={appEntryElement} />
       {isPlatformMode && APP_ENTRY_PATH === '/' && (
@@ -480,15 +518,25 @@ function App() {
       } />
       <Route path="/setup/*" element={
         isLoggedIn ? (
-          <Suspense fallback={<PageLoading />}>
-            <SetupWizard />
-          </Suspense>
+          <SuspendedGate>
+            <Suspense fallback={<PageLoading />}>
+              <SetupWizard />
+            </Suspense>
+          </SuspendedGate>
         ) : (
           <Navigate to={APP_ENTRY_PATH} replace />
         )
       } />
+      {/* The desktop shell's menu bar window. None of the app shell, and its
+          own signed-out state rather than the entry's: a sign-in started
+          here would take over a panel too small to hold it. */}
+      <Route path="/desktop/menubar" element={
+        <Suspense fallback={null}>
+          <DesktopMenubar />
+        </Suspense>
+      } />
       <Route path="/*" element={
-        isLoggedIn ? <AuthenticatedShell /> : <Navigate to={APP_ENTRY_PATH} replace />
+        isLoggedIn ? <SuspendedGate><AuthenticatedShell /></SuspendedGate> : <Navigate to={APP_ENTRY_PATH} replace />
       } />
     </Routes>
     </AriaLocale>

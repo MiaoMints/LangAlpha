@@ -214,24 +214,24 @@ def history(monkeypatch):
     the database is faked, so the service's own read path serves the files."""
     content = {path: text.encode() for path, text in TRANSCRIPT.items()}
 
-    def workspace_transcripts(workspace_id):
+    def workspace_transcripts(workspace_id, *, scope):
         return [THREADS[workspace_id]] if workspace_id in THREADS else []
 
     def found(workspace_id, short_id):
         thread_id = THREADS.get(workspace_id)
         return bool(thread_id) and thread_id[:8] == short_id
 
-    def list_transcript(workspace_id, short_id):
+    def list_transcript(workspace_id, short_id, *, scope=None):
         if not found(workspace_id, short_id):
             return None
         return {path: (_sha(data), len(data)) for path, data in content.items()}
 
-    def load_transcript_file(workspace_id, short_id, path):
+    def load_transcript_file(workspace_id, short_id, path, *, scope):
         if not found(workspace_id, short_id) or path not in content:
             return None
         return StoredFile(USER, _sha(content[path]), content[path])
 
-    def list_transcript_tree(workspace_id, short_id, limit):
+    def list_transcript_tree(workspace_id, short_id, limit, *, scope):
         thread_id = THREADS.get(workspace_id)
         if thread_id is None or short_id not in (None, thread_id[:8]):
             return []
@@ -522,6 +522,32 @@ async def test_every_file_lists_the_size_version_and_content_its_read_returns(
     assert "content" not in listed["user/memory/big.md"]
     assert "content" not in listed["computer/threads.jsonl"]
     assert listed["user/profile/README.md"]["content"]
+
+
+@pytest.mark.asyncio
+async def test_homes_stand_in_folder_serves_homes_transcripts(tree, history, monkeypatch):
+    """Home's turn in its stand-in saves its transcript under Home, so the
+    pointer compaction leaves in the stand-in's folder must read Home's."""
+    from src.server.database.home_workspace import get_home_stand_in_id
+
+    stand_in = get_home_stand_in_id(USER)
+    rows = {
+        **WORKSPACES,
+        stand_in: {
+            "workspace_id": stand_in,
+            "user_id": USER,
+            "computer_id": COMPUTER,
+            "dir_name": ".home-stand-in",
+        },
+    }
+    monkeypatch.setattr(
+        workspace_db, "get_workspace_placement", AsyncMock(side_effect=rows.get)
+    )
+    monkeypatch.setitem(THREADS, get_home_workspace_id(USER), T1)
+
+    listing = await tree.list(f"workspaces/{stand_in}/transcripts")
+
+    assert [e["name"] for e in listing.entries] == [SHORT]
 
 
 @pytest.mark.asyncio

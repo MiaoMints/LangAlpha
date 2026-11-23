@@ -52,6 +52,9 @@ from src.server.services.persistence.file import (
     RestoreIdentityLost,
 )
 from src.server.services.persistence.sync_result import BackupIncomplete
+from src.server.services import browser_settings, browser_view
+from src.server.services.computer_usage.events import note_start_path
+from src.server.services.computer_usage.causes import computer_cause
 from src.server.services.workspace_layout import (
     held_workspace_layout,
     layout_from_binding,
@@ -59,6 +62,7 @@ from src.server.services.workspace_layout import (
 )
 from src.server.services.user_skills import sandbox_skill_sync_params
 
+from src.server.services.computer_manager._attach_only import refuse_start
 from src.server.services.computer_manager._types import (
     ComputerBinding,
     _PROJECTS_ATTACHED_CAP,
@@ -91,7 +95,7 @@ class ProvisioningMixin:
         # may name someone else's sandbox. NULL means nothing to destroy.
         computer_id = binding.computer_id
         durable_sandbox_id = binding.provider_ref
-        await self._revoke_data_token(computer_id)
+        await self._revoke_computer_tokens(computer_id)
         await self._revoke_livefs(computer_id)
         # Its previews end with it rather than at expiry, on every path that
         # retires a machine, the sweep's included.
@@ -202,7 +206,8 @@ class ProvisioningMixin:
         user_id: str | None,
         sandbox: Any,
         reusing_sandbox: bool = False,
-        force_refresh: bool = False,
+        *,
+        rebuild_overlay: bool = False,
     ) -> Any:
         """``_sync_project_assets`` for code about to run on ``sandbox``: the
         file mount comes up beside the sync when due."""
@@ -211,7 +216,11 @@ class ProvisioningMixin:
             user_id,
             sandbox,
             self._sync_project_assets(
-                binding, user_id, sandbox, reusing_sandbox, force_refresh
+                binding,
+                user_id,
+                sandbox,
+                reusing_sandbox,
+                rebuild_overlay=rebuild_overlay,
             ),
             workspace_id=binding.workspace_id,
         )
@@ -223,6 +232,8 @@ class ProvisioningMixin:
         sandbox: Any,
         reusing_sandbox: bool = False,
         force_refresh: bool = False,
+        *,
+        rebuild_overlay: bool = False,
     ) -> Any:
         """Upload this project's assets, returning the asset leg's result or None.
 
@@ -270,6 +281,7 @@ class ProvisioningMixin:
                         skill_dirs=skill_dirs,
                         reusing_sandbox=reusing_sandbox,
                         force_refresh=force_refresh,
+                        rebuild_overlay=rebuild_overlay,
                         project=ProjectContext(workspace_id, dir_name or ""),
                         root_owner_dir_name=await self._layout_root_owner_dir(
                             replace(binding, dir_name=dir_name)
@@ -299,7 +311,7 @@ class ProvisioningMixin:
         # built it has bound it.
         token = (
             asyncio.ensure_future(
-                self._keep_data_token(binding.computer_id, user_id, sandbox)
+                self._keep_computer_tokens(binding.computer_id, user_id, sandbox)
             )
             if reusing_sandbox
             else None
@@ -322,13 +334,40 @@ class ProvisioningMixin:
             raise
         if token is not None:
             await token
+        await self._keep_browser_settings(binding, sandbox)
         total = (time.time() - _sync_t0) * 1000
         logger.info(f"[SYNC_DETAIL] workspace_id={workspace_id} total={total:.0f}ms")
         return assets
 
-    async def refresh_project_assets(
-        self, workspace_id: str, user_id: str | None, sandbox: Any
-    ) -> Any:
+    @staticmethod
+    async def _keep_browser_settings(binding: ComputerBinding, sandbox: Any) -> None:
+        """Hand the machine its owner's browser settings once its runtime has
+        synced, since the runtime is what takes them. Only the first acquire on
+        a sandbox writes, or one whose row says they changed. A machine that
+        sets the browser up itself starts doing so here."""
+        browser_view.install_soon(sandbox)
+        await browser_settings.keep(sandbox, binding.browser)
+
+    async def _keep_published_browser_settings(
+        self, binding: ComputerBinding, sandbox: Any
+    ) -> None:
+        """Hand a sandbox just bound the settings its row holds now. One saved
+        while it was building found no machine running it and was left for the
+        acquire, whose binding was read before the save."""
+        try:
+            computer = await get_computer(binding.computer_id)
+        except Exception as e:
+            # Not a reason to unwind a bound sandbox; the next acquire hands them.
+            logger.warning(
+                f"Could not read the browser settings of computer {binding.computer_id}: {e}"
+            )
+            return
+        if computer is not None:
+            await self._keep_browser_settings(
+                replace(binding, browser=browser_settings.read(computer)), sandbox
+            )
+
+    async def refresh_project_assets(self, workspace_id: str, sandbox: Any) -> Any:
         """Force one project's assets back in sync on a machine already running.
 
         The refresh route's half of the acquisition-path sync, and the same
@@ -336,11 +375,15 @@ class ProvisioningMixin:
         derived from the binding, which is the manager's to resolve. A route
         that rebuilt either would drift from the path that provisions. No
         command runs next, so the file mount waits for the next turn.
+
+        It takes no caller: what the machine is given is its owner's, as on
+        the acquisition path, and whoever asked for the refresh may be another
+        member whose own secrets and skills must never land on it.
         """
         binding = await self.resolve_binding(workspace_id)
         return await self._sync_project_assets(
             binding,
-            user_id,
+            binding.user_id,
             sandbox,
             reusing_sandbox=True,
             force_refresh=True,
@@ -585,6 +628,7 @@ class ProvisioningMixin:
 
             # Only the bound sandbox can be published without appearing stale.
             self._put_session(computer_id, session, workspace_id=workspace_id)
+            await self._keep_published_browser_settings(binding, session.sandbox)
 
             # post_init could not clear completeness before this sandbox was bound.
             # Now a marker permits clearing it; absent a marker, retry the restore.
@@ -627,6 +671,7 @@ class ProvisioningMixin:
         project shadow that lags a resize would rebuild at the old size.
         ``outage_since`` is the host outage that authorized replacing the old
         sandbox, if one did; the bind holds only while that outage runs."""
+        refuse_start(binding.computer_id)
         if binding.provider_ref and not binding.provider.recreatable:
             # Every path that replaces a sandbox checks this first; all of
             # them end here, so a new one that forgets cannot replace a
@@ -635,6 +680,9 @@ class ProvisioningMixin:
                 f"Computer {binding.computer_id} is on a machine the server "
                 "cannot replace"
             )
+        note_start_path(
+            binding.computer_id, "rebuild" if binding.provider_ref else "create"
+        )
         workspace_id = binding.workspace_id
         workspace = await db_get_workspace(workspace_id)
         # Warm-path recovery may lack user_id. Use the NOT NULL row owner or
@@ -695,7 +743,7 @@ class ProvisioningMixin:
         # A rebuild no turn follows (a spec change, a platform-secret
         # rotation) would otherwise leave the new sandbox without a token
         # until the sweep reached it.
-        await self._keep_data_token(binding.computer_id, user_id, session.sandbox)
+        await self._keep_computer_tokens(binding.computer_id, user_id, session.sandbox)
         return session
 
     async def _stamp_sandbox_config(self, binding: ComputerBinding) -> None:
@@ -852,14 +900,14 @@ class ProvisioningMixin:
         # workspace has to stay up holding it until an operator gives it a
         # transfer path that fits. The message names paths because a count
         # gives the user nothing to act on.
-        if result.unsaved:
+        if result.at_risk:
             message = (
-                f"File backup for {workspace_id} left {len(result.unsaved)} "
+                f"File backup for {workspace_id} left {len(result.at_risk)} "
                 f"file(s) unsaved: {result.describe_unsaved()}"
             )
             if strict:
                 raise BackupIncomplete(
-                    f"{message}; aborting before sandbox teardown", result.unsaved
+                    f"{message}; aborting before sandbox teardown", result.at_risk
                 )
             logger.warning(message)
             return False
@@ -1145,17 +1193,18 @@ class ProvisioningMixin:
         *,
         source: str,
         mark: Callable[[str], None] = lambda _phase: None,
-    ) -> None:
+    ) -> bool:
         """A start's asset sync and folder restore, then the skill pass.
 
         In that order so the pass sees the final disk, and a start that did
-        both records the attach it spared (``_claim_attached``)."""
+        both records the attach it spared (``_claim_attached``). Says whether
+        the asset sync ran to its end."""
         synced = await self._sync_sandbox_assets(
             binding, user_id, session.sandbox, reusing_sandbox=True
         )
         mark("asset_sync")
         if not session.sandbox:
-            return
+            return False
         restored = await self._maybe_restore_files(binding, session.sandbox)
         if not restored:
             # A key from before a stop on this sandbox would have the next
@@ -1178,6 +1227,7 @@ class ProvisioningMixin:
             attach_key=attach_key,
         )
         mark("skill_reconcile")
+        return synced is not None
 
     async def _ensure_project_attached(
         self, binding: ComputerBinding, session: Any, *, user_id: str | None = None
@@ -1192,6 +1242,9 @@ class ProvisioningMixin:
         sandbox = getattr(session, "sandbox", None)
         if sandbox is None:
             return
+        # Every acquire, warm ones included: most run no sync, and a save that
+        # did not reach the machine waits for this. Free once it has them.
+        await self._keep_browser_settings(binding, sandbox)
         workspace_id = binding.workspace_id
         key = (workspace_id, self._session_sandbox_id(session))
         recorded = False
@@ -1270,12 +1323,14 @@ class ProvisioningMixin:
                     f"its MCP config did not resolve"
                 )
                 return False
+            # Only the overlay: what the computer shares with its other
+            # workspaces follows the manifest, as on any other sync.
             result = await self._sync_sandbox_assets(
                 binding,
                 user_id,
                 sandbox,
                 reusing_sandbox=True,
-                force_refresh=True,
+                rebuild_overlay=True,
             )
             if result is None or await sandbox.workspace_overlay_missing(
                 workspace_id=workspace_id, dir_name=dir_name
@@ -1395,6 +1450,7 @@ class ProvisioningMixin:
                 "a bound workspace still has active work"
             )
             return None
+        refuse_start(binding.computer_id)
 
         logger.info(
             f"Migrating workspace {workspace_id} sandbox: {actual_wd} -> {expected_wd}"
@@ -1432,12 +1488,14 @@ class ProvisioningMixin:
         # The machine owns the transition, so the claim is its CAS: claiming on
         # the project would let a lagging shadow replace a machine that has
         # meanwhile stopped.
-        if not transition_already_owned and not await try_claim_computer_for_start(
-            binding.computer_id,
-            from_status="running",
-            expected_provider_ref=old_sandbox_id,
-            require_provider_ref=True,
-        ):
+        with computer_cause("rebuild"):
+            claimed = transition_already_owned or await try_claim_computer_for_start(
+                binding.computer_id,
+                from_status="running",
+                expected_provider_ref=old_sandbox_id,
+                require_provider_ref=True,
+            )
+        if not claimed:
             logger.warning(
                 f"Skipping migration for {workspace_id}: could not claim the "
                 f"replacement (sandbox {old_sandbox_id})"
@@ -1486,7 +1544,8 @@ class ProvisioningMixin:
             await self._end_replaced_usage_run(binding.computer_id, old_sandbox_id)
 
             core_config = self._core_config_for(binding)
-            new_session = await self._recover_sandbox(binding, user_id, core_config)
+            with computer_cause("rebuild"):
+                new_session = await self._recover_sandbox(binding, user_id, core_config)
         except (Exception, asyncio.CancelledError):
             # stopped permits recovery from the backup; error would block starts.
             # Catch CancelledError explicitly: it is a BaseException and would otherwise

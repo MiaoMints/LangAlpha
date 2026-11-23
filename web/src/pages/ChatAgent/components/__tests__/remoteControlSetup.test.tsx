@@ -41,6 +41,8 @@ vi.mock('../../utils/api', () => ({
 import { createSshPairing, getComputerProviders, getComputers, getSshPairing } from '../../utils/api';
 import { addComputerRow } from '../../hooks/useComputers';
 import CreateComputerDialog from '../CreateComputerDialog';
+import { useRemoteControlSetup } from '../remoteControlSetupState';
+import { renderHookWithProviders } from '@/test/utils';
 
 const mockProviders = getComputerProviders as Mock;
 const mockGetComputers = getComputers as Mock;
@@ -516,6 +518,7 @@ describe('closing the dialog', () => {
     ['refused the address', { ok: false, error: 'bad_url' }],
     ['could not run the helper', { ok: false, error: 'unsupported' }],
     ['could not take the old pairing down', { ok: false, error: 'not_replaced' }],
+    ['kept the old pairing when the new one failed', { ok: false, error: 'not_replaced', message: 'That command has expired.' }],
     ['gave no answer', null],
   ] as const)('touches nothing when closed after the shell %s', async (_label, answer) => {
     macStatus = { ...PAIRED, fingerprint: 'SHA256:anotherAccount' };
@@ -528,6 +531,15 @@ describe('closing the dialog', () => {
     unmount();
     await settle();
     expect(disable).not.toHaveBeenCalled();
+  });
+
+  it("says why when the helper kept the other pairing, in the deployment's words", async () => {
+    macStatus = { ...PAIRED, fingerprint: 'SHA256:anotherAccount' };
+    enable.mockResolvedValue({ ok: false, error: 'not_replaced', message: 'That command has expired.', status: macStatus });
+    const user = userEvent.setup();
+    open();
+    await agreeAndTurnOn(user);
+    expect(await screen.findByRole('alert')).toHaveTextContent('That command has expired.');
   });
 
   it('touches nothing when closed during an enable the shell then refuses', async () => {
@@ -564,3 +576,17 @@ describe('closing the dialog', () => {
     expect(disable).not.toHaveBeenCalled();
   });
 });
+
+describe('useRemoteControlSetup', () => {
+  it('pairs no Mac again while a supported one it reached is being added', async () => {
+    mockStatus.mockResolvedValue(READY);
+    const { result } = renderHookWithProviders(() => useRemoteControlSetup(true));
+    act(() => result.current.setAcknowledged(true));
+    act(() => result.current.start());
+    await waitFor(() => expect(result.current.create).toBeTruthy());
+    act(() => result.current.start());
+    await settle();
+    expect(mockMint).toHaveBeenCalledTimes(1);
+  });
+});
+

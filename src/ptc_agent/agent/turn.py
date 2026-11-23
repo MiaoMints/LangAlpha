@@ -14,6 +14,7 @@ from ptc_agent.agent.middleware.model_resilience import (
     build_fallback_pairs,
 )
 from ptc_agent.config import AgentConfig
+from src.llms.model_identity import client_label
 
 
 @dataclass(frozen=True)
@@ -24,6 +25,11 @@ class TurnModel:
     client: Any
     name: str
     guidance: str
+
+    @property
+    def label(self) -> str:
+        """The model as the agent is told it runs on."""
+        return client_label(self.client, self.name)
 
 
 def turn_model(
@@ -79,7 +85,6 @@ def build_model_resilience_middleware(
         primary_name=turn.name,
         primary_client=turn.client,
         fallbacks=build_fallback_pairs(config),
-        users_fallbacks=config.fallback_users_choice,
         max_retries=3,
         backoff_factor=2.0,
         initial_delay=1.0,

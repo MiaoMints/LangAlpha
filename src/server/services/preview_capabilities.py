@@ -40,6 +40,7 @@ from ptc_agent.core.sandbox.preview_probe import is_loopback_url
 from ptc_agent.core.sandbox.runtime import PreviewInfo
 from src.server.services.preview_base import PreviewBase, preview_base
 from src.utils.cache.redis_cache import get_cache_client
+from src.server.services.shared_workspaces.access import verdict, workspace_access
 
 logger = logging.getLogger(__name__)
 
@@ -52,10 +53,12 @@ __all__ = [
     "is_current",
     "mint",
     "preview_origin",
+    "proxied",
     "publish",
     "resolve",
     "resolve_host",
     "revoke",
+    "serves",
     "until_revoked",
 ]
 
@@ -107,10 +110,17 @@ class Capability:
     workspace_id: str
     generation: int
     expires_at: int
+    #: The workspace's owner, kept when the ``teams`` flag is on, so the
+    #: proxy can end the capability with the owner's access without a read
+    #: of the workspace (``serves``).
+    owner_id: str | None = None
+    #: The member a shared workspace's capability was minted for: it serves
+    #: only while that member may still use the workspace (``serves``).
+    viewer_id: str | None = None
 
     def to_record(self) -> dict[str, Any]:
         upstream = self.upstream
-        return {
+        record = {
             "v": _NULL_UPSTREAM_VERSION if upstream is None else _RECORD_VERSION,
             "sandbox_id": self.sandbox_id,
             "port": self.port,
@@ -120,6 +130,11 @@ class Capability:
             "expires_at": self.expires_at,
             "headers": {} if upstream is None else dict(upstream.headers),
         }
+        if self.owner_id is not None:
+            record["owner_id"] = self.owner_id
+        if self.viewer_id is not None:
+            record["viewer_id"] = self.viewer_id
+        return record
 
     @classmethod
     def from_record(cls, record: Any) -> Capability | None:
@@ -136,6 +151,8 @@ class Capability:
                 workspace_id=str(record["workspace_id"]),
                 generation=int(record["generation"]),
                 expires_at=int(record["expires_at"]),
+                owner_id=str(record["owner_id"]) if record.get("owner_id") else None,
+                viewer_id=str(record["viewer_id"]) if record.get("viewer_id") else None,
             )
         except (AttributeError, KeyError, TypeError, ValueError):
             return None
@@ -178,6 +195,7 @@ async def mint(
     workspace_id: str,
     expires_in: int,
     base: PreviewBase,
+    viewer_id: str | None = None,
 ) -> str:
     """A capability URL for *info*, live for *expires_in* seconds.
 
@@ -215,6 +233,8 @@ async def mint(
         workspace_id=workspace_id,
         generation=generation,
         expires_at=int(time.time()) + expires_in,
+        owner_id=await _owner_to_keep(workspace_id),
+        viewer_id=viewer_id,
     )
     if not await get_cache_client().set(
         _record_key(token), capability.to_record(), ttl=expires_in
@@ -239,7 +259,7 @@ async def resolve(token: str) -> Capability | None:
     capability = Capability.from_record(record)
     if capability is None or capability.expires_at <= time.time():
         return None
-    if not await is_current(capability):
+    if not await serves(capability):
         return None
     return capability
 
@@ -270,15 +290,71 @@ async def is_current(capability: Capability) -> bool:
     return current is not None and int(current) == capability.generation
 
 
+async def serves(capability: Capability) -> bool:
+    """Whether *capability* still opens its port: not revoked, and its
+    workspace's owner not suspended, which ends it as a revocation does.
+    Nothing more is read with the ``teams`` flag off."""
+    if not await is_current(capability):
+        return False
+    if capability.viewer_id is not None:
+        return await _viewer_may(capability.workspace_id, capability.viewer_id)
+    from src.server.services.account import read_standing
+    from src.server.services.membership import teams_door_open
+
+    if not teams_door_open():
+        return True
+    owner = capability.owner_id or await _workspace_owner(capability.workspace_id)
+    return not owner or not (
+        await read_standing(owner, unknown_on_cache_error=True)
+    ).suspended
+
+
+async def _viewer_may(workspace_id: str, viewer_id: str) -> bool:
+    """Whether the member a capability was minted for may still use its
+    shared workspace, read afresh: leaving it or the organization ends their
+    previews at the next request. Unknown raises, which the proxy answers
+    with a 503 and an open stream rides out."""
+    from src.server.database.workspace import get_workspace
+
+    try:
+        reach = await verdict(workspace_access(await get_workspace(workspace_id), viewer_id))
+    except Exception as e:
+        raise PreviewProxyUnavailable("could not read the viewer's access") from e
+    if reach == "unknown":
+        raise PreviewProxyUnavailable("could not read the viewer's access")
+    return reach == "member"
+
+
+async def _workspace_owner(workspace_id: str) -> str | None:
+    from src.server.database.workspace import get_workspace
+
+    try:
+        workspace = await get_workspace(workspace_id)
+    except Exception as e:
+        raise PreviewProxyUnavailable("could not read the workspace's owner") from e
+    return str(workspace["user_id"]) if workspace and workspace.get("user_id") else None
+
+
+async def _owner_to_keep(workspace_id: str) -> str | None:
+    """The owner a new capability keeps; None with the ``teams`` flag off,
+    where nothing is read and the record is as before."""
+    from src.server.services.membership import teams_door_open
+
+    if not teams_door_open():
+        return None
+    return await _workspace_owner(workspace_id)
+
+
 async def until_revoked(capability: Capability) -> None:
-    """Return once *capability* is revoked, re-reading every ``RECHECK_S``.
+    """Return once *capability* is revoked, or its owner suspended
+    (``serves``), re-reading every ``RECHECK_S``.
 
     Unknown is not revoked: an open stream or socket rides out a Redis blip.
     """
     while True:
         await asyncio.sleep(RECHECK_S)
         try:
-            if not await is_current(capability):
+            if not await serves(capability):
                 return
         except PreviewProxyUnavailable:
             continue
@@ -303,6 +379,19 @@ async def revoke(sandbox_id: str | None) -> None:
         logger.warning("Could not revoke previews of sandbox %s: %s", sandbox_id, e)
 
 
+def proxied(link: PreviewInfo) -> PreviewInfo:
+    """*link*, the server's own way to a port, as a preview a browser reaches
+    only through the proxy: for a port whose revocation must reach a socket
+    already open, which a URL the browser dials itself never hears of."""
+    return PreviewInfo(
+        url=link.url,
+        token=None,
+        auth_headers=link.auth_headers,
+        browser_ready=False,
+        process_local=is_loopback_url(link.url),
+    )
+
+
 async def publish(
     info: PreviewInfo,
     *,
@@ -310,6 +399,7 @@ async def publish(
     port: int,
     workspace_id: str,
     expires_in: int,
+    viewer_id: str | None = None,
 ) -> str:
     """The URL a browser is handed for *info*.
 
@@ -331,4 +421,5 @@ async def publish(
         workspace_id=workspace_id,
         expires_in=expires_in,
         base=base,
+        viewer_id=viewer_id,
     )

@@ -5,9 +5,10 @@
  */
 import { useId, type ReactNode } from 'react';
 import { useTranslation } from 'react-i18next';
-import { AlertCircle, Laptop, Star } from 'lucide-react';
+import { AlertCircle, Cloud, House, Laptop, Lock } from 'lucide-react';
 
 import { Button } from '@/components/ui/button';
+import { ToggleSwitch } from '@/components/ui/switch';
 import { cn } from '@/lib/utils';
 import type { Computer, ComputerStartFailure } from '@/types/api';
 
@@ -19,12 +20,15 @@ import { ComputerStatusIndicator } from './computerStatusUi';
 import { tierLabel } from './tierUi';
 import { activeSpecChange, effectiveTier, specChangeLabel, SpecChangeProgress } from './specChangeUi';
 import { Pill } from './pill';
-import { providerLabel, providerManagesSpec } from './providerUi';
+import { providerIsOwnMachine, providerLabel, providerManagesSpec } from './providerUi';
+import { useRule } from '@/hooks/useAccount';
+import { RULE } from '@/lib/accountRules';
 import { ArtFrame } from './machineArt/ArtFrame';
 import { MachineArt } from './machineArt/MachineArt';
 import { machineArtOf, machineModelOf, machineStateOf } from './machineArt/machine';
 import { railOrdinal } from './computerRailState';
-import { shownStartFailure, startFailureRemedy } from './startFailure';
+import { pairedElsewhere, shownStartFailure, startFailureRemedy } from './startFailure';
+import type { SheetAction } from '@/components/modelAccess/tokenTarget';
 
 /**
  * Everything a card or the details can ask of one machine, already bound to
@@ -51,6 +55,34 @@ export interface MachineActions {
   movingHome: boolean;
   makePrimaryHeld: boolean;
   makePrimary: () => void;
+  /** Add or replace the setup token Claude Code uses on it. */
+  claudeCodeToken: (action: SheetAction) => void;
+  removeClaudeCodeToken: () => void;
+}
+
+/** The pills for what a machine is to the account: its primary, or Home's stand-in. */
+export function RolePills({ computer }: { computer: Computer }) {
+  const { t } = useTranslation();
+  return (
+    <>
+      {computer.is_primary && (
+        <Pill icon={House} title={t('computer.primaryBadgeTitle', 'New workspaces are created on this computer')}>
+          {t('computer.primaryBadge', 'Primary')}
+        </Pill>
+      )}
+      {computer.stands_in_for_home && (
+        <Pill
+          icon={Cloud}
+          title={t(
+            'computer.standInBadgeTitle',
+            "The Chief of Staff works here while your primary computer can't be reached, so this computer stays even with no workspaces. You can still remove it.",
+          )}
+        >
+          {t('computer.standInBadge', 'Stands in for Home')}
+        </Pill>
+      )}
+    </>
+  );
 }
 
 interface MachineFrameProps {
@@ -86,13 +118,9 @@ export function MachineFrame({ computer, index, thisMac, inert, onOpen }: Machin
         />
       }
       br={
-        (computer.is_primary || thisMac) && (
+        (computer.is_primary || computer.stands_in_for_home || thisMac) && (
           <>
-            {computer.is_primary && (
-              <Pill icon={Star} title={t('computer.primaryBadgeTitle', 'New workspaces are created on this computer')}>
-                {t('computer.primaryBadge', 'Primary')}
-              </Pill>
-            )}
+            <RolePills computer={computer} />
             {thisMac && <Pill icon={Laptop}>{t('computer.remoteControl.thisMacBadge', 'This Mac')}</Pill>}
           </>
         )
@@ -132,12 +160,29 @@ export function StartFailureNote({ failure, className }: { failure: ComputerStar
   );
 }
 
+/** Whether a rule keeps this machine, one the user brought, from being
+ *  used: it stays theirs to stop, rename and remove, and no Start is offered. */
+function useOwnMachineHeld(computer: Pick<Computer, 'kind'>): { held: boolean; who: string } {
+  const ownMachines = useRule(RULE.ownMachines);
+  return { held: providerIsOwnMachine(computer.kind) && !ownMachines.allowed, who: ownMachines.who.start };
+}
+
 /** The lines under a machine's name that say why it is not doing more. */
 export function ComputerNotes({ computer, thisMac, prepareHintId, primaryNote = false }: ComputerNotesProps) {
   const { t } = useTranslation();
   const failure = shownStartFailure(computer);
+  const own = useOwnMachineHeld(computer);
   return (
     <>
+      {own.held && (
+        <p className="computer-card-failure computer-card-note" data-testid="computer-rule-held">
+          <Lock aria-hidden="true" className="computer-card-failure-glyph" style={{ color: 'var(--color-text-tertiary)' }} />
+          <span className="computer-card-failure-text">
+            <span className="computer-card-failure-lead">{t('organization.machines.cantBeUsed')}</span>{' '}
+            {t('organization.machines.heldBody', { who: own.who })}
+          </span>
+        </p>
+      )}
       {failure && <StartFailureNote failure={failure} className="computer-card-note" />}
       {thisMac?.paused && (
         <p className="computer-card-note">
@@ -233,7 +278,8 @@ export function SpecRow({ computer, onChangeSpec }: Pick<ComputerSpecRowsProps, 
 /**
  * Reinstall or Reconnect, after a start that failed for a reason Start alone
  * cannot fix. It leads, and Start stays beside it: the user may have fixed
- * the machine themselves.
+ * the machine themselves. A machine that paired with another account is the
+ * exception, since only Reconnect brings it back.
  */
 export function StartFailureAction({ computer, actions }: { computer: Computer; actions: MachineActions }) {
   const { t } = useTranslation();
@@ -251,15 +297,25 @@ export function StartFailureAction({ computer, actions }: { computer: Computer; 
   );
 }
 
-/** Start or Stop, whichever the machine is not. */
+/** Start or Stop, whichever the machine is not, and no Start for a machine Reconnect alone can bring back. */
 export function PowerButton({ computer, actions }: { computer: Computer; actions: MachineActions }) {
   const { t } = useTranslation();
   const specChange = activeSpecChange(computer);
+  const own = useOwnMachineHeld(computer);
+  if (computer.status === 'stopped' && pairedElsewhere(computer)) return null;
+  // Stopping a machine a rule holds stays open; starting one does not.
+  if (own.held && computer.status !== 'running') return null;
   // Second to the fix a failed start offers, so one button leads.
   const quiet = startFailureRemedy(computer) !== null;
   if (computer.status === 'running') {
     return (
-      <Button size="sm" disabled={actions.powerBusy || !!specChange} onClick={() => actions.power('stop')} data-computer-power>
+      <Button
+        size="sm"
+        variant={quiet ? 'outline' : 'default'}
+        disabled={actions.powerBusy || !!specChange}
+        onClick={() => actions.power('stop')}
+        data-computer-power
+      >
         {t('computer.stop', 'Stop')}
       </Button>
     );
@@ -276,6 +332,53 @@ export function PowerButton({ computer, actions }: { computer: Computer; actions
     >
       {t('computer.start', 'Start')}
     </Button>
+  );
+}
+
+interface ToggleRowProps {
+  label: string;
+  checked: boolean;
+  onChange: () => void;
+  disabled?: boolean;
+  /** The line that explains the switch, read with it. */
+  describedBy?: string;
+}
+
+/** A switch as a label and value row of a `computer-card-spec` list. */
+export function ToggleRow({ label, checked, onChange, disabled, describedBy }: ToggleRowProps) {
+  return (
+    <div>
+      <dt>{label}</dt>
+      <dd>
+        <ToggleSwitch
+          checked={checked}
+          onChange={onChange}
+          disabled={disabled}
+          ariaLabel={label}
+          ariaDescribedBy={describedBy}
+        />
+      </dd>
+    </div>
+  );
+}
+
+/** One setting of the computer's, as a section of the details: its switch,
+ *  the hint under it, and anything that goes with it after. */
+export function SettingToggle({ label, checked, onChange, disabled, hint, children }: Omit<ToggleRowProps, 'describedBy'> & {
+  hint: ReactNode;
+  children?: ReactNode;
+}) {
+  const hintId = useId();
+  return (
+    <section className="computer-details-group">
+      <dl className="computer-card-spec mt-0">
+        <ToggleRow label={label} checked={checked} onChange={onChange} disabled={disabled} describedBy={hintId} />
+      </dl>
+      <p id={hintId} className="mt-1.5 text-[12px]" style={{ color: 'var(--color-text-secondary)' }}>
+        {hint}
+      </p>
+      {children}
+    </section>
   );
 }
 

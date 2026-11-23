@@ -7,7 +7,7 @@
  * there, and `web/.env` would otherwise decide the mode for the run.
  */
 import { describe, it, expect, vi } from 'vitest';
-import { screen } from '@testing-library/react';
+import { screen, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 
 import { renderWithProviders } from '@/test/utils';
@@ -365,5 +365,128 @@ describe('ChangeSpecDialog, the slot a larger computer holds', () => {
       expect(radio(name)).toHaveAccessibleDescription(/^None left/);
     }
     expect(screen.getByTestId('tier-slot')).toHaveTextContent("Your plan's computer larger than Small is in use.");
+  });
+});
+
+describe('ChangeSpecDialog, opened for the size its opener needs', () => {
+  const HEALTHY = { ...LOW_DISK, disk: null };
+  const PLAN_PAGE = 'https://console.example.com/plans?return=%2Fsettings';
+
+  it('picks that size on open where the plan allows it', () => {
+    renderWithProviders(
+      <ChangeSpecDialog target={HEALTHY} onClose={() => {}} onSubmit={() => {}} busy={false} provider={DAYTONA} quota={ON_PLAN} request={{ tier: 'performance', planUrl: null, leadKey: 'lead.key' }} />,
+    );
+    expect(radio('Medium')).toBeChecked();
+    expect(radio('Small')).toHaveAccessibleDescription(/^Current/);
+    expect(apply()).toBeEnabled();
+  });
+
+  it('never seeds below the size the computer has reached since the request was read', () => {
+    const request = { tier: 'performance' as const, planUrl: null, leadKey: 'computer.spec.planLimited' };
+    const dialog = (target: React.ComponentProps<typeof ChangeSpecDialog>['target']) => (
+      <ChangeSpecDialog target={target} onClose={() => {}} onSubmit={() => {}} busy={false} provider={DAYTONA} quota={PRO} request={request} />
+    );
+    const { rerender } = renderWithProviders(dialog(HEALTHY));
+    expect(radio('Medium')).toBeChecked();
+    rerender(dialog({ ...HEALTHY, resource_tier: 'max' }));
+    expect(radio('Large')).toBeChecked();
+    expect(radio('Medium')).not.toBeChecked();
+  });
+
+  it('opens on the current size without a wanted one', () => {
+    renderWithProviders(
+      <ChangeSpecDialog target={HEALTHY} onClose={() => {}} onSubmit={() => {}} busy={false} provider={DAYTONA} quota={ON_PLAN} />,
+    );
+    expect(radio('Small')).toBeChecked();
+  });
+
+  it('keeps the current size where the plan leaves that size off, and sends the upgrade hint to the opener\'s plan page', () => {
+    renderWithProviders(
+      <ChangeSpecDialog
+        target={HEALTHY}
+        onClose={() => {}}
+        onSubmit={() => {}}
+        busy={false}
+        provider={DAYTONA}
+        quota={NOT_ON_PLAN}
+        request={{ tier: 'performance', planUrl: PLAN_PAGE, leadKey: 'computer.spec.planLimited' }}
+      />,
+    );
+    expect(radio('Medium')).toBeDisabled();
+    expect(radio('Small')).toBeChecked();
+    expect(apply()).toBeDisabled();
+    expect(within(screen.getByTestId('spec-plan-cta')).getByRole('link', { name: 'Upgrade plan' })).toHaveAttribute('href', PLAN_PAGE);
+  });
+
+  it('leads the upgrade hint with what the opener needs the size for, where the plan keeps it closed', () => {
+    renderWithProviders(
+      <ChangeSpecDialog
+        target={HEALTHY}
+        onClose={() => {}}
+        onSubmit={() => {}}
+        busy={false}
+        provider={DAYTONA}
+        quota={NOT_ON_PLAN}
+        request={{ tier: 'performance', planUrl: PLAN_PAGE, leadKey: 'Claude Code needs Medium.' }}
+      />,
+    );
+    expect(within(screen.getByTestId('spec-plan-cta')).getByText('Claude Code needs Medium.')).toBeInTheDocument();
+  });
+
+  it('opens the plan page in a new tab, or in this one where the page under it has nothing to lose', () => {
+    const show = (planInPlace: boolean) => renderWithProviders(
+      <ChangeSpecDialog
+        target={HEALTHY}
+        onClose={() => {}}
+        onSubmit={() => {}}
+        busy={false}
+        provider={DAYTONA}
+        quota={NOT_ON_PLAN}
+        request={{ tier: 'performance', planUrl: PLAN_PAGE, leadKey: 'computer.spec.planLimited' }}
+        planInPlace={planInPlace}
+      />,
+    );
+    const link = () => within(screen.getByTestId('spec-plan-cta')).getByRole('link', { name: 'Upgrade plan' });
+    const { unmount } = show(false);
+    expect(link()).toHaveAttribute('target', '_blank');
+    unmount();
+    show(true);
+    expect(link()).toHaveAttribute('href', PLAN_PAGE);
+    expect(link()).not.toHaveAttribute('target');
+  });
+
+  it('keeps the current size where the provider offers no such size', () => {
+    renderWithProviders(
+      <ChangeSpecDialog
+        target={HEALTHY}
+        onClose={() => {}}
+        onSubmit={() => {}}
+        busy={false}
+        provider={{ ...DAYTONA, tiers: DAYTONA.tiers?.filter((s) => s.tier !== 'performance') }}
+        quota={ON_PLAN}
+        request={{ tier: 'performance', planUrl: null, leadKey: 'computer.spec.planLimited' }}
+      />,
+    );
+    expect(radio('Small')).toBeChecked();
+  });
+});
+
+describe('ChangeSpecDialog, what a change keeps', () => {
+  it('says unpushed git work is lost, whether the computer is running or stopped', () => {
+    const HEALTHY = { ...LOW_DISK, disk: null };
+    for (const status of ['running', 'stopped'] as const) {
+      const { unmount } = renderWithProviders(
+        <ChangeSpecDialog target={{ ...HEALTHY, status }} onClose={() => {}} onSubmit={() => {}} busy={false} quota={ON_PLAN} />,
+      );
+      expect(screen.getByText(/Unpushed git commits, branches and stashes on this computer are not kept\./)).toBeInTheDocument();
+      unmount();
+    }
+  });
+
+  it('is read as the dialog\'s description when it opens', () => {
+    renderWithProviders(
+      <ChangeSpecDialog target={{ ...LOW_DISK, disk: null }} onClose={() => {}} onSubmit={() => {}} busy={false} quota={ON_PLAN} />,
+    );
+    expect(screen.getByRole('dialog')).toHaveAccessibleDescription(/Unpushed git commits, branches and stashes on this computer are not kept\.$/);
   });
 });

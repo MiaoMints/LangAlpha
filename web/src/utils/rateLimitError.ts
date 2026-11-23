@@ -7,6 +7,11 @@
  * sent to resolve it.
  */
 
+import type { PlanRefusal } from '@/api/model';
+import type { PlanLimit, UpstreamErrorHint, UpstreamPayer } from '@/lib/upstreamFailure';
+import type { RuleStop } from '@/lib/turnRefusal';
+import type { ErrorKind } from '@/types/sse';
+
 /** A 429's `detail`, as it comes off the wire. Only the two fields this module
  *  acts on are named: the counts the quota service also sends are already folded
  *  into `message`, so naming them here only invites reading them back out. */
@@ -16,51 +21,18 @@ export interface RateLimitErrorInfo {
   [key: string]: unknown;
 }
 
-/** Hints the backend emits for upstream provider failures — each maps to an
- *  i18n-bound bullet the user sees ("check your API key", etc.). Keep in sync
- *  with the ``hints`` list in ``stream_errors.error_event_data``. */
-export type UpstreamErrorHint =
-  | 'api_key'
-  | 'model_access'
-  | 'provider_status'
-  | 'try_another_model'
-  | 'reconnect_account';
-
-/** The allowlist used to sanitize ``hints`` coming off the SSE wire. Any hint
- *  not in this set is dropped — protects renderers from rendering unknown
- *  strings as i18n keys. */
-export const UPSTREAM_HINT_KEYS: readonly UpstreamErrorHint[] = [
-  'api_key',
-  'model_access',
-  'provider_status',
-  'try_another_model',
-  'reconnect_account',
-];
-
-/** i18n key lookup for each hint. Keep renderers in sync by importing this
- *  rather than re-declaring the map at each call site. */
-export const UPSTREAM_HINT_I18N_KEY: Record<UpstreamErrorHint, string> = {
-  api_key: 'chat.errorHintApiKey',
-  model_access: 'chat.errorHintModelAccess',
-  provider_status: 'chat.errorHintProviderStatus',
-  try_another_model: 'chat.errorHintTryAnotherModel',
-  reconnect_account: 'chat.errorHintReconnectAccount',
-};
-
 /** Where a subscription whose sign-in lapsed is renewed. The server's refusal
  *  of a turn carries the same link already worded; a failure mid-stream names
  *  only the hint, so the client supplies the destination. */
-export const RECONNECT_ACCOUNT_LINK: ErrorLinkSpec = {
+export const RECONNECT_ACCOUNT_LINK: PageLinkSpec = {
   url: '/settings?tab=model',
   label: 'Reconnect',
   labelKey: 'chat.errorLinkReconnect',
 };
 
-export function isUpstreamHint(value: unknown): value is UpstreamErrorHint {
-  return UPSTREAM_HINT_KEYS.includes(value as UpstreamErrorHint);
-}
-
-export interface ErrorLinkSpec {
+/** A link to a page: a route of this app, the account console, or another site. */
+export interface PageLinkSpec {
+  kind?: undefined;
   url: string;
   /** Literal text, for a label the producer authored (or the service did, on a
    *  link that arrives off the wire already worded). ``labelKey`` wins when
@@ -75,6 +47,30 @@ export interface ErrorLinkSpec {
    *  and indistinguishable from one of our routes. See ``ErrorLink`` for what
    *  the flag buys. */
   external?: boolean;
+  /** A page of the account console: a new tab in a browser, and this window
+   *  in the desktop app, which shows the console there and would send a new
+   *  tab to the default browser, signed out (as `ConsoleLink`). */
+  console?: boolean;
+  /** The cloud computer to bring to the size Claude Code runs at: the link
+   *  reads as what does that for this user (`MediumActionLink`). */
+  resize?: string;
+}
+
+/**
+ * Where an error sends the user. Most links go to a page; the way out of a
+ * refusal for want of a computer Home can live on opens the Computers dialog
+ * instead, worded for the device it is on (`ComputerRefusal`), so it has no
+ * URL: `needsComputer` adds one, `needsBackup` opens the computer whose
+ * backup is off, where backup is turned on.
+ */
+export type ErrorLinkSpec =
+  | PageLinkSpec
+  | { kind: 'needsComputer' }
+  | { kind: 'needsBackup'; computerId: string; name: string };
+
+/** A link's key among an error's links. */
+export function errorLinkKey(link: ErrorLinkSpec): string {
+  return link.kind === undefined ? `${link.url}|${link.label}` : link.kind;
 }
 
 export interface StructuredError {
@@ -83,22 +79,46 @@ export interface StructuredError {
   links?: ErrorLinkSpec[];
   /** ``upstream`` = LLM provider's fault (their 5xx/401/429). ``internal`` =
    *  our pipeline. Undefined for rate-limit errors built on the client.
-   *  ``notice`` = nothing failed, so it reads as information, not an error. */
-  kind?: 'upstream' | 'internal' | 'notice';
+   *  ``notice`` = nothing failed, so it reads as information, not an error.
+   *  ``computer_unreachable`` = the turn's own machine did not answer. */
+  kind?: ErrorKind | 'notice';
+  /** On ``computer_unreachable``: the connect code, which words its card, and
+   *  the computer that did not answer with its name, when the server knows
+   *  which: a Chief of Staff reaches computers other than its page's. */
+  unreachable?: { code?: string; computerId?: string; computerName?: string };
+  /** The account's standing kept the turn from running or ended it: drawn as
+   *  a neutral row, with nothing to retry. */
+  ruleStop?: RuleStop;
+  /** A turn a Claude plan's limit ended, worded where it is drawn, in the
+   *  reader's zone and language, under its own headline. */
+  planRefusal?: PlanRefusal;
   /** HTTP status from the upstream provider, when known. */
   statusCode?: number;
   /** Bulleted guidance to render under the message. */
   hints?: UpstreamErrorHint[];
+  /** Who the provider billed for an upstream failure. Absent on a frame from
+   *  before the server named it, which reads as it always did. */
+  payer?: UpstreamPayer;
+  /** The user's account the failure came from (``DeepSeek``, ``ChatGPT``),
+   *  when they pay and the server could name it. */
+  account?: string;
+  /** What the provider said went wrong, where the server could tell. */
+  reason?: string;
+  /** A subscription's usage limit, which reads as the plan working rather
+   *  than as a failure: its own headline and sentence, in the reader's zone. */
+  planLimit?: PlanLimit;
   /** User-configured (primary) model name, when the failure is model-attributable.
    *  Drives the model-aware error headline. */
   model?: string;
   /** Every model the resilience middleware attempted this turn (primary +
    *  fallbacks). When more than one, the display shows an "Also tried" line. */
   attemptedModels?: Array<{ model: string; error?: string; statusCode?: number | null; attempts?: number }>;
+  /** The run that failed, when the frame names it, for a report to name. */
+  runId?: string;
 }
 
 /** The one 429 this service raises on its own: the concurrency gate in
- *  ``enforce_chat_limit``. Never travels through the quota service, so it
+ *  ``chat_limit_for``. Never travels through the quota service, so it
  *  arrives without a message and we supply one. */
 const OUR_OWN_LIMIT = 'burst_limit';
 
@@ -107,16 +127,24 @@ const OUR_OWN_LIMIT = 'burst_limit';
  *  user's account, and the portal is where they act on it. */
 const NOT_ABOUT_THE_ACCOUNT = new Set([OUR_OWN_LIMIT, 'service_unavailable']);
 
+/** An organization seat's allowance for the period is used up: a limit the
+ *  organization sets, not a failure, and not one the member's own plan pages
+ *  can lift. Shown in the server's words, with no link. */
+export const SEAT_ALLOWANCE_USED = 'seat_allowance_used';
+
 export function buildRateLimitError(
   info: RateLimitErrorInfo,
   platformUrl?: string | null,
-): StructuredError {
+): Omit<StructuredError, 'links'> & { links?: PageLinkSpec[] } {
   // The message is the quota service's, verbatim. It knows the plan, the
   // counts, the user's language and their local day. Rebuilding it here from
   // `type` put billing wording in an open-source client, hard-coded one
   // deployment's answer for every self-hoster, printed "resets at midnight UTC"
   // to everyone outside UTC, and still covered only 5 of the 9 types the
   // service issues — the other 4 came out as "Rate limit exceeded".
+  if (info.type === SEAT_ALLOWANCE_USED && typeof info.message === 'string' && info.message) {
+    return { message: info.message, ruleStop: { kind: 'limit' } };
+  }
   const message =
     info.type === OUR_OWN_LIMIT
       ? 'Too many concurrent requests. Please wait a moment.'
@@ -135,7 +163,7 @@ export function buildRateLimitError(
   // the quota gate rejected before anything was persisted. Navigating in place
   // discards both, so the user returns from topping up to a thread that looks
   // like nothing happened.
-  const links: ErrorLinkSpec[] | undefined =
+  const links: PageLinkSpec[] | undefined =
     platformUrl && !NOT_ABOUT_THE_ACCOUNT.has(info.type as string)
       ? [
           {

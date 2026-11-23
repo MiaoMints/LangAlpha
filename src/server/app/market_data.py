@@ -9,7 +9,7 @@ from typing import NamedTuple, Optional
 
 from fastapi import APIRouter, HTTPException, Query
 
-from src.server.utils.api import CurrentUserId
+from src.server.dependencies.principal import DataReadUserId
 
 from src.server.models.market_data import (
     IntradayDataPoint,
@@ -20,6 +20,9 @@ from src.server.models.market_data import (
     CacheMetadata,
     BatchCacheStats,
     CompanyOverviewResponse,
+    CompanyProfile,
+    CompanyProfilesRequest,
+    CompanyProfilesResponse,
     StockSearchResult,
     StockSearchResponse,
     PriceTargetSummary,
@@ -38,8 +41,9 @@ from src.server.services.cache.intraday_cache_service import (
 from src.server.services.cache.daily_cache_service import (
     DailyCacheService,
 )
-from src.data_client.normalize import series_lineage
+from src.data_client.normalize import listing_currency, series_lineage
 from src.server.services.cache.quote_cache_service import QuoteCacheService
+from src.server.services.cache.profile_cache_service import get_profiles
 from src.data_client.freshness import measure_bars, measure_daily, measure_quote
 from market_protocol import (
     InstrumentRef, display_spelling, is_family_index, to_canonical, to_legacy_api,
@@ -84,8 +88,7 @@ def _price_ref(symbol: str, *, is_index: bool = False, equity: bool = False):
 
 
 def _currency_of(symbol: str, *, is_index: bool = False, equity: bool = False) -> Optional[str]:
-    ref = _price_ref(symbol, is_index=is_index, equity=equity)
-    return ref.price_currency if ref else None
+    return listing_currency(_price_ref(symbol, is_index=is_index, equity=equity))
 
 
 class _SeriesMeta(NamedTuple):
@@ -108,7 +111,7 @@ def _series_meta(symbol: str, result, *, is_index: bool = False, equity: bool = 
     treatment, tier = series_lineage(header.get("publisher"), ref)
     return _SeriesMeta(
         fields={
-            "currency": ref.price_currency if ref else None,
+            "currency": listing_currency(ref),
             "timezone": ref.tz if ref else None,
             "price_treatment": header.get("price_treatment") or treatment,
         },
@@ -316,7 +319,7 @@ async def _get_batch_intraday(
 )
 async def get_stock_intraday(
     symbol: str,
-    user_id: CurrentUserId,
+    user_id: DataReadUserId,
     interval: str = Query("1min", description="Data interval (1min, 5min, 15min, 30min, 1hour, 4hour)"),
     from_date: Optional[str] = Query(None, alias="from", description="Start date (YYYY-MM-DD)"),
     to_date: Optional[str] = Query(None, alias="to", description="End date (YYYY-MM-DD)"),
@@ -333,7 +336,7 @@ async def get_stock_intraday(
 )
 async def get_index_intraday(
     symbol: str,
-    user_id: CurrentUserId,
+    user_id: DataReadUserId,
     interval: str = Query("1min", description="Data interval (1min, 5min, 1hour)"),
     from_date: Optional[str] = Query(None, alias="from", description="Start date (YYYY-MM-DD)"),
     to_date: Optional[str] = Query(None, alias="to", description="End date (YYYY-MM-DD)"),
@@ -350,7 +353,7 @@ async def get_index_intraday(
 )
 async def get_stock_daily(
     symbol: str,
-    user_id: CurrentUserId,
+    user_id: DataReadUserId,
     from_date: Optional[str] = Query(None, alias="from", description="Start date (YYYY-MM-DD)"),
     to_date: Optional[str] = Query(None, alias="to", description="End date (YYYY-MM-DD)"),
 ) -> DailyResponse:
@@ -375,7 +378,7 @@ async def get_stock_daily(
 )
 async def get_index_daily(
     symbol: str,
-    user_id: CurrentUserId,
+    user_id: DataReadUserId,
     from_date: Optional[str] = Query(None, alias="from", description="Start date (YYYY-MM-DD)"),
     to_date: Optional[str] = Query(None, alias="to", description="End date (YYYY-MM-DD)"),
 ) -> DailyResponse:
@@ -399,7 +402,7 @@ async def get_index_daily(
 )
 async def get_batch_stocks_intraday(
     request: BatchIntradayRequest,
-    user_id: CurrentUserId,
+    user_id: DataReadUserId,
 ) -> BatchIntradayResponse:
     """Get intraday data for multiple stocks."""
     return await _get_batch_intraday(request, user_id, is_index=False)
@@ -413,7 +416,7 @@ async def get_batch_stocks_intraday(
 )
 async def get_batch_indexes_intraday(
     request: BatchIntradayRequest,
-    user_id: CurrentUserId,
+    user_id: DataReadUserId,
 ) -> BatchIntradayResponse:
     """Get intraday data for multiple indexes."""
     return await _get_batch_intraday(request, user_id, is_index=True)
@@ -431,7 +434,7 @@ async def get_batch_indexes_intraday(
     description="Search for stocks by symbol or company name using keywords.",
 )
 async def search_stocks(
-    user_id: CurrentUserId,
+    user_id: DataReadUserId,
     query: str = Query(..., description="Search query (symbol or company name)", min_length=1),
     limit: int = Query(50, description="Maximum number of results to return", ge=1, le=100),
     exchange: list[str] = Query(default=[], description="Filter by exchange short names (e.g., NASDAQ, NYSE)"),
@@ -440,7 +443,9 @@ async def search_stocks(
     Search for stocks by keyword.
     
     Searches both ticker symbols and company names. Returns matching stocks
-    with their symbols, names, and exchange information.
+    with their symbols, names, and exchange information, the closest matches
+    first and the most traded first among equally close ones
+    (:mod:`src.server.services.symbol_search`).
     
     Example queries:
     - "AAPL" - Find by symbol
@@ -451,53 +456,28 @@ async def search_stocks(
         raise HTTPException(status_code=422, detail="Query parameter is required and cannot be empty")
 
     try:
-        from src.utils.cache.redis_cache import get_cache_client
-        from src.data_client import get_financial_data_provider
-        from src.data_client.financial_data_provider import PartialSearch
+        from src.server.services.symbol_search import NoSearchSource, search_symbols
 
-        cache = get_cache_client()
-        cache_key = f"search:{query.strip().lower()}:{limit}"
-
-        cached = await cache.get(cache_key)
-        if cached is not None:
-            results = [StockSearchResult(**r) for r in cached["results"]]
-            if exchange:
-                exchange_set = {e.upper() for e in exchange}
-                results = [r for r in results if r.exchangeShortName and r.exchangeShortName.upper() in exchange_set]
-            return StockSearchResponse(query=query.strip(), results=results, count=len(results))
-
-        provider = await get_financial_data_provider()
-        if provider.financial is None:
+        try:
+            rows = await search_symbols(query, limit, user_id, frozenset(e.upper() for e in exchange))
+        except NoSearchSource:
             raise HTTPException(status_code=503, detail="No financial data provider available")
 
-        complete = True
-        try:
-            raw_results = await provider.financial.search_stocks(query=query.strip(), limit=limit)
-        except PartialSearch as partial:
-            # A directory failed: answer with what the others found, uncached,
-            # so the next search asks it again.
-            raw_results, complete = partial.rows, False
-
-        results = []
-        for item in raw_results:
-            result = StockSearchResult(
+        # Cut before validating: the rows past the limit are never shown, and
+        # a provider row with a null name would otherwise fail the request.
+        results = [
+            StockSearchResult(
                 symbol=item.get("symbol", ""),
-                name=item.get("name", ""),
+                name=item.get("name") or "",
                 nameLocal=item.get("nameLocal"),
                 nameEn=item.get("nameEn"),
                 currency=item.get("currency"),
                 stockExchange=item.get("stockExchange"),
                 exchangeShortName=item.get("exchangeShortName"),
+                match=item.get("match"),
             )
-            results.append(result)
-
-        # Cache unfiltered results
-        if complete:
-            await cache.set(cache_key, {"results": [r.model_dump() for r in results]}, ttl=300)
-
-        if exchange:
-            exchange_set = {e.upper() for e in exchange}
-            results = [r for r in results if r.exchangeShortName and r.exchangeShortName.upper() in exchange_set]
+            for item in rows[:limit]
+        ]
 
         return StockSearchResponse(query=query.strip(), results=results, count=len(results))
 
@@ -521,7 +501,7 @@ async def search_stocks(
     summary="Get company overview",
     description="Retrieve comprehensive company overview data including quote, performance, analyst ratings, financials, and revenue breakdown.",
 )
-async def get_company_overview(symbol: str, user_id: CurrentUserId) -> CompanyOverviewResponse:
+async def get_company_overview(symbol: str, user_id: DataReadUserId) -> CompanyOverviewResponse:
     """Get company overview data for a stock symbol."""
     if not symbol or not symbol.strip():
         raise HTTPException(status_code=422, detail="Symbol is required")
@@ -576,6 +556,42 @@ async def get_company_overview(symbol: str, user_id: CurrentUserId) -> CompanyOv
 
 
 # =============================================================================
+# Company Profiles Endpoint
+# =============================================================================
+
+@router.post(
+    "/profiles",
+    response_model=CompanyProfilesResponse,
+    summary="Get company profiles",
+    description="Name, sector, industry, market cap, currency, exchange and country for up to 50 stocks.",
+)
+async def get_company_profiles(
+    request: CompanyProfilesRequest,
+    user_id: DataReadUserId,
+) -> CompanyProfilesResponse:
+    """Profiles for many listings, each cached on its own instrument."""
+    errors: dict[str, str] = {}
+    # Keyed by the spelling as sent, so a caller finds each answer under what it
+    # asked for (600519.SS, which answers as 600519.SH); two spellings of one
+    # listing share a read.
+    listings: dict[str, str] = {}
+    for raw in dict.fromkeys(s.strip().upper() for s in request.symbols if s and s.strip()):
+        try:
+            listings[raw] = _listing_symbol(raw)
+        except HTTPException as e:
+            errors[raw] = str(e.detail)
+
+    profiles = await get_profiles(list(dict.fromkeys(listings.values())))
+    results: dict[str, CompanyProfile] = {}
+    for requested, listing in listings.items():
+        if listing in profiles.failed:
+            errors[requested] = profiles.failed[listing]
+        elif profiles.found.get(listing):
+            results[requested] = CompanyProfile(symbol=_requested(requested), **profiles.found[listing])
+    return CompanyProfilesResponse(results=results, errors=errors)
+
+
+# =============================================================================
 # Analyst Data Endpoint
 # =============================================================================
 
@@ -604,7 +620,7 @@ def _remeasured(quote: Optional[dict], symbol: str) -> Optional[dict]:
 )
 async def get_analyst_data(
     symbol: str,
-    user_id: CurrentUserId,
+    user_id: DataReadUserId,
     grade_limit: int = Query(50, description="Maximum number of grade records to return", ge=1, le=200),
 ) -> AnalystDataResponse:
     """Get analyst data for a stock symbol."""
@@ -707,7 +723,7 @@ _MAX_BATCH_SNAPSHOT_SYMBOLS = 250
     description="Retrieve real-time snapshot data for multiple stock symbols.",
 )
 async def get_stock_snapshots(
-    user_id: CurrentUserId,
+    user_id: DataReadUserId,
     symbols: str = Query(..., description="Comma-separated stock symbols (max 250)"),
 ) -> SnapshotResponse:
     """Get batch snapshots for stocks."""
@@ -721,7 +737,7 @@ async def get_stock_snapshots(
     description="Retrieve real-time snapshot data for multiple index symbols.",
 )
 async def get_index_snapshots(
-    user_id: CurrentUserId,
+    user_id: DataReadUserId,
     symbols: str = Query(..., description="Comma-separated index symbols (e.g. GSPC,IXIC,DJI)"),
 ) -> SnapshotResponse:
     """Get batch snapshots for indexes."""
@@ -744,7 +760,7 @@ def _snapshot(
     """
     return SnapshotData(**{
         **row,
-        "currency": row.get("currency") or ref.price_currency,
+        "currency": row.get("currency") or listing_currency(ref),
         "asset_class": ref.asset_class.value,
         "symbol": symbol,
         "requested": requested,
@@ -819,7 +835,7 @@ async def _get_batch_snapshots(
     summary="Get single stock snapshot",
     description="Retrieve real-time snapshot data for a single stock symbol.",
 )
-async def get_single_stock_snapshot(symbol: str, user_id: CurrentUserId) -> SnapshotData:
+async def get_single_stock_snapshot(symbol: str, user_id: DataReadUserId) -> SnapshotData:
     """Get snapshot for a single stock — same cache path as the batch endpoint."""
     requested = _requested(symbol)
     ref = _price_ref(requested, equity=True)
@@ -850,7 +866,7 @@ async def get_single_stock_snapshot(symbol: str, user_id: CurrentUserId) -> Snap
     description="Alias for /market-status for backward compatibility.",
 )
 async def get_market_status_alias(
-    user_id: CurrentUserId,
+    user_id: DataReadUserId,
     market: str = Query("us", description="Market region: us, cn or hk"),
 ) -> MarketStatusResponse:
     """Alias for get_market_status."""
@@ -864,7 +880,7 @@ async def get_market_status_alias(
     description="Retrieve the current market status (open, closed, extended hours).",
 )
 async def get_market_status(
-    user_id: CurrentUserId,
+    user_id: DataReadUserId,
     market: str = Query("us", description="Market region: us, cn or hk"),
 ) -> MarketStatusResponse:
     """Get current market status for *market*."""

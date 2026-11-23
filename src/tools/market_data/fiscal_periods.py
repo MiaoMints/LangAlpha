@@ -10,7 +10,6 @@ import logging
 
 logger = logging.getLogger(__name__)
 
-FILING_DATE_TOLERANCE_DAYS = 5  # a filing lands within days of its earnings release
 DAYS_PER_QUARTER = 90  # Approximate days per fiscal quarter
 
 
@@ -70,40 +69,8 @@ def infer_fiscal_period(
     return None
 
 
-def match_filing_to_fiscal_period(
-    filing_date: str,
-    earnings_calendar: List[Dict],
-    lookup: Dict[str, str],
-) -> str:
-    """
-    Match a SEC filing date to its fiscal period using earnings calendar.
-    Returns the fiscal period name or 'Quarterly' if no match found.
-    """
-    if not earnings_calendar or not filing_date or filing_date == "N/A":
-        return "Quarterly"
-
-    try:
-        filing_dt = datetime.strptime(filing_date, "%Y-%m-%d")
-        best_match = None
-        min_diff = float("inf")
-
-        for cal in earnings_calendar:
-            cal_date = cal.get("date")
-            fiscal_ending = cal.get("fiscalDateEnding")
-            if not cal_date or not fiscal_ending:
-                continue
-
-            try:
-                cal_dt = datetime.strptime(cal_date, "%Y-%m-%d")
-                diff = abs((filing_dt - cal_dt).days)
-                if diff < min_diff and diff <= FILING_DATE_TOLERANCE_DAYS:
-                    min_diff = diff
-                    if fiscal_ending in lookup:
-                        best_match = lookup[fiscal_ending]
-            except ValueError:
-                continue
-
-        return best_match or "Quarterly"
-
-    except ValueError:
-        return "Quarterly"
+def period_name(period_end: Optional[str], lookup: Dict[str, str]) -> Optional[str]:
+    """The fiscal name for *period_end*, read off the statements or inferred."""
+    if not period_end:
+        return None
+    return lookup.get(period_end) or infer_fiscal_period(period_end, lookup)

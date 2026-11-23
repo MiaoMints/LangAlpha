@@ -22,8 +22,11 @@ from ptc_agent.config.core import (
     SandboxConfig,
     SecurityConfig,
 )
+from ptc_agent.core.paths import WorkspaceLayout
+from ptc_agent.core.sandbox.execution import app_command
 from ptc_agent.core.sandbox.runtime import (
     PreviewInfo,
+    PreviewPortInUse,
     SessionCommandResult,
     SandboxProvider,
     SandboxRuntime,
@@ -383,11 +386,14 @@ class TestWorkspaceScopedPreviewCommands:
                 8080,
                 command="python -m http.server 8080",
                 force=True,
-                work_dir="/home/workspace/project-a",
+                folder=WorkspaceLayout("/home/workspace", "project-a"),
             )
 
         mock_sandbox_for_endpoint.start_and_get_preview_url.assert_awaited_once_with(
-            "cd /home/workspace/project-a && python -m http.server 8080",
+            app_command(
+                WorkspaceLayout("/home/workspace", "project-a"),
+                "python -m http.server 8080",
+            ),
             8080,
             expires_in=3600,
             owner="ws-test-001",
@@ -412,7 +418,8 @@ class TestWorkspaceScopedPreviewCommands:
 
         def launched(returns=None):
             async def launch(cmd, *_args, **_kwargs):
-                events.append(f"launch {cmd.split(' && ')[0]}")
+                cd = next(p for p in cmd.split(" && ") if p.startswith("cd "))
+                events.append(f"launch {cd}")
                 return returns
             return launch
 
@@ -441,7 +448,7 @@ class TestWorkspaceScopedPreviewCommands:
         and the server would start in the sibling's folder."""
         from src.server.app.workspace_sandbox import (
             PreviewRestartRequest,
-            owner_preview_url,
+            owner_preview,
             restart_preview_server,
         )
 
@@ -458,12 +465,41 @@ class TestWorkspaceScopedPreviewCommands:
                 )
                 assert response.success is True
             else:
-                await owner_preview_url(
+                await owner_preview(
                     "ws-test-001", "test-user-123", 8080,
                     command="python -m http.server 8080", force=True,
                 )
 
         assert events == ["hold", "read", "launch cd /home/workspace/project-a", "release"]
+
+    @pytest.mark.asyncio
+    async def test_the_command_that_starts_the_app_is_the_one_its_key_names(
+        self, mock_sandbox_for_endpoint
+    ):
+        """The owner's grant is tied to the key. Read apart from the launch
+        (before the computer woke, say), it could name a command replaced
+        meanwhile, and the new program would read under the old one's grant."""
+        from src.server.app.workspace_sandbox import owner_preview
+        from src.server.database.share_links import command_key
+
+        stored = AsyncMock(return_value="python app.py")
+        events = []
+        with ExitStack() as stack:
+            for p in self._held_folder(mock_sandbox_for_endpoint, events):
+                stack.enter_context(p)
+            stack.enter_context(
+                patch("src.server.app.workspace_sandbox.get_preview_command", stored)
+            )
+            lookup = stack.enter_context(
+                patch("src.server.services.preview_links.get_preview_command", AsyncMock())
+            )
+            preview = await owner_preview("ws-test-001", "test-user-123", 8080, force=True)
+
+        stored.assert_awaited_once_with("ws-test-001", 8080)
+        lookup.assert_not_awaited()
+        launched = mock_sandbox_for_endpoint.start_and_get_preview_url.await_args.args[0]
+        assert launched.endswith("&& python app.py")
+        assert preview.command_key == command_key("python app.py")
 
     @pytest.mark.asyncio
     async def test_a_url_a_browser_cannot_open_is_cached_and_returned_as_published(
@@ -495,7 +531,7 @@ class TestWorkspaceScopedPreviewCommands:
                 "ws-test-001",
                 8080,
                 command=None,
-                work_dir="/home/workspace/project-a",
+                folder=WorkspaceLayout("/home/workspace", "project-a"),
             )
 
         assert url == capability
@@ -505,6 +541,7 @@ class TestWorkspaceScopedPreviewCommands:
             port=8080,
             workspace_id="ws-test-001",
             expires_in=3600,
+            viewer_id=None,
         )
         assert cache_url.await_args.args[2] == capability
 
@@ -515,7 +552,7 @@ class TestWorkspaceScopedPreviewCommands:
         from fastapi import HTTPException
 
         from src.config import env
-        from src.server.app.workspace_sandbox import owner_preview_url
+        from src.server.app.workspace_sandbox import owner_preview
 
         monkeypatch.setattr(env, "PREVIEW_PROXY_BASE_URL", "")
         mock_sandbox_for_endpoint.get_preview_url = AsyncMock(
@@ -531,12 +568,61 @@ class TestWorkspaceScopedPreviewCommands:
             for p in self._held_folder(mock_sandbox_for_endpoint, events):
                 stack.enter_context(p)
             with pytest.raises(HTTPException) as raised:
-                await owner_preview_url(
+                await owner_preview(
                     "ws-test-001", "test-user-123", 8080, command=None
                 )
 
         assert raised.value.status_code == 501
         assert "preview proxy" in raised.value.detail
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("route", ["restart", "open"])
+    async def test_a_port_held_by_something_else_is_409_with_its_message(
+        self, mock_sandbox_for_endpoint, route
+    ):
+        """The message says to choose another port, which a 500 "Failed to
+        get preview URL" kept from the reader."""
+        from fastapi import HTTPException
+
+        from src.server.app.workspace_sandbox import (
+            PreviewRestartRequest,
+            owner_preview,
+            restart_preview_server,
+        )
+
+        events = []
+        with ExitStack() as stack:
+            for p in self._held_folder(mock_sandbox_for_endpoint, events):
+                stack.enter_context(p)
+            mock_sandbox_for_endpoint.start_and_get_preview_url.side_effect = (
+                PreviewPortInUse(8080)
+            )
+            stack.enter_context(
+                patch(
+                    "src.server.app.workspace_sandbox.get_preview_owner",
+                    AsyncMock(return_value="ws-other"),
+                )
+            )
+            mock_sandbox_for_endpoint._is_preview_reachable = AsyncMock(return_value=True)
+            with pytest.raises(HTTPException) as raised:
+                if route == "restart":
+                    await restart_preview_server(
+                        "ws-test-001",
+                        "test-user-123",
+                        PreviewRestartRequest(port=8080, command="python -m http.server 8080"),
+                    )
+                else:
+                    await owner_preview(
+                        "ws-test-001", "test-user-123", 8080,
+                        command="python -m http.server 8080", force=True,
+                    )
+
+        assert raised.value.status_code == 409
+        # The agent reads the same words as the preview tool's result.
+        assert raised.value.detail == {
+            "code": "port_in_use",
+            "message": "Port 8080 is already in use on this computer. Choose another port.",
+        }
 
     @pytest.mark.asyncio
     async def test_no_launch_starts_in_a_folder_left_mid_move(self, mock_sandbox_for_endpoint):
@@ -590,7 +676,7 @@ class TestWorkspaceScopedPreviewCommands:
                 "ws-test-001",
                 8080,
                 command="python -m http.server 8080",
-                work_dir="/home/workspace/project-a",
+                folder=WorkspaceLayout("/home/workspace", "project-a"),
             )
 
         assert url == "https://preview.example.com/signed?token=abc"
@@ -602,7 +688,77 @@ class TestWorkspaceScopedPreviewCommands:
             expires_in=60,
             owner_workspace_id="ws-test-001",
             url_expires_at=ANY,
+            viewer_id=None,
         )
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("claim,port_in_use", [("ws-test-001", False), (None, True)])
+    async def test_a_held_port_this_workspace_claimed_is_not_another_programs(
+        self, mock_sandbox_for_endpoint, claim, port_in_use
+    ):
+        """A worker that did not start the workspace's app cannot tell it from
+        another program when it does not answer, so the workspace's own claim
+        keeps it a failure rather than a port another program holds."""
+        from src.server.services.preview_links import resolve_preview
+
+        mock_sandbox_for_endpoint._is_preview_reachable = AsyncMock(return_value=False)
+        mock_sandbox_for_endpoint.start_and_get_preview_url.side_effect = PreviewPortInUse(8080)
+        with (
+            patch(
+                "src.server.services.preview_links.get_preview_owner",
+                AsyncMock(return_value=claim),
+            ),
+            patch(
+                "src.server.services.preview_links._get_cached_signed_url",
+                AsyncMock(return_value=None),
+            ),
+            pytest.raises(RuntimeError, match="already in use") as raised,
+        ):
+            await resolve_preview(
+                mock_sandbox_for_endpoint,
+                "ws-test-001",
+                8080,
+                command="python -m http.server 8080",
+                folder=WorkspaceLayout("/home/workspace", "project-a"),
+            )
+
+        assert isinstance(raised.value, PreviewPortInUse) is port_in_use
+
+    @pytest.mark.asyncio
+    async def test_a_port_this_workspace_claimed_reads_the_same_on_the_next_try(
+        self, mock_sandbox_for_endpoint
+    ):
+        """The claim outlives a failed try, or the next would find no claim and
+        tell the reader another program holds the workspace's own port."""
+        from src.server.services.preview_links import resolve_preview
+
+        cache = MagicMock()
+        cache.acquire_lock = AsyncMock(return_value=True)
+        cache.release_lock = AsyncMock()
+        values = {"preview:owner:sb-123:8080": "ws-test-001"}
+        cache.get = AsyncMock(side_effect=lambda key: values.get(key))
+        cache.set = AsyncMock(side_effect=lambda key, value, ttl=None: values.__setitem__(key, value) or True)
+        cache.delete = AsyncMock(side_effect=lambda key: values.pop(key, None))
+        mock_sandbox_for_endpoint._is_preview_reachable = AsyncMock(return_value=False)
+        mock_sandbox_for_endpoint.start_and_get_preview_url.side_effect = PreviewPortInUse(8080)
+
+        with patch(
+            "src.server.services.preview_links.get_cache_client",
+            return_value=cache,
+        ):
+            for _ in range(2):
+                with pytest.raises(RuntimeError) as raised:
+                    await resolve_preview(
+                        mock_sandbox_for_endpoint,
+                        "ws-test-001",
+                        8080,
+                        command="python -m http.server 8080",
+                        folder=WorkspaceLayout("/home/workspace", "project-a"),
+                        force=True,
+                    )
+                assert not isinstance(raised.value, PreviewPortInUse)
+
+        assert values["preview:owner:sb-123:8080"] == "ws-test-001"
 
     @pytest.mark.asyncio
     async def test_cross_worker_launch_reserves_owner_before_provider_work(self):
@@ -665,7 +821,7 @@ class TestWorkspaceScopedPreviewCommands:
                 "workspace-a",
                 8080,
                 command="python -m http.server 8080",
-                work_dir="/home/workspace/a",
+                folder=WorkspaceLayout("/home/workspace", "a"),
             ))
             await launch_entered.wait()
             second_task = asyncio.create_task(resolve_preview(
@@ -673,13 +829,13 @@ class TestWorkspaceScopedPreviewCommands:
                 "workspace-b",
                 8080,
                 command="python -m http.server 8080",
-                work_dir="/home/workspace/b",
+                folder=WorkspaceLayout("/home/workspace", "b"),
             ))
             await asyncio.sleep(0.1)
             second.start_and_get_preview_url.assert_not_awaited()
             finish_launch.set()
             assert await first_task == "https://preview.example.com/a"
-            with pytest.raises(RuntimeError, match="already in use"):
+            with pytest.raises(PreviewPortInUse, match="already in use"):
                 await second_task
 
     @pytest.mark.asyncio
@@ -707,7 +863,7 @@ class TestWorkspaceScopedPreviewCommands:
                     "workspace-a",
                     8080,
                     command="python -m http.server 8080",
-                    work_dir="/home/workspace/a",
+                    folder=WorkspaceLayout("/home/workspace", "a"),
                 )
 
         assert "preview:owner:sb-123:8080" not in values
@@ -730,13 +886,13 @@ class TestWorkspaceScopedPreviewCommands:
                 AsyncMock(return_value="https://preview.example.com/b"),
             ),
         ):
-            with pytest.raises(RuntimeError, match="already in use"):
+            with pytest.raises(PreviewPortInUse, match="already in use"):
                 await resolve_preview(
                     mock_sandbox_for_endpoint,
                     "workspace-a",
                     8080,
                     command=None,
-                    work_dir="/home/workspace/a",
+                    folder=WorkspaceLayout("/home/workspace", "a"),
                 )
 
         mock_sandbox_for_endpoint.get_preview_url.assert_not_awaited()
@@ -759,7 +915,7 @@ class TestWorkspaceScopedPreviewCommands:
                     "workspace-a",
                     8080,
                     command="python -m http.server 8080",
-                    work_dir="/home/workspace/a",
+                    folder=WorkspaceLayout("/home/workspace", "a"),
                 )
 
         mock_sandbox_for_endpoint.start_and_get_preview_url.assert_not_awaited()
@@ -882,7 +1038,7 @@ def test_a_page_opens_inside_the_signed_url_without_displacing_its_token(page, e
 @pytest.mark.asyncio
 async def test_occupied_preview_port_never_returns_sibling_url(sandbox, mock_runtime):
     mock_runtime.exec.return_value = MagicMock(exit_code=0)
-    with pytest.raises(RuntimeError, match="already in use"):
+    with pytest.raises(PreviewPortInUse, match="already in use"):
         await sandbox.start_and_get_preview_url("python -m http.server 8080", 8080)
     mock_runtime.session_execute.assert_not_awaited()
     mock_runtime.get_preview_url.assert_not_awaited()
@@ -911,7 +1067,7 @@ async def test_occupied_preview_port_rejects_a_sibling_workspace(
     sandbox._preview_sessions[8080] = ("preview-8080", "cmd-1")
     sandbox._preview_owners[8080] = "ws-1"
     mock_runtime.exec.return_value = MagicMock(exit_code=0)
-    with pytest.raises(RuntimeError, match="already in use"):
+    with pytest.raises(PreviewPortInUse, match="already in use"):
         await sandbox.start_and_get_preview_url(
             "python -m http.server 8080", 8080, owner="ws-2"
         )

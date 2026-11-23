@@ -1,13 +1,14 @@
 """Glob tool for file pattern matching."""
 
 import structlog
-from langchain_core.tools import BaseTool, tool
+from langchain_core.tools import BaseTool
 
 from ptc_agent.agent.backends import FilesystemBackend
 from ptc_agent.agent.tools.utils import mark_sandbox_raised, stamp_sandbox_served
 from ptc_agent.core.paths import logged_path
 from ptc_agent.core.sandbox.glob_runtime import TooManyPatterns, expand_braces
 from src.observability.private_errors import failure
+from src.tools.turn_tool import turn_tool
 
 logger = structlog.get_logger(__name__)
 
@@ -18,6 +19,14 @@ logger = structlog.get_logger(__name__)
 # Kept well under LargeResultEvictionMiddleware's threshold, which now also backstops
 # this tool if the cap is ever raised.
 GLOB_MATCH_LIMIT = 1000
+
+
+def glob_cut_note(shown: int, total: int) -> str:
+    """What a listing cut short ends with, after a blank line."""
+    return (
+        f"\n\n[showing first {shown} of {total} matches — narrow "
+        f"the pattern or pass a subdirectory path to see the rest]"
+    )
 
 
 def create_glob_tool(backend: FilesystemBackend) -> BaseTool:
@@ -31,7 +40,7 @@ def create_glob_tool(backend: FilesystemBackend) -> BaseTool:
         Configured Glob tool function
     """
 
-    @tool("Glob")
+    @turn_tool("Glob")
     async def glob(pattern: str, path: str | None = None) -> str:
         """Find files matching a glob pattern.
 
@@ -84,12 +93,7 @@ def create_glob_tool(backend: FilesystemBackend) -> BaseTool:
             shown = [backend.virtualize_path(m) for m in matches[:GLOB_MATCH_LIMIT]]
 
             lines = [f"Found {total} file(s) matching '{pattern}':", *shown]
-            if truncated:
-                lines.append(
-                    f"\n[showing first {GLOB_MATCH_LIMIT} of {total} matches — narrow "
-                    f"the pattern or pass a subdirectory path to see the rest]"
-                )
-            result = "\n".join(lines)
+            result = "\n".join(lines) + (glob_cut_note(GLOB_MATCH_LIMIT, total) if truncated else "")
 
             logger.info(
                 "Glob completed successfully",

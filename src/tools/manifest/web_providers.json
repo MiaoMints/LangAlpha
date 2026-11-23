@@ -273,6 +273,37 @@
         }
       }
     },
+    "deepseek": {
+      "display_name": "DeepSeek",
+      "env_key": "DEEPSEEK_API_KEY",
+      "capabilities": {
+        "search": {
+          "tracking_name": "DeepSeekSearchTool",
+          "default_level": "standard",
+          "levels": [
+            {
+              "name": "standard",
+              "display_name": "Standard",
+              "credits": 0.75,
+              "native_params": {}
+            }
+          ]
+        },
+        "fetch": {
+          "tracking_name": "DeepSeekFetchTool",
+          "default_level": "standard",
+          "max_batch_size": 1,
+          "levels": [
+            {
+              "name": "standard",
+              "display_name": "Standard",
+              "credits": 0.75,
+              "native_params": {}
+            }
+          ]
+        }
+      }
+    },
     "firecrawl": {
       "display_name": "Firecrawl",
       "env_key": "FIRECRAWL_API_KEY",
@@ -293,7 +324,7 @@
             {
               "name": "stealth",
               "display_name": "Stealth",
-              "credits": 20,
+              "credits": 4,
               "native_params": {
                 "proxy": "stealth"
               }
@@ -345,24 +376,6 @@
         }
       }
     },
-    "deepseek": {
-      "display_name": "DeepSeek",
-      "env_key": "DEEPSEEK_API_KEY",
-      "capabilities": {
-        "search": {
-          "tracking_name": "DeepSeekSearchTool",
-          "default_level": "standard",
-          "levels": [
-            {
-              "name": "standard",
-              "display_name": "Standard",
-              "credits": 1,
-              "native_params": {}
-            }
-          ]
-        }
-      }
-    },
     "auto": {
       "display_name": "Auto (free tier first)",
       "env_key": null,
@@ -386,6 +399,10 @@
     "TavilySearchImages": {
       "credits_per_use": 16,
       "search_type": "advanced"
+    },
+    "FirecrawlCredits": {
+      "credits_per_use": 4,
+      "search_type": "per_firecrawl_credit"
     }
   }
 }

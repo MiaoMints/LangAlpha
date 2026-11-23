@@ -3,16 +3,24 @@
 import hashlib
 import importlib.util
 import json
+import os
+import posixpath
 import secrets
 import shlex
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
-from pathlib import Path
-from typing import Any, Final
+from pathlib import Path, PurePosixPath
+from typing import TYPE_CHECKING, Any, Final
 
 import structlog
 
+from ptc_agent.core.paths import SandboxLayout
+
+from .browser_runtime import protocol as browser_protocol
 from .livefs_runtime import protocol as livefs_protocol
+
+if TYPE_CHECKING:
+    from .runtime import SandboxProvider
 
 logger = structlog.get_logger(__name__)
 
@@ -45,7 +53,19 @@ _MCP_SHARED_RUNTIME_FILES: tuple[str, ...] = (
 _SANDBOX_INTERNAL_PACKAGES: dict[str, str] = {
     "data_client": "src.data_client",
     "market_protocol": "market_protocol",
+    # The chart layer library agent code imports. Its render page
+    # (``chartkit/render/``, built from web/ by ``pnpm build:chart-render``)
+    # ships with it; a checkout that never built it gets snapshots that say
+    # they are unavailable.
+    "chartkit": "chartkit",
 }
+
+
+#: The chart render page the image built, kept outside ``libs/chartkit`` so the
+#: dev stack's source mount cannot hide it. Used only when the chartkit being
+#: shipped has no render page of its own (a checkout that never ran
+#: ``pnpm build:chart-render``); a host build, when present, wins.
+_CHART_RENDER_FALLBACK = os.environ.get("CHARTKIT_RENDER_DIR", "")
 
 
 def _internal_package_dir(module: str) -> Path | None:
@@ -78,6 +98,16 @@ _LIVEFS_SOURCE_DIR = Path(__file__).with_name("livefs_runtime")
 #: submitted source.
 TURN_CWD_SANDBOX_NAME = "sitecustomize.py"
 _TURN_CWD_SOURCE = Path(__file__).with_name("turn_cwd_sitecustomize.py")
+#: The browser's runtime, shipped the same way, and its wrapper, which goes on
+#: every command's PATH as ``agent-browser`` and runs it.
+_BROWSER_SOURCE_DIR = Path(__file__).with_name("browser_runtime")
+#: Where the `la` CLI's shim ships, relative to ``_internal/src/``; its
+#: bundle (built by `cli/`, absent until it is) sits beside the directory.
+_CLI_BIN = PurePosixPath(SandboxLayout.CLI_BIN_DIR).relative_to(
+    SandboxLayout.INTERNAL_SRC_DIR
+)
+#: The names the CLI answers to on a computer's PATH.
+CLI_NAMES = ("langalpha", "la")
 #: Names the directory that ``sitecustomize.py`` chdirs into.
 TURN_CWD_ENV = "PTC_TURN_CWD"
 #: Names the file ``sitecustomize.py`` writes a code run's own unhandled
@@ -197,6 +227,28 @@ async def publish_private_file(
                 pass
 
 
+async def publish_token_file(
+    runtime: Any,
+    path: str,
+    payload: dict[str, Any],
+    *,
+    call: Callable[..., Awaitable[Any]] = _direct_call,
+) -> bool:
+    """Write a token file the server mints, its ``payload`` dated by
+    ``iat_ms``: a file, not an env var, so a fresh token reaches running
+    processes, which re-read it when it changes, and an older write never
+    replaces a newer one. True only once the write is confirmed."""
+    return await publish_private_file(
+        runtime,
+        path,
+        payload,
+        what=f"token file {posixpath.basename(path)}",
+        script=REPLACE_UNLESS_NEWER_SCRIPT,
+        args=(str(payload["iat_ms"]),),
+        call=call,
+    )
+
+
 def _sha256_file(path: Path) -> str:
     """Return the hex SHA-256 digest of a file's contents."""
     return hashlib.sha256(path.read_bytes()).hexdigest()
@@ -208,31 +260,51 @@ def _hash_dict(d: dict[str, str]) -> str:
     return hashlib.sha256(payload.encode()).hexdigest()
 
 
-def _internal_package_files(
-    src_dir: Path, *, livefs: bool = True
-) -> list[tuple[Path, Path]]:
-    """``(local_path, path relative to src/)`` for every internal-package file.
+def _internal_package_uploads(
+    src_dir: Path, provider: "type[SandboxProvider] | None" = None
+) -> list[tuple[Path, Path, int | None]]:
+    """``(local_path, path relative to src/, mode)`` for every internal-package
+    file; ``mode`` is what the file is set to once uploaded, None for the
+    upload's own (0644).
 
     Walks ``_SANDBOX_INTERNAL_PACKAGES`` with ``rglob("*")`` — every regular
     file except ``__pycache__`` ships, so data seeds can never silently drop
-    out of the sync. Empty when ``src/__init__.py`` is missing. ``livefs``
-    False leaves out the file mount's daemon, for a computer that never mounts.
+    out of the sync. Empty when ``src/__init__.py`` is missing. A *provider*
+    whose computers never mount leaves out the file mount's daemon. Read off
+    the class, so the upload and the manifest that gates it cannot be handed
+    different sets.
     """
+    livefs = provider is None or provider.mounts_livefs
     src_init = src_dir / "__init__.py"
     if not src_init.exists():
         return []
-    files: list[tuple[Path, Path]] = [(src_init, Path("__init__.py"))]
+    files: list[tuple[Path, Path, int | None]] = [(src_init, Path("__init__.py"), None)]
     # The file-transfer runtime rides the same all-or-nothing module so it is
     # hashed into the manifest and re-shipped whenever it changes.
-    files.append((_TRANSFER_RUNTIME_SOURCE, Path(TRANSFER_RUNTIME_SANDBOX_NAME)))
-    files.append((_TURN_CWD_SOURCE, Path(TURN_CWD_SANDBOX_NAME)))
+    files.append((_TRANSFER_RUNTIME_SOURCE, Path(TRANSFER_RUNTIME_SANDBOX_NAME), None))
+    files.append((_TURN_CWD_SOURCE, Path(TURN_CWD_SANDBOX_NAME), None))
     for supervisor_file in sorted(_SUPERVISOR_SOURCE_DIR.glob("*.py")):
         files.append((
             supervisor_file,
             Path(SUPERVISOR_SANDBOX_PACKAGE) / supervisor_file.name,
+            None,
         ))
     for livefs_file in sorted(_LIVEFS_SOURCE_DIR.glob("*.py")) if livefs else ():
-        files.append((livefs_file, Path(LIVEFS_SANDBOX_PACKAGE) / livefs_file.name))
+        files.append((livefs_file, Path(LIVEFS_SANDBOX_PACKAGE) / livefs_file.name, None))
+    # The engine's config file ships beside the modules: the wrapper points the
+    # engine at it, and an engine handed a config path that is not there fails.
+    browser_files = [*_BROWSER_SOURCE_DIR.glob("*.py"), *_BROWSER_SOURCE_DIR.glob("*.json")]
+    for browser_file in sorted(browser_files):
+        files.append((browser_file, Path(browser_protocol.PACKAGE_NAME) / browser_file.name, None))
+    files.append((_BROWSER_SOURCE_DIR / "agent-browser", Path(_CLI_BIN, "agent-browser"), 0o755))
+    cli_bundle = src_dir.parent / "cli" / "dist" / "la.mjs"
+    if cli_bundle.is_file():
+        files.append((cli_bundle, Path(_CLI_BIN.parent, "la.mjs"), None))
+        # Run by name from PATH, so executable. `langalpha` is the CLI's name,
+        # `la` its short one; one shim answers to both.
+        shim = src_dir.parent / "cli" / "sandbox" / "shim"
+        for name in CLI_NAMES:
+            files.append((shim, Path(_CLI_BIN, name), 0o755))
     for pkg, module in _SANDBOX_INTERNAL_PACKAGES.items():
         pkg_dir = _internal_package_dir(module)
         if pkg_dir is None or not pkg_dir.exists():
@@ -245,8 +317,22 @@ def _internal_package_files(
         for file_path in sorted(pkg_dir.rglob("*")):
             if not file_path.is_file() or "__pycache__" in file_path.parts:
                 continue
-            files.append((file_path, Path(pkg) / file_path.relative_to(pkg_dir)))
+            files.append((file_path, Path(pkg) / file_path.relative_to(pkg_dir), None))
+        if pkg == "chartkit" and not (pkg_dir / "render" / "chart-render.html").is_file():
+            fallback = Path(_CHART_RENDER_FALLBACK) if _CHART_RENDER_FALLBACK else None
+            if fallback is not None and (fallback / "chart-render.html").is_file():
+                for file_path in sorted(fallback.rglob("*")):
+                    if file_path.is_file():
+                        files.append((file_path, Path(pkg, "render") / file_path.relative_to(fallback), None))
     return files
+
+
+def _internal_package_files(
+    src_dir: Path, provider: "type[SandboxProvider] | None" = None
+) -> list[tuple[Path, Path]]:
+    """``(local_path, path relative to src/)`` for every file
+    ``_internal_package_uploads`` ships."""
+    return [(local, rel) for local, rel, _ in _internal_package_uploads(src_dir, provider)]
 
 
 def _resolve_local_path(local_path: str, config_dir: Path | None) -> str | None:

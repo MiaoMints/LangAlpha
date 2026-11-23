@@ -2,22 +2,28 @@ import React from 'react';
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { screen, waitFor, fireEvent, within } from '@testing-library/react';
 import { renderWithProviders } from '@/test/utils';
-import { tabsStorageKey } from '@/pages/ChatAgent/components/filePanel/useFileTabs';
+import { threadTabsStorageKey } from '@/pages/ChatAgent/components/filePanel/useFileTabs';
 import { URL_FRESH_MS } from '@/pages/ChatAgent/components/filePanel/usePreviews';
 
 vi.mock('@/pages/ChatAgent/utils/api', async (importOriginal) => {
   const orig = await importOriginal<Record<string, unknown>>();
   return {
     ...orig,
-    readWorkspaceFile: vi.fn(async () => ({ content: '# Notes', mime: 'text/markdown', truncated: false })),
-    readWorkspaceFileFull: vi.fn(async () => ({ content: '# Notes' })),
-    writeWorkspaceFile: vi.fn(async () => ({})),
+    readWorkspaceFile: vi.fn(async () => ({ content: '# Notes', mime: 'text/markdown', truncated: false, from: { kind: 'live' } })),
+    readWorkspaceFileFull: vi.fn(async () => ({ content: '# Notes', version: null, rewriting: false, from: { kind: 'live' } })),
+    writeWorkspaceFile: vi.fn(async () => ({ version: null })),
     downloadWorkspaceFileAsArrayBuffer: vi.fn(),
     triggerFileDownload: vi.fn(),
     resolveWorkspaceFile: vi.fn(),
     getPreviewUrl: vi.fn(async () => ({ url: 'https://8050-sandbox.example.com/' })),
   };
 });
+// In a browser the app's address goes into a frame host of its own, which
+// jsdom cannot load; framing it directly keeps the address on the frame.
+vi.mock('@/pages/ChatAgent/components/viewers/frameHost', async (importOriginal) => ({
+  ...(await importOriginal<Record<string, unknown>>()),
+  framedDirectly: () => true,
+}));
 vi.mock('@/hooks/useWorkspace', () => ({ useWorkspace: () => ({ data: { status: 'running', name: 'ws' } }) }));
 vi.mock('@/contexts/ThemeContext', () => ({ useTheme: () => ({ theme: 'dark' }) }));
 vi.mock('@/pages/ChatAgent/components/FilePanelMemo', () => ({
@@ -130,11 +136,11 @@ describe('FilePanel running apps', () => {
   it('re-mints the URL for a tab restored from storage, which stored none', async () => {
     // The entry is in the shape strips were written in before tabs shed the
     // file-only fields, so a strip saved then still comes back.
-    localStorage.setItem(tabsStorageKey('ws'), JSON.stringify({
+    localStorage.setItem(threadTabsStorageKey('ws', 't1'), JSON.stringify({
       tabs: [{ path: null, kind: 'preview', preview: false, port: 8050, title: 'Dashboard' }],
       active: 0,
     }));
-    renderWithProviders(panel());
+    renderWithProviders(panel({ threadId: 't1' }));
 
     await waitFor(() => expect(previewUrl()).toHaveBeenCalledWith('ws', 8050, undefined, false));
     expect(await screen.findByTitle('App on port 8050')).toBeTruthy();

@@ -1,0 +1,202 @@
+"""A Claude Code turn, built from the agent a langalpha turn would run.
+
+The agent is built as for any turn, and Claude Code takes from it the system
+prompt, the tool node with every tool-call middleware around it, and the
+hooks a turn opens with, which write the turn's rows and freeze the baseline.
+Claude Code runs the model loop, so nothing that wraps a model call runs on
+these turns, and the turn's rows and baseline reach Claude in the turn's own
+message instead (``runtime.turn_prompt``). Where the CLI runs, and on which
+token, is the launcher's, which the caller picks (the server's
+``turn_launcher``): on the user's own computer it runs there
+(``SSHLauncher``), anywhere else on the backend's own machine
+(``LocalLauncher``).
+
+A call that may wait for the user (``waits_for_user``) is held until the
+model-side hooks a langalpha turn runs before its calls (``_HOLDS``: the
+credit gate, an order or a hand-off put to the user) have run, and the rows a
+langalpha turn writes before a model call (``_OPENING_ROWS``) open the turn.
+The plan's model-call hooks (its check-in, nudge and close-out) the runtime
+asks itself where its next request starts (``agent_plan``).
+
+The pieces are read off the compiled agent's builder by the names
+``create_agent`` gives them (``tools``, ``<middleware>.before_agent``), since it
+is the one place the stack is composed; ``test_agent.py`` pins that shape.
+"""
+
+from __future__ import annotations
+
+from collections.abc import AsyncIterator, Callable, Mapping, Sequence
+from typing import Any
+
+from langchain_core.messages import ToolMessage
+from langchain_core.runnables import RunnableConfig
+
+from ptc_agent.agent.claude_code.agent_plan import AgentPlan
+from ptc_agent.agent.claude_code.cli import RuntimeSpec
+from ptc_agent.agent.claude_code.cli_waits import CliWaits
+from ptc_agent.agent.claude_code.compaction import NO_RULES, CompactionRules
+from ptc_agent.agent.claude_code.launcher import Launcher
+from ptc_agent.agent.claude_code.mid_turn import TaskSteering
+from ptc_agent.agent.claude_code.runtime import TURN_KEY, Baseline, ClaudeTurn, build_claude_code_graph
+from ptc_agent.agent.middleware import ask_user
+from ptc_agent.agent.middleware.background_subagent.event_capture import SubagentEventCaptureMiddleware
+from ptc_agent.agent.middleware.credit_gate import CreditGateMiddleware
+from ptc_agent.agent.middleware.order_governance import OrderGovernanceMiddleware, places_order
+from ptc_agent.agent.middleware.steering import SteeringMiddleware
+from ptc_agent.agent.middleware.wakeups import WakeupCancelNoticeMiddleware
+from ptc_agent.core.claude_code_clis import CliQueue
+from src.llms.claude_code import ClaudeCodeTarget
+from src.tools.secretary._commands import HANDOFF_TOOL_NAME
+from src.tools.secretary.approvals import StandingApprovalMiddleware
+from src.tools.wakeups import quiet
+
+#: The middleware whose model hooks a held call passes before it runs, as a
+#: langalpha turn's calls pass them after its model step. A call they stop
+#: for has to be one ``waits_for_user`` holds, or the credit gate's.
+_HOLDS = (CreditGateMiddleware, OrderGovernanceMiddleware, StandingApprovalMiddleware)
+#: The middleware whose model-call hooks write rows the turn opens with.
+_OPENING_ROWS = (WakeupCancelNoticeMiddleware,)
+
+
+def waits_for_user(orders: frozenset[str]):
+    """Which calls may wait for the user: a question, an order (``orders``
+    names the tools that place one) or a hand-off's card."""
+
+    def waits(name: str, args: Mapping[str, Any]) -> bool:
+        return name in (ask_user.TOOL_NAME, HANDOFF_TOOL_NAME) or name in orders
+
+    return waits
+
+
+def _ends_turn(message: ToolMessage) -> bool:
+    return quiet.quiet_result(message) is not None
+
+
+def _with_turn(config: RunnableConfig, turn: ClaudeTurn) -> RunnableConfig:
+    return {**config, "configurable": {**(config.get("configurable") or {}), TURN_KEY: turn}}
+
+
+class ClaudeCodeGraph:
+    """The turn graph, used as any turn's graph is, each run on a ``ClaudeTurn`` of its own.
+
+    One compiled graph can serve several runs, as a subagent's serves each of
+    its tasks, so the turn, and the CLI it starts, belong to the run, which
+    goes through ``astream`` or ``ainvoke``. Either closes the turn however
+    the run ends, in the run's own task, and only after the graph's own run,
+    so no step is still using the CLI when it goes; everything else is the
+    compiled graph's.
+
+    A run takes as input only the keys ``takes`` names, those the agent it
+    runs takes, as ``create_agent``'s graph drops the rest: a subagent's run
+    is handed its parent's whole state, private channels and Claude session
+    included, which are the parent's own.
+    """
+
+    def __init__(self, graph: Any, turn: Callable[..., ClaudeTurn], takes: frozenset[str] | None = None, *,
+                 compaction: CompactionRules = NO_RULES) -> None:
+        self.graph = graph
+        self._turn = turn
+        self._takes = takes
+        #: The rules its turns compact by, the user's settings as built.
+        self.compaction = compaction
+
+    def _input(self, input: Any) -> Any:
+        if self._takes is None or not isinstance(input, Mapping):
+            return input
+        return {k: v for k, v in input.items() if k in self._takes}
+
+    def turn(self, config: RunnableConfig) -> ClaudeTurn:
+        """A turn for the run ``config`` names: its thread, and its namespace, a subagent task's for a task's run."""
+        configurable = config.get("configurable") or {}
+        if not (thread := configurable.get("thread_id")):
+            raise RuntimeError("a Claude Code turn runs for a user, on a thread")
+        return self._turn(thread_key=str(thread), checkpoint_ns=configurable.get("checkpoint_ns") or "")
+
+    async def ainvoke(self, input: Any, config: RunnableConfig, **kwargs: Any) -> Any:
+        turn = self.turn(config)
+        try:
+            return await self.graph.ainvoke(self._input(input), _with_turn(config, turn), **kwargs)
+        finally:
+            await turn.close()
+
+    async def astream(self, input: Any, config: RunnableConfig, **kwargs: Any) -> AsyncIterator[Any]:
+        turn = self.turn(config)
+        stream = self.graph.astream(self._input(input), _with_turn(config, turn), **kwargs)
+        try:
+            async for event in stream:
+                yield event
+        finally:
+            try:
+                await stream.aclose()
+            finally:
+                await turn.close()
+
+    def invoke(self, input: Any, config: RunnableConfig | None = None, **kwargs: Any) -> Any:
+        raise NotImplementedError("a Claude Code run runs through astream or ainvoke")
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self.graph, name)
+
+
+def claude_code_graph(
+    agent: Any, *, system_prompt: str, target: ClaudeCodeTarget, user_id: str | None,
+    checkpointer: Any, launcher: Callable[[CliQueue], Launcher], entry: Sequence[Any] = (),
+    compaction: CompactionRules, middleware: Sequence[Any] = (), baseline: Baseline | None = None,
+    steering: SteeringMiddleware | TaskSteering | None = None, alert_senders: frozenset[str] = frozenset(),
+    plan: AgentPlan | None = None, shared: bool = False,
+) -> ClaudeCodeGraph:
+    """The turn graph for ``agent``, the compiled agent ``create_agent`` built.
+
+    ``entry`` are the middleware whose turn-entry hooks run first, in order,
+    then the opening rows' and the holds' hooks of ``middleware``, the agent's
+    stack, in the order ``create_agent`` runs them. ``baseline`` renders the thread's frozen baseline, and ``steering`` is the
+    agent's own, which the turn takes in what is sent into the thread with
+    between tool calls and as each query ends, coming back for a notice of
+    ``alert_senders`` as a langalpha turn does. ``plan`` is the agent's plan
+    as the turn asks its check-in, nudge and close-out itself, where the
+    agent keeps one. The user is who
+    Claude Code is told the device belongs to, so a graph without one is
+    refused, and each run's thread and namespace name its working
+    directory (``ClaudeTurn.run_key``). ``launcher`` makes where a turn's
+    CLI runs, one for each turn, since a launcher serves one run at a time,
+    told of the turn's waits for one of its computer's CLIs where it shows them,
+    and ``compaction`` says when Claude's session compacts and moves to this
+    build's prompt and tools.
+    """
+    if not user_id:
+        raise RuntimeError("a Claude Code turn runs for a user, on a thread")
+    nodes = agent.builder.nodes
+    tool_node = nodes["tools"].runnable
+    orders = frozenset(t.name for t in tool_node.tools_by_name.values() if places_order(t))
+    spec = RuntimeSpec(
+        system_prompt=system_prompt,
+        model=target.model,
+        tools=list(tool_node.tools_by_name.values()),
+        billing={k: v for k, v in (target.metadata or {}).items() if isinstance(v, str)},
+        effort=target.effort,
+        waits=waits_for_user(orders),
+        ends_turn=_ends_turn,
+        shared=shared,
+    )
+    def turn(**run: str) -> ClaudeTurn:
+        waits = CliWaits()
+        return ClaudeTurn(spec, launcher(waits), identity=user_id, baseline=baseline, compaction=compaction,
+                          steering=steering, alert_senders=alert_senders, waits=waits, **run)
+
+    def hooks(of: Sequence[Any], hook: str) -> list[tuple[str, Any]]:
+        return [(name, nodes[name].runnable) for m in of if (name := f"{m.name}.{hook}") in nodes]
+
+    holds = [m for m in middleware if isinstance(m, _HOLDS)]
+    governance = next((m for m in holds if isinstance(m, OrderGovernanceMiddleware)), None)
+    capture = next((m for m in middleware if isinstance(m, SubagentEventCaptureMiddleware)), None)
+    graph = build_claude_code_graph(
+        tool_node,
+        entry=hooks(entry, "before_agent") + hooks([m for m in middleware if isinstance(m, _OPENING_ROWS)], "before_model"),
+        pause=hooks(holds, "before_model") + hooks(holds[::-1], "after_model"),
+        checkpointer=checkpointer,
+        abandon=governance.abandon if governance else None,
+        on_reply=capture.capture if capture else None,
+        plan=plan,
+    ).with_config({"recursion_limit": agent.config["recursion_limit"]})
+    builder = agent.builder
+    return ClaudeCodeGraph(graph, turn, frozenset(builder.schemas[builder.input_schema]), compaction=compaction)

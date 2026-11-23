@@ -12,10 +12,16 @@ follows):
   wakeups that fire together share one block and one turn;
 - a turn is running, or the latest one waits on the user: the job parks for
   that turn to take in, or for its ending to release;
+- the computer the wake would run on cannot be reached (the user's machine
+  asleep): the job parks until it connects again, its notice unread, so the
+  slots a series reaches meanwhile are skipped and its return brings one wake;
 - the wake is refused: a refusal that clears by itself is retried under the
   outbox backoff, and once that runs out, or at once on one that does not
   (the user's usage limit), the job and its riders are held for the
-  thread's next turn instead of dropped;
+  thread's next turn instead of dropped; one the Claude plan refused is
+  held until it resets, and its wake then says when it was due; one refused
+  for a suspended account asks again each hour, so a reinstated account
+  wakes as it would have;
 - the thread is archived, its workspace deleted, or its owner turned
   wakeups off: the wakeup is cancelled and the notice dropped, since nobody
   would see the turn it starts.
@@ -35,6 +41,7 @@ import logging
 import uuid
 from dataclasses import dataclass, field
 from typing import Any, Literal, Optional
+
 
 logger = logging.getLogger(__name__)
 
@@ -130,7 +137,9 @@ class _Wake:
 # How a claim ended, for the riders it froze: kept by the run that shows
 # them (``settled``), by the head a refusal held (``held``) or a new owner
 # (``fence_lost``); given back to the thread because no wake was admitted
-# (``release``), or because the head parked for a live turn (``parked``).
+# (``release``), or because the head parked for a live turn, for its
+# computer, or to wait for room among the user's Claude Code turns
+# (``parked``).
 _Exit = Literal["settled", "held", "fence_lost", "release", "parked"]
 
 
@@ -204,7 +213,8 @@ async def render_wake(
     notices: list[dict[str, Any]] = []
     user_tz: Optional[str] = None
     for job in jobs:
-        found = notice_of(job.get("payload") or {})
+        job_payload = job.get("payload") or {}
+        found = notice_of(job_payload)
         if found is None:
             continue
         wakeup_id, notice, seq = found
@@ -213,7 +223,8 @@ async def render_wake(
             continue
         if user_tz is None:
             user_tz = await user_timezone(str(row.get("user_id") or ""))
-        line, payload = await render_notice(row, notice, seq, user_tz=user_tz)
+        held = (job_payload.get("plan_hold") or job_payload.get("plan_waited")) if started_turn else None
+        line, payload = await render_notice(row, notice, seq, user_tz=user_tz, plan_hold=held)
         lines.append(line)
         notices.append(payload)
     if not lines:
@@ -263,6 +274,7 @@ async def execute_wakeup(job: dict) -> None:
 
 async def _deliver(wake: _Wake) -> _Exit:
     from src.server.database import conversation as conv_db
+    from src.server.database.conversation.threads_read import thread_person
     from src.server.database import workspace as ws_db
     from src.server.database.runs import lifecycle as tl_db
     from src.server.database.runs import outbox as outbox_db
@@ -271,7 +283,9 @@ async def _deliver(wake: _Wake) -> _Exit:
     from src.server.services.features import user_feature_enabled
     from src.server.services.hook_outbox import LEASE_SECONDS, MAX_ATTEMPTS
     from src.server.services.report_back.notify_turn import (
-        park_while_thread_busy,
+        SUSPENDED_WAIT_S,
+        TURN_ROOM_WAIT_S,
+        park_unless_ready,
         post_notification_turn,
         release_if_a_turn_ended,
         run_marker,
@@ -328,10 +342,7 @@ async def _deliver(wake: _Wake) -> _Exit:
         )
         await end_wakeup(thread_id, wakeup_id, "workspace")
         return "settled"
-    user_id = wake.payload.get("user_id")
-    if not user_id:
-        meta = await conv_db.get_thread_auth_meta(thread_id)
-        user_id = (meta or {}).get("user_id")
+    user_id = wake.payload.get("user_id") or await thread_person(thread_id)
     if not user_id:
         logger.warning(f"{_LOG} No owner for thread {thread_id}; dropping {subject}")
         return "settled"
@@ -352,16 +363,32 @@ async def _deliver(wake: _Wake) -> _Exit:
     async def _still_due() -> bool:
         return await fire_db.job_owed(job_id)
 
+    plan_hold: dict[str, Any] = {}
+
+    async def _plan_limited(detail: dict[str, Any]) -> None:
+        plan_hold.update(
+            reset_at=detail["held_until"], window=detail.get("window"), known=detail.get("held_known", True),
+            credential=detail.get("held_credential"), model_id=detail.get("held_model"),
+        )
+
     async def _unanswered() -> None:
         # A POST with no answer may yet be admitted carrying this notice and
         # its riders, past whatever this claim ends in, so a cancel must not
         # recall them (``TOO_LATE_SQL``).
         await outbox_db.merge_job_payload(job_id, {"unanswered": True})
 
+    # A hold for the Claude plan's reset that came due ends here: the wake
+    # gets the retries any fresh one does, and parks as any other.
+    plan_held = "plan_hold" in wake.payload
+    if plan_held and not await outbox_db.end_plan_hold(job_id, attempts=attempts):
+        return "fence_lost"
     # Out of retries: this claim is the one more look a held job's release
     # bought it, or the last of its backoff, so a refusal holds it again
     # rather than starting another round.
-    spent = bool(wake.payload.get("exhausted")) or attempts >= MAX_ATTEMPTS
+    spent = not plan_held and (
+        bool(wake.payload.get("exhausted"))
+        or attempts - int(wake.payload.get("waited") or 0) >= MAX_ATTEMPTS
+    )
 
     for _ in range(_MAX_ROUNDS):
         if not await _fence():
@@ -370,10 +397,11 @@ async def _deliver(wake: _Wake) -> _Exit:
             logger.info(f"{_LOG} {subject} was delivered or settled meanwhile")
             return "release"
 
-        if await park_while_thread_busy(
+        if await park_unless_ready(
             job_id,
             attempts,
             thread_id,
+            workspace_id=str(thread["workspace_id"]),
             log_prefix=_LOG,
             subject=subject,
             parks_at_ceiling=True,
@@ -416,6 +444,9 @@ async def _deliver(wake: _Wake) -> _Exit:
             busy_fails_fast=True,
             refusal_fails_fast=True,
             on_unanswered=_unanswered,
+            on_plan_limited=_plan_limited,
+            room_fails_fast=True,
+            suspension_waits=True,
         )
         if outcome == "dispatched":
             if run_id is None:
@@ -442,6 +473,27 @@ async def _deliver(wake: _Wake) -> _Exit:
             return "fence_lost"
         if outcome == "superseded":
             return "release"
+        if outcome in ("full", "suspended"):
+            # A suspended account's wake waits by the clock too, still owed,
+            # so a reinstated account wakes as it would have.
+            await _release_riders(wake)
+            wait_s = TURN_ROOM_WAIT_S if outcome == "full" else SUSPENDED_WAIT_S
+            if await outbox_db.wait_for_room(job_id, attempts=attempts, wait_s=wait_s):
+                return "parked"
+            return "fence_lost"
+        if outcome == "plan_limited":
+            if await _adopt_own_wake(wake):
+                return "settled"
+            # Held until the plan resets, then woken, rather than for the
+            # thread's next turn, which may not come for days.
+            if await outbox_db.hold_alert_for_plan(job_id, attempts=attempts, plan_hold=plan_hold):
+                logger.info(
+                    f"{_LOG} Wake for {subject} on thread {thread_id} held with "
+                    f"{len(wake.riders)} rider(s) until the Claude plan resets at "
+                    f"{plan_hold['reset_at']}"
+                )
+                return "held"
+            return "fence_lost"
         if outcome == "cap" and not spent:
             logger.warning(
                 f"{_LOG} Thread {thread_id} kept refusing the wake for "

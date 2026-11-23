@@ -1,5 +1,6 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import type { Mock } from 'vitest';
+import { reloadHeld } from '@/lib/reloadHolds';
 
 vi.mock('@/api/client', () => {
   const mockGet = vi.fn().mockResolvedValue({ data: {} });
@@ -153,6 +154,16 @@ describe('ChatAgent API utilities', () => {
       expect(body).toEqual({ first_query: '', title: 'Getting started', workspace_id: 'ws-1' });
     });
 
+    it('asks for a thread shared with its workspace only when the switch says so', async () => {
+      mockPost.mockResolvedValue({ data: { thread_id: 't-1' } });
+
+      await createThreadWithTitle({ workspaceId: 'ws-1', firstQuery: 'hi', sharedWithWorkspace: true });
+      await createThreadWithTitle({ workspaceId: 'ws-1', firstQuery: 'hi', sharedWithWorkspace: false });
+      expect(mockPost.mock.calls[0][1]).toEqual({ first_query: 'hi', workspace_id: 'ws-1', shared_with_workspace: true });
+      // Private is the server's default, so a private or personal thread's request is unchanged.
+      expect(mockPost.mock.calls[1][1]).toEqual({ first_query: 'hi', workspace_id: 'ws-1' });
+    });
+
     it("stores the thread's own effort and fast mode only when picked", async () => {
       mockPost.mockResolvedValue({ data: { thread_id: 't-1' } });
 
@@ -292,12 +303,16 @@ describe('ChatAgent API utilities', () => {
       expect(body.fast_mode).toBe(true);
     });
 
-    it('invokes onRunIdResolved with the run_id from Content-Location BEFORE reading the body', async () => {
-      // Track ordering: did onRunIdResolved fire before any reader.read() call?
+    it('names the run from Content-Location with the first frame, not the headers or a keepalive', async () => {
+      // The server beats through setup, so its headers precede admission and the
+      // run they name may never start.
+      const encoder = new TextEncoder();
+      const chunks = [':keepalive\n\n', 'event: metadata\ndata: {"run_id": "abc-123"}\n\n'];
       const callOrder: string[] = [];
       const readMock = vi.fn().mockImplementation(() => {
-        callOrder.push('body-read');
-        return Promise.resolve({ done: true, value: undefined });
+        const next = chunks.shift();
+        callOrder.push(next ? `read:${next.slice(0, 6)}` : 'read:end');
+        return Promise.resolve(next ? { done: false, value: encoder.encode(next) } : { done: true, value: undefined });
       });
       global.fetch = vi.fn().mockResolvedValue({
         ok: true,
@@ -313,19 +328,78 @@ describe('ChatAgent API utilities', () => {
       const onRunIdResolved = vi.fn().mockImplementation((rid: string) => {
         callOrder.push(`run-id:${rid}`);
       });
+      const onEvent = vi.fn().mockImplementation(() => {
+        callOrder.push('event');
+      });
 
       await sendHitlResponse(
         { int1: { decisions: [{ type: 'approve' }] } },
         'ws-1', 't-1',
-        { onEvent: () => {}, onRunIdResolved },
+        { onEvent, onRunIdResolved },
       );
 
       expect(onRunIdResolved).toHaveBeenCalledTimes(1);
-      // Now also carries the server-assigned thread_id parsed from the same
+      // Carries the server-assigned thread_id parsed from the same
       // Content-Location path, so an early stop can hard-cancel the run.
       expect(onRunIdResolved).toHaveBeenCalledWith('abc-123', 't-1');
-      // The run_id MUST be latched before any body byte is read.
-      expect(callOrder[0]).toBe('run-id:abc-123');
+      expect(callOrder).toEqual(['read::keepa', 'read:event:', 'run-id:abc-123', 'event', 'read:end']);
+    });
+
+    it.each([
+      ['a hold, which comes ahead of the run row', 'turn_held', false],
+      ['a cold start, which comes after it', 'workspace_status', true],
+    ])('names the run or not on %s', async (_case, event, named) => {
+      const encoder = new TextEncoder();
+      const chunks = [`id: 0\nevent: ${event}\ndata: {"status": "x"}\n\n`];
+      global.fetch = vi.fn().mockResolvedValue({
+        ok: true,
+        status: 200,
+        headers: new Headers({
+          'Content-Location': '/api/v1/threads/t-1/messages/stream?run_id=abc-123',
+        }),
+        body: {
+          getReader: () => ({
+            read: () => {
+              const next = chunks.shift();
+              return Promise.resolve(next ? { done: false, value: encoder.encode(next) } : { done: true, value: undefined });
+            },
+          }),
+        },
+      });
+
+      const onRunIdResolved = vi.fn();
+      await sendHitlResponse({ int1: { decisions: [{ type: 'approve' }] } }, 'ws-1', 't-1', { onEvent: () => {}, onRunIdResolved });
+
+      expect(onRunIdResolved).toHaveBeenCalledTimes(named ? 1 : 0);
+    });
+
+    it('holds the stale-build reload through setup frames until the run speaks', async () => {
+      const encoder = new TextEncoder();
+      const chunks = [
+        ':keepalive\n\n',
+        'id: 0\nevent: turn_held\ndata: {"status": "held"}\n\n',
+        'id: 1\nevent: metadata\ndata: {"run_id": "abc-123"}\n\n',
+      ];
+      const heldAtEachRead: boolean[] = [];
+      global.fetch = vi.fn().mockResolvedValue({
+        ok: true,
+        status: 200,
+        headers: new Headers(),
+        body: {
+          getReader: () => ({
+            read: () => {
+              heldAtEachRead.push(reloadHeld());
+              const next = chunks.shift();
+              return Promise.resolve(next ? { done: false, value: encoder.encode(next) } : { done: true, value: undefined });
+            },
+          }),
+        },
+      });
+
+      await sendHitlResponse({ int1: { decisions: [{ type: 'approve' }] } }, 'ws-1', 't-1', { onEvent: () => {} });
+
+      expect(heldAtEachRead).toEqual([true, true, true, false]);
+      expect(reloadHeld()).toBe(false);
     });
 
     it('does NOT invoke onRunIdResolved when Content-Location lacks run_id', async () => {
@@ -868,6 +942,24 @@ describe('ChatAgent API utilities', () => {
       expect(body).not.toHaveProperty('agent_mode');
     });
 
+    // A send of file comments names them by id, with where the person reads;
+    // the server claims them under the request key, so a retransmit carries
+    // the same ids.
+    it('carries file comment ids and where the person reads, and none when the send has none', async () => {
+      await sendChatMessageStream('', 'ws-1', 't-1', {
+        onEvent: () => {}, artifactComments: { ids: ['c-2', 'c-1'], reading: 'file' }, requestKey: 'rk-1',
+      });
+      const body = bodyOfLastSend();
+      expect(body.artifact_comment_ids).toEqual(['c-2', 'c-1']);
+      expect(body.reading).toBe('file');
+      expect(body.request_key).toBe('rk-1');
+
+      (global.fetch as Mock).mockClear();
+      await sendChatMessageStream('hi', 'ws-1', 't-1', { onEvent: () => {}, artifactComments: { ids: [], reading: 'chat' } });
+      expect(bodyOfLastSend()).not.toHaveProperty('artifact_comment_ids');
+      expect(bodyOfLastSend()).not.toHaveProperty('reading');
+    });
+
     // Watch OFF: no skills item, no market_watch key.
     it('sends no market-watch skill and no market_watch flag when off', async () => {
       await sendChatMessageStream('hi', 'ws-1', 't-1', { onEvent: () => {} });
@@ -1231,6 +1323,8 @@ describe('replayThreadHistory: the page request', () => {
     global.fetch = originalFetch;
   });
 
+  const PAGE = { limit: 20, maxBytes: 3_000_000, minTurns: 5 };
+
   const requested = () => {
     const [url, opts] = (global.fetch as Mock).mock.calls[0];
     return { url: new URL(url as string), opts: opts as RequestInit };
@@ -1243,15 +1337,17 @@ describe('replayThreadHistory: the page request', () => {
     expect(url.search).toBe('');
   });
 
-  it('asks for the newest N turns with limit alone', async () => {
-    await replayThreadHistory('t-1', () => {}, { limit: 20 });
+  it('asks for the newest turns a page budget allows', async () => {
+    await replayThreadHistory('t-1', () => {}, { page: PAGE });
     const { url } = requested();
     expect(url.searchParams.get('limit')).toBe('20');
+    expect(url.searchParams.get('max_bytes')).toBe('3000000');
+    expect(url.searchParams.get('min_turns')).toBe('5');
     expect(url.searchParams.has('before_turn')).toBe(false);
   });
 
-  it('asks for the page before a turn with limit and before_turn', async () => {
-    await replayThreadHistory('t-1', () => {}, { limit: 20, beforeTurn: 75 });
+  it('asks for the page before a turn with the budget and before_turn', async () => {
+    await replayThreadHistory('t-1', () => {}, { page: PAGE, beforeTurn: 75 });
     const { url } = requested();
     expect(url.searchParams.get('limit')).toBe('20');
     expect(url.searchParams.get('before_turn')).toBe('75');
@@ -1266,7 +1362,7 @@ describe('replayThreadHistory: the page request', () => {
 
   it('passes the abort signal through to the fetch', async () => {
     const controller = new AbortController();
-    await replayThreadHistory('t-1', () => {}, { limit: 20, beforeTurn: 40, signal: controller.signal });
+    await replayThreadHistory('t-1', () => {}, { page: PAGE, beforeTurn: 40, signal: controller.signal });
     expect(requested().opts.signal).toBe(controller.signal);
   });
 
@@ -1276,7 +1372,7 @@ describe('replayThreadHistory: the page request', () => {
     const controller = new AbortController();
     controller.abort();
     await expect(
-      replayThreadHistory('t-1', () => {}, { limit: 20, beforeTurn: 40, signal: controller.signal }),
+      replayThreadHistory('t-1', () => {}, { page: PAGE, beforeTurn: 40, signal: controller.signal }),
     ).resolves.toMatchObject({ aborted: true, disconnected: false });
   });
 });

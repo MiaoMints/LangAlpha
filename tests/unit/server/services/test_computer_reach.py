@@ -15,7 +15,7 @@ import pytest
 from fastapi import HTTPException
 
 from ptc_agent.agent.tools.computer_reach import ComputerTarget, ComputerUnreachable
-from ptc_agent.core.project_context import ProjectContext, current_project, project_bound
+from ptc_agent.core.project_context import MachinePaths, ProjectContext, current_project, project_bound
 from ptc_agent.core.sandbox.providers.ssh_errors import SSHConnectError
 from ptc_agent.core.sandbox.runtime import SandboxTransientError
 from src.server.services import computer_reach
@@ -128,6 +128,27 @@ def test_a_limit_refusal_uses_the_platforms_own_message():
     assert _why_not("Studio Mac", error) == 'Computer "Studio Mac" could not start: Computer limit reached.'
 
 
+def test_a_suspended_account_is_told_to_the_agent_not_the_person():
+    """The refusal's own copy tells its reader to ask an admin, which the
+    agent would do nothing useful with."""
+    error = HTTPException(
+        status_code=403,
+        detail={"message": "Ask an admin of your organization.", "type": "account_suspended"},
+    )
+    assert _why_not("Studio Mac", error) == (
+        'Computer "Studio Mac" was not used: this account\'s access through the '
+        "user's organization has ended, so nothing ran there. Tell the user."
+    )
+
+
+def test_an_unchecked_account_is_not_worded_as_a_retry():
+    from src.server.services.platform_client import quota_service_unavailable
+
+    text = _why_not("Studio Mac", quota_service_unavailable())
+    assert text.startswith('Computer "Studio Mac" was not used:')
+    assert "again" not in text.lower()
+
+
 def test_an_ssh_failure_is_worded_for_the_owner():
     error = SSHConnectError("timeout", "The machine did not answer.")
     assert error.for_owner in _why_not("Studio Mac", error)
@@ -193,6 +214,22 @@ async def test_a_computer_in_error_is_refused_without_a_start():
 
 
 @pytest.mark.asyncio
+async def test_a_machine_that_cannot_be_reached_is_refused_without_a_dial():
+    """Home's stand-in reaching for the machine Home lives on, while it is away."""
+    manager = _manager()
+    with (
+        patch("src.server.services.ssh_computers.computer_unreachable", AsyncMock(return_value=True)),
+        pytest.raises(ComputerUnreachable) as e,
+    ):
+        await _reach(manager, "Studio Mac")
+    assert str(e.value) == (
+        'Computer "Studio Mac" can\'t be reached now, so its files and the '
+        "workspaces on it can't be read until it is back."
+    )
+    manager.reach_computer.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_another_computer_is_reached_at_its_root_with_its_folders_as_siblings():
     session = SimpleNamespace(sandbox=None)
     manager = _manager(session)
@@ -228,6 +265,43 @@ async def test_a_failed_wake_becomes_the_agents_sentence():
     with pytest.raises(ComputerUnreachable) as e:
         await _reach(manager, "Studio Mac")
     assert "asleep or offline" in str(e.value)
+
+
+async def _target(manager, wanted, own_session, **kw):
+    from contextlib import ExitStack
+
+    with ExitStack() as stack:
+        for p in _patched(manager, **kw):
+            stack.enter_context(p)
+        return await TurnComputers(USER, HOME_ID, own_session).target(wanted)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("wanted", [None, "", "Cloud computer"])
+async def test_a_copy_reads_the_turns_own_computer_from_homes_folder(wanted):
+    """CopyFile's side on the turn's own computer reads paths as Read and
+    Write there do, from Home's folder, not from the machine's root."""
+    own = SimpleNamespace(sandbox=SimpleNamespace(layout=SimpleNamespace(root="/home/workspace")))
+    home = ProjectContext(workspace_id="home-ws", dir_name="Home")
+    manager = _manager()
+    with project_bound(home):
+        target = await _target(manager, wanted, own)
+    assert target.computer_id == HOME_ID
+    assert target.name == "Cloud computer"
+    assert target.session is own
+    assert target.project is home
+    assert target.root == "/home/workspace"
+    manager.reach_computer.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_a_copy_reaches_another_computer_as_its_tools_do():
+    session = SimpleNamespace(sandbox=None)
+    manager = _manager(session)
+    target = await _target(manager, "Studio Mac", OWN)
+    assert target.computer_id == MAC_ID
+    assert target.session is session
+    assert target.root == "/Users/studio/langalpha"
 
 
 def test_a_user_with_one_computer_gets_no_reach():
@@ -359,7 +433,7 @@ SSH_ROWS = [
 ]
 
 
-def _machine(root, files=None, home=None, *, files_as_command_user=True):
+def _machine(root, files=None, home=None, *, files_as_command_user=True, config_home=""):
     """A computer at ``root`` with the real path rules, holding ``files``."""
     layout = SandboxLayout(root)
     files = files if files is not None else {}
@@ -413,7 +487,10 @@ def _machine(root, files=None, home=None, *, files_as_command_user=True):
     sandbox.adownload_file_bytes_capped = download
     sandbox.aupload_file_bytes = upload
     sandbox.execute_bash_command = execute_bash_command
-    runtime = SimpleNamespace(login_home=AsyncMock(return_value=home)) if home else None
+    runtime = (
+        SimpleNamespace(login_home=AsyncMock(return_value=home), login_config_home=AsyncMock(return_value=config_home))
+        if home else None
+    )
     sandbox.runtime = runtime
     return SimpleNamespace(sandbox=sandbox)
 
@@ -462,7 +539,32 @@ async def test_a_machine_of_the_users_own_is_reached_with_its_login_home():
         ),
     ):
         target = await TurnComputers(USER, HOME_ID, OWN).reach("Studio Mac")
-    assert target.project.machine.home == "/Users/studio"
+    assert target.project.machine == MachinePaths(
+        home="/Users/studio", denied=("/Users/studio/.config/langalpha",)
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("config_home", "denied"),
+    [
+        ("/Users/studio/cfg", "/Users/studio/cfg/langalpha"),
+        ("cfg", "/Users/studio/.config/langalpha"),
+    ],
+)
+async def test_a_machine_that_names_a_config_home_is_reached_with_langalphas_folder_there_denied(config_home, denied):
+    mac = _machine(MAC_ROOT, home="/Users/studio", config_home=config_home)
+    with (
+        patch.object(computer_reach, "get_computer_roster", AsyncMock(return_value=SSH_ROWS)),
+        patch.object(computer_reach, "get_computer", AsyncMock(return_value={"status": "running"})),
+        patch.object(computer_reach, "get_computer_folders", AsyncMock(return_value={})),
+        patch(
+            "src.server.services.workspace_manager.WorkspaceManager.get_instance",
+            return_value=_manager(mac),
+        ),
+    ):
+        target = await TurnComputers(USER, HOME_ID, OWN).reach("Studio Mac")
+    assert target.project.machine == MachinePaths(home="/Users/studio", denied=(denied,))
 
 
 async def _reach_kind(kind):
@@ -712,3 +814,42 @@ async def test_a_name_another_send_is_still_copying_to_is_not_reused():
     )
     assert got.path == "sent/notes-2.txt"
     assert uploaded == {"sent/notes-2.txt": b""}
+
+
+@pytest.mark.asyncio
+async def test_a_remembered_wake_is_refused_once_the_policy_keeps_work_off_own_machines():
+    """A wake remembered for the turn passed the policy as it stood then; a
+    policy set mid-turn kept later calls running on the user's own machine."""
+    from src.server.services.policy import policy_denied
+
+    session = SimpleNamespace(sandbox=None)
+    manager = _manager(session)
+    manager.cached_session_for_computer = lambda row: session
+    turn = TurnComputers(USER, HOME_ID, OWN)
+    ssh_row = {"status": "running", "kind": "ssh", "user_id": USER}
+    refuse = AsyncMock()
+    with (
+        patch.object(computer_reach, "get_computer", AsyncMock(return_value=ssh_row)),
+        patch("src.server.services.account.refuse_machine_use", refuse),
+    ):
+        await _reach_with_row(manager, turn)
+        refuse.side_effect = policy_denied(
+            "own_machines", "Your own machines cannot be used.", "organization", status_code=403
+        )
+        with pytest.raises(ComputerUnreachable) as e:
+            await _reach_with_row(manager, turn)
+    assert "does not allow work on the user's own machines" in str(e.value)
+    manager.reach_computer.assert_awaited_once()
+    refuse.assert_awaited_with("ssh", USER)
+
+
+async def _reach_with_row(manager, turn):
+    with (
+        patch.object(computer_reach, "get_computer_roster", AsyncMock(return_value=ROWS)),
+        patch.object(computer_reach, "get_computer_folders", AsyncMock(return_value={})),
+        patch(
+            "src.server.services.workspace_manager.WorkspaceManager.get_instance",
+            return_value=manager,
+        ),
+    ):
+        return await turn.reach("Studio Mac")

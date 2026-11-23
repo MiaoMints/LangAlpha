@@ -3,11 +3,16 @@ the turn's caption shows of it. Prompt surface, approved on the design page:
 a change here is a change to what the agent is told.
 
 The notice names the log file and never carries the output: the agent reads
-it with Read or tail.
+it with Read or tail. It does carry what the command's outbox came to (the
+read-back of the chart layers it published), which no file holds, after the
+``<system>`` block in a ``<chart-layers>`` block of its own: the read-back quotes
+what sandbox code wrote (layer titles, labels, refused values), which must
+never read as the system speaking.
 """
 
 from __future__ import annotations
 
+import re
 from datetime import datetime
 from typing import TYPE_CHECKING, Any, Mapping, Sequence
 
@@ -60,6 +65,7 @@ def command_report(row: Mapping[str, Any]) -> "CommandReport":
         status=row["status"],
         failure_reason=row.get("failure_reason"),
         tool_call_id=row.get("tool_call_id") or None,
+        chart_layers=row.get("outbox_layers") or None,
     )
 
 
@@ -84,13 +90,17 @@ def command_report_message(
     wakeups: Sequence[Mapping[str, Any]] = (),
     *,
     steered: bool = False,
+    paid_calls: str = "",
 ) -> str:
     """The notice the agent reads when a command ends, as its own turn or as
     a steer into a live one.
 
     "while you were working" only when a live turn takes it in, and never
     for a command the after-turn limit stopped, which ended while no turn
-    ran, or one the user stopped, which the user saw happen."""
+    ran, or one the user stopped, which the user saw happen. ``paid_calls``
+    is the line naming what its paid data calls cost, set apart after the
+    output as a result that returned in time carries it: a handed-off
+    command's result is a placeholder, so this is where the agent learns it."""
     code_run = row.get("tool") == "ExecuteCode"
     noun = "code run" if code_run else "command"
     description = _one_line(str(row.get("description") or ""))
@@ -135,8 +145,17 @@ def command_report_message(
         body = f"FAILED{exited} after {took}{when}. Output: {log}"
 
     lines = ["<system>", f"{head} {body}"]
-    pending = wakeups_line(wakeups)
-    if pending:
+    if paid_calls:
+        lines += ["", paid_calls]
+    if pending := wakeups_line(wakeups):
         lines.append(pending)
     lines.append("</system>")
+    # What its outbox came to (its chart layers' read-back), as an inline
+    # result carries it after the output: the command's own words, so
+    # outside the system's.
+    if published := row.get("outbox_report"):
+        # Sandbox-written text: it cannot close the block it sits in. Named for
+        # what it holds, since the command's output stays in its log.
+        published = re.sub(r"<\s*/\s*chart-layers", r"<\\/chart-layers", published, flags=re.I)
+        lines += [f'<chart-layers command_id="{row["command_id"]}">', published, "</chart-layers>"]
     return "\n".join(lines)

@@ -5,6 +5,7 @@ import { SwapCell } from '@/components/ui/crossfade';
 import { motion } from '@/lib/framer';
 import { SPRING_FOLD } from '@/lib/motion';
 import { formatWorkedFor } from '@/lib/elapsed';
+import { writeRolling } from '@/lib/rollingDigits';
 import { announceAnchoredToggle } from '../../utils/anchoredToggle';
 import { TURN_END_DELAY, isFreshSend, playEntrance } from './transcriptMotion';
 import type { FoldState } from './types';
@@ -41,12 +42,13 @@ const ROW_STYLE: React.CSSProperties = {
   paddingTop: '5px',
   paddingBottom: '5px',
   marginBottom: '0.5rem',
-  borderBottom: '1px solid var(--color-border-muted)',
-  fontSize: '0.8125rem',
+  // Terminal's label size (its case and tracking, and the card's divider
+  // under it, are the row's classes).
+  fontSize: 'var(--cs-text-label, 0.8125rem)',
   color: 'var(--Labels-Tertiary)',
 };
 
-const CONTROL_STYLE: React.CSSProperties = { color: 'inherit', font: 'inherit' };
+const CONTROL_STYLE: React.CSSProperties = { color: 'inherit', font: 'inherit', textTransform: 'inherit' };
 
 /**
  * The header that stands in for a turn's process: a running clock while the
@@ -67,7 +69,7 @@ export const TurnFold = memo(function TurnFold({ state, startedAt, completedAt, 
     : t('chat.workedFor', { duration: formatWorkedFor(completedAt - startedAt, t) });
 
   return (
-    <div ref={rowRef} style={ROW_STYLE} data-turn-fold={state}>
+    <div ref={rowRef} className="rule-b [text-transform:var(--term-case)] tracking-[calc(0.08em*var(--term-track))]" style={ROW_STYLE} data-turn-fold={state}>
       <SwapCell
         swapKey={state === 'live' ? 'live' : 'settled'}
         layerClassName="inline-flex"
@@ -107,16 +109,16 @@ export const TurnFold = memo(function TurnFold({ state, startedAt, completedAt, 
  * clock through React state would add a commit per second to that, for one
  * word that no other part of the tree reads. The first write is a layout
  * effect, so the first painted frame already carries the text while render
- * stays free of the clock.
+ * stays free of the clock. Each tick rolls the digits that changed.
  */
-function WorkingLabel({ startedAt }: { startedAt: number }): React.ReactElement {
+export function WorkingLabel({ startedAt }: { startedAt: number }): React.ReactElement {
   const { t } = useTranslation();
   const ref = useRef<HTMLSpanElement>(null);
 
   useLayoutEffect(() => {
     const write = () => {
       const el = ref.current;
-      if (el) el.textContent = t('chat.workingFor', { duration: formatWorkedFor(Date.now() - startedAt, t) });
+      if (el) writeRolling(el, t('chat.workingFor', { duration: formatWorkedFor(Date.now() - startedAt, t) }));
     };
     write();
     const id = setInterval(write, 1000);

@@ -14,6 +14,7 @@ from unittest.mock import AsyncMock, patch
 import pytest
 
 from src.server.services.report_back import steer_executor
+from src.server.services.report_back.notify_turn import TURN_ROOM_WAIT_S
 
 _OUTBOX = "src.server.database.runs.outbox"
 _RUNS = "src.server.database.runs.lifecycle"
@@ -56,12 +57,15 @@ def _payload(**over) -> dict:
     }
 
 
-async def _execute(payload: dict, *, latest_status: str = "completed", post=None):
+async def _execute(
+    payload: dict, *, latest_status: str = "completed", post=None, away: bool = False
+):
     mocks = {
         "finish": AsyncMock(return_value=True),
         "defer": AsyncMock(return_value="pending"),
         "post": post or AsyncMock(return_value=("dispatched", "run-new")),
         "park": AsyncMock(return_value=False),
+        "away": AsyncMock(return_value=away),
     }
     with ExitStack() as stack:
         enter = stack.enter_context
@@ -77,6 +81,7 @@ async def _execute(payload: dict, *, latest_status: str = "completed", post=None
         )
         enter(patch(f"{_RUNS}.get_run", AsyncMock(return_value={"id": "run-new"})))
         enter(patch(f"{_NOTIFY}.park_while_thread_busy", mocks["park"]))
+        enter(patch(f"{_NOTIFY}.park_while_computer_away", mocks["away"]))
         enter(patch(f"{_NOTIFY}.post_notification_turn", mocks["post"]))
         await steer_executor.execute_steer(_job())
     return mocks
@@ -159,6 +164,21 @@ async def test_a_busy_cap_at_the_ceiling_settles_through_the_defer():
 
 
 @pytest.mark.asyncio
+async def test_no_room_for_another_claude_code_turn_asks_again_by_the_clock():
+    """Room opens as turns on other threads end: reparked, the safety net
+    would hand it straight back and spend its attempts."""
+    room = AsyncMock(return_value=True)
+    post = AsyncMock(return_value=("full", None))
+    with patch(f"{_OUTBOX}.wait_for_room", room):
+        mocks = await _execute(_payload(), post=post)
+
+    assert post.await_args.kwargs["room_fails_fast"]
+    room.assert_awaited_once_with(JOB_ID, attempts=1, wait_s=TURN_ROOM_WAIT_S)
+    mocks["defer"].assert_not_awaited()
+    mocks["finish"].assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_the_exhaust_followup_hands_a_task_steer_to_its_refresh():
     job = {"hook_outbox_id": JOB_ID, "payload": {"target": "task", "task_run_id": "tr-1"}}
     refresh = AsyncMock()
@@ -168,3 +188,36 @@ async def test_the_exhaust_followup_hands_a_task_steer_to_its_refresh():
         await steer_executor._on_exhausted(job)
 
     refresh.assert_awaited_once_with(job)
+
+
+@pytest.mark.asyncio
+async def test_another_agents_steer_waits_for_an_asleep_machine():
+    """Its turn is nobody's to watch, so it parks for the user's machine
+    rather than fail at its connect."""
+    payload = _payload(sender="chief_of_staff", origin={"id": "home-1"})
+    mocks = await _execute(payload, away=True)
+
+    mocks["post"].assert_not_awaited()
+    mocks["finish"].assert_not_awaited()
+    assert mocks["away"].await_args.kwargs["workspace_id"] == "ws-1"
+
+
+@pytest.mark.asyncio
+async def test_the_users_own_steer_is_posted_for_them_to_see():
+    mocks = await _execute(_payload(), away=True)
+
+    mocks["away"].assert_not_awaited()
+    mocks["post"].assert_awaited_once()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("named", ["deepseek-flash", None])
+async def test_a_hand_off_no_turn_read_starts_its_turn_on_the_model_it_named(named):
+    """The thread's model may have changed since the hand-off was admitted
+    into a turn on its model; an unnamed one runs the thread's own."""
+    extra = {"llm_model": named} if named else {}
+    payload = _payload(sender="chief_of_staff", origin={"id": "home-1"}, **extra)
+    mocks = await _execute(payload)
+
+    body = mocks["post"].await_args.kwargs["body"]
+    assert body.get("llm_model") == named

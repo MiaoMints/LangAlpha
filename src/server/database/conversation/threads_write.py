@@ -1,7 +1,7 @@
 """Write paths for conversation_threads: creation, status/metadata updates, deletion."""
 
 import logging
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Optional, List, Dict, Any
 
 import psycopg
@@ -15,7 +15,9 @@ from src.server.contracts.status import (
 from src.server.database import pool
 from src.server.database.conversation import _sql, errors
 from src.server.database.share_codes import mint_share_code
+from src.server.database.sql_fences import advisory_key
 from src.server.utils.pg_sanitize import normalize_uuid
+from src.server.utils.thread_stamp import stamped_title
 
 logger = logging.getLogger(__name__)
 
@@ -41,47 +43,32 @@ async def forget_workspace_exists(workspace_id: str) -> None:
     await get_cache_client().delete(ws_exists_key(workspace_id))
 
 
-async def calculate_next_thread_index(workspace_id: str, conn=None) -> int:
+def next_thread_index_sql(workspace_id_sql: str) -> str:
+    """The workspace's next thread_index: one past its highest, so a deleted
+    thread's number is never handed out again while a later one exists. Read
+    it only under ``lock_thread_index``."""
+    return (
+        "(SELECT COALESCE(MAX(thread_index), -1) + 1 FROM conversation_threads"
+        f" WHERE workspace_id = {workspace_id_sql})"
+    )
+
+
+async def lock_thread_index(cur, workspace_id: str) -> None:
+    """Hold the workspace's thread numbering until the transaction ends.
+
+    thread_index is unique per workspace and read as ``MAX + 1``
+    (``next_thread_index_sql``), so threads started at once read the same
+    number unless each reads it under this lock, in a statement after the
+    lock is taken: a statement's snapshot is taken when it starts, so one that
+    waited for the lock inside it would still miss the thread the holder
+    inserted.
     """
-    Calculate the next thread_index for a workspace (0-based).
-
-    Uses MAX(thread_index) + 1 instead of COUNT(*) to correctly handle
-    gaps from deleted threads and avoid unique constraint violations.
-
-    Args:
-        workspace_id: Workspace ID
-        conn: Optional database connection to reuse
-    """
-    try:
-        if conn:
-            async with conn.cursor(row_factory=dict_row) as cur:
-                await cur.execute(
-                    """
-                    SELECT COALESCE(MAX(thread_index), -1) + 1 as next_index
-                    FROM conversation_threads
-                    WHERE workspace_id = %s
-                """,
-                    (workspace_id,),
-                )
-                result = await cur.fetchone()
-                return result["next_index"]
-        else:
-            async with pool.get_db_connection() as conn:
-                async with conn.cursor(row_factory=dict_row) as cur:
-                    await cur.execute(
-                        """
-                        SELECT COALESCE(MAX(thread_index), -1) + 1 as next_index
-                        FROM conversation_threads
-                        WHERE workspace_id = %s
-                    """,
-                        (workspace_id,),
-                    )
-                    result = await cur.fetchone()
-                    return result["next_index"]
-
-    except Exception as e:
-        logger.error(f"Error calculating thread index: {e}")
-        return 0
+    # Keyed on the id as Postgres compares it, so two spellings of one
+    # workspace share the lock.
+    key = normalize_uuid(workspace_id) or str(workspace_id)
+    await cur.execute(
+        "SELECT pg_advisory_xact_lock(%s)", (advisory_key("THREAD_INDEX", key),)
+    )
 
 
 async def create_thread(
@@ -89,7 +76,6 @@ async def create_thread(
     workspace_id: str,
     current_status: str,
     msg_type: str = "ptc",
-    thread_index: Optional[int] = None,
     title: Optional[str] = None,
     external_id: Optional[str] = None,
     platform: Optional[str] = None,
@@ -97,10 +83,13 @@ async def create_thread(
     subagents_allowed: Optional[bool] = None,
     reasoning_effort: Optional[str] = None,
     fast_mode: Optional[bool] = None,
+    created_by: Optional[str] = None,
+    shared_with_workspace: bool = False,
     conn=None,
 ) -> Dict[str, Any]:
     """
-    Create a thread entry (thread_index auto-calculated if not provided).
+    Create a thread entry, numbered next in its workspace
+    (``lock_thread_index``).
 
     `msg_type` names the agent the thread runs on: 'ptc', the full agent, for
     every new thread.
@@ -137,31 +126,46 @@ async def create_thread(
         "title",
         "subagents_allowed",
     ]
-    base_params = [conversation_thread_id, workspace_id, current_status, msg_type]
-    # thread_index is appended per-attempt (may be recalculated on retry)
-
-    extra_params: List[Any] = []
+    params: List[Any] = [
+        conversation_thread_id,
+        workspace_id,
+        current_status,
+        msg_type,
+        workspace_id,
+        title,
+        subagents_allowed,
+        workspace_id,
+    ]
+    # Columns whose value is an expression, with the params it binds above.
+    expressions = {
+        "thread_index": next_thread_index_sql("%s"),
+        "subagents_allowed": _sql.stored_subagents_allowed("%s", "%s"),
+    }
     if platform:
         columns.append("platform")
-        extra_params.append(platform)
+        params.append(platform)
     if external_id:
         columns.append("external_id")
-        extra_params.append(external_id)
+        params.append(external_id)
     if metadata:
         columns.append("metadata")
-        extra_params.append(Json(metadata))
+        params.append(Json(metadata))
     if reasoning_effort is not None:
         columns.append("reasoning_effort")
-        extra_params.append(reasoning_effort)
+        params.append(reasoning_effort)
     if fast_mode is not None:
         columns.append("fast_mode")
-        extra_params.append(fast_mode)
+        params.append(fast_mode)
+    if created_by is not None:
+        # Only in a shared workspace: who started the thread.
+        columns.append("created_by")
+        params.append(created_by)
+        if shared_with_workspace:
+            columns.extend(("workspace_shared_at", "workspace_shared_by"))
+            params.extend((datetime.now(timezone.utc), created_by))
 
     col_str = ", ".join(columns)
-    placeholders = ", ".join(
-        _sql.stored_subagents_allowed("%s", "%s") if c == "subagents_allowed" else "%s"
-        for c in columns
-    )
+    placeholders = ", ".join(expressions.get(c, "%s") for c in columns)
     returning_str = f"{col_str}, created_at, updated_at"
 
     sql = f"""
@@ -170,63 +174,30 @@ async def create_thread(
         RETURNING {returning_str}
     """
 
-    max_retries = 3
-    for attempt in range(max_retries):
-        # Calculate thread_index if not provided, or recalculate on retry
-        if thread_index is None or attempt > 0:
-            thread_index = await calculate_next_thread_index(workspace_id, conn=conn)
-
-        params = tuple(
-            base_params
-            + [thread_index, title, subagents_allowed, workspace_id]
-            + extra_params
-        )
-
-        try:
-            if conn:
-                async with conn.cursor(row_factory=dict_row) as cur:
-                    await cur.execute(sql, params)
-                    result = await cur.fetchone()
-                    logger.info(
-                        f"[conversation_db] create_thread thread_id={conversation_thread_id} thread_index={thread_index} workspace_id={workspace_id}"
-                    )
-                    return dict(result)
-            else:
-                async with pool.get_db_connection() as conn_new:
-                    async with conn_new.cursor(row_factory=dict_row) as cur:
-                        await cur.execute(sql, params)
-                        result = await cur.fetchone()
-                        return dict(result)
-
-        except psycopg.errors.UniqueViolation as e:
-            # A collision on the external-id dedup index can't be fixed by
-            # retrying — (platform, external_id) is fixed for this insert, so a
-            # concurrent create won the race. Surface a typed conflict (routes map
-            # it to a 409 / an in-stream ``external_id_conflict`` SSE error) that
-            # channel clients recover from by regenerating under a fresh external
-            # key. Only the per-workspace thread_index constraint is the retryable
-            # race handled below (recalc thread_index + reinsert).
-            if (
-                errors._unique_violation_constraint(e) == errors._EXTERNAL_ID_INDEX
-                and platform
-                and external_id
-            ):
-                raise errors.ExternalIdConflictError(
-                    platform=platform, external_id=external_id
-                )
-            if attempt == max_retries - 1:
-                logger.error(
-                    f"thread_index conflict after {max_retries} attempts for workspace {workspace_id}"
-                )
+    async with pool.get_db_connection(conn) as owned, owned.transaction():
+        async with owned.cursor(row_factory=dict_row) as cur:
+            await lock_thread_index(cur, workspace_id)
+            try:
+                await cur.execute(sql, params)
+            except psycopg.errors.UniqueViolation as e:
+                # The (platform, external_id) dedup index: a concurrent create
+                # won the race, and no retry can change that. A typed conflict
+                # (a 409, or an in-stream ``external_id_conflict``) lets the
+                # channel client regenerate under a fresh external key.
+                if (
+                    errors._unique_violation_constraint(e) == errors._EXTERNAL_ID_INDEX
+                    and platform
+                    and external_id
+                ):
+                    raise errors.ExternalIdConflictError(
+                        platform=platform, external_id=external_id
+                    ) from e
                 raise
-            logger.warning(
-                f"thread_index conflict (attempt {attempt + 1}/{max_retries}), retrying for workspace {workspace_id}"
-            )
-            continue
-
-        except Exception as e:
-            logger.error(f"Error creating thread: {e}")
-            raise
+            result = await cur.fetchone()
+    logger.info(
+        f"[conversation_db] create_thread thread_id={conversation_thread_id} thread_index={result['thread_index']} workspace_id={workspace_id}"
+    )
+    return dict(result)
 
 
 async def update_thread_external_id(
@@ -381,6 +352,7 @@ async def ensure_thread_exists(
     platform: Optional[str] = None,
     metadata: Optional[Dict[str, Any]] = None,
     subagents_allowed: Optional[bool] = None,
+    resume: bool = True,
 ) -> bool:
     """
     Ensure conversation_threads row exists before workflow starts.
@@ -401,6 +373,9 @@ async def ensure_thread_exists(
             resume never rewrites it.
         subagents_allowed: Applied only when this call creates the row;
             None, or the side the owner's default is on, follows the default.
+        resume: Whether an existing row takes ``initial_status``. False for a
+            send that makes the thread ahead of its admission, which may yet
+            be refused and must leave a thread it found as it was.
 
     Returns:
         True if this call created the thread row, False if it already existed.
@@ -427,12 +402,11 @@ async def ensure_thread_exists(
     # Fast path: both cached and thread exists → just update status, no pool checkout
     # needed for existence checks
     if ws_cached and thread_cached:
-        await update_thread_status(
-            conversation_thread_id, initial_status
-        )
-        logger.debug(
-            f"Resumed thread {conversation_thread_id}, updated status to {initial_status}"
-        )
+        if resume:
+            await update_thread_status(conversation_thread_id, initial_status)
+            logger.debug(
+                f"Resumed thread {conversation_thread_id}, updated status to {initial_status}"
+            )
         return False
 
     # Slow path: at least one cache miss — need a connection.
@@ -477,13 +451,11 @@ async def ensure_thread_exists(
         # Step 3: Create thread if it doesn't exist
         created = False
         if not thread_exists:
-            # Use initial query as thread title (truncate to 255 chars)
-            title = initial_query[:255] if initial_query else None
+            title = stamped_title(initial_query) if initial_query else None
             await create_thread(
                 conversation_thread_id=conversation_thread_id,
                 workspace_id=workspace_id,
                 current_status=initial_status,
-                thread_index=None,  # Will be calculated inside create_thread using same conn
                 title=title,
                 external_id=external_id,
                 platform=platform,
@@ -496,15 +468,16 @@ async def ensure_thread_exists(
             created = True
         else:
             # Thread exists (resume scenario), update status
-            await update_thread_status(
-                conversation_thread_id, initial_status, conn=conn
-            )
+            if resume:
+                await update_thread_status(
+                    conversation_thread_id, initial_status, conn=conn
+                )
+                logger.debug(
+                    f"Resumed thread {conversation_thread_id}, updated status to {initial_status}"
+                )
             # Cache thread existence on resume too (in case cache was cold)
             if not thread_cached:
                 stamp_exists.append(thread_key)
-            logger.debug(
-                f"Resumed thread {conversation_thread_id}, updated status to {initial_status}"
-            )
 
     if stamp_exists and cache.enabled and cache.client:
         for key in stamp_exists:
@@ -608,6 +581,67 @@ async def delete_thread(conversation_thread_id: str, conn=None) -> bool:
     except Exception as e:
         logger.error(f"Error deleting thread: {e}")
         raise
+
+
+async def delete_unused_thread(conversation_thread_id: str, *, request_key: str) -> bool:
+    """Delete a thread no turn ever started in: the one a refused send made
+    before admission. Whether it was deleted.
+
+    The row lock comes first and the checks after it, in statements of their
+    own: a START that wrote its turn rows has committed by then, and one
+    still to come waits on the lock and then fails on the missing thread,
+    rather than having its rows cascade away under it. A copy of the send
+    under ``request_key`` that another worker admitted keeps the thread too,
+    run or steer, since that copy carries what the refused one claimed.
+    """
+    from src.server.database.runs.lifecycle import request_key_has_run
+    from src.server.database.runs.outbox import steer_key_taken
+
+    async with pool.get_db_connection() as conn:
+        async with conn.transaction():
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    """
+                    SELECT 1 FROM conversation_threads
+                     WHERE conversation_thread_id = %s
+                       FOR UPDATE
+                    """,
+                    (conversation_thread_id,),
+                )
+                if await cur.fetchone() is None:
+                    return False
+                if await request_key_has_run(conn, request_key) or (
+                    await steer_key_taken(conn, request_key)
+                ):
+                    return False
+                await cur.execute(
+                    """
+                    DELETE FROM conversation_threads t
+                     WHERE t.conversation_thread_id = %s
+                       AND NOT EXISTS (
+                           SELECT 1 FROM conversation_queries q
+                            WHERE q.conversation_thread_id = t.conversation_thread_id
+                       )
+                       AND NOT EXISTS (
+                           SELECT 1 FROM conversation_responses r
+                            WHERE r.conversation_thread_id = t.conversation_thread_id
+                       )
+                    """,
+                    (conversation_thread_id,),
+                )
+                deleted = cur.rowcount > 0
+    # After the commit, as a retry of the send under this thread id would
+    # otherwise skip making the row it needs.
+    if deleted:
+        from src.utils.cache.redis_cache import get_cache_client
+
+        cache = get_cache_client()
+        if cache.enabled and cache.client:
+            try:
+                await cache.client.delete(thread_exists_key(conversation_thread_id))
+            except Exception:
+                logger.debug("Evicting a removed thread's existence failed", exc_info=True)
+    return deleted
 
 
 _UNSET = object()

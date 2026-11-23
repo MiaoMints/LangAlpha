@@ -53,7 +53,7 @@ from src.server.app.workspace_files.crud import (
 )
 from src.server.app.workspace_files.crud import DeleteFilesRequest, WriteFileRequest
 from src.server.app.workspace_files.file_refs import ResolveFileRefRequest
-from src.server.app.workspace_files.serve import serve_workspace_file
+from src.server.app.workspace_files.serve import _owner_visible, serve_workspace_file
 from src.server.database.workspace_folders import moving_path
 
 WS_A = "ws-folder-a"
@@ -66,9 +66,9 @@ B_SECRET = b"sibling-workspace-bytes"
 A_REPORT = b"<html><body>a report</body></html>"
 
 _SERVE_DBWS = "src.server.app.workspace_files.serve.db_get_workspace"
-_SERVE_FP = "src.server.app.workspace_files.serve.FilePersistenceService"
+_SERVE_FP = "src.server.services.warm_files.FilePersistenceService"
 _SERVE_WD = "src.server.app.workspace_files.serve.work_dir_for"
-_SERVE_WSMGR = "src.server.app.workspace_files.serve.WorkspaceManager"
+_SERVE_WSMGR = "src.server.services.warm_files.WorkspaceManager"
 _SERVE_VAULT = "src.server.app.workspace_files.serve.get_vault_secrets_for_redaction"
 
 _SHARE_WD = "src.server.app.share_access.work_dir_for"
@@ -77,9 +77,10 @@ _SHARE_DBWS = "src.server.app.share_access.db_get_workspace"
 _SHARE_VAULT = "src.server.app.share_files.get_vault_secrets_for_redaction"
 
 _CRUD_DBWS = "src.server.app.workspace_files.crud.db_get_workspace"
-_CRUD_OWNER = "src.server.app.workspace_files.crud.require_workspace_owner"
+_CRUD_OWNER = "src.server.app.workspace_files.crud.workspace_access"
 _CRUD_ACQUIRE_TO_CHANGE = "src.server.app.workspace_files.crud.acquire_sandbox_to_change"
-_CRUD_WD = "src.server.app.workspace_files.crud.owner_work_dir"
+_CRUD_WD = "src.server.app.workspace_files._shared.owner_work_dir"
+_CRUD_KEEP_PASS = "src.server.app.workspace_files.crud.keep_updated_after_change"
 _CRUD_VAULT = "src.server.app.workspace_files.crud.get_vault_secrets_for_redaction"
 _CRUD_LINK = "src.server.app.workspace_files.crud.live_download_link"
 _CRUD_SCAN = "src.server.app.workspace_files.crud.FilePersistenceService.list_sandbox_files"
@@ -187,6 +188,9 @@ class _ComputerSandbox:
             return False
         return True
 
+    async def awrite_file_text_guarded(self, filepath: str, content: str, _guard) -> str | None:
+        return "" if await self.awrite_file_text(filepath, content) else None
+
     async def aupload_file_bytes(self, filepath: str, content: bytes, **_: object) -> bool:
         self.writes.append(filepath)
         try:
@@ -273,6 +277,7 @@ def _shared_thread(perms: dict | None = None) -> dict:
         "conversation_thread_id": "thread-folder-1",
         "workspace_id": WS_A,
         "share_permissions": perms or {"allow_files": True, "allow_download": True},
+        "owner_id": "owner-1",
     }
 
 
@@ -479,7 +484,7 @@ async def test_read_denies_every_reach_for_the_sibling(computer, requested) -> N
     with (
         patch(_CRUD_DBWS, AsyncMock(return_value=_workspace())),
         patch(_FILES_DBWS, AsyncMock(return_value=_workspace())),
-        patch(_CRUD_OWNER, MagicMock()),
+        patch(_CRUD_OWNER, AsyncMock()),
         patch(_CRUD_WD, return_value=computer.work_dir),
         patch(_CRUD_ACQUIRE_TO_CHANGE, _acquired(computer.sandbox, _workspace())),
         patch(_CRUD_VAULT, AsyncMock(return_value=[])),
@@ -498,7 +503,7 @@ async def test_download_denies_every_reach_for_the_sibling(computer, requested) 
     with (
         patch(_CRUD_DBWS, AsyncMock(return_value=_workspace())),
         patch(_FILES_DBWS, AsyncMock(return_value=_workspace())),
-        patch(_CRUD_OWNER, MagicMock()),
+        patch(_CRUD_OWNER, AsyncMock()),
         patch(_CRUD_WD, return_value=computer.work_dir),
         patch(_CRUD_ACQUIRE_TO_CHANGE, _acquired(computer.sandbox, _workspace())),
         patch(_CRUD_VAULT, AsyncMock(return_value=[])),
@@ -515,7 +520,7 @@ async def test_listing_never_leaves_the_workspace_folder(computer, requested) ->
     with (
         patch(_CRUD_DBWS, AsyncMock(return_value=_workspace())),
         patch(_FILES_DBWS, AsyncMock(return_value=_workspace())),
-        patch(_CRUD_OWNER, MagicMock()),
+        patch(_CRUD_OWNER, AsyncMock()),
         patch(_CRUD_WD, return_value=computer.work_dir),
         patch(_CRUD_ACQUIRE_TO_CHANGE, _acquired(computer.sandbox, _workspace())),
     ):
@@ -538,7 +543,7 @@ async def test_write_never_lands_outside_the_workspace_folder(
     with (
         patch(_CRUD_DBWS, AsyncMock(return_value=_workspace())),
         patch(_FILES_DBWS, AsyncMock(return_value=_workspace())),
-        patch(_CRUD_OWNER, MagicMock()),
+        patch(_CRUD_OWNER, AsyncMock()),
         patch(_CRUD_WD, return_value=computer.work_dir),
         patch(_CRUD_ACQUIRE_TO_CHANGE, _acquired(computer.sandbox, _workspace())),
     ):
@@ -557,7 +562,7 @@ async def test_write_to_the_shared_scratch_folds_into_the_workspace(computer) ->
     with (
         patch(_CRUD_DBWS, AsyncMock(return_value=_workspace())),
         patch(_FILES_DBWS, AsyncMock(return_value=_workspace())),
-        patch(_CRUD_OWNER, MagicMock()),
+        patch(_CRUD_OWNER, AsyncMock()),
         patch(_CRUD_WD, return_value=computer.work_dir),
         patch(_CRUD_ACQUIRE_TO_CHANGE, _acquired(computer.sandbox, _workspace())),
     ):
@@ -578,7 +583,7 @@ async def test_delete_never_names_a_path_outside_the_workspace_folder(
     with (
         patch(_CRUD_DBWS, AsyncMock(return_value=_workspace())),
         patch(_FILES_DBWS, AsyncMock(return_value=_workspace())),
-        patch(_CRUD_OWNER, MagicMock()),
+        patch(_CRUD_OWNER, AsyncMock()),
         patch(_CRUD_WD, return_value=computer.work_dir),
         patch(_CRUD_ACQUIRE_TO_CHANGE, _acquired(computer.sandbox, _workspace())),
     ):
@@ -600,7 +605,7 @@ async def test_delete_unlinks_a_symlink_instead_of_its_target(computer) -> None:
     with (
         patch(_CRUD_DBWS, AsyncMock(return_value=_workspace())),
         patch(_FILES_DBWS, AsyncMock(return_value=_workspace())),
-        patch(_CRUD_OWNER, MagicMock()),
+        patch(_CRUD_OWNER, AsyncMock()),
         patch(_CRUD_WD, return_value=computer.work_dir),
         patch(_CRUD_ACQUIRE_TO_CHANGE, _acquired(computer.sandbox, _workspace())),
     ):
@@ -631,7 +636,7 @@ async def test_listing_after_a_rename_reads_the_folder_the_acquisition_settled(
     with (
         patch(_CRUD_DBWS, AsyncMock(return_value=before)),
         patch(_FILES_DBWS, AsyncMock(return_value=before)),
-        patch(_CRUD_OWNER, MagicMock()),
+        patch(_CRUD_OWNER, AsyncMock()),
         patch(_CRUD_ACQUIRE_TO_CHANGE, _acquired(computer.sandbox, after)),
     ):
         result = await list_workspace_files(
@@ -642,6 +647,23 @@ async def test_listing_after_a_rename_reads_the_folder_the_acquisition_settled(
 
 
 @pytest.mark.asyncio
+async def test_a_saved_file_asks_for_one_keep_updated_pass(computer) -> None:
+    """A page kept for the Dashboard follows an edit made outside a turn."""
+    with (
+        patch(_CRUD_DBWS, AsyncMock(return_value=_workspace())),
+        patch(_FILES_DBWS, AsyncMock(return_value=_workspace())),
+        patch(_CRUD_OWNER, AsyncMock()),
+        patch(_CRUD_WD, return_value=computer.work_dir),
+        patch(_CRUD_ACQUIRE_TO_CHANGE, _acquired(computer.sandbox, _workspace())),
+        patch(_CRUD_KEEP_PASS) as keep_pass,
+    ):
+        await write_workspace_file(
+            WS_A, OWNER, path="work/report.html", body=WriteFileRequest(content="x")
+        )
+    keep_pass.assert_called_once_with(workspace_id=WS_A, user_id=OWNER)
+
+
+@pytest.mark.asyncio
 async def test_write_after_a_rename_does_not_recreate_the_former_folder(
     computer,
 ) -> None:
@@ -649,7 +671,7 @@ async def test_write_after_a_rename_does_not_recreate_the_former_folder(
     with (
         patch(_CRUD_DBWS, AsyncMock(return_value=before)),
         patch(_FILES_DBWS, AsyncMock(return_value=before)),
-        patch(_CRUD_OWNER, MagicMock()),
+        patch(_CRUD_OWNER, AsyncMock()),
         patch(_CRUD_ACQUIRE_TO_CHANGE, _acquired(computer.sandbox, after)),
     ):
         result = await write_workspace_file(
@@ -677,7 +699,7 @@ async def test_the_workspace_serves_its_own_files(computer) -> None:
         _warm(mgr, computer.sandbox)
         fp.get_file_content = AsyncMock(return_value=None)
         response = await serve_workspace_file(
-            WS_A, "work/report.html", inject_theme=False
+            WS_A, "work/report.html", visible=_owner_visible
         )
     assert response.status_code == 200
     assert response.body == A_REPORT

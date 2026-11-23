@@ -5,10 +5,11 @@ The intermediate ``HistoryEvent`` model is modeled on the v3 stream channels
 is never exposed on the wire, so upstream protocol changes land in a future
 adapter instead of rippling through replay.
 
-Artifact derivation mirrors the live emitters: ``file_operation``/``todo_update``
-payloads are rebuilt from tool-call args (the same source the middleware reads),
-``html_widget``/``preview_url``/``chart_annotation`` from the checkpointed
-ToolMessage artifact, and ``task`` from ``additional_kwargs.task_artifact``.
+Artifact derivation mirrors the live emitters: ``file_operation`` payloads are
+rebuilt from tool-call args, ``html_widget``/``preview_url``/``plan_update`` from
+the checkpointed ToolMessage artifact, and ``task`` from
+``additional_kwargs.task_artifact``. A legacy ``TodoWrite`` call is replayed as
+the ``plan_update`` its list would have drawn.
 Non-derivable payloads (image URL rewrites, widget ``data``) are merged by the
 replay endpoint from persisted sources, not synthesized here.
 """
@@ -18,23 +19,31 @@ from __future__ import annotations
 import uuid
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, Literal
+from typing import TYPE_CHECKING, Any, Literal, NamedTuple
 
 from langchain_core.messages import AIMessage, AnyMessage, HumanMessage, ToolMessage
 
 from ptc_agent.agent.middleware.background_subagent.workflow.emitter import (
     WORKFLOW_FRAME_FIELDS,
 )
+from ptc_agent.agent.middleware.compaction.brief import HANDOFF_UI_NAME
 from ptc_agent.agent.middleware.compaction.utils import (
     compaction_summary,
-    context_threshold,
     parse_summary_message,
 )
+from ptc_agent.agent.middleware.compaction.usage_event import token_usage_fields
+from ptc_agent.agent.middleware.plan_close_out import is_close_out_reply
 from ptc_agent.agent.middleware.tool.argument_parsing import parse_tool_args
 from ptc_agent.agent.tools.computer_reach import ran_elsewhere
+from ptc_agent.agent.tools.plan import (
+    PLAN_ARTIFACT_TYPE,
+    PlanStepDict,
+    plan_payload,
+    settled,
+)
 from ptc_agent.agent.transcript.classify import STEERING_MARKERS, human_kind
+from src.llms.claude_code import PLAN_NOTICE_KEY, QUEUE_EVENT_TYPE
 from src.llms.content_utils import extract_content_with_type
-from src.llms.token_counter import extract_token_usage
 from src.server.utils.content_normalizer import normalize_text_content
 from src.server.utils.error_sanitization import (
     sanitize_error_text as _sanitize_error_text,
@@ -56,14 +65,22 @@ HistoryEventKind = Literal[
     "steering-delivered",
     "context-window",
     "user-message",
+    "claude-code-plan",
 ]
 
 _FILE_OPERATION_TOOLS = {"Write", "Edit"}
+
+
+class _FromResult(NamedTuple):
+    artifact_type: str
+    carries_status: bool
+
+
 _ARTIFACT_FROM_TOOL_MESSAGE = {
-    "ShowWidget": "html_widget",
-    "GetPreviewUrl": "preview_url",
-    "draw_chart_annotation": "chart_annotation",
-    "manage_chart_annotations": "chart_annotation",
+    "ShowWidget": _FromResult("html_widget", True),
+    "GetPreviewUrl": _FromResult("preview_url", False),
+    # The resolved plan: an ``advance`` names no steps, so only the result has the list.
+    "UpdatePlan": _FromResult(PLAN_ARTIFACT_TYPE, True),
 }
 
 
@@ -92,9 +109,11 @@ def messages_to_history_events(
     for message in messages:
         if isinstance(message, HumanMessage):
             events.extend(_project_human_message(message, agent))
+            events.extend(_stamped_summary(message, agent))
             continue
         if isinstance(message, ToolMessage):
             events.extend(_project_tool_message(message, tool_call_index, agent))
+            events.extend(_stamped_summary(message, agent))
             continue
         if isinstance(message, AIMessage):
             events.extend(_project_ai_message(message, tool_call_index, agent))
@@ -218,6 +237,13 @@ def history_events_to_sse(
                     {"thread_id": thread_id, "agent": event.agent, **event.data},
                 )
             )
+        elif event.kind == "claude-code-plan":
+            items.append(
+                _sse(
+                    "claude_code_plan",
+                    {"thread_id": thread_id, "agent": event.agent, **event.data},
+                )
+            )
     return items
 
 
@@ -290,17 +316,12 @@ def _project_ai_message(
     message_id = message.id or "unknown"
     # A compaction before this call: live, its signal fires before the call
     # streams, so the notice sits between the calls it fell between.
-    summary = compaction_summary(message)
-    if summary is not None:
-        events.append(
-            HistoryEvent(
-                "context-window",
-                agent,
-                summary["summary_message_id"],
-                _stamped_summarize_payload(summary),
-            )
-        )
+    events.extend(_stamped_summary(message, agent))
     text, reasoning, phase = split_content_blocks(message.content)
+    if is_close_out_reply(message):
+        # Live the plan's close-out is never streamed, and its reasoning is
+        # kept only for the provider: its plan calls alone are shown.
+        text = reasoning = None
     tool_calls = _filter_tool_calls(message.tool_calls or [])
 
     if reasoning:
@@ -331,24 +352,33 @@ def _project_ai_message(
             HistoryEvent("tool-call", agent, message_id, {"tool_calls": tool_calls})
         )
 
-    # Mirror the live token_usage emitter (compaction middleware): same
-    # extractor, same >0 gate, same total — parity by construction.
-    usage = extract_token_usage(message)
-    input_tokens = usage.get("input_tokens", 0)
-    if input_tokens > 0:
-        output_tokens = usage.get("output_tokens", 0)
-        usage_data: dict[str, Any] = {
-            "action": "token_usage",
-            "signal": "complete",
-            "input_tokens": input_tokens,
-            "output_tokens": output_tokens,
-            "total_tokens": input_tokens + output_tokens,
-        }
-        threshold = context_threshold(message)
-        if threshold is not None:
-            usage_data["threshold"] = threshold
+    # The live token_usage emitter (compaction middleware) builds its event
+    # from the same fields, so the two cannot part.
+    usage = token_usage_fields(message)
+    if usage is not None:
+        usage_data = {"action": "token_usage", "signal": "complete", **usage}
         events.append(HistoryEvent("context-window", agent, message_id, usage_data))
+    # A reply the Claude plan ran out during: its notice, after it, as live.
+    notice = (message.response_metadata or {}).get(PLAN_NOTICE_KEY)
+    if isinstance(notice, dict):
+        events.append(HistoryEvent("claude-code-plan", agent, message_id, dict(notice)))
     return events
+
+
+def _stamped_summary(message: AnyMessage, agent: str) -> list[HistoryEvent]:
+    """The compaction stamped on ``message``: on a response, one before its
+    call; on a prompt or a tool result, one made between it and the reply."""
+    summary = compaction_summary(message)
+    if summary is None:
+        return []
+    return [
+        HistoryEvent(
+            "context-window",
+            agent,
+            summary["summary_message_id"],
+            _stamped_summarize_payload(summary),
+        )
+    ]
 
 
 def _project_tool_message(
@@ -447,21 +477,19 @@ def _derive_artifact(
         }
 
     if tool_name == "TodoWrite":
-        todos = _normalize_todos(args.get("todos"))
-        counts = {"completed": 0, "in_progress": 0, "pending": 0}
-        for todo in todos:
-            todo_status = todo.get("status", "pending")
-            if todo_status in counts:
-                counts[todo_status] += 1
+        todo_plan = todo_plan_payload(args.get("todos"))
+        if todo_plan is None:
+            return None
         return {
-            "artifact_type": "todo_update",
+            "artifact_type": PLAN_ARTIFACT_TYPE,
             "artifact_id": tool_call_id,
             "status": status,
-            "payload": {"todos": todos, "total": len(todos), **counts},
+            "payload": todo_plan,
         }
 
-    artifact_type = _ARTIFACT_FROM_TOOL_MESSAGE.get(tool_name or "")
-    if artifact_type:
+    from_result = _ARTIFACT_FROM_TOOL_MESSAGE.get(tool_name or "")
+    if from_result:
+        artifact_type = from_result.artifact_type
         tool_artifact = getattr(message, "artifact", None)
         if not isinstance(tool_artifact, dict) or not tool_artifact:
             return None
@@ -471,11 +499,26 @@ def _derive_artifact(
         return {
             "artifact_type": artifact_type,
             "artifact_id": artifact_id,
-            "status": status if artifact_type == "html_widget" else None,
+            "status": status if from_result.carries_status else None,
             "payload": tool_artifact,
         }
 
     return None
+
+
+def todo_plan_payload(todos: Any) -> dict[str, Any] | None:
+    """The ``plan_update`` payload a legacy ``TodoWrite`` list draws, or None
+    for one with no item. Its call and the ``todo_update`` frames it streamed
+    both carry the list as ``[{content, status}]``."""
+    steps: list[PlanStepDict] = [
+        PlanStepDict(
+            title=str(t.get("content", "")),
+            status=t["status"] if t.get("status") in ("pending", "in_progress", "completed") else "pending",
+        )
+        for t in (todos if isinstance(todos, list) else [])
+        if isinstance(t, dict)
+    ]
+    return plan_payload(settled(steps)) if steps else None
 
 
 def split_content_blocks(content: Any) -> tuple[str | None, str | None, str | None]:
@@ -518,22 +561,6 @@ def split_content_blocks(content: Any) -> tuple[str | None, str | None, str | No
 
 def _filter_tool_calls(tool_calls: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return [tc for tc in tool_calls if (tc.get("name") or "").strip()]
-
-
-def _normalize_todos(todos: Any) -> list[dict[str, Any]]:
-    if not isinstance(todos, list):
-        return []
-    normalized = []
-    for todo in todos:
-        if isinstance(todo, dict):
-            normalized.append(
-                {
-                    "content": todo.get("content", ""),
-                    "activeForm": todo.get("activeForm", todo.get("content", "")),
-                    "status": todo.get("status", "pending"),
-                }
-            )
-    return normalized
 
 
 def _count_lines(text: str) -> int:
@@ -603,11 +630,11 @@ def _stamped_summarize_payload(stamp: dict[str, Any]) -> dict[str, Any]:
 
 def inline_summary_ids(messages: Iterable[AnyMessage]) -> set[str]:
     """The summaries ``messages`` replay where they fired, off the
-    responses that answered from them."""
+    messages stamped with them."""
     return {
         stamp["summary_message_id"]
         for message in messages
-        if isinstance(message, AIMessage) and (stamp := compaction_summary(message))
+        if (stamp := compaction_summary(message))
     }
 
 
@@ -702,6 +729,25 @@ def _summary_texts(
     if isinstance(message, HumanMessage) and message.id:
         texts[message.id] = parse_summary_message(message)
     return texts
+
+
+def handoff_items(thread_id: str, turn: SpanDelta) -> list[dict[str, Any]]:
+    """The mark of a turn that opened on another model's brief
+    (``handoff_mark``), as the ``context_window`` signal it streamed."""
+    return [
+        {
+            "event": "context_window",
+            "data": {
+                "thread_id": thread_id,
+                "agent": MAIN_AGENT,
+                "action": "brief",
+                "signal": "complete",
+                **(record.get("props") or {}),
+            },
+        }
+        for record in turn.new_ui_records
+        if record.get("name") == HANDOFF_UI_NAME
+    ]
 
 
 def context_signal_items(
@@ -870,26 +916,27 @@ def model_fallback_items(
     thread_id: str, turn: SpanDelta, *, agent: str = MAIN_AGENT
 ) -> list[dict[str, Any]]:
     """Project a turn's model_fallback notices from its new ``ui`` records.
-
-    The whitelist is every prop ``_emit_fallback`` pushes — narrower than the
-    live handler's list, which also serves transient ``model_retry`` fields
-    that never reach the checkpointed ``ui`` channel. ``agent`` identifies the
-    namespace being projected (main or ``task:{id}``).
+    ``agent`` identifies the namespace being projected (main or ``task:{id}``).
     """
-    return [item for _, item in _model_fallbacks(thread_id, turn, agent)]
+    return [
+        item
+        for _, item in _placed_notices(thread_id, turn, agent)
+        if item["event"] == "model_fallback"
+    ]
 
 
-def with_model_fallbacks(
+def with_notices(
     thread_id: str,
     turn: SpanDelta,
     project: Callable[[list[AnyMessage]], list[dict[str, Any]]],
     *,
     agent: str = MAIN_AGENT,
 ) -> list[dict[str, Any]]:
-    """``project(turn.messages)`` with the turn's model_fallback notices where
-    they fired live: after the items of the message the falling-back call
-    followed, which is as many items as projecting the messages up to it
-    gives. A record that names no message of the span opens the turn."""
+    """``project(turn.messages)`` with the notices the turn's ``ui`` records
+    keep (``_NOTICES``) where they fired live: after the items of the
+    message they followed, which is as many items as projecting the
+    messages up to it gives. A record that names no message of the span
+    opens the turn."""
     ids = [message.id for message in turn.messages]
 
     def position(after: str | None) -> int:
@@ -900,7 +947,7 @@ def with_model_fallbacks(
     placed = sorted(
         (
             (position(after), item)
-            for after, item in _model_fallbacks(thread_id, turn, agent)
+            for after, item in _placed_notices(thread_id, turn, agent)
         ),
         key=lambda p: p[0],
     )
@@ -915,22 +962,41 @@ def with_model_fallbacks(
     return out
 
 
-def _model_fallbacks(
+def _placed_notices(
     thread_id: str, turn: SpanDelta, agent: str
 ) -> list[tuple[str | None, dict[str, Any]]]:
-    """Each fallback notice, with the id of the message its call followed."""
+    """Each notice the turn's ``ui`` records keep, in their order, with the id
+    of the message it followed."""
     out: list[tuple[str | None, dict[str, Any]]] = []
     for record in turn.new_ui_records:
-        if record.get("name") != MODEL_FALLBACK_UI_NAME:
+        notice = _NOTICES.get(record.get("name"))
+        if notice is None:
             continue
-        props = record.get("props") or {}
-        data: dict[str, Any] = {"thread_id": thread_id, "agent": agent}
-        for key in MODEL_FALLBACK_FIELDS:
-            if key in props:
-                data[key] = props[key]
-        error_text = props.get("error")
-        if isinstance(error_text, str):
-            data["error"] = _sanitize_error_text(error_text)
+        props = record.get("props")
+        event, data = notice(props if isinstance(props, dict) else {})
         after = (record.get("metadata") or {}).get("after_message_id")
-        out.append((after, {"event": "model_fallback", "data": data}))
+        out.append((after, {"event": event, "data": {"thread_id": thread_id, "agent": agent, **data}}))
     return out
+
+
+def _model_fallback(props: dict[str, Any]) -> tuple[str, dict[str, Any]]:
+    """The whitelist is every prop ``_emit_fallback`` pushes, narrower than the
+    live handler's list, which also serves transient ``model_retry`` fields
+    that never reach the checkpointed ``ui`` channel."""
+    data = {key: props[key] for key in MODEL_FALLBACK_FIELDS if key in props}
+    if isinstance(error_text := props.get("error"), str):
+        data["error"] = _sanitize_error_text(error_text)
+    return "model_fallback", data
+
+
+def _cli_wait(props: dict[str, Any]) -> tuple[str, dict[str, Any]]:
+    """A Claude Code turn's wait for a CLI, as the ``admitted`` event that
+    ended it live, which its record keeps whole (``CliWait.mark``)."""
+    return QUEUE_EVENT_TYPE, props
+
+
+#: The ``ui`` records replay shows as notices where they fired.
+_NOTICES: dict[str, Callable[[dict[str, Any]], tuple[str, dict[str, Any]]]] = {
+    MODEL_FALLBACK_UI_NAME: _model_fallback,
+    QUEUE_EVENT_TYPE: _cli_wait,
+}

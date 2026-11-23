@@ -430,6 +430,7 @@ async def get_financial_data_provider() -> FinancialDataProvider:
             return _financial_data_provider
 
         financial: FinancialDataSource | None = None
+        financial_name: str | None = None
         intel: MarketIntelSource | None = None
 
         if _fmp_available():
@@ -437,14 +438,14 @@ async def get_financial_data_provider() -> FinancialDataProvider:
             from .fmp.financial_source import FMPFinancialSource
 
             fmp_client = await get_fmp_client()
-            financial = FMPFinancialSource(fmp_client)
+            financial, financial_name = FMPFinancialSource(fmp_client), "fmp"
             logger.debug(
                 "financial_data.source.registered | name=fmp (FinancialDataSource)"
             )
         elif _yfinance_available():
             from .yfinance.financial_source import YFinanceFinancialSource
 
-            financial = YFinanceFinancialSource()
+            financial, financial_name = YFinanceFinancialSource(), "yfinance"
             logger.debug(
                 "financial_data.source.registered | name=yfinance (FinancialDataSource)"
             )
@@ -481,14 +482,17 @@ async def get_financial_data_provider() -> FinancialDataProvider:
                 default=financial,
                 by_market={"cn": MarketRoute(
                     GinlixDataCnFinancialSource(client), screens=screens_cn, claims_query=has_cjk,
+                    name="tushare",
                 )},
                 name_rows=functools.partial(attach_names, local="nameLocal", english="nameEn"),
+                default_name=financial_name,
             )
             intel = RoutedMarketIntelSource(
                 default=intel,
                 by_market={"cn": MarketRoute(
-                    GinlixDataCnIntelSource(client), claims_option=is_cn_option,
+                    GinlixDataCnIntelSource(client), claims_option=is_cn_option, name="tushare",
                 )},
+                default_name="ginlix-data",
             )
             logger.debug(
                 "financial_data.source.registered | name=ginlix-data (cn routing)"
@@ -498,3 +502,22 @@ async def get_financial_data_provider() -> FinancialDataProvider:
             financial=financial, intel=intel
         )
         return _financial_data_provider
+
+
+async def reset_data_providers() -> None:
+    """Forget the chains built so far, for a change in which sources have keys.
+
+    Each under its own lock, so a build that started under the old environment
+    finishes and is then dropped rather than stored after the reset. The next
+    caller rebuilds from the current environment; one holding a chain finishes
+    its call on it.
+    """
+    global _market_data_provider, _news_data_provider, _financial_data_provider
+    async with _market_data_provider_lock:
+        _market_data_provider = None
+    async with _news_data_provider_lock:
+        _news_data_provider = None
+    async with _financial_data_provider_lock:
+        _financial_data_provider = None
+    async with _news_sources_lock:
+        _news_sources.clear()

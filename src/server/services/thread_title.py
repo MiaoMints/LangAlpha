@@ -17,7 +17,9 @@ from datetime import datetime, timezone as dt_timezone
 from pydantic import BaseModel, Field
 
 from src.server.database.conversation import update_thread_title_cas
+from src.server.utils.thread_stamp import message_to_title
 from src.utils.timezone_utils import zone_or_none
+from src.server.services.shared_workspaces.access import shared_org_of
 
 logger = logging.getLogger(__name__)
 
@@ -75,7 +77,7 @@ class ThreadTitleSchema(BaseModel):
 
 def _build_user_prompt(first_query: str) -> str:
     nonce = secrets.token_hex(8)
-    truncated = first_query[:_QUERY_PROMPT_CHARS]
+    truncated = message_to_title(first_query)[:_QUERY_PROMPT_CHARS]
     return (
         f"<first_message_{nonce} user_supplied=\"true\">\n"
         f"{truncated}\n"
@@ -97,10 +99,10 @@ async def generate_thread_title(
     thread_id: str,
     user_id: str,
     first_query: str,
-    expected_title: str,
+    expected_title: str | None,
     llm_service,
     timezone: str | None = None,
-) -> tuple[str, bool]:
+) -> tuple[str | None, bool]:
     """Generate + CAS-persist a title. Never raises (except CancelledError).
 
     ``timezone`` (IANA) localizes the current-time context injected into the
@@ -165,12 +167,19 @@ async def generate_thread_title(
     # (dispatched threads have no mounted view to learn the title otherwise).
     from src.server.services.thread_lifecycle_feed import publish_thread_title
 
+    workspace_id = str(updated["workspace_id"])
+    try:
+        # A shared thread's title is news to every member.
+        shared_org = await shared_org_of(workspace_id)
+    except Exception:
+        shared_org = None
     await publish_thread_title(
         user_id=user_id,
         thread_id=thread_id,
-        workspace_id=str(updated["workspace_id"]),
+        workspace_id=workspace_id,
         title=title,
         updated_at=updated.get("updated_at"),
+        shared_org=shared_org,
     )
 
     return title, True
@@ -202,7 +211,7 @@ def schedule_title_generation(
     thread_id: str,
     user_id: str,
     first_query: str,
-    expected_title: str,
+    expected_title: str | None,
     timezone: str | None = None,
 ) -> asyncio.Task | None:
     """Detach a title generation for *thread_id*; None when no LLM is wired.

@@ -10,8 +10,9 @@ import { updateMessage } from '../../hooks/utils/messageHelpers';
 import { setCardStatus } from './buckets';
 import { buildCreditPauseState } from './creditPauseCard';
 import { isToolApprovalInterrupt, toolApprovalCards } from './toolApprovalCard';
-import type { SSEEvent, StreamProcessorRefs } from '../types';
+import type { PendingInterrupt, SSEEvent, StreamProcessorRefs } from '../types';
 import type { StreamRuntime } from '../runtime';
+import { eventOrder } from '../eventOrder';
 
 export function projectLiveInterrupt(
   rt: StreamRuntime,
@@ -38,12 +39,16 @@ export function projectLiveInterrupt(
     seg: AssistantMessage['contentSegments'][number],
   ): AssistantMessage['contentSegments'] =>
     interruptAlreadyRendered ? (segs || []) : [...(segs || []), seg];
+  // The run streaming now raised the pause.
+  const arm = (pending: PendingInterrupt): void => {
+    rt.pause.arm({ ...pending, runId: rt.currentRunIdRef.current }, [event.interrupt_id]);
+  };
 
   if (actionType === 'ask_user_question') {
     // --- User question interrupt ---
     const questionId = event.interrupt_id || `question-${Date.now()}`;
     const questionData = actionRequests[0];
-    const order = event._eventId != null ? Number(event._eventId) : ++refs.contentOrderCounterRef.current;
+    const order = eventOrder(event, () => ++refs.contentOrderCounterRef.current);
 
     rt.setMessages((prev) =>
       updateMessage(prev,assistantMessageId, (m) => { if (m.role !== 'assistant') return m; const msg = m as AssistantMessage; return {
@@ -64,8 +69,7 @@ export function projectLiveInterrupt(
       }; })
     );
 
-    rt.pendingInterruptIdsRef.current.add(event.interrupt_id!);
-    rt.setPendingInterrupt({
+    arm({
       type: 'ask_user_question',
       interruptId: event.interrupt_id,
       assistantMessageId,
@@ -75,7 +79,7 @@ export function projectLiveInterrupt(
     // --- Create workspace interrupt ---
     const proposalId = event.interrupt_id || `workspace-${Date.now()}`;
     const proposalData = actionRequests[0];
-    const order = event._eventId != null ? Number(event._eventId) : ++refs.contentOrderCounterRef.current;
+    const order = eventOrder(event, () => ++refs.contentOrderCounterRef.current);
 
     rt.setMessages((prev) =>
       updateMessage(prev,assistantMessageId, (m) => { if (m.role !== 'assistant') return m; const msg = m as AssistantMessage; return {
@@ -94,8 +98,7 @@ export function projectLiveInterrupt(
       }; })
     );
 
-    rt.pendingInterruptIdsRef.current.add(event.interrupt_id!);
-    rt.setPendingInterrupt({
+    arm({
       type: 'create_workspace',
       interruptId: event.interrupt_id,
       assistantMessageId,
@@ -105,7 +108,7 @@ export function projectLiveInterrupt(
     // --- Start question interrupt ---
     const proposalId = event.interrupt_id || `question-start-${Date.now()}`;
     const proposalData = actionRequests[0];
-    const order = event._eventId != null ? Number(event._eventId) : ++refs.contentOrderCounterRef.current;
+    const order = eventOrder(event, () => ++refs.contentOrderCounterRef.current);
 
     rt.setMessages((prev) =>
       updateMessage(prev,assistantMessageId, (m) => { if (m.role !== 'assistant') return m; const msg = m as AssistantMessage; return {
@@ -124,8 +127,7 @@ export function projectLiveInterrupt(
       }; })
     );
 
-    rt.pendingInterruptIdsRef.current.add(event.interrupt_id!);
-    rt.setPendingInterrupt({
+    arm({
       type: 'start_question',
       interruptId: event.interrupt_id,
       assistantMessageId,
@@ -135,7 +137,7 @@ export function projectLiveInterrupt(
     // --- PTC agent interrupt ---
     const proposalId = event.interrupt_id || `ptc-agent-${Date.now()}`;
     const proposalData = actionRequests[0];
-    const order = event._eventId != null ? Number(event._eventId) : ++refs.contentOrderCounterRef.current;
+    const order = eventOrder(event, () => ++refs.contentOrderCounterRef.current);
 
     rt.setMessages((prev) =>
       updateMessage(prev,assistantMessageId, (m) => { if (m.role !== 'assistant') return m; const msg = m as AssistantMessage; return {
@@ -148,6 +150,7 @@ export function projectLiveInterrupt(
             workspace_name: proposalData.workspace_name,
             question: proposalData.question ?? '',
             report_back: proposalData.report_back ?? true,
+            model: proposalData.model ?? null,
             interruptId: event.interrupt_id,
             // Persist tool_call_id ON the proposal so the clicked card
             // self-identifies for backfill — never read from
@@ -160,8 +163,7 @@ export function projectLiveInterrupt(
       }; })
     );
 
-    rt.pendingInterruptIdsRef.current.add(event.interrupt_id!);
-    rt.setPendingInterrupt({
+    arm({
       type: 'ptc_agent',
       interruptId: event.interrupt_id,
       assistantMessageId,
@@ -172,7 +174,7 @@ export function projectLiveInterrupt(
     // --- Secretary action interrupt ---
     const proposalId = event.interrupt_id || `secretary-${actionType}-${Date.now()}`;
     const proposalData = actionRequests[0];
-    const order = event._eventId != null ? Number(event._eventId) : ++refs.contentOrderCounterRef.current;
+    const order = eventOrder(event, () => ++refs.contentOrderCounterRef.current);
 
     rt.setMessages((prev) =>
       updateMessage(prev,assistantMessageId, (m) => { if (m.role !== 'assistant') return m; const msg = m as AssistantMessage; return {
@@ -193,8 +195,7 @@ export function projectLiveInterrupt(
       }; })
     );
 
-    rt.pendingInterruptIdsRef.current.add(event.interrupt_id!);
-    rt.setPendingInterrupt({
+    arm({
       type: actionType,
       interruptId: event.interrupt_id,
       assistantMessageId,
@@ -204,7 +205,7 @@ export function projectLiveInterrupt(
     // --- Credit pause interrupt ---
     const proposalId = event.interrupt_id!;
     const pauseState = buildCreditPauseState(actionRequests[0], event.interrupt_id!);
-    const order = event._eventId != null ? Number(event._eventId) : ++refs.contentOrderCounterRef.current;
+    const order = eventOrder(event, () => ++refs.contentOrderCounterRef.current);
 
     // A re-raise is the pause saying it was never consumed, whatever the resume
     // looked like from the client: admission opens a run either way, so the card
@@ -223,8 +224,7 @@ export function projectLiveInterrupt(
           }; })
     );
 
-    rt.pendingInterruptIdsRef.current.add(event.interrupt_id!);
-    rt.setPendingInterrupt({
+    arm({
       type: 'credit_pause',
       interruptId: event.interrupt_id,
       assistantMessageId,
@@ -237,7 +237,7 @@ export function projectLiveInterrupt(
       event.interrupt_id,
       `tool-approval-${Date.now()}`,
     );
-    const order = event._eventId != null ? Number(event._eventId) : ++refs.contentOrderCounterRef.current;
+    const order = eventOrder(event, () => ++refs.contentOrderCounterRef.current);
 
     // A re-raise is the backend saying the calls are still stopped, whatever
     // the resume looked like from the client, and the click already settled
@@ -263,8 +263,7 @@ export function projectLiveInterrupt(
           }; })
     );
 
-    rt.pendingInterruptIdsRef.current.add(event.interrupt_id!);
-    rt.setPendingInterrupt({
+    arm({
       type: 'tool_approval',
       interruptId: event.interrupt_id,
       assistantMessageId,

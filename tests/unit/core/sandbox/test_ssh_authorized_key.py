@@ -8,6 +8,7 @@ rewrite ours.
 
 import os
 import shlex
+import shutil
 import subprocess
 import sys
 import time
@@ -235,6 +236,14 @@ class TestTurns:
     )
 
     def test_overlapping_removals_each_keep_the_others_removal(self, tmp_path):
+        # The run that waits for the lock sleeps a second between tries; a
+        # shorter sleep keeps the race and its ten attempts out of the clock.
+        stub = tmp_path / "bin"
+        stub.mkdir()
+        (stub / "sleep").write_text(
+            f"#!/bin/sh\nexec {shutil.which('sleep', path='/usr/bin:/bin')} 0.2\n"
+        )
+        (stub / "sleep").chmod(0o755)
         for attempt in range(10):
             home = tmp_path / str(attempt)
             home.mkdir()
@@ -244,7 +253,7 @@ class TestTurns:
             runs = [
                 subprocess.Popen(
                     ["sh", "-c", remove_script(key)],
-                    env={"HOME": str(home), "PATH": "/usr/bin:/bin"},
+                    env={"HOME": str(home), "PATH": f"{stub}:/usr/bin:/bin"},
                     stdout=subprocess.PIPE,
                     text=True,
                 )
@@ -255,10 +264,13 @@ class TestTurns:
             assert path.read_text() == "".join(f"{x}\n" for x in _OTHERS)
             assert not (home / ".ssh" / "authorized_keys.langalpha.lock").exists()
 
-    def test_a_lock_left_by_a_run_that_died_is_broken(self, tmp_path):
+    @pytest.mark.parametrize("left_by", ["this script", "an older script"])
+    def test_a_lock_left_by_a_run_that_died_is_broken(self, tmp_path, left_by):
         path = _keys(tmp_path, _OTHERS[0], _KEY)
         lock = tmp_path / ".ssh" / "authorized_keys.langalpha.lock"
         lock.mkdir()
+        if left_by == "this script":
+            (lock / "held").touch()
         os.utime(lock, (time.time() - 300, time.time() - 300))
 
         assert _remove(tmp_path) == "removed"

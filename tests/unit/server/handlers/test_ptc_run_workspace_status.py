@@ -24,6 +24,10 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from src.server.services.turn_runtime import TurnRoute
+from src.server.services.report_back.handoff.carry import PriorAttempt
+
+from src.server.services.shared_workspaces.turn import TurnIdentity
+from src.server.handlers.chat.request_prep import PriorThread
 
 PTC = "src.server.handlers.chat.ptc_run"
 
@@ -64,6 +68,9 @@ def _make_request():
     # generator. request_key is likewise threaded into start_run.
     req.retry_of_run_id = None
     req.request_key = None
+    # A truthy one would claim page comments in the DB.
+    req.artifact_comment_ids = None
+    req.artifact_comments = None
     return req
 
 
@@ -114,7 +121,8 @@ def _make_workspace_manager(
 
 
 async def _run_to_sentinel(
-    request, workspace_manager, stamps=None, *, named_model=None, begin_run_error=None, keep=None
+    request, workspace_manager, stamps=None, *, named_model=None, begin_run_error=None, keep=None, config=None,
+    admit=(True, None), dispatched=False,
 ):
     """``stamps``, when given, gets each event's delay from the first pull.
 
@@ -130,7 +138,8 @@ async def _run_to_sentinel(
 
     with (
         patch(f"{PTC}.setup") as mock_setup,
-        patch(f"{PTC}.ensure_thread", new_callable=AsyncMock),
+        patch(f"{PTC}.carry.prior_attempt", new=AsyncMock(return_value=PriorAttempt(latest=None, retried=None))),
+        patch(f"{PTC}.ensure_thread", new=AsyncMock(return_value=PriorThread())),
         patch(
             f"{PTC}._resolve_fork",
             return_value=("Q", None),
@@ -140,10 +149,10 @@ async def _run_to_sentinel(
         patch(
             f"{PTC}.wait_or_steer",
             new_callable=AsyncMock,
-            return_value=(True, None),
+            return_value=admit,
         ),
         patch(
-            f"{PTC}.get_user_profile_for_prompt",
+            "src.server.services.shared_workspaces.turn.get_user_profile_for_prompt",
             new_callable=AsyncMock,
             return_value=None,
         ),
@@ -169,10 +178,12 @@ async def _run_to_sentinel(
             run_id="r-1",
             user_input="hi",
             user_id="u-1",
-            route=TurnRoute("ws-1", "analyst"),
+            route=TurnRoute("ws-1", "analyst", "u-1"),
+            identity=TurnIdentity("u-1", "u-1", "u-1"),
             is_byok=False,
-            config=_make_config(),
+            config=config or _make_config(),
             named_model=named_model,
+            dispatched=dispatched,
         )
 
         collected: list[str] = []
@@ -360,3 +371,54 @@ async def test_a_named_model_is_kept_only_once_the_turn_is_admitted(admitted):
         keep.assert_awaited_once_with("t-1", named)
     else:
         keep.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("dispatched", [True, False])
+async def test_a_hand_off_steered_into_a_turn_on_its_model_keeps_it_on_the_thread(dispatched):
+    """A hand-off naming a model steers only a turn running on it, so the
+    thread keeps the model as a turn it started would. Only a hand-off: a
+    send of the user's own is not held to the running turn's model."""
+    from src.server.handlers.chat.request_prep import HandOffSteered
+    from src.server.services.llm.thread_model import NamedModel
+
+    keep = AsyncMock()
+    named = NamedModel("m-a", seen="m-pin")
+    await _run_to_sentinel(
+        _make_request(),
+        _make_workspace_manager(has_ready=True, observed_state=None),
+        named_model=named,
+        keep=keep,
+        admit=(False, HandOffSteered("run-live", "job-1")),
+        dispatched=dispatched,
+    )
+
+    if dispatched:
+        keep.assert_awaited_once_with("t-1", named)
+    else:
+        keep.assert_not_awaited()
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "turn",
+    [{"origin": MagicMock(type="automation")}, {"wakeup": {"v": 1, "notices": []}}],
+    ids=["an-automation", "a-wakeup"],
+)
+async def test_a_turn_nobody_started_starts_on_the_setup_token_the_user_stored(turn):
+    from src.server.services.llm.claude_code import Admitted
+    from src.server.services.llm.thread_model import NamedModel
+
+    request = _make_request()
+    request.origin, request.wakeup, request.market_target = None, None, None
+    for field, value in turn.items():
+        setattr(request, field, value)
+    config = _make_config()
+    config.claude_code_admitted = Admitted("stored_token", "stored_token")
+    keep = AsyncMock()
+    named = NamedModel("m-a", seen="m-pin")
+    await _run_to_sentinel(
+        request, _make_workspace_manager(has_ready=True, observed_state=None),
+        named_model=named, keep=keep, config=config,
+    )
+
+    keep.assert_awaited_once_with("t-1", named)

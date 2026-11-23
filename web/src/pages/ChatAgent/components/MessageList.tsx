@@ -6,23 +6,35 @@ import { NotificationDivider } from './messageList/NotificationDivider';
 import { WakeupRow } from './messageList/WakeupRow';
 import { QuietChecksRow } from './messageList/QuietChecksRow';
 import { MessageBubble } from './messageList/MessageBubble';
+import { SharedThreadContext } from './messageList/SharedThreadContext';
+import { bubbleSender, continuesSender, type BubbleSender } from '../session/sharedThread';
 import { TurnFold } from './messageList/TurnFold';
-import { projectMessageContent, visibleProjection } from './messageList/contentProjection';
+import { AgentPlan } from './messageList/AgentPlan';
+import type { ShownPlan } from './messageList/requestPlans';
+import { holdsAnswerText, projectMessageContent, visibleProjection } from './messageList/contentProjection';
 import { useMessageActions } from './messageList/MessageActionsContext';
 import { isReportRow, opensTurn } from './messageList/messagePredicates';
 import { ReportRow, type ReportProvenance } from './messageList/ReportRow';
+import { planReportChartCards } from './chartLayerGrouping';
 import { HandoffPlacesContext, placeHandoffs, samePlaces } from './analystHandoff/reportLinks';
 import {
-  computeTurnTails, hasTurn, hiddenOpenerTurns, liveTurns, messageTimeMs, projectTurns, type ProjectedMessage,
+  computeReplyEnds, computeTurnTails, hasTurn, hiddenOpenerTurns, liveTurns, messageTimeMs, projectTurns, turnStartTimes, type ProjectedMessage,
 } from './messageList/turnProjection';
-import { planQuietChecks } from './messageList/quietChecks';
+import { planQuietChecks, quietEndsByTurn } from './messageList/quietChecks';
+import type { QuietEnd } from '../session/wakeupEvents';
 import { CollapseClock, CollapseClockContext } from './messageList/transcriptMotion';
 import { ProseTyping, ProseTypingContext } from './messageList/proseTyping';
 import { useLiveMessages, type LiveMessages } from '../session/stream/liveMessages';
 import type { ChatMessage, WakeupArrival } from '@/types/chat';
 import { turnFilesByTurn } from '../utils/turnFiles';
+import { useCloudTurnFiles } from '../hooks/useCloudTurnFiles';
 import { useWorkspaceFolders } from '../contexts/WorkspaceContext';
 import type { FeedbackResult, FoldState, MessageRecord } from './messageList/types';
+
+const NO_QUIET_ENDS: ReadonlyMap<number, QuietEnd> = new Map();
+/** Between messages of one member's run: the action row under each already
+ *  spaces them, so the list's own gap would hold them a message apart. */
+const RUN_GAP: React.CSSProperties = { marginTop: 8 };
 
 /** What the fold row for one backend turn needs to know about it. */
 interface TurnFoldInfo {
@@ -34,6 +46,8 @@ interface TurnFoldInfo {
   isLive: boolean;
   /** Nothing stands for the turn once folded, so it settles to `process`. */
   noAnswer: boolean;
+  /** A wake turn that ended quietly: its closing line stands as its answer. */
+  quietEnd: QuietEnd | null;
   /** The turn has process or commentary to fold away. One that ran here with
    *  none keeps the row it worked under, as a label. */
   foldable: boolean;
@@ -129,9 +143,17 @@ interface MessageListProps {
   /** The turns this view has drawn running, kept by the view so they outlive
    *  the list (see `useTurnPresentation`). */
   ranHere?: Set<number>;
+  /** Each request's plan, drawn under the message that asked for it, by
+   *  message id (`threadPlans`): the host leaves out the one its tray shows. */
+  plans?: ReadonlyMap<string, ShownPlan>;
 }
 
-function MessageList({ messages: latest, isLoading, isLoadingHistory, isSubagentView, readOnly, allowFiles, feedbackByTurn, dispatcherContext, starting, ranHere: rememberedRanHere }: MessageListProps): React.ReactElement | null {
+interface HeldTranscript {
+  messages: MessageRecord[];
+  plans?: ReadonlyMap<string, ShownPlan>;
+}
+
+function MessageList({ messages: latest, isLoading, isLoadingHistory, isSubagentView, readOnly, allowFiles, feedbackByTurn, dispatcherContext, starting, ranHere: rememberedRanHere, plans: latestPlans }: MessageListProps): React.ReactElement | null {
   // A history load writes the transcript an event at a time as its response
   // arrives. Drawn as it went, a finished turn showed its work open above no
   // answer and then folded it away once the answer and its end landed. The
@@ -139,11 +161,13 @@ function MessageList({ messages: latest, isLoading, isLoadingHistory, isSubagent
   // commit holds the whole transcript (loadConversationHistory's reveal). A
   // list that mounts mid-load (main shown again while the thread loads) drew
   // nothing before it, and what the load has written so far is the half it
-  // must not show, so it holds nothing, which draws the skeleton.
-  const [held, setHeld] = React.useState<MessageRecord[] | null>(() => (isLoadingHistory ? [] : null));
-  if (isLoadingHistory && held === null) setHeld(latest);
+  // must not show, so it holds nothing, which draws the skeleton. The plans
+  // are held with it, since they are read off the messages being rewritten.
+  const [held, setHeld] = React.useState<HeldTranscript | null>(() => (isLoadingHistory ? { messages: [] } : null));
+  if (isLoadingHistory && held === null) setHeld({ messages: latest, plans: latestPlans });
   if (!isLoadingHistory && held !== null) setHeld(null);
-  const messages = isLoadingHistory ? held ?? latest : latest;
+  const messages = isLoadingHistory ? held?.messages ?? latest : latest;
+  const plans = isLoadingHistory && held ? held.plans : latestPlans;
   const isMobile = useIsMobile();
   const { onOpenFile } = useMessageActions();
   // The deck keeps the workspace's own notes file out on every surface; its
@@ -169,11 +193,21 @@ function MessageList({ messages: latest, isLoading, isLoadingHistory, isSubagent
   // tail then run over the VISIBLE list, so a hidden bubble never steals an
   // affordance from a painted one.
   const projected = React.useMemo(() => projectTurns(messages), [messages]);
+  // A chart a report row cards is carded there for its whole turn, so every
+  // projection of that turn's messages leaves it out, with the same set, or
+  // the projection cache would answer one reader with another's build.
+  const reportCharts = React.useMemo(() => planReportChartCards(projected), [projected]);
+  const rootDir = folders?.rootDir;
+  const project = React.useCallback(
+    (message: MessageRecord) => projectMessageContent(message, isSubagentView, rootDir, reportCharts.omitByMessage.get(message)),
+    [isSubagentView, rootDir, reportCharts],
+  );
   const visible = React.useMemo(
-    () => visibleProjection(projected, isSubagentView, folders?.rootDir),
-    [projected, isSubagentView, folders?.rootDir],
+    () => visibleProjection(projected, isSubagentView, rootDir, (message) => reportCharts.omitByMessage.get(message)),
+    [projected, isSubagentView, rootDir, reportCharts],
   );
   const turnTails = React.useMemo(() => computeTurnTails(visible), [visible]);
+  const replyEnds = React.useMemo(() => computeReplyEnds(visible, turnTails), [visible, turnTails]);
   // The bubbles of the server's turns. A send it never stored is painted
   // like any other but has no turn to time, fold, rate or list files under.
   const turned = React.useMemo(() => projected.filter(hasTurn), [projected]);
@@ -194,10 +228,12 @@ function MessageList({ messages: latest, isLoading, isLoadingHistory, isSubagent
 
   // The deliverables strip reads the RAW projection: a turn's files are named
   // across its whole span, including a bubble the list never paints.
-  const filesByTurn = React.useMemo(
+  const ownFilesByTurn = React.useMemo(
     () => turnFilesByTurn(turned, folders),
     [turned, folders],
   );
+  // A Home turn that ran on the cloud names its files where they were then.
+  const filesByTurn = useCloudTurnFiles(turned, ownFilesByTurn, { enabled: !readOnly });
 
   // Only the newest turn can still be running. A bubble's own `isStreaming`
   // is per model call, not per turn: the text handler drops it on every
@@ -216,13 +252,20 @@ function MessageList({ messages: latest, isLoading, isLoadingHistory, isSubagent
   }, [turned]);
 
   const live = React.useMemo(
-    () => liveTurns(turned, newestTurn, !!isLoading, (message) => projectMessageContent(message, isSubagentView, folders?.rootDir).hasPinnedLive),
-    [turned, newestTurn, isLoading, isSubagentView, folders?.rootDir],
+    () => liveTurns(turned, newestTurn, !!isLoading, (message) => project(message).hasPinnedLive),
+    [turned, newestTurn, isLoading, project],
   );
 
   const [typing] = React.useState(() => new ProseTyping());
   const { running, ranHere } = useTurnPresentation(live, turned, typing, rememberedRanHere);
   const [collapseClock] = React.useState(() => new CollapseClock());
+
+  // How each settled turn ended quietly. A subagent's transcript has no wake
+  // turns, so it reads none.
+  const quietEnds = React.useMemo(
+    () => (isSubagentView ? NO_QUIET_ENDS : quietEndsByTurn(turned, live)),
+    [turned, live, isSubagentView],
+  );
 
   // Both display preferences fold finished turns; only live reasoning differs.
   // The same pass times every settled turn, whose reply shows when it ended.
@@ -230,11 +273,11 @@ function MessageList({ messages: latest, isLoading, isLoadingHistory, isSubagent
     const folds = new Map<number, TurnFoldInfo>();
     const ends = new Map<number, number>();
 
-    const startedAt = new Map<number, number>();
+    const startedAt = turnStartTimes(visible);
     const sentHere = new Map<number, boolean>();
-    const firstReplyAt = new Map<number, number>();
     const rowPos = new Map<number, number>();
-    const assistantBubbles = new Map<number, MessageRecord[]>();
+    // Each turn's assistant bubbles, by their place in the visible list.
+    const assistantBubbles = new Map<number, number[]>();
 
     // The turn's end is stamped on its tail bubble, and that bubble is not
     // always painted: a steering continuation that settled empty is dropped
@@ -256,36 +299,20 @@ function MessageList({ messages: latest, isLoading, isLoadingHistory, isSubagent
       const role = message.role as string;
       if (role === 'user') {
         // A steering bubble is projected onto the NEXT turn (it lands after the
-        // opener already advanced the counter), and on replay its timestamp is
-        // not history time. Only a turn's own initiator can start its clock.
+        // opener already advanced the counter). Only a turn's own initiator
+        // starts it; of two openers on one count the later is the turn's, and
+        // the row starts over there, as its clock does (`turnStartTimes`).
         if (!opensTurn(message)) continue;
-        // Of two openers on one count the later is the turn's: the row and
-        // the clock start over there.
-        const ts = messageTimeMs(message.timestamp);
-        if (ts !== undefined) startedAt.set(turnIndex, ts);
-        else startedAt.delete(turnIndex);
         sentHere.set(turnIndex, message.sentHere === true);
         rowPos.delete(turnIndex);
-        firstReplyAt.delete(turnIndex);
         assistantBubbles.delete(turnIndex);
         continue;
       }
       if (role !== 'assistant') continue;
       if (!rowPos.has(turnIndex)) rowPos.set(turnIndex, i);
-      if (!firstReplyAt.has(turnIndex)) {
-        const ts = messageTimeMs(message.timestamp);
-        if (ts !== undefined) firstReplyAt.set(turnIndex, ts);
-      }
       const bubbles = assistantBubbles.get(turnIndex);
-      if (bubbles) bubbles.push(message);
-      else assistantBubbles.set(turnIndex, [message]);
-    }
-
-    // A turn with no row of its own to take its clock from (a report-back
-    // whose row names no source, or one attached live) starts at its first
-    // reply, the nearest thing.
-    for (const [turnIndex, ts] of firstReplyAt) {
-      if (!startedAt.has(turnIndex)) startedAt.set(turnIndex, ts);
+      if (bubbles) bubbles.push(i);
+      else assistantBubbles.set(turnIndex, [i]);
     }
 
     for (let i = 0; i < visible.length; i++) {
@@ -294,7 +321,8 @@ function MessageList({ messages: latest, isLoading, isLoadingHistory, isSubagent
       if (!turnTails[i]) continue;
       const { message, turnIndex } = visible[i];
       if (turnIndex === null) continue;
-      const contents = (assistantBubbles.get(turnIndex) ?? []).map((bubble) => projectMessageContent(bubble, isSubagentView, folders?.rootDir));
+      const bubbles = assistantBubbles.get(turnIndex) ?? [];
+      const contents = bubbles.map((b) => project(visible[b].message));
       const isLive = running.has(turnIndex);
       // A pinned call outlives the stream that launched it, so the stream-close
       // stamp was taken before the turn's work was done and a fold reading it
@@ -320,8 +348,13 @@ function MessageList({ messages: latest, isLoading, isLoadingHistory, isSubagent
       const foldable = contents.some((content) => content.hasProcess) || contents.reduce((sum, content) => sum + content.textCount, 0) >= 2;
       if (!foldable && !isLive && !ranHere.has(turnIndex)) continue;
       const hasFiles = !!onOpenFile && (!readOnly || allowFiles) && (filesByTurn.get(turnIndex)?.length ?? 0) > 0;
+      const quietEnd = isLive ? null : quietEnds.get(turnIndex) ?? null;
       folds.set(turnIndex, {
-        noAnswer: !(contents.at(-1)?.lastTextKey || contents.some((content) => content.hasRetained) || hasFiles),
+        // Read only for a settled turn, and cheapest first: whether a text holds
+        // an answer can mean scoring it.
+        noAnswer: !isLive && !(hasFiles || quietEnd || contents.some((content) => content.hasRetained)
+          || bubbles.some((b) => holdsAnswerText(project(visible[b].message), replyEnds[b]))),
+        quietEnd,
         rowPos: pos,
         startedAt: start,
         completedAt,
@@ -331,12 +364,29 @@ function MessageList({ messages: latest, isLoading, isLoadingHistory, isSubagent
       });
     }
     return { turnFolds: folds, turnEnds: ends };
-  }, [visible, turned, turnTails, live, running, ranHere, isSubagentView, folders?.rootDir, filesByTurn, onOpenFile, readOnly, allowFiles]);
+  }, [visible, turned, turnTails, replyEnds, live, running, ranHere, project, filesByTurn, onOpenFile, readOnly, allowFiles, quietEnds]);
 
-  const items = React.useMemo(
-    () => planQuietChecks(visible, turned, live, isSubagentView),
-    [visible, turned, live, isSubagentView],
-  );
+  const items = React.useMemo(() => planQuietChecks(visible, quietEnds), [visible, quietEnds]);
+  // In a shared workspace's thread, the entries that carry on another
+  // member's run of messages, read against the entry drawn just above. A
+  // plan drawn under a message ends the run, since it sits between.
+  const sharedView = React.useContext(SharedThreadContext);
+  const continuing = React.useMemo(() => {
+    const runs = new Set<number>();
+    if (!sharedView) return runs;
+    let above: BubbleSender | undefined;
+    for (const item of items) {
+      if (item.kind !== 'entry') {
+        above = undefined;
+        continue;
+      }
+      const { message } = visible[item.index];
+      const sender = bubbleSender(sharedView, message as ChatMessage);
+      if (continuesSender(above, sender)) runs.add(item.index);
+      above = plans?.has(message.id as string) ? undefined : sender;
+    }
+    return runs;
+  }, [items, visible, sharedView, plans]);
 
   // Empty state - show when no messages exist (hidden in subagent view)
   if (messages.length === 0) {
@@ -412,6 +462,7 @@ function MessageList({ messages: latest, isLoading, isLoadingHistory, isSubagent
               together={!!prev && isReportRow(prev)}
               readOnly={readOnly}
               dispatcherContext={dispatcherContext}
+              chartCards={reportCharts.byReport.get(message.id as string)}
             />
           );
         }
@@ -429,9 +480,10 @@ function MessageList({ messages: latest, isLoading, isLoadingHistory, isSubagent
               : turnIndex !== null && expandedTurns.has(turnIndex) ? 'expanded' : info.noAnswer ? 'process' : 'collapsed';
         const bubbleProps = {
           message,
-          contentProjection: projectMessageContent(message, isSubagentView, folders?.rootDir),
+          contentProjection: project(message),
           turnIndex,
           isTurnTail: turnTails[i],
+          endsReply: replyEnds[i],
           canRegenerate: turnIndex === null || !hiddenTurns.has(turnIndex),
           isLatestReply: message.id === latestReplyId,
           // The fold already decided whether this turn is working, and that
@@ -445,6 +497,7 @@ function MessageList({ messages: latest, isLoading, isLoadingHistory, isSubagent
             : (turnIndex !== null && running.has(turnIndex)) || !!message.isStreaming,
           turnFiles: turnTails[i] && turnIndex !== null ? filesByTurn.get(turnIndex) : undefined,
           completedAt: turnTails[i] && turnIndex !== null ? turnEnds.get(turnIndex) : undefined,
+          quietEnd: turnTails[i] ? info?.quietEnd ?? null : null,
           feedback: turnIndex === null ? null : feedbackByTurn?.[turnIndex] ?? null,
           isLoading,
           fold,
@@ -453,14 +506,18 @@ function MessageList({ messages: latest, isLoading, isLoadingHistory, isSubagent
           allowFiles,
           isMobile,
           dispatcherContext,
+          continuesSender: continuing.has(i),
         };
+        const plan = plans?.get(message.id as string);
         // Every bubble gets the wrapper from its first paint: a turn's row comes
         // with its first assistant bubble, and switching a bubble from bare to
         // wrapped at the same key would remount it.
         // The row and the answer it heads are one item of the list's rhythm, so
         // the gap between them is the row's own margin, not the list's.
+        // A run of one member's messages sits closer together than the
+        // list's rhythm, as a group chat stacks them.
         return (
-          <div key={message.id as string}>
+          <div key={message.id as string} style={continuing.has(i) ? RUN_GAP : undefined}>
             {info && turnIndex !== null && info.rowPos === i && (
               <TurnFold
                 state={fold}
@@ -472,6 +529,11 @@ function MessageList({ messages: latest, isLoading, isLoadingHistory, isSubagent
               />
             )}
             <MessageBubble {...bubbleProps} />
+            {plan && (
+              <div className={isMobile ? 'mt-4' : 'mt-6'}>
+                <AgentPlan {...plan} heading />
+              </div>
+            )}
           </div>
         );
       })}

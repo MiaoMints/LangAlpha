@@ -6,7 +6,7 @@
  */
 
 import type { AssistantMessage } from '@/types/chat';
-import { getThreadMux, type ThreadMuxSink } from '../stream/threadStreamMux';
+import type { ThreadMuxSink } from '../stream/threadStreamMux';
 import {
   isTerminalStatus,
   normalizeWireStatus,
@@ -49,6 +49,8 @@ export interface SubagentMuxDeps {
   ) => void;
   /** useSubagentHistory's checkpoint read for one settled task. */
   hydrateTaskTranscript: (agentId: string, meta?: TaskTranscriptMeta) => Promise<unknown>;
+  /** Re-read the Claude plan behind the user's Claude Code tokens. */
+  refreshClaudeCodePlan: () => void;
 }
 
 /**
@@ -164,6 +166,8 @@ export function createSubagentMuxController(rt: SubagentRuntime, deps: SubagentM
       // run, else now. A drain re-closing a task already settled here must not
       // restart its clock.
       const news = !isSettledTask(shortTaskId);
+      // A task's run on a Claude Code model moves the plan as a main run does.
+      if (news) deps.refreshClaudeCodePlan();
       const finished = latestRun(runsOfTask(rt.subagentHistory.get().runs, `task:${shortTaskId}`))?.finishedAtMs;
       // Record the exact outcome so every downstream reactivation guard can seed
       // the RIGHT terminal status (a failed task must not resurface as completed).
@@ -220,6 +224,11 @@ export function createSubagentMuxController(rt: SubagentRuntime, deps: SubagentM
         deps.armReportBackWatch(rt.threadIdRef.current, null, 'taskStreamEnd');
       }
     },
+    onMainRunClosed: () => {
+      // A run's plan reports are kept as it tears down, after a Stop from
+      // this tab has read the plan and stopped reading the run's own stream.
+      deps.refreshClaudeCodePlan();
+    },
     onResyncRequired: () => {
       // The knowledge horizon outran the server's catch-up window (tab
       // asleep / long outage): reload the projection from history, which
@@ -249,7 +258,7 @@ export function createSubagentMuxController(rt: SubagentRuntime, deps: SubagentM
     snapshotAtMs?: number,
   ) => {
     rt.subagentProcessEventRef.current = processEvent;
-    getThreadMux(tid).attach(muxSink, snapshotAtMs);
+    rt.muxSlot.attach(tid, muxSink, snapshotAtMs);
   };
 
   return { isSettledTask, attachSubagentMux };

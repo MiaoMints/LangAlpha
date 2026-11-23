@@ -215,7 +215,14 @@ def _pairing(*, token="abc", base="https://example.com", expires_in=15 * 60, **f
     )
 
 
-_REPORT_URL = "https://example.com/api/v1/computers/ssh/pairings/abc/report"
+def _report_url(token="abc"):
+    return f"https://example.com/api/v1/computers/ssh/pairings/{token}/report"
+
+
+# A token shaped as ``create_pairing`` makes one. Too long to turn up by chance
+# in a run's id or a host key, which a short one like "abc" now and then did.
+_TOKEN = "5d1c0f7e9a2b4c6d8e0f1a2b3c4d5e6f"
+
 # Keeps its arguments, and the config it reads on its stdin when told to.
 _FAKE_CURL = (
     'printf "%s\\n" "$@" >> "$HOME/curl-args"; '
@@ -250,7 +257,7 @@ async def test_the_script_authorizes_the_key_once_and_reports_back(
     paired under a ``login_from`` is not rewritten on its first start.
     """
     _serve(monkeypatch)
-    rendered = await script.render_script("abc", SSHConfig(login_from=login_from))
+    rendered = await script.render_script(_TOKEN, SSHConfig(login_from=login_from))
 
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
@@ -276,12 +283,13 @@ async def test_the_script_authorizes_the_key_once_and_reports_back(
     assert keys == f"ssh-rsa OLD\n{line}\n"
     args = (tmp_path / "curl-args").read_text()
     # The token stays off curl's arguments, which any account can list.
-    assert "abc" not in args
+    assert _TOKEN not in args
     assert "user=" in args
     # Each run names itself, so the server tells the two apart.
     runs = [a for a in args.splitlines() if a.startswith("run=")]
     assert len(runs) == 2 and len(set(runs)) == 2 and "run=" not in runs
-    assert (tmp_path / "curl-config").read_text() == f'url = "{_REPORT_URL}"\n'
+    config = (tmp_path / "curl-config").read_text()
+    assert config == f'url = "{_report_url(_TOKEN)}"\n'
 
 
 @pytest.mark.asyncio
@@ -308,7 +316,7 @@ async def test_a_script_that_stops_tells_the_server_why(tmp_path, monkeypatch):
     told = (tmp_path / "curl-args").read_text().splitlines()
     assert f"failed=Could not create {tmp_path}/.ssh." in told
     assert any(a.startswith("run=") and a != "run=" for a in told)
-    assert (tmp_path / "curl-config").read_text() == f'url = "{_REPORT_URL}"\n'
+    assert (tmp_path / "curl-config").read_text() == f'url = "{_report_url()}"\n'
 
 
 # Stand-ins for what a tunneled run reaches on a Linux machine, the service
@@ -413,25 +421,26 @@ async def test_the_script_parses(monkeypatch, tunnels):
 # config on its stdin, the host keys asked of the machine's own sshd when no
 # file has them, the tunnel loop's waits, drawn at random, the run each
 # report and stop names, and the tunnel's folder and service, named for the
-# deployment (named ``tunnel``, the tunneled ones render as pinned before).
+# deployment (named ``tunnel``, the tunneled ones render as pinned before),
+# and the setup lock, a file the shell creates exclusively.
 _RENDERED = {
     ("https://langalpha.example.com", False): (
         "164822f6f1dd3da3692d25d8303c49b61072679dcd8ca7f2cdaf75bb167738ea"
     ),
     ("https://langalpha.example.com", True): (
-        "dc6bcf339ca15117ed8521385a2fbf840f38921ddf7d067fbcc0c97cbb6120cb"
+        "6ea0ced1a79cd6ee8e48f6468bbef77698bee3e4fa8c6f25b2255a4d987d30d4"
     ),
     ("http://127.0.0.1:8000", False): (
         "075b2891f7524801fa0f587509217b062dfac0790f4d8b04e9b5abfa77cac524"
     ),
     ("http://127.0.0.1:8000", True): (
-        "666c9d86ed18ad54bee6237ae08848a594a08adb32248e7422a10b1f24995965"
+        "8e556cc62a2fbc5219b8ccd348cd27600d763a33b040a6c8d8171309eea48b5b"
     ),
     ("http://[::1]:8000", False): (
         "2b70537889e0496254c0999740ee53fc4bec8f71d9307c85dcde00e176327d1e"
     ),
     ("http://[::1]:8000", True): (
-        "953fbfde166535d4b1452d5be43f8d198a596e210f1ba7718fd7b285886cc3bf"
+        "7ff69889589a79c8b474a37b7b041af6e735a1c82cbb1b836eacd621077feeac"
     ),
     (None, False): "59d0a2e548d9fa61be969ee269ed92e8620e74903b4fc7f3357faf1a8c489c89",
 }

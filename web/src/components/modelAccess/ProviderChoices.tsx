@@ -2,7 +2,7 @@ import { ChevronRight } from 'lucide-react';
 import { BrandMark } from '@/pages/ChatAgent/components/mcp/BrandMark';
 import { llmProviderArt } from '@/lib/brandArt';
 import { cn } from '@/lib/utils';
-import { StatusLabel } from './parts';
+import { StatusLabel, type RowStatus } from './parts';
 
 /**
  * One provider to pick: its mark, its name and a note under it, and
@@ -12,15 +12,21 @@ import { StatusLabel } from './parts';
 export function ProviderChoice({
   markProvider,
   name,
+  tag,
   note,
   connected,
+  status,
   onPick,
   layout = 'list',
 }: {
   markProvider: string;
   name: string;
+  /** A word beside the name, such as Legacy. */
+  tag?: string;
   note?: string;
   connected: boolean;
+  /** A status of its own in place of Connected, for a choice that can stand in more states than connected or not. */
+  status?: RowStatus;
   onPick: () => void;
   layout?: 'list' | 'grid';
 }) {
@@ -37,10 +43,13 @@ export function ProviderChoice({
       >
         <BrandMark name={name} art={llmProviderArt(markProvider)} size="sm" className="rounded-md" />
         <span className="flex min-w-0 flex-1 flex-col">
-          <span className="truncate text-sm" style={{ color: 'var(--color-text-primary)' }}>{name}</span>
+          <span className="flex min-w-0 items-baseline gap-2">
+            <span className="truncate text-sm" style={{ color: 'var(--color-text-primary)' }}>{name}</span>
+            {tag && <span className="shrink-0 text-xs" style={{ color: 'var(--color-text-tertiary)' }}>{tag}</span>}
+          </span>
           {note && <span className={cn('text-xs', !list && 'line-clamp-2')} style={{ color: 'var(--color-text-tertiary)' }}>{note}</span>}
         </span>
-        {connected && <StatusLabel status="connected" className="shrink-0" />}
+        {status ? <StatusLabel status={status} className="shrink-0" /> : connected && <StatusLabel status="connected" className="shrink-0" />}
         {list && <ChevronRight aria-hidden="true" className="h-4 w-4 shrink-0" style={{ color: 'var(--color-text-tertiary)' }} />}
       </button>
     </li>
