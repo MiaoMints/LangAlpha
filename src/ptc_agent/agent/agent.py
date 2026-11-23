@@ -159,6 +159,7 @@ from src.tools.web.search import get_web_search_tool
 from src.tools.web.fetch import web_fetch_tool
 from src.tools.web.crawl import create_crawl_tools
 from src.tools.sec.tool import create_sec_filing_tool
+from src.tools.desk_news import get_desk_news
 from src.tools.market_data.tool import (
     get_daily_prices,
     get_company_overview,
@@ -637,6 +638,9 @@ class PTCAgent:
         )
         shared_tools.append(web_search_tool)
         shared_tools.append(web_fetch_tool)
+
+        # The deployment's own fifteen-source desk; warm and free to read.
+        shared_tools.append(get_desk_news)
 
         # Site-crawl tools (PTC-only): experimental opt-in feature, further
         # tier-gated at resolve time. The factory returns [] when the crawl

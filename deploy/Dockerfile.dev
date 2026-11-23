@@ -20,6 +20,9 @@ RUN CHART_RENDER_OUT_DIR=/chart-render pnpm run build:chart-render
 # Tracks Dockerfile.backend — see the note there on why 3.13 is a floor.
 FROM python:3.13-slim
 
+# Local network adaptation: Debian and Playwright downloads.
+RUN if [ -f /etc/apt/sources.list.d/debian.sources ]; then sed -i -e 's|deb.debian.org|mirrors.tuna.tsinghua.edu.cn|g' -e 's|security.debian.org|mirrors.tuna.tsinghua.edu.cn|g' /etc/apt/sources.list.d/debian.sources; fi
+
 ENV PYTHONUNBUFFERED=1
 
 # Install system deps (curl for healthcheck, postgresql-client for DB init).
@@ -52,7 +55,15 @@ RUN extras=""; \
 # Install browsers for Scrapling crawling (--with-deps pulls OS libraries)
 # patchright: Chromium for DynamicFetcher (Tier 2)
 # scrapling install: Camoufox for StealthyFetcher (Tier 3)
-RUN uv run patchright install --with-deps chromium \
+# Chrome for Testing is supplied from the build context; the upstream CDN is slow from this network.
+COPY chrome-linux64.zip /tmp/chrome-linux64.zip
+ENV PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
+RUN mkdir -p /ms-playwright/chromium-1208 \
+    && python3 -m zipfile -e /tmp/chrome-linux64.zip /ms-playwright/chromium-1208 \
+    && chmod -R a+rX /ms-playwright/chromium-1208 \
+    && touch /ms-playwright/chromium-1208/INSTALLATION_COMPLETE \
+    && rm -f /tmp/chrome-linux64.zip \
+    && uv run patchright install --with-deps chromium \
     && uv run scrapling install
 
 # Copy application source (will be overridden by volume mounts in dev).

@@ -30,7 +30,7 @@ sandbox:
   # Other providers a user may pick when creating a computer; `provider` stays
   # the default. Each needs its credentials, and a computer keeps its provider.
   # "ssh" is offered only this way: it lets users add their own Linux or macOS machine.
-  # offered_providers: ["e2b", "ssh"]
+  offered_providers: ["ssh"]
 
   # Daytona cloud sandbox configuration
   daytona:
@@ -122,8 +122,8 @@ sandbox:
   # Ignored when provider is "daytona" or "e2b". Override with DOCKER_SANDBOX_* env vars.
   docker:
     image: "langalpha-sandbox:latest" # Build with: docker build -f Dockerfile.sandbox -t langalpha-sandbox:latest .
-    memory_limit: "4g"
-    cpu_count: 2.0
+    memory_limit: "1536m"
+    cpu_count: 1.0
     network_mode: "bridge" # "bridge" (default) or "none" for full isolation
     dev_mode: false # true = bind-mount host dir (fast local dev, files shared instantly)
     # host_work_dir: "/tmp/langalpha-sandbox-work"  # Required when dev_mode is true
@@ -165,6 +165,12 @@ mcp:
     # false and price_data stops launching on the next restart.
     - name: "price_data"
       enabled: true
+
+    # The market-data bundle reads the FMP key from its own process env; it
+    # ships no env of its own, so the sandbox never saw the key without this.
+    - name: "macro"
+      env:
+        FMP_API_KEY: "${FMP_API_KEY}"
 
     # Adding a server of your own looks like this:
     # - name: "tavily"

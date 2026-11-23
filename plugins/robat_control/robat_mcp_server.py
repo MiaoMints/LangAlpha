@@ -381,6 +381,98 @@ def list_active_alerts() -> _OUT_ALERTS:
     return _envelope(_call("GET", "/api/alerts/active"))
 
 
+_OUT_BARS = output_model("RobatSymbolBars", envelope_schema(ANY))
+
+
+@mcp.tool()
+def get_symbol_bars(symbol: str, interval: str = "1h", limit: int = 60, account_key: str | None = None) -> _OUT_BARS:
+    """Closed candles for one symbol, oldest to newest.
+
+    The still-forming candle is excluded, so the last row is a finished bar and its
+    high and low can be trusted as structure. Use it before deciding an entry, a stop
+    or whether a level from a trader post still matters.
+
+    Args:
+        symbol: Pair such as BTCUSDT.
+        interval: Binance interval, lower case — 15m, 1h, 4h, 1d.
+        limit: How many closed bars to return, 3 to 300; default 60.
+        account_key: Trading account to read from; omit for the default account.
+
+    Returns:
+        dict: {count, data, source}. Each bar has open_time, open_price, high_price,
+        low_price, close_price, volume and close_time (epoch ms). On error:
+        {error, detail}.
+    """
+    return _envelope(
+        _call(
+            "GET",
+            "/maintenance/symbol-bars",
+            params={
+                "symbol": symbol,
+                "interval": interval,
+                "limit": int(limit),
+                "account_key": account_key,
+            },
+        )
+    )
+
+
+_OUT_ANALYSIS = output_model("RobatAnalysisMessages", envelope_schema(ANY))
+
+
+@mcp.tool()
+def list_analysis_messages(since_minutes: int = 180, limit: int = 20) -> _OUT_ANALYSIS:
+    """Market commentary waiting for a decision.
+
+    A trader post that only describes levels - resistance, support, a bias - and never
+    names an entry is not a signal. The bot keeps those as analysis rows instead of
+    dropping them; this tool returns the ones nobody has reviewed yet, oldest first.
+    Read the text, check the chart, then decide whether the setup is worth taking.
+
+    Args:
+        since_minutes: How far back to look; default 180.
+        limit: Maximum rows; default 20.
+
+    Returns:
+        dict: {count, data, source}. Each row carries event_id, trader_id, symbol, side,
+        text, created_at and reason_detail. On error: {error, detail}.
+    """
+    return _envelope(
+        _call(
+            "GET",
+            "/maintenance/analysis-messages",
+            params={"since_minutes": int(since_minutes), "limit": int(limit)},
+        )
+    )
+
+
+_OUT_ANALYSIS_ACK = output_model("RobatAnalysisAck", envelope_schema(ANY))
+
+
+@mcp.tool()
+def acknowledge_analysis_messages(event_ids: list[int], note: str | None = None) -> _OUT_ANALYSIS_ACK:
+    """Mark commentary as reviewed so it is never analysed twice.
+
+    Call this for every row you looked at, including the ones you decided not to trade.
+    Skipping it means the same post comes back on the next pass.
+
+    Args:
+        event_ids: The event_id values from list_analysis_messages.
+        note: One line on what you decided and why; stored for the audit trail.
+
+    Returns:
+        dict: {count, data, source} where data holds acked and event_ids. On error:
+        {error, detail}.
+    """
+    return _envelope(
+        _call(
+            "POST",
+            "/maintenance/analysis-messages/ack",
+            body={"event_ids": [int(item) for item in event_ids], "note": note},
+        )
+    )
+
+
 _OUT_RISK = output_model("RobatRiskView", envelope_schema(ANY))
 
 

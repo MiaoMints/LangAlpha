@@ -263,6 +263,8 @@ redis:
 # once per request.
 market_data:
   providers:
+    - name: desk
+      markets: [cn, hk, us, crypto]
     - name: ginlix-data
       markets: [us]          # US equities only
     - name: tushare
@@ -283,6 +285,7 @@ market_data:
 # Ordered news provider chain — sequential fallback (no market routing).
 news_data:
   providers:
+    - name: cn-desk
     - name: ginlix-data
     - name: fmp
     - name: yfinance
@@ -403,13 +406,13 @@ cli_approvals:
 # =============================================================================
 market_insight:
   enabled: true
-  timezone: "America/New_York"
+  timezone: "Asia/Shanghai"
   generation_timeout: 600         # Seconds before background generation times out
   max_symbols_context: 20         # Max symbols in personalized prompt context
   dedup_window_minutes: 5         # Dedup window for per-user insights
   schedule:
-    pre_market: "09:00"           # Overnight news (8 PM yesterday → 9 AM today)
-    post_market: "20:30"          # Daily recap (full day summary)
-    market_update_start: "10:00"  # Hourly updates start
-    market_update_end: "20:00"    # Hourly updates end (inclusive)
+    pre_market: "08:30"           # Before the A-share open
+    post_market: "15:30"          # After the A-share close
+    market_update_start: "09:30"  # Hourly updates start
+    market_update_end: "23:00"    # Through the crypto evening
     market_update_interval: 60    # Minutes between updates
