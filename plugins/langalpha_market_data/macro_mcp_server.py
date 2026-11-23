@@ -35,7 +35,7 @@ from datetime import datetime, timezone
 
 
 from data_client.fmp import get_fmp_client, fmp_lifespan
-from mcp_servers._dates import calendar_days, rates_days
+from mcp_servers._dates import calendar_days, rates_days, upcoming_days
 from mcp_servers._envelope import error_from_exception, make_error, make_response
 from mcp_servers._schemas import (
     NULLABLE_STR,
@@ -257,7 +257,7 @@ async def get_economic_calendar(
         On error: {error: <code>, detail}.
     """
     try:
-        lo, hi = calendar_days(from_date, to_date)
+        lo, hi = upcoming_days(from_date, to_date)
     except Exception as e:  # noqa: BLE001
         return error_from_exception(e, _UPSTREAM_FAILED)
 
