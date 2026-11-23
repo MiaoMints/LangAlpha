@@ -38,6 +38,7 @@ def test_a_brief_binds_research_tools_and_nothing_on_the_account():
         names = {tool.name for tool in insight_tools(_config())}
 
     assert names == {
+        "get_desk_news",
         "WebSearch",
         "WebFetch",
         "get_sec_filing",
