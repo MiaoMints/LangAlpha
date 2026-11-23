@@ -146,9 +146,11 @@ async def test_article_by_id_tickertick_fallback(client):
     chain.get_news_article = AsyncMock(return_value=None)
     tickertick = AsyncMock()
     tickertick.get_news_article = AsyncMock(return_value=ARTICLE)
+    read_body = AsyncMock(return_value="the page text")
 
     with (
         patch("src.server.app.news._cache", cache),
+        patch("src.server.app.news.read_article_body", read_body),
         patch("src.data_client.get_news_data_provider", AsyncMock(return_value=chain)),
         patch("src.data_client.get_news_source", AsyncMock(return_value=tickertick)) as get_source,
     ):
@@ -157,6 +159,35 @@ async def test_article_by_id_tickertick_fallback(client):
     assert resp.status_code == 200
     assert resp.json()["id"] == "abc123"
     get_source.assert_awaited_once_with("tickertick")
+    read_body.assert_awaited_once_with("https://example.com/a", cache_key="abc123")
+
+
+async def test_article_by_id_survives_a_body_fetch_that_raises(client):
+    """A body fetch that blows up must not cost the caller the article row.
+
+    The page text is a bonus: whatever the fetcher raises (a DNS failure, a
+    socket blocked by the test harness, a parser bug) the detail endpoint
+    still answers 200 with the row it was given and no content.
+    """
+    cache = AsyncMock()
+    cache.get_article_by_id = AsyncMock(return_value=None)
+    chain = AsyncMock()
+    chain.get_news_article = AsyncMock(return_value=None)
+    tickertick = AsyncMock()
+    tickertick.get_news_article = AsyncMock(return_value=ARTICLE)
+    read_body = AsyncMock(side_effect=RuntimeError("socket blocked"))
+
+    with (
+        patch("src.server.app.news._cache", cache),
+        patch("src.server.app.news.read_article_body", read_body),
+        patch("src.data_client.get_news_data_provider", AsyncMock(return_value=chain)),
+        patch("src.data_client.get_news_source", AsyncMock(return_value=tickertick)),
+    ):
+        resp = await client.get("/api/v1/news/abc123")
+
+    assert resp.status_code == 200
+    assert resp.json()["id"] == "abc123"
+    assert resp.json()["content"] is None
 
 
 async def test_concurrent_misses_collapse_to_one_fetch(client):

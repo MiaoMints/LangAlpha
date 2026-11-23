@@ -25,6 +25,7 @@ from src.server.services.insight_service import (
     _extract_structured_output,
     _llm_extract_fallback,
     _research,
+    _NO_SOURCE_RETRY,
 )
 
 
@@ -687,7 +688,12 @@ class TestSchedule:
         assert len(market_updates) == 11
 
     def test_todays_schedule_weekend(self):
-        """Weekend schedule has pre_market and post_market only (no market_update)."""
+        """A weekend carries the same schedule: crypto trades every day.
+
+        The hourly brief is not a weekday event here -- the desk covers
+        crypto around the clock, so Saturday and Sunday get the identical
+        pre_market + hourly updates + post_market day the weekday does.
+        """
         svc = InsightService()
         from zoneinfo import ZoneInfo
         et = ZoneInfo("America/New_York")
@@ -697,10 +703,11 @@ class TestSchedule:
         jobs = svc._todays_schedule(saturday)
         types = [jtype for _, jtype in jobs]
 
-        assert "pre_market" in types
-        assert "post_market" in types
-        assert "market_update" not in types
-        assert len(jobs) == 2
+        assert types[0] == "pre_market"
+        assert types[-1] == "post_market"
+        market_updates = [t for t in types if t == "market_update"]
+        assert len(market_updates) == 11
+        assert len(jobs) == 13
 
     def test_next_job_wraps_to_tomorrow(self):
         """When no jobs remain today, _next_job returns first job tomorrow."""
@@ -760,14 +767,20 @@ class TestCatchupIfNeeded:
 
     @pytest.mark.asyncio
     async def test_catchup_picks_post_market_evening(self):
-        mock_gen = await self._catchup_at(datetime(2025, 3, 15, 21, 0, tzinfo=ET))
+        """After 23:00 the evening belongs to post_market, not the hourly brief."""
+        mock_gen = await self._catchup_at(datetime(2025, 3, 14, 23, 30, tzinfo=ET))
         assert mock_gen.call_args[0][0] == "post_market"
 
     @pytest.mark.asyncio
-    async def test_catchup_skips_market_update_on_a_weekend(self):
-        """A Saturday afternoon restart runs nothing: the weekend has no hourly update."""
+    async def test_catchup_runs_the_hourly_update_on_a_weekend(self):
+        """A Saturday afternoon restart catches up on the hourly brief.
+
+        Crypto trades through the weekend, so the weekend schedule does
+        carry market_update and a restart owes the day one.
+        """
         mock_gen = await self._catchup_at(datetime(2025, 3, 15, 14, 0, tzinfo=ET))
-        mock_gen.assert_not_called()
+        mock_gen.assert_called_once()
+        assert mock_gen.call_args[0][0] == "market_update"
 
 
 # ---------------------------------------------------------------------------
@@ -907,14 +920,59 @@ class TestGenerateInsight:
         mock_db.claim_system_insight = AsyncMock(side_effect=[in_flight, in_flight, outcome])
         mock_db.complete_market_insight = AsyncMock()
         mock_agent.return_value = "{}"
+        # A cited brief: an uncited one spends the run's one retry, which
+        # would make the count below about the retry, not about the claim.
         svc._extract_with_fallback = AsyncMock(
-            return_value={"headline": "h", "summary": "s", "news_items": [], "topics": []}
+            return_value={
+                "headline": "h",
+                "summary": "s",
+                "news_items": [{"title": "t", "url": "https://example.com/t"}],
+                "topics": [],
+            }
         )
 
         await svc._generate_insight("market_update", datetime(2025, 3, 14, 14, 0, tzinfo=ET))
 
         assert mock_db.claim_system_insight.await_count == 3
         assert mock_agent.await_count == runs
+
+    @pytest.mark.asyncio
+    @patch("src.server.services.insight_service._research", new_callable=AsyncMock)
+    @patch("src.server.services.insight_service.insight_db")
+    async def test_an_uncited_brief_spends_one_told_retry(self, mock_db, mock_agent):
+        """A brief that cites nothing is researched once more, told plainly.
+
+        The retry names the requirement instead of silently looping: the
+        second run is asked for real URLs, and its answer is what gets
+        stored.
+        """
+        svc = InsightService()
+        mock_db.claim_system_insight = AsyncMock(
+            return_value=SystemInsightClaim(row={"market_insight_id": "test-id"})
+        )
+        mock_db.complete_market_insight = AsyncMock()
+        mock_agent.return_value = "{}"
+        svc._extract_with_fallback = AsyncMock(
+            side_effect=[
+                {"headline": "h", "summary": "s", "news_items": [], "topics": []},
+                {
+                    "headline": "h2",
+                    "summary": "s2",
+                    "news_items": [{"title": "t", "url": "https://example.com/t"}],
+                    "topics": [],
+                },
+            ]
+        )
+
+        await svc._generate_insight("market_update", datetime(2025, 3, 14, 14, 0, tzinfo=ET))
+
+        assert mock_agent.await_count == 2
+        first_prompt = mock_agent.await_args_list[0].args[0]
+        second_prompt = mock_agent.await_args_list[1].args[0]
+        assert _NO_SOURCE_RETRY not in first_prompt
+        assert _NO_SOURCE_RETRY in second_prompt
+        stored = mock_db.complete_market_insight.call_args.kwargs
+        assert stored["headline"] == "h2"
 
     @pytest.mark.asyncio
     @patch("src.server.services.insight_service._research", new_callable=AsyncMock)

@@ -297,12 +297,27 @@ async def get_news(
 
 
 async def _with_body(article: dict) -> NewsArticle:
-    """The article plus its page text, fetched on demand and cached by id."""
+    """The article plus its page text, fetched on demand and cached by id.
+
+    The body is a bonus on top of the feed row, never a condition for it:
+    a source that times out, refuses the fetch, or is unreachable must still
+    return the article it listed, just without the page text.
+    """
     payload = dict(article)
     if not payload.get("content"):
-        payload["content"] = await read_article_body(
-            payload.get("article_url"), cache_key=str(payload.get("id") or "") or None
-        )
+        try:
+            payload["content"] = await read_article_body(
+                payload.get("article_url"),
+                cache_key=str(payload.get("id") or "") or None,
+            )
+        except Exception as exc:  # noqa: BLE001 - the body is optional
+            logger.debug(
+                "[NEWS] no body for %s: %s: %s",
+                payload.get("id"),
+                type(exc).__name__,
+                exc,
+            )
+            payload["content"] = None
     return NewsArticle(**payload)
 
 
