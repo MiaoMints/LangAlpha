@@ -647,15 +647,13 @@ async def get_analyst_data(
             raise HTTPException(status_code=503, detail="No financial data provider available")
 
         # Price targets: via provider (works for FMP and yfinance)
-        # Grades: FMP-only (per-analyst records); gracefully empty otherwise
+        # Grades: FMP's per-analyst records, else Yahoo's upgrades and downgrades;
+        # gracefully empty when neither answers
         async def _fetch_grades() -> list:
             try:
-                from src.data_client.fmp.fmp_client import FMPClient
-                fmp_client = FMPClient()
-                try:
-                    return await fmp_client.get_stock_grades(symbol_upper, limit=grade_limit)
-                finally:
-                    await fmp_client.close()
+                from src.data_client.analyst_grades import fmp_else_yahoo
+
+                return await fmp_else_yahoo("get_stock_grades", symbol_upper, grade_limit)
             except Exception:
                 logger.warning("Failed to fetch grades for %s", symbol_upper, exc_info=True)
                 return []

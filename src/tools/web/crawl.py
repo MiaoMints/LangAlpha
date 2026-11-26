@@ -18,6 +18,7 @@ from urllib.parse import urlparse
 
 
 from src.config.tool_settings import get_crawl_provider
+from src.data_client.free_fallback import free_fallback_enabled
 from src.observability import TOOL_PROVIDER, stamp_run, stamp_tool_provider
 from src.tools.decorators import create_logged_tool, get_tool_tracker
 from src.tools.turn_tool import turn_tool
@@ -55,7 +56,18 @@ def _build_firecrawl_adapter():
     return FirecrawlCrawlAdapter()
 
 
-_ADAPTER_BUILDERS = {"firecrawl": _build_firecrawl_adapter}
+
+
+def _build_inhouse_crawl_adapter():
+    from src.tools.web.providers.inhouse import InhouseCrawlAdapter
+
+    return InhouseCrawlAdapter()
+
+
+_ADAPTER_BUILDERS = {
+    "firecrawl": _build_firecrawl_adapter,
+    "inhouse": _build_inhouse_crawl_adapter,
+}
 
 
 def _host_dirname(url: str) -> str:
@@ -132,9 +144,20 @@ def create_crawl_tools(filesystem_backend: Any) -> List[Any]:
 
     Returns [] when the configured provider has no crawl capability, no
     adapter, or its API key is unset — deployments without a key never
-    register the tools.
+    register the tools. Unless the free fallback is on: then a keyed provider
+    with no key is stood in for by the built-in crawl, which needs none.
     """
     provider = get_crawl_provider()
+    spec = get_web_provider_spec(provider)
+    if (
+        provider != "inhouse"
+        and spec is not None
+        and spec.env_key
+        and not os.getenv(spec.env_key)
+        and free_fallback_enabled()
+    ):
+        logger.info("Crawl provider %r has no key; using the built-in crawl", provider)
+        provider = "inhouse"
     cap = get_capability(provider, CAPABILITY_CRAWL)
     spec = get_web_provider_spec(provider)
     builder = _ADAPTER_BUILDERS.get(provider)

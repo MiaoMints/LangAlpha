@@ -30,17 +30,19 @@ except ModuleNotFoundError:  # imported as a package module (tests)
     from mcp_servers._bootstrap import MCPServer
 
 import asyncio
+import re
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone as _tz
 from typing import Any, Optional
 
 from data_client.ginlix_data.option_snapshots import snapshot_row
 from market_protocol.calendars import get_calendar, prebuild_calendars
-from data_client.normalize import listing_currency
+from data_client.normalize import listing_currency, normalize_bars
 from data_client.ginlix_data import (
     close_ginlix_mcp_client,
     get_ginlix_mcp_client,
 )
+from data_client.free_fallback import free_fallback_enabled
 from market_protocol import market_of, to_canonical, to_display
 
 try:
@@ -200,6 +202,14 @@ async def get_options_chain(
         )
 
     if not await _ginlix.ensure():
+        if free_fallback_enabled():
+            return await _free_chain(
+                display, currency, timezone, contract_type=contract_type,
+                expiration_date_gte=expiration_date_gte,
+                expiration_date_lte=expiration_date_lte,
+                strike_price_gte=strike_price_gte, strike_price_lte=strike_price_lte,
+                limit=limit,
+            )
         return make_error(
             "client_unavailable",
             "Options data requires ginlix-data (not configured).",
@@ -216,6 +226,14 @@ async def get_options_chain(
         limit=limit,
     )
     if "error" in result:
+        if free_fallback_enabled():
+            return await _free_chain(
+                display, currency, timezone, contract_type=contract_type,
+                expiration_date_gte=expiration_date_gte,
+                expiration_date_lte=expiration_date_lte,
+                strike_price_gte=strike_price_gte, strike_price_lte=strike_price_lte,
+                limit=limit,
+            )
         return _ginlix_error(result, symbol=display)
 
     return make_response(
@@ -226,6 +244,77 @@ async def get_options_chain(
         timezone=timezone,
         truncated=result.get("truncated", False),
         underlying_ticker=display,
+    )
+
+
+def _free():
+    """Yahoo Finance's option reads, loaded on first use so a sandbox without
+    yfinance still starts this server."""
+    from data_client.yfinance.market_intel_source import YFinanceMarketIntelSource
+
+    return YFinanceMarketIntelSource()
+
+
+async def _free_chain(display, currency, timezone, **filters) -> dict:
+    """The chain from Yahoo Finance when ginlix-data is absent or refuses."""
+    asked = {name: value for name, value in filters.items() if value is not None}
+    try:
+        result = await _free().get_options_chain(display, **asked)
+    except Exception as exc:  # noqa: BLE001
+        return error_from_exception(exc, "Options chain fetch failed.", symbol=display)
+    return make_response(
+        result.get("results", []),
+        source="yfinance",
+        symbol=display,
+        currency=currency,
+        timezone=timezone,
+        truncated=result.get("truncated", False),
+        underlying_ticker=display,
+    )
+
+
+_OCC_ROOT = re.compile(r"^(?:O:)?([A-Z0-9.-]+?)\d{6}[CP]\d{8}$")
+
+
+async def _free_prices(opt, currency, timezone, canonical, from_date, to_date) -> dict:
+    """One contract's bars from Yahoo Finance when ginlix-data is absent or
+    refuses, dated in the underlying's exchange time like the paid read."""
+    match = _OCC_ROOT.match(str(opt).upper())
+    underlying = match.group(1) if match else (opt[2:-15] if opt.startswith("O:") else opt[:-15])
+    try:
+        bars = await _free().get_options_ohlcv(opt, from_date, to_date, canonical)
+        data = list(reversed(normalize_bars(  # normalize_bars is descending
+            bars, underlying, intraday=canonical not in ("1day", "1week", "1month"),
+        )))
+    except Exception as exc:  # noqa: BLE001
+        return error_from_exception(
+            exc, "Options prices fetch failed.", symbol=opt, interval=canonical
+        )
+    return make_response(
+        data, source="yfinance", symbol=opt, interval=canonical,
+        currency=currency, timezone=timezone, truncated=False,
+    )
+
+
+async def _free_snapshot(tickers, options_tickers) -> dict:
+    """Contract snapshots from Yahoo Finance when ginlix-data is absent or
+    refuses, shaped and dated as the paid read shapes them."""
+    try:
+        rows = await _free().get_options_snapshot(tickers)
+        # A call during the startup warm-up must not build the calendar on the loop.
+        await asyncio.to_thread(get_calendar, "XNYS")
+    except Exception as exc:  # noqa: BLE001
+        return error_from_exception(
+            exc, "Options snapshot fetch failed.", tickers=options_tickers
+        )
+    contexts = [_underlying_context(t) for t in tickers]
+    currencies = {c for (_d, c, _tz) in contexts if c}
+    timezones = {tz for (_d, _c, tz) in contexts if tz}
+    return make_response(
+        [snapshot_row(row, datetime.now(_tz.utc)) for row in rows],
+        source="yfinance",
+        currency=next(iter(currencies)) if len(currencies) == 1 else None,
+        timezone=next(iter(timezones)) if len(timezones) == 1 else None,
     )
 
 
@@ -288,6 +377,10 @@ async def get_options_prices(
         )
 
     if not await _ginlix.ensure():
+        if free_fallback_enabled():
+            return await _free_prices(
+                opt, currency, timezone, canonical, from_date, to_date
+            )
         return make_error(
             "client_unavailable",
             "Options data requires ginlix-data (not configured).",
@@ -298,6 +391,10 @@ async def get_options_prices(
         opt, from_date=from_date, to_date=to_date, interval=canonical,
     )
     if isinstance(result, dict):
+        if free_fallback_enabled():
+            return await _free_prices(
+                opt, currency, timezone, canonical, from_date, to_date
+            )
         return _ginlix_error(result, symbol=opt, interval=canonical)
 
     data = list(reversed(result.bars))  # normalize_bars is descending → ascending
@@ -345,6 +442,8 @@ async def get_options_snapshot(
         return make_error("invalid_argument", "No options tickers provided.")
 
     if not await _ginlix.ensure():
+        if free_fallback_enabled():
+            return await _free_snapshot(tickers, options_tickers)
         return make_error(
             "client_unavailable",
             "Options data requires ginlix-data (not configured).",
@@ -360,6 +459,8 @@ async def get_options_snapshot(
 
     result = await _ginlix.fetch_options_snapshot(tickers)
     if "error" in result:
+        if free_fallback_enabled():
+            return await _free_snapshot(tickers, options_tickers)
         return _ginlix_error(result, tickers=options_tickers)
 
     # A call during the startup warm-up must not build the calendar on the loop.

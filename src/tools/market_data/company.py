@@ -48,13 +48,20 @@ from .sec_filings import PeriodicFiling, fetch_periodic_filings
 from .segments import SegmentBreakdown, fetch_segments, segment_lines
 from .utils import finite_or_none, format_percentage, get_market_session
 from src.data_client import get_financial_data_provider, get_market_data_provider
+from src.data_client.analyst_grades import fmp_else_yahoo as _fmp_else_yahoo
 from src.data_client.fmp.analyst import price_targets
 from src.data_client.ginlix_data.directory import display_names, profile_name
 from src.data_client.normalize import change_from, minor_unit_places
 from src.utils.market_hours import ET
 from market_protocol import AssetClass, InstrumentRef
 
-from ._shared import _fmp_request, _get_user_id, _mark_failure, _mark_no_data, _safe_result
+from ._shared import (
+    _fmp_request,
+    _get_user_id,
+    _mark_failure,
+    _mark_no_data,
+    _safe_result,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -257,8 +264,12 @@ async def _gather_company(
     if extended:
         calls.update({
             "filings": fetch_periodic_filings(profile.get("cik")),
-            "grades": _fmp_request("get_stock_grades", symbol, limit=10),
-            "price_targets": _fmp_request("get_price_target_news", symbol, limit=5),
+            "grades": _fmp_else_yahoo(
+                "get_stock_grades", symbol, 10, request=_fmp_request
+            ),
+            "price_targets": _fmp_else_yahoo(
+                "get_price_target_news", symbol, 5, request=_fmp_request
+            ),
             "snapshot": _snapshot(symbol, user_id),
         })
         if intel is not None:

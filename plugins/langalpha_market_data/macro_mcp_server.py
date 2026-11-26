@@ -27,14 +27,10 @@ except ModuleNotFoundError:  # imported as a package module (tests)
 
 from typing import Optional
 
-import asyncio
-import json
-import time
-import urllib.request
-from datetime import datetime, timezone
-
 
 from data_client.fmp import get_fmp_client, fmp_lifespan
+from data_client.free_calendar import earnings_calendar_async, economic_calendar_async
+from data_client.free_fallback import free_fallback_enabled
 from mcp_servers._dates import calendar_days, rates_days, upcoming_days
 from mcp_servers._envelope import error_from_exception, make_error, make_response
 from mcp_servers._schemas import (
@@ -453,7 +449,8 @@ async def get_earnings_calendar(
     try:
         client = await get_fmp_client()
     except Exception:  # noqa: BLE001
-        return make_error("client_unavailable", _CLIENT_UNAVAILABLE)
+        spare = await _free_earnings(from_date, to_date)
+        return spare or make_error("client_unavailable", _CLIENT_UNAVAILABLE)
 
     try:
         lo, hi = calendar_days(from_date, to_date)
@@ -461,7 +458,14 @@ async def get_earnings_calendar(
 
         if not isinstance(data or [], list):
             # FMP answers some refusals with a 200 and an error object, not rows.
-            return make_error("upstream_error", _UPSTREAM_FAILED)
+            return await _free_earnings(from_date, to_date) or make_error(
+                "upstream_error", _UPSTREAM_FAILED
+            )
+
+        if not data:
+            spare = await _free_earnings(from_date, to_date)
+            if spare:
+                return spare
 
         return make_response(
             data or [],
@@ -473,6 +477,9 @@ async def get_earnings_calendar(
         )
 
     except Exception as e:  # noqa: BLE001
+        spare = await _free_earnings(from_date, to_date)
+        if spare:
+            return spare
         return error_from_exception(e, _UPSTREAM_FAILED)
 
 
@@ -482,104 +489,38 @@ if __name__ == "__main__":
 
 # --- Keyless calendar fallback -------------------------------------------
 #
-# FMP gates its calendar behind the Starter plan; the public forex-factory week
-# files carry the same events with a UTC-able timestamp and an impact rating.
-# Only used when FMP answers nothing, so the FMP path stays authoritative.
+# FMP gates both calendars behind the Starter plan. The shared module reads
+# forex-factory's week files and Yahoo's earnings calendar; only used when FMP
+# answers nothing, so the FMP path stays authoritative.
 
-_FF_WEEKS = (
-    "https://nfs.faireconomy.media/ff_calendar_thisweek.json",
-    "https://nfs.faireconomy.media/ff_calendar_nextweek.json",
-)
-_FF_TTL_SECONDS = 600.0
-_FF_TIMEOUT_SECONDS = 20.0
-_FF_CACHE: dict[str, tuple[float, list[dict[str, object]]]] = {}
-_FF_COUNTRIES = {
-    "USD": "US",
-    "EUR": "EU",
-    "GBP": "UK",
-    "JPY": "JP",
-    "CNY": "CN",
-    "AUD": "AU",
-    "NZD": "NZ",
-    "CAD": "CA",
-    "CHF": "CH",
-}
-
-
-def _ff_fetch(url: str) -> list[dict[str, object]]:
-    """Read one week file, or nothing when the feed is unreachable."""
-    now = time.monotonic()
-    cached = _FF_CACHE.get(url)
-    if cached is not None and now - cached[0] < _FF_TTL_SECONDS:
-        return cached[1]
-    request = urllib.request.Request(
-        url,
-        headers={
-            "User-Agent": (
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                "(KHTML, like Gecko) Chrome/152.0.0.0 Safari/537.36"
-            )
-        },
-    )
-    with urllib.request.urlopen(request, timeout=_FF_TIMEOUT_SECONDS) as response:
-        payload = json.loads(response.read().decode("utf-8", "replace"))
-    rows = payload if isinstance(payload, list) else []
-    _FF_CACHE[url] = (now, rows)
-    return rows
-
-
-def _ff_stamp(raw: object) -> str:
-    """Render an offset timestamp as naive UTC, the shape FMP returns."""
-    text = str(raw or "").strip()
-    if not text:
-        return ""
-    try:
-        parsed = datetime.fromisoformat(text)
-    except ValueError:
-        return ""
-    if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=timezone.utc)
-    return parsed.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
 
 
 async def _fallback_calendar(lo: str, hi: str) -> list[dict[str, object]]:
     """Events between two YYYY-MM-DD dates, shaped like FMP's calendar rows."""
-    rows: list[dict[str, object]] = []
-    for url in _FF_WEEKS:
-        try:
-            rows.extend(await asyncio.to_thread(_ff_fetch, url))
-        except Exception:  # noqa: BLE001
-            continue
+    if not free_fallback_enabled():
+        return []
+    return await economic_calendar_async(lo, hi)
 
-    events: list[dict[str, object]] = []
-    for row in rows:
-        if not isinstance(row, dict):
-            continue
-        stamp = _ff_stamp(row.get("date"))
-        if not stamp:
-            continue
-        day = stamp[:10]
-        if day < lo or day > hi:
-            continue
-        currency = str(row.get("country") or "").upper()
-        events.append(
-            {
-                "date": stamp,
-                "country": _FF_COUNTRIES.get(currency, currency),
-                "event": str(row.get("title") or ""),
-                "currency": currency,
-                "previous": row.get("previous"),
-                "estimate": row.get("forecast"),
-                "actual": row.get("actual"),
-                "change": None,
-                "changePercentage": None,
-                "impact": str(row.get("impact") or ""),
-                "unit": None,
-            }
-        )
 
-    events.sort(key=lambda event: (str(event["date"]), str(event["event"])))
-    return events
+async def _free_earnings(from_date: str, to_date: str) -> dict | None:
+    """Yahoo's calendar when the switch is on and Yahoo answers, else None."""
+    if not free_fallback_enabled():
+        return None
+    try:
+        lo, hi = calendar_days(from_date, to_date)
+        rows, truncated = await earnings_calendar_async(lo, hi)
+    except Exception:  # noqa: BLE001 — FMP's failure is the one reported
+        return None
+    if not rows:
+        return None
+    return make_response(
+        rows,
+        source="yfinance",
+        data_type="earnings_calendar",
+        truncated=truncated,
+        from_date=from_date,
+        to_date=to_date,
+    )
 
 
 def _fallback_response(events, from_date, to_date):
@@ -588,6 +529,7 @@ def _fallback_response(events, from_date, to_date):
         events,
         source="forexfactory",
         data_type="economic_calendar",
+        timezone="UTC",
         from_date=from_date,
         to_date=to_date,
     )

@@ -56,6 +56,7 @@ from data_client.lifespan import closing_lifespan
 from data_client.market_data_provider import symbol_market
 from data_client.normalize import (
     listing_currency,
+    normalize_bars,
     minor_unit_places,
     populated,
     scale_price,
@@ -63,6 +64,7 @@ from data_client.normalize import (
 )
 from data_client.ginlix_data import close_ginlix_mcp_client, get_ginlix_mcp_client
 from data_client.ginlix_data.cn_financial import GinlixDataCnFinancialSource
+from data_client.free_fallback import free_fallback_enabled
 from mcp_servers._envelope import error_from_exception, make_error, make_response
 from mcp_servers._schemas import (
     ANY,
@@ -108,6 +110,13 @@ _tushare_financial = None
 
 #: Echo key of the CN tools: set only when a failed tushare read left the answer to FMP.
 _FALLBACK = {"fallback_from": FALLBACK_FROM}
+# Yahoo stands in under its own name; only the schemas that declare
+# `fallback_from` may say which paid source stood aside.
+_SOURCE_FREE = "yfinance"
+_FREE_MARKED = frozenset(
+    {"financial_statements", "financial_ratios", "growth_metrics", "dividends_and_splits",
+     "shares_float", "key_executives"}
+)
 
 
 def _canonical(symbol: str) -> str:
@@ -186,9 +195,149 @@ async def _labels(read, what: str, disp: str) -> list:
         return []
 
 
-async def _from_fmp(disp: str, read, *, data_type: str, **extra) -> dict:
+def _free() -> Any:
+    """The Yahoo stand-ins, imported where the sandbox path resolves them."""
+    from data_client.yfinance import free_fundamentals
+
+    return free_fundamentals
+
+
+async def _free_rows(disp: str, data_type: str, asked: dict[str, Any], **extra: Any) -> dict | None:
+    """Yahoo's answer where FMP could not serve; None when off, failed or empty.
+
+    ``extra`` is the tool's own echo, so the free envelope carries the keys the
+    FMP one does. An empty Yahoo read is a miss: the FMP failure stays the
+    answer, since that is the one the caller can act on.
+    """
+    if not free_fallback_enabled():
+        return None
+    try:
+        rows = await asyncio.to_thread(_free().read, data_type, disp, asked)
+    except Exception as exc:  # noqa: BLE001 — FMP's failure is the one reported
+        logger.warning("yfinance %s failed for %s: %s", data_type, disp, type(exc).__name__)
+        return None
+    if not populated(rows):
+        return None
+    if data_type in _FREE_MARKED:
+        extra = {**extra, "fallback_from": _SOURCE}
+    return make_response(rows, source=_SOURCE_FREE, symbol=disp, data_type=data_type, **extra)
+
+
+def _indicator_values(indicator: str, period: int, close: list, high: list, low: list) -> list:
+    """One indicator over oldest-first prices; None until enough bars have passed.
+
+    Wilder's smoothing (RSI, ADX) and the plain moving averages, computed the
+    way FMP documents its series, so a value matches FMP's to rounding.
+    """
+    n = len(close)
+    out: list = [None] * n
+    gains = losses = smoothed = adx = None
+    first_dx: list[float] = []
+    k = 2 / (period + 1)
+    for i in range(period - 1, n):
+        c = close[i]
+        window = close[i - period + 1 : i + 1]
+        if indicator == "sma":
+            out[i] = sum(window) / period
+        elif indicator == "wma":
+            out[i] = sum(w * v for w, v in zip(range(1, period + 1), window)) / (period * (period + 1) / 2)
+        elif indicator == "ema":
+            out[i] = sum(window) / period if i == period - 1 else c * k + out[i - 1] * (1 - k)
+        elif indicator == "williams":
+            hh, ll = max(high[i - period + 1 : i + 1]), min(low[i - period + 1 : i + 1])
+            out[i] = -100 * (hh - c) / (hh - ll) if hh != ll else 0.0
+        elif indicator == "rsi":
+            if i < period:
+                continue
+            if i == period:
+                changes = [close[j] - close[j - 1] for j in range(1, period + 1)]
+                gains = sum(ch for ch in changes if ch > 0) / period
+                losses = sum(-ch for ch in changes if ch < 0) / period
+            else:
+                change = c - close[i - 1]
+                gains = (gains * (period - 1) + max(change, 0)) / period
+                losses = (losses * (period - 1) + max(-change, 0)) / period
+            out[i] = 100.0 if not losses else 100.0 - 100.0 / (1.0 + gains / losses)
+        elif indicator == "adx":
+            if i < period:
+                continue
+            if i == period:
+                steps = [_true_range(high[j], low[j], close[j - 1], high[j - 1], low[j - 1]) for j in range(1, period + 1)]
+                smoothed = tuple(sum(column) for column in zip(*steps))
+            else:
+                step = _true_range(high[i], low[i], close[i - 1], high[i - 1], low[i - 1])
+                smoothed = tuple(prev - prev / period + cur for prev, cur in zip(smoothed, step))
+            tr_s, plus_s, minus_s = smoothed
+            pdi = 100 * plus_s / tr_s if tr_s else 0.0
+            mdi = 100 * minus_s / tr_s if tr_s else 0.0
+            dx = 100 * abs(pdi - mdi) / (pdi + mdi) if pdi + mdi else 0.0
+            if adx is None:
+                first_dx.append(dx)
+                if len(first_dx) == period:
+                    adx = sum(first_dx) / period
+            else:
+                adx = (adx * (period - 1) + dx) / period
+            out[i] = adx
+    return out
+
+
+def _true_range(high: float, low: float, prev_close: float, prev_high: float, prev_low: float) -> tuple:
+    up, down = high - prev_high, prev_low - low
+    plus = up if up > down and up > 0 else 0.0
+    minus = down if down > up and down > 0 else 0.0
+    return max(high - low, abs(high - prev_close), abs(low - prev_close)), plus, minus
+
+
+def _indicator_series(indicator: str, period: int, rows: list[dict]) -> list[float | None]:
+    """``indicator`` per bar for newest-first *rows*, aligned with *rows*."""
+    ordered = list(reversed(rows))
+    values = _indicator_values(
+        indicator, period,
+        [r["close"] for r in ordered], [r["high"] for r in ordered], [r["low"] for r in ordered],
+    )
+    return list(reversed(values))
+
+
+async def _free_indicator(api: str, indicator: str, period: int, timeframe: str) -> list[dict]:
+    """Yahoo's bars with the indicator attached, newest first; [] when off or short."""
+    from data_client.yfinance.free_bars import free_bars
+
+    if not free_fallback_enabled() or period < 1:
+        return []
+    try:
+        bars = await free_bars(api, timeframe)
+    except Exception as exc:  # noqa: BLE001 — FMP's failure is the one reported
+        logger.warning("yfinance bars for %s %s failed: %s", api, timeframe, type(exc).__name__)
+        return []
+    rows = [
+        row
+        for row in normalize_bars(bars, api, intraday=timeframe != "1day")
+        if None not in (row["open"], row["high"], row["low"], row["close"])
+    ]
+    if len(rows) < period + 1:
+        return []
+    values = _indicator_series(indicator, period, rows)
+    out = [
+        {**row, indicator: round(value, 4)}
+        for row, value in zip(rows, values)
+        if value is not None
+    ]
+    return out[:500]
+
+
+async def _from_fmp(
+    disp: str, read, *, data_type: str, free_args: dict[str, Any] | None = None, **extra
+) -> dict:
     """Answer a tool from FMP: *read* takes the client and returns the payload."""
     payload, error = await _fmp_read(disp, read)
+    if error or not populated(payload):
+        asked = {"symbol": disp, **extra, **(free_args or {})}
+        if data_type == "analyst_ratings":
+            ref = _equity_ref(disp)
+            asked.update(places=minor_unit_places(disp), tz=ref.tz if ref else None)
+        free = await _free_rows(disp, data_type, asked, **extra)
+        if free is not None:
+            return free
     if error:
         return error
     return make_response(
@@ -203,7 +352,9 @@ def _limit_error(disp: str, limit: int, most: int | None = None) -> dict | None:
     return make_error("invalid_argument", f"limit must be {span}, not {limit}", symbol=disp)
 
 
-async def _cn_first(disp: str, cn_read, fmp_read, *, data_type: str, **extra) -> dict:
+async def _cn_first(
+    disp: str, cn_read, fmp_read, *, data_type: str, free_args: dict[str, Any] | None = None, **extra
+) -> dict:
     """Serve a tool from tushare for a CN listing, from FMP otherwise.
 
     The single definition of the cn-branch contract: gate on ``_tushare_for``
@@ -216,7 +367,7 @@ async def _cn_first(disp: str, cn_read, fmp_read, *, data_type: str, **extra) ->
     canonical ``600519.XSHG`` still gates in as a CN listing.
     """
     def fmp():
-        return _from_fmp(disp, fmp_read, data_type=data_type, **extra)
+        return _from_fmp(disp, fmp_read, data_type=data_type, free_args=free_args, **extra)
 
     ts = _tushare_for(disp)
     if ts is None or not await get_ginlix_mcp_client().ensure():
@@ -322,6 +473,7 @@ async def get_financial_statements(
         _cn_statements,
         _fmp_statements,
         data_type="financial_statements",
+        free_args={"limit": limit},
         statement_type=statement_type,
         period=period,
     )
@@ -381,7 +533,12 @@ async def get_financial_ratios(
     # they have no marketCap, enterpriseValue or priceToEarningsRatio, and FMP's
     # are not mixed in to stand for them.
     return await _cn_first(
-        disp, _cn_ratios, _fmp_ratios, data_type="financial_ratios", period=period
+        disp,
+        _cn_ratios,
+        _fmp_ratios,
+        data_type="financial_ratios",
+        free_args={"limit": limit},
+        period=period,
     )
 
 
@@ -435,6 +592,7 @@ async def get_growth_metrics(
         lambda ts: ts.get_growth_periods(disp, period=period, limit=limit),
         _fmp_growth,
         data_type="growth_metrics",
+        free_args={"limit": limit},
         period=period,
     )
 
@@ -487,6 +645,8 @@ async def get_historical_valuation(
     try:
         client = await get_fmp_client()
     except Exception:  # noqa: BLE001
+        if answer := await _free_rows(disp, "historical_valuation", {"symbol": disp, "period": period, "limit": limit}, currency=None, period=period):
+            return answer
         return make_error("client_unavailable", _CLIENT_UNAVAILABLE, symbol=disp)
 
     try:
@@ -494,6 +654,8 @@ async def get_historical_valuation(
         historical_dcf = await client.get_historical_dcf(api, period=period, limit=limit)
         enterprise_value = await client.get_enterprise_value(api, period=period, limit=limit)
     except Exception as e:  # noqa: BLE001
+        if answer := await _free_rows(disp, "historical_valuation", {"symbol": disp, "period": period, "limit": limit}, currency=None, period=period):
+            return answer
         return error_from_exception(e, _UPSTREAM_FAILED, symbol=disp)
 
     key_metrics = await _labels(client.get_key_metrics(api, period=period, limit=limit), "key metrics", disp)
@@ -598,6 +760,7 @@ async def get_analyst_ratings(
         disp,
         _views,
         data_type="analyst_ratings",
+        free_args={"limit": limit},
         currency=listing_currency(ref),
     )
 
@@ -653,6 +816,8 @@ async def get_analyst_estimates(
         _labels(client.get_income_statement(api, period="annual", limit=1), "income statement", disp),
     ))
     if error:
+        if answer := await _free_rows(disp, "analyst_estimates", {"symbol": disp, "limit": limit, "period": period}, currency=None, period=period):
+            return answer
         return error
     rows, statements = answer
     return make_response(
@@ -714,6 +879,8 @@ async def get_earnings_surprises(
         _labels(client.get_income_statement(api, period="quarter", limit=limit + 2), "income statement", disp),
     ))
     if error:
+        if answer := await _free_rows(disp, "earnings_surprises", {"symbol": disp, "limit": limit}, currency=None):
+            return answer
         return error
     reports, statements = answer
     # FMP gives a US listing's figures in US dollars only when it also files in
@@ -766,6 +933,8 @@ async def get_insider_trades(
     try:
         client = await get_fmp_client()
     except Exception:  # noqa: BLE001
+        if answer := await _free_rows(disp, "insider_trades", {"symbol": disp, "limit": limit}):
+            return answer
         return make_error("client_unavailable", _CLIENT_UNAVAILABLE, symbol=disp)
 
     try:
@@ -780,6 +949,8 @@ async def get_insider_trades(
         )
 
     except Exception as e:  # noqa: BLE001
+        if answer := await _free_rows(disp, "insider_trades", {"symbol": disp, "limit": limit}):
+            return answer
         return error_from_exception(e, _UPSTREAM_FAILED, symbol=disp)
 
 
@@ -962,40 +1133,45 @@ async def get_technical_indicator(
             symbol=disp,
         )
     api = _fmp_symbol(symbol)
+    ref = _equity_ref(symbol)
+    source, rows, failure = _SOURCE, None, None
     try:
         client = await get_fmp_client()
     except Exception:  # noqa: BLE001
-        return make_error("client_unavailable", _CLIENT_UNAVAILABLE, symbol=disp)
+        client = None
+        failure = make_error("client_unavailable", _CLIENT_UNAVAILABLE, symbol=disp)
+    if client is not None:
+        try:
+            rows = await client.get_technical_indicator(
+                api, indicator=indicator, period=period, timeframe=timeframe
+            ) or []
+        except Exception as e:  # noqa: BLE001
+            failure = error_from_exception(e, _UPSTREAM_FAILED, symbol=disp)
+    if not rows and free_fallback_enabled():
+        computed = await _free_indicator(api, indicator, period, timeframe)
+        if computed:
+            rows, source = computed, _SOURCE_FREE
+    if rows is None:
+        return failure
+    if timeframe == "1day":
+        # FMP stamps a daily row with a midnight time; the contract is a bare date.
+        rows = [
+            {**row, "date": str(row["date"])[:10]}
+            if isinstance(row, dict) and row.get("date") else row
+            for row in rows
+        ]
+    newest = rows[0].get("date") if rows and isinstance(rows[0], dict) else None
 
-    ref = _equity_ref(symbol)
-    try:
-        data = await client.get_technical_indicator(
-            api, indicator=indicator, period=period, timeframe=timeframe
-        )
-        rows = data or []
-        if timeframe == "1day":
-            # FMP stamps a daily row with a midnight time; the contract is a bare date.
-            rows = [
-                {**row, "date": str(row["date"])[:10]}
-                if isinstance(row, dict) and row.get("date") else row
-                for row in rows
-            ]
-        newest = rows[0].get("date") if rows and isinstance(rows[0], dict) else None
-
-        return make_response(
-            rows,
-            source=_SOURCE,
-            symbol=disp,
-            data_type="technical_indicator",
-            indicator=indicator,
-            period=period,
-            timeframe=timeframe,
-            **series_labels(_SOURCE, ref, timeframe, newest),
-        )
-
-    except Exception as e:  # noqa: BLE001
-        return error_from_exception(e, _UPSTREAM_FAILED, symbol=disp)
-
+    return make_response(
+        rows,
+        source=source,
+        symbol=disp,
+        data_type="technical_indicator",
+        indicator=indicator,
+        period=period,
+        timeframe=timeframe,
+        **series_labels(source, ref, timeframe, newest),
+    )
 
 if __name__ == "__main__":
     mcp.run(transport="stdio")

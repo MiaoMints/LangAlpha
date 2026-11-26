@@ -34,6 +34,7 @@ except ModuleNotFoundError:  # imported as a package module (tests)
 import asyncio
 import logging
 from datetime import datetime, timedelta, timezone as _tz
+from types import SimpleNamespace
 from typing import Any, Literal, Optional
 
 import httpx
@@ -56,6 +57,7 @@ from data_client.normalize import (
 )
 from data_client.ginlix_data.cn_source import GinlixDataCnSource
 from data_client.ginlix_data.directory import NameDirectory
+from data_client.free_fallback import free_fallback_enabled
 from market_protocol import (
     InstrumentRef,
     index_families,
@@ -332,6 +334,154 @@ async def _fetch_stock_bars(
     )
 
 
+def _free():
+    """The free-feed helpers, loaded on first use so a sandbox without yfinance
+    still starts this server and answers from its paid feeds."""
+    from data_client.yfinance.free_bars import desk_bars, free_bars, yahoo_free_symbol
+    from data_client.yfinance.market_intel_source import YFinanceMarketIntelSource
+
+    return SimpleNamespace(
+        desk_bars=desk_bars,
+        free_bars=free_bars,
+        yahoo_free_symbol=yahoo_free_symbol,
+        YFinanceMarketIntelSource=YFinanceMarketIntelSource,
+    )
+
+
+async def _free_else(
+    answer: tuple[Optional[dict], Optional[dict]],
+    resolved: _Resolved,
+    canonical: str,
+    start_date: Optional[str],
+    end_date: Optional[str],
+) -> tuple[Optional[dict], Optional[dict]]:
+    """*answer*, unless the free feed has the bars the paid tiers lack.
+
+    A refused or empty FMP read (a lapsed plan, a missing key) is answered from
+    Yahoo Finance, which says so: ``source`` names it and ``fallback_from`` the
+    source it stood in for. Without bars the paid answer stands, error included.
+    """
+    if not free_fallback_enabled():
+        return answer
+    display, legacy, currency, timezone, ref = resolved
+    family = ref is not None and is_family_index(ref)
+    try:
+        free = _free()
+        bars = await free.free_bars(
+            legacy, canonical, start_date, end_date, is_index=family,
+            yahoo=free.yahoo_free_symbol(display, "stock", is_index=family) if family else None,
+        )
+    except Exception as exc:  # noqa: BLE001 (the paid answer stands)
+        logger.warning("free bars unavailable for %s: %s", display, type(exc).__name__)
+        return answer
+    # free_bars already shifted a pence venue's prices to major units.
+    data = _display_rows(
+        bars, legacy, intraday=canonical not in DAILY_INTERVALS, places=0
+    )
+    if not data:
+        return answer
+    return {
+        "data": data,
+        "source": "yfinance",
+        "fallback_from": "fmp",
+        "symbol": display,
+        "interval": canonical,
+        "currency": currency,
+        "timezone": timezone,
+        "truncated": False,
+    }, None
+
+
+async def _free_asset_rows(
+    ask: str, display: str, asset_type: str, interval: str,
+    from_date: Optional[str], to_date: Optional[str],
+) -> tuple[list, str]:
+    """A pair's, coin's or commodity's bars from the free feeds: ``(rows, source)``.
+
+    A coin is read from Binance first (it quotes in real time) and Yahoo after;
+    a rate or a commodity comes from Yahoo. ``([], "yfinance")`` when none has it.
+    """
+    try:
+        free = _free()
+        yahoo = free.yahoo_free_symbol(ask, asset_type)
+        if asset_type == "crypto":
+            bars = await free.desk_bars(yahoo, interval, from_date, to_date)
+            if bars:
+                return bars, "binance"
+        bars = await free.free_bars(
+            display, interval, from_date, to_date, asset_type=asset_type, yahoo=yahoo
+        )
+        return bars, "yfinance"
+    except Exception as exc:  # noqa: BLE001 (the paid answer stands)
+        logger.warning("free bars unavailable for %s: %s", display, type(exc).__name__)
+        return [], "yfinance"
+
+
+async def _free_short_data(
+    display: str,
+    legacy: str,
+    timezone: Optional[str],
+    data_type: str,
+    from_date: Optional[str],
+    to_date: Optional[str],
+    limit: int,
+) -> dict:
+    """Short interest from Yahoo Finance and short volume from FINRA's daily file.
+
+    The record shapes and newest-first order match the ginlix-data read; a
+    section that fails is named in ``errors`` by the failure's class alone.
+    """
+    try:
+        intel = _free().YFinanceMarketIntelSource()
+    except Exception as exc:  # noqa: BLE001
+        return make_error(
+            "client_unavailable",
+            f"Short data needs ginlix-data or yfinance ({type(exc).__name__}).",
+            symbol=display,
+            data_type=data_type,
+        )
+    wanted = ("short_interest", "short_volume") if data_type == "both" else (data_type,)
+    data: dict[str, list] = {}
+    errors: dict[str, str] = {}
+    for section in wanted:
+        key = "settlement_date" if section == "short_interest" else "date"
+        try:
+            if section == "short_interest":
+                rows = await intel.get_short_interest(
+                    legacy, limit=max(limit, 1), sort=f"{key}.desc"
+                )
+            else:
+                rows = await intel.get_short_volume(legacy, limit=500, sort=f"{key}.desc")
+        except Exception as exc:  # noqa: BLE001 (the other section may answer)
+            errors[section] = f"{type(exc).__name__}: {section} unavailable"
+            continue
+        rows = sorted(
+            (row for row in rows if isinstance(row, dict) and row.get(key)),
+            key=lambda row: str(row[key]),
+            reverse=True,
+        )
+        if from_date:
+            rows = [row for row in rows if str(row[key])[:10] >= from_date[:10]]
+        if to_date:
+            rows = [row for row in rows if str(row[key])[:10] <= to_date[:10]]
+        if rows:
+            data[section] = rows[: max(limit, 1)]
+
+    if not data:
+        return make_error(
+            "upstream_error",
+            "; ".join(errors.values()) or "No short data answered.",
+            symbol=display,
+            data_type=data_type,
+        )
+    extra: dict[str, Any] = {"data_type": data_type}
+    if errors:
+        extra["errors"] = errors
+    return make_response(
+        data, source="yfinance", symbol=display, timezone=timezone, **extra
+    )
+
+
 async def _fetch_chain_bars(
     resolved: _Resolved,
     canonical: str,
@@ -410,11 +560,11 @@ async def _fetch_chain_bars(
     try:
         client = await get_fmp_client()
     except Exception:  # noqa: BLE001
-        return miss or (None, make_error(
+        return await _free_else(miss or (None, make_error(
             "client_unavailable",
             "FMP client unavailable (FMP_API_KEY not configured).",
             symbol=display,
-        ))
+        )), resolved, canonical, start_date, end_date)
 
     places = minor_unit_places(legacy)
     window = None
@@ -431,21 +581,26 @@ async def _fetch_chain_bars(
                 fmp_symbol, canonical, from_date=window.from_day, to_date=window.to_day
             )
     except Exception as e:  # noqa: BLE001
-        return miss or (None, error_from_exception(
+        return await _free_else(miss or (None, error_from_exception(
             e, "FMP fetch failed.", symbol=display, interval=canonical
-        ))
+        )), resolved, canonical, start_date, end_date)
     if not isinstance(rows or [], list):
         # FMP answers some failures with a 200 and an error object, not rows.
-        return miss or (None, make_error(
+        return await _free_else(miss or (None, make_error(
             "upstream_error", "FMP fetch failed.", symbol=display, interval=canonical
-        ))
+        )), resolved, canonical, start_date, end_date)
     truncated = getattr(rows, "truncated", False)
     if window is not None:
         rows = window.rows(rows or [])
 
     data = _display_rows(rows or [], legacy, intraday=intraday, places=places)
-    if miss and not data:
-        return miss
+    if not data:
+        # An empty read stands unless the free feed holds the bars.
+        empty = {
+            "data": data, "source": "fmp", "symbol": display, "interval": canonical,
+            "currency": currency, "timezone": timezone, "truncated": truncated,
+        }
+        return await _free_else(miss or (empty, None), resolved, canonical, start_date, end_date)
     return {
         "data": data,
         "source": "fmp",
@@ -600,62 +755,97 @@ async def get_asset_data(
     try:
         client = await get_fmp_client()
     except Exception:  # noqa: BLE001
-        return make_error(
+        client = None
+        if not free_fallback_enabled():
+            return make_error(
+                "client_unavailable",
+                "FMP client unavailable (FMP_API_KEY not configured).",
+                symbol=display,
+            )
+
+    rows: Any = None
+    window = None
+    truncated = False
+    paid_error: Optional[dict] = None
+    if client is None:
+        paid_error = make_error(
             "client_unavailable",
             "FMP client unavailable (FMP_API_KEY not configured).",
             symbol=display,
         )
-
-    window = None
-    try:
-        # Bounds are read as the hosted tools read them (mcp_servers/_dates.py).
-        if canonical in DAILY_INTERVALS:
-            if at == "commodity":
-                lo, hi = commodity_daily_days(from_date, to_date)
-                rows = await client.get_commodity_price(symbol, from_date=lo, to_date=hi)
-            else:
-                lo, hi = daily_days(from_date, to_date)
-                if at == "crypto":
-                    rows = await client.get_crypto_price(fmp_symbol, from_date=lo, to_date=hi)
+    else:
+        try:
+            # Bounds are read as the hosted tools read them (mcp_servers/_dates.py).
+            if canonical in DAILY_INTERVALS:
+                if at == "commodity":
+                    lo, hi = commodity_daily_days(from_date, to_date)
+                    rows = await client.get_commodity_price(symbol, from_date=lo, to_date=hi)
                 else:
-                    rows = await client.get_forex_price(fmp_symbol, from_date=lo, to_date=hi)
-        elif at == "commodity":
-            # FMP labels a commodity in New York time, the zone its envelope
-            # states, so its labels stand.
-            window = intraday_window(from_date, to_date, NEW_YORK)
-            rows = await client.get_commodity_intraday_chart(
-                symbol, canonical, from_date=window.from_day, to_date=window.to_day
+                    lo, hi = daily_days(from_date, to_date)
+                    if at == "crypto":
+                        rows = await client.get_crypto_price(fmp_symbol, from_date=lo, to_date=hi)
+                    else:
+                        rows = await client.get_forex_price(fmp_symbol, from_date=lo, to_date=hi)
+            elif at == "commodity":
+                # FMP labels a commodity in New York time, the zone its envelope
+                # states, so its labels stand.
+                window = intraday_window(from_date, to_date, NEW_YORK)
+                rows = await client.get_commodity_intraday_chart(
+                    symbol, canonical, from_date=window.from_day, to_date=window.to_day
+                )
+            else:
+                # FMP labels a pair in New York time too, but its envelope states
+                # UTC: the window is read there and the labels rewritten into it.
+                window = intraday_window(from_date, to_date, timezone, labels=NEW_YORK)
+                if at == "crypto":
+                    rows = await client.get_crypto_intraday_chart(
+                        fmp_symbol, canonical, from_date=window.from_day, to_date=window.to_day
+                    )
+                else:
+                    rows = await client.get_forex_intraday_chart(
+                        fmp_symbol, canonical, from_date=window.from_day, to_date=window.to_day
+                    )
+        except Exception as e:  # noqa: BLE001
+            if not free_fallback_enabled():
+                return error_from_exception(
+                    e, "FMP fetch failed.", symbol=display, interval=canonical
+                )
+            # A refused plan is not the caller's mistake: the free feeds may
+            # still answer, and this error stands when they do not.
+            logger.warning("FMP fetch failed for %s; trying the free feeds", display)
+            paid_error = error_from_exception(
+                e, "FMP fetch failed.", symbol=display, interval=canonical
             )
         else:
-            # FMP labels a pair in New York time too, but its envelope states
-            # UTC: the window is read there and the labels rewritten into it.
-            window = intraday_window(from_date, to_date, timezone, labels=NEW_YORK)
-            if at == "crypto":
-                rows = await client.get_crypto_intraday_chart(
-                    fmp_symbol, canonical, from_date=window.from_day, to_date=window.to_day
-                )
-            else:
-                rows = await client.get_forex_intraday_chart(
-                    fmp_symbol, canonical, from_date=window.from_day, to_date=window.to_day
-                )
-    except Exception as e:  # noqa: BLE001
-        return error_from_exception(
-            e, "FMP fetch failed.", symbol=display, interval=canonical
+            truncated = getattr(rows, "truncated", False)
+            if window is not None and isinstance(rows, list):
+                rows = window.rows(rows)
+
+    source, fallback_from = "fmp", None
+    if not rows and free_fallback_enabled():
+        # Binance for a coin, Yahoo for the rest: the vendor spellings differ,
+        # so each feed is asked in its own.
+        free_rows, source = await _free_asset_rows(
+            fmp_symbol if pair else symbol, display, at, canonical, from_date, to_date
         )
-    truncated = getattr(rows, "truncated", False)
-    if window is not None and isinstance(rows, list):
-        rows = window.rows(rows)
+        if free_rows:
+            rows, fallback_from = free_rows, "fmp"
+    if not rows and paid_error is not None:
+        return paid_error
 
     env = {
         "data": _display_rows(rows or [], symbol, intraday=intraday),
-        "source": "fmp",
+        "source": source,
         "symbol": display,
         "interval": canonical,
         "currency": currency,
         "timezone": timezone,
-        "truncated": truncated,
+        "truncated": bool(rows) and truncated,
         "asset_type": at,
     }
+    if fallback_from:
+        env["fallback_from"] = fallback_from
+
     return make_response(**env, **_series_labels(env, ref, canonical))
 
 
@@ -714,6 +904,10 @@ async def get_short_data(
         )
 
     if not await _ginlix.ensure():
+        if free_fallback_enabled():
+            return await _free_short_data(
+                display, legacy, timezone, data_type, from_date, to_date, limit
+            )
         return make_error(
             "client_unavailable",
             "Short data requires ginlix-data (not configured).",
@@ -731,6 +925,11 @@ async def get_short_data(
             data[section] = raw[section]
         if f"{section}_error" in raw:
             errors[section] = raw[f"{section}_error"]
+
+    if not data and free_fallback_enabled():
+        return await _free_short_data(
+            display, legacy, timezone, data_type, from_date, to_date, limit
+        )
 
     if not data:
         return make_error(

@@ -9,6 +9,8 @@ from typing import Optional
 from fastapi import APIRouter, HTTPException, Query
 
 from src.data_client.fmp.fmp_client import FMPClient
+from src.data_client.free_calendar import economic_calendar_async, earnings_calendar_async
+from src.data_client.free_fallback import free_fallback_enabled
 from src.server.models.calendar import (
     EarningsCalendarResponse,
     EarningsEvent,
@@ -23,6 +25,21 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/v1/calendar", tags=["Calendar"])
 
 _earnings_cache = EarningsCacheService()
+
+
+async def _spare(source, lo: str, hi: str) -> list[dict] | None:
+    """Keyless rows when the switch is on and the stand-in answers, else None."""
+    if not free_fallback_enabled():
+        return None
+    try:
+        if source == "earnings":
+            rows, _truncated = await earnings_calendar_async(lo, hi)
+        else:
+            rows = await economic_calendar_async(lo, hi)
+    except Exception as exc:  # noqa: BLE001 — FMP's failure is the one reported
+        logger.warning("%s calendar stand-in for %s..%s failed: %s", source, lo, hi, type(exc).__name__)
+        return None
+    return rows or None
 
 
 def _default_dates(
@@ -57,16 +74,19 @@ async def get_economic_calendar(
     try:
         fmp_client = FMPClient()
     except (ValueError, ImportError):
-        # FMP unavailable — no fallback for economic calendar
-        return EconomicCalendarResponse(data=[], count=0)
+        # FMP unavailable: the keyless calendar answers when the switch is on
+        spare = await _spare("economic", from_date, to_date)
+        return _economic_response(spare, "forexfactory" if spare else "fmp")
 
     try:
         try:
             raw = await fmp_client.get_economic_calendar(
                 from_date=from_date, to_date=to_date
             )
-            events = [EconomicEvent(**item) for item in (raw or [])]
-            return EconomicCalendarResponse(data=events, count=len(events))
+            spare = await _spare("economic", from_date, to_date) if not raw else None
+            if spare is not None:
+                return _economic_response(spare, "forexfactory")
+            return _economic_response(raw or [], "fmp")
         finally:
             await fmp_client.close()
 
@@ -74,6 +94,9 @@ async def get_economic_calendar(
         raise
     except Exception as e:
         logger.error("Error fetching economic calendar: %s", e)
+        spare = await _spare("economic", from_date, to_date)
+        if spare is not None:
+            return _economic_response(spare, "forexfactory")
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -99,8 +122,9 @@ async def get_earnings_calendar(
     try:
         fmp_client = FMPClient()
     except (ValueError, ImportError):
-        # FMP unavailable — no fallback for earnings calendar
-        return EarningsCalendarResponse(data=[], count=0)
+        # FMP unavailable: the keyless calendar answers when the switch is on
+        spare = await _spare("earnings", from_date, to_date)
+        return _earnings_response(spare, "yfinance" if spare else "fmp")
 
     try:
         try:
@@ -108,6 +132,10 @@ async def get_earnings_calendar(
                 from_date=from_date, to_date=to_date
             )
             items = raw or []
+            if not items:
+                spare = await _spare("earnings", from_date, to_date)
+                if spare is not None:
+                    return _earnings_response(spare, "yfinance")
             events = [EarningsEvent(**item) for item in items]
 
             # Populate cache; a cut read is served but not kept
@@ -122,4 +150,17 @@ async def get_earnings_calendar(
         raise
     except Exception as e:
         logger.error("Error fetching earnings calendar: %s", e)
+        spare = await _spare("earnings", from_date, to_date)
+        if spare is not None:
+            return _earnings_response(spare, "yfinance")
         raise HTTPException(status_code=500, detail=str(e))
+
+
+def _economic_response(rows: list | None, source: str) -> EconomicCalendarResponse:
+    events = [EconomicEvent(**item) for item in rows or []]
+    return EconomicCalendarResponse(data=events, count=len(events), source=source)
+
+
+def _earnings_response(rows: list | None, source: str) -> EarningsCalendarResponse:
+    events = [EarningsEvent(**item) for item in rows or []]
+    return EarningsCalendarResponse(data=events, count=len(events), source=source)

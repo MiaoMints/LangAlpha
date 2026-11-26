@@ -17,6 +17,8 @@ from datetime import datetime
 from typing import Any
 from unittest.mock import patch
 
+import pytest
+
 
 def assert_ok_envelope(
     result: dict[str, Any],
@@ -95,3 +97,12 @@ def frozen_clock(at: datetime):
             return at.astimezone(tz) if tz else at
 
     return patch("data_client.normalize.datetime", _Frozen)
+
+
+@pytest.fixture(autouse=True)
+def _free_fallback_off(monkeypatch):
+    """The failure contracts mock only the paid sources.
+
+    A stand-in left on would read them as an outage and reach the network.
+    """
+    monkeypatch.setenv("LANGALPHA_FREE_FALLBACK", "0")

@@ -316,6 +316,226 @@ class RoutedMarketIntelSource(_RoutedSource):
         return await self._on_default("get_options_ohlcv", list, options_ticker, *args, **kwargs)
 
 
+class _Chained(_BySymbol):
+    """``get_*`` answered by the primary source, then the secondary.
+
+    *subject* names the first argument in the recorded fallback; by default it
+    is that argument's own text.
+    """
+
+    def __init__(self, empty: Callable[[], Any], subject: Callable[[Any], str] = str) -> None:
+        super().__init__(empty)
+        self._subject = subject
+
+    def __get__(self, obj: Any, objtype: Any = None) -> Any:
+        if obj is None:
+            return self
+        return functools.partial(obj._chained, self.name, self._empty, subject=self._subject)
+
+
+def _what(method: str) -> str:
+    return method.removeprefix("get_").replace("_", " ")
+
+
+class _FallbackChain:
+    """A source answered by *primary*, else by *secondary*.
+
+    A primary that raises or returns nothing hands the call to the secondary
+    and records the hand-off (:mod:`fallbacks`). A primary that failed stays
+    failed when the secondary has nothing or fails too, so an outage never
+    reads as an empty answer; the secondary's own failure is raised as is.
+    """
+
+    def __init__(
+        self,
+        primary: Any,
+        secondary: Any = None,
+        *,
+        primary_name: str = "fmp",
+        secondary_name: str = "yfinance",
+    ) -> None:
+        self._primary = primary
+        self._secondary = secondary
+        self._primary_name = primary_name
+        self._secondary_name = secondary_name
+
+    async def _chained(
+        self,
+        method: str,
+        empty: Callable[[], Any],
+        symbol: str,
+        /,
+        *args: Any,
+        subject: Callable[[Any], str] = str,
+        **kwargs: Any,
+    ) -> Any:
+        failure = None
+        try:
+            result = await getattr(self._primary, method)(symbol, *args, **kwargs)
+        except Exception as exc:  # noqa: BLE001 (the secondary may still answer)
+            _log_fallback(method, exc)
+            failure = exc
+        else:
+            if populated(result):
+                return result
+        answer = empty()
+        if self._secondary is not None:
+            fn = getattr(self._secondary, method, None)
+            if fn is not None:
+                try:
+                    answer = await fn(symbol, *args, **kwargs)
+                except Exception:  # noqa: BLE001 (a primary failure is the one kept)
+                    if failure is None:
+                        raise
+        served = populated(answer)
+        if served or failure is not None:
+            record(
+                Fallback(
+                    symbol=subject(symbol),
+                    what=_what(method),
+                    source=self._primary_name,
+                    error=error_label(failure) if failure is not None else None,
+                    served_by=self._secondary_name if served else None,
+                )
+            )
+        if failure is not None and not served:
+            raise surfaced(self._primary_name, failure)
+        return answer
+
+    async def close(self) -> None:
+        await _close_all(
+            [("primary", self._primary), ("secondary", self._secondary)]
+        )
+
+
+class FallbackFinancialSource(_FallbackChain):
+    """A financial source answered by *primary* (FMP), else by *secondary*.
+
+    Keeps the chain's rule for every ``get_*`` call and adds the two calls
+    that take no symbol.
+    """
+
+    get_company_profile = _Chained(list)
+    get_income_statements = _Chained(list)
+    get_cash_flows = _Chained(list)
+    get_key_metrics = _Chained(list)
+    get_financial_ratios = _Chained(list)
+    get_price_performance = _Chained(list)
+    get_analyst_price_targets = _Chained(list)
+    get_analyst_ratings = _Chained(list)
+    get_earnings_history = _Chained(list)
+    get_revenue_by_segment = _Chained(list)
+    get_realtime_quote = _Chained(list)
+
+    async def screen_stocks(self, **filters: Any) -> list[dict[str, Any]]:
+        funds = bool(filters.get("isEtf") or filters.get("isFund"))
+        failure = None
+        primary_answered = False
+        if self._primary is not None:
+            try:
+                result = await self._primary.screen_stocks(**dict(filters))
+            except Exception as exc:  # noqa: BLE001 (the secondary may still answer)
+                _log_fallback("screen_stocks", exc)
+                failure = exc
+            else:
+                primary_answered = True
+                if populated(result):
+                    return result
+        # Yahoo's screen covers stocks only; a fund screen has no free stand-in.
+        if funds:
+            if failure is not None:
+                raise surfaced(self._primary_name, failure)
+            if primary_answered:
+                return []
+            raise ValueError("Yahoo's screen covers stocks only; a fund or ETF screen needs FMP")
+        if self._secondary is not None:
+            try:
+                answer = await self._secondary.screen_stocks(**dict(filters))
+            except Exception:  # noqa: BLE001 (a primary failure is the one kept)
+                if failure is None:
+                    raise
+            else:
+                served = populated(answer)
+                if served or failure is not None:
+                    record(
+                        Fallback(
+                            symbol="screen",
+                            what="screen stocks",
+                            source=self._primary_name,
+                            error=error_label(failure) if failure is not None else None,
+                            served_by=self._secondary_name if served else None,
+                        )
+                    )
+                if failure is None or served:
+                    return answer
+        if failure is not None:
+            raise surfaced(self._primary_name, failure)
+        return []
+
+    async def search_stocks(self, query: str, limit: int = 50) -> list[dict[str, Any]]:
+        failure = None
+        if self._primary is not None:
+            try:
+                result = await self._primary.search_stocks(query, limit)
+            except Exception as exc:  # noqa: BLE001 (the secondary may still answer)
+                _log_fallback("search_stocks", exc)
+                failure = exc
+            else:
+                if populated(result):
+                    return result
+        if self._secondary is not None:
+            try:
+                answer = await self._secondary.search_stocks(query, limit)
+            except Exception:  # noqa: BLE001 (a primary failure is the one kept)
+                if failure is None:
+                    raise
+            else:
+                served = populated(answer)
+                if served or failure is not None:
+                    record(
+                        Fallback(
+                            symbol=query,
+                            what="search stocks",
+                            source=self._primary_name,
+                            error=error_label(failure) if failure is not None else None,
+                            served_by=self._secondary_name if served else None,
+                        )
+                    )
+                if failure is None or served:
+                    return answer
+        if failure is not None:
+            raise surfaced(self._primary_name, failure)
+        return []
+
+class FallbackMarketIntelSource(_FallbackChain):
+    """A market-intel source answered by *primary* (ginlix-data), else yfinance."""
+
+    def __init__(
+        self,
+        primary: Any,
+        secondary: Any = None,
+        *,
+        primary_name: str = "ginlix-data",
+        secondary_name: str = "yfinance",
+    ) -> None:
+        super().__init__(
+            primary, secondary, primary_name=primary_name, secondary_name=secondary_name
+        )
+
+    get_options_chain = _Chained(_results)
+    get_short_interest = _Chained(list)
+    get_short_volume = _Chained(list)
+    get_float_shares = _Chained(dict)
+    # Calls whose first argument is not a symbol name it in the record by itself.
+    get_options_snapshot = _Chained(list, subject=",".join)
+    get_movers = _Chained(list)
+
+    async def get_options_ohlcv(
+        self, options_ticker: str, *args: Any, **kwargs: Any
+    ) -> list[dict[str, Any]]:
+        return await self._chained("get_options_ohlcv", list, options_ticker, *args, **kwargs)
+
+
 class FinancialDataProvider:
     """Bundles a :class:`FinancialDataSource` and a :class:`MarketIntelSource`.
 

@@ -373,6 +373,30 @@
               "native_params": {}
             }
           ]
+        },
+        "crawl": {
+          "tracking_name": "InhouseCrawlTool",
+          "default_level": "standard",
+          "levels": [
+            {
+              "name": "standard",
+              "display_name": "Standard",
+              "credits": 0,
+              "native_params": {}
+            }
+          ]
+        },
+        "map": {
+          "tracking_name": "InhouseMapTool",
+          "default_level": "map",
+          "levels": [
+            {
+              "name": "map",
+              "display_name": "Map",
+              "credits": 0,
+              "native_params": {}
+            }
+          ]
         }
       }
     },

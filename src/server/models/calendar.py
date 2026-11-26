@@ -25,6 +25,7 @@ class EconomicCalendarResponse(BaseModel):
 
     data: list[EconomicEvent] = Field(default_factory=list, description="Economic events")
     count: int = Field(0, description="Number of events returned")
+    source: str = Field("fmp", description="Feed that answered: fmp, or a keyless stand-in")
 
 
 class EarningsEvent(BaseModel):
@@ -44,3 +45,4 @@ class EarningsCalendarResponse(BaseModel):
 
     data: list[EarningsEvent] = Field(default_factory=list, description="Earnings events")
     count: int = Field(0, description="Number of events returned")
+    source: str = Field("fmp", description="Feed that answered: fmp, or a keyless stand-in")

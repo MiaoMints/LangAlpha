@@ -15,8 +15,8 @@ from zoneinfo import ZoneInfo
 
 import numpy as np
 
-from src.data_client.base import IntervalNotSupported
-from src.data_client.normalize import (
+from ..base import IntervalNotSupported
+from ..normalize import (
     build_series,
     change_from,
     minor_unit_places,
@@ -27,7 +27,16 @@ from market_protocol import InstrumentRef, Series, to_canonical, to_major_units
 from market_protocol.calendars import get_calendar, session_bounds
 from market_protocol.enums import AssetClass
 from market_protocol.symbology import ALWAYS_24_7, FUTURES_MIC, WEEKDAYS_24_5
-from src.utils.market_hours import interval_seconds
+try:
+    from src.utils.market_hours import interval_seconds
+except ModuleNotFoundError:  # mirrored into sandboxes as top-level data_client without src.utils
+    _SANDBOX_INTERVAL_SECONDS = {
+        "1s": 1, "1min": 60, "5min": 300, "15min": 900,
+        "30min": 1800, "1hour": 3600, "4hour": 14400, "1day": 86400,
+    }
+
+    def interval_seconds(interval: str) -> int:
+        return _SANDBOX_INTERVAL_SECONDS.get(interval, 60)
 
 from .yahoo import yahoo_symbol, yahoo_ticker
 

@@ -125,25 +125,41 @@ def get_market_status(market: str = "US") -> _OUT_GET_MARKET_STATUS:
     try:
         m = yf.Market(market)
         status = m.status
-        zone = None
-        if isinstance(status, dict):
-            status = dict(status)
-            zone = (status.get("timezone") or {}).get("$text")
-            if zone:
-                for key in ("open", "close"):
-                    if isinstance(status.get(key), datetime):
-                        status[key] = status[key].astimezone(ZoneInfo(zone))
-        return make_response(
-            clean_value({"status": status, "summary": m.summary}),
-            source=SOURCE,
-            timezone=zone or "UTC",
-            market=market,
-            count=1,
-        )
     except Exception as e:  # noqa: BLE001
         return make_error(
             "upstream_error", safe_detail("Market status", e), market=market
         )
+    # A market whose summary will not load still has a status worth answering.
+    try:
+        summary = m.summary
+    except Exception:  # noqa: BLE001
+        summary = {}
+    # Yahoo nests the zone under {"$text": ...}; a plain string status ("OPEN")
+    # and a zone name zoneinfo rejects both fall back to UTC rather than failing.
+    zone = None
+    if isinstance(status, dict):
+        status = dict(status)
+        cell = status.get("timezone")
+        zone = cell.get("$text") if isinstance(cell, dict) else None
+        tz = None
+        if isinstance(zone, str) and zone:
+            try:
+                tz = ZoneInfo(zone)
+            except Exception:  # noqa: BLE001
+                zone = None
+        else:
+            zone = None
+        if tz is not None:
+            for key in ("open", "close"):
+                if isinstance(status.get(key), datetime):
+                    status[key] = status[key].astimezone(tz)
+    return make_response(
+        clean_value({"status": status, "summary": summary}),
+        source=SOURCE,
+        timezone=zone or "UTC",
+        market=market,
+        count=1,
+    )
 
 
 _OUT_SCREEN_STOCKS = output_model("ScreenStocksOut", envelope_schema(OBJECT))

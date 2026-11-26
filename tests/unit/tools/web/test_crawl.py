@@ -282,6 +282,7 @@ class TestCreateCrawlTools:
 
     def test_missing_key_returns_no_tools(self, monkeypatch):
         monkeypatch.delenv("FIRECRAWL_API_KEY", raising=False)
+        monkeypatch.setenv("LANGALPHA_FREE_FALLBACK", "0")
         assert crawl_mod.create_crawl_tools(FakeBackend()) == []
 
     def test_unknown_provider_returns_no_tools(self, monkeypatch):

@@ -14,11 +14,13 @@ The chain comes from ``fetch_chain`` in agent_config.yaml and defaults to
 import asyncio
 import hashlib
 import logging
+import re
 from contextvars import ContextVar
 from typing import Annotated, Any, List, Optional
 
 from langchain_core.tools import StructuredTool
 
+from src.data_client.free_fallback import free_fallback_enabled
 from src.llms import LLM, format_llm_content, make_api_call, maybe_disable_streaming
 from src.tools.web.inhouse.sitemap import get_sitemap_summary
 from src.tools.decorators import log_io
@@ -43,6 +45,7 @@ _DEFAULT_CHAIN = ["inhouse"]
 
 # Extraction model configuration
 EXTRACTION_TIMEOUT = 60.0  # seconds per model attempt
+DIGEST_LIMIT = 4000  # characters of page text returned when no model can extract
 WEB_FETCH_DEADLINE = 300.0  # seconds for the whole call: fetch, sitemap and extraction
 
 # Per-request overrides for extraction model (set by chat handler from user preferences)
@@ -228,6 +231,43 @@ def _compose_native_output(result: FetchResult) -> str:
     return "\n\n".join(parts)
 
 
+class ExtractionUnavailable(Exception):
+    """No candidate model could be built (unknown name, missing key, ...)."""
+
+    def __init__(self, failures: List[str]):
+        super().__init__("; ".join(failures))
+        self.failures = failures
+
+
+def _extraction_models(model: str) -> List[str]:
+    """The extraction model, then agent_config.yaml ``llm.fallback`` in order."""
+    names = [model]
+    if free_fallback_enabled():
+        from src.config.tool_settings import _get_agent_config_dict
+
+        spare = (_get_agent_config_dict().get("llm") or {}).get("fallback") or []
+        names += [n for n in spare if isinstance(n, str)]
+    seen: List[str] = []
+    for name in names:
+        if name and name not in seen:
+            seen.append(name)
+    return seen
+
+
+def _page_digest(markdown: str) -> str:
+    """The page's own text, cleaned and cut, for when extraction has no model."""
+    text = re.sub(r"!\[[^\]]*\]\([^)]*\)", "", markdown)
+    text = re.sub(r"\[([^\]]*)\]\([^)]*\)", r"\1", text)
+    text = re.sub(r"<[^>]+>", "", text)
+    text = re.sub(r"\n{3,}", "\n\n", text).strip()
+    if len(text) > DIGEST_LIMIT:
+        text = text[:DIGEST_LIMIT].rstrip() + "\n\n[truncated]"
+    return (
+        "No extraction model is available, so here is the page text itself "
+        f"(at most {DIGEST_LIMIT} characters):\n\n{text}"
+    )
+
+
 async def _extract_with_llm(
     markdown: str,
     prompt: str,
@@ -268,13 +308,25 @@ async def _extract_with_llm(
 """
 
     client_override = fetch_llm_client_override.get()
+    llm = None
     if client_override is not None:
         # Deep-copy: maybe_disable_streaming mutates .streaming in place and
         # the override may be a shared instance from config.subsidiary_llm_clients.
         # Mirrors thread_maintenance.py::compact.
         llm = client_override.model_copy()
     else:
-        llm = LLM(model).get_llm()
+        # A model that cannot be built (its key is missing, usually) is not
+        # this call's answer: the next configured model gets the page instead.
+        failures: List[str] = []
+        for name in _extraction_models(model):
+            try:
+                llm = LLM(name).get_llm()
+            except Exception as e:  # noqa: BLE001
+                failures.append(f"{name}: {type(e).__name__}")
+                continue
+            break
+        if llm is None:
+            raise ExtractionUnavailable(failures)
 
     # Disable streaming to keep extraction chunks off the agent's SSE stream,
     # EXCEPT for Codex whose proxy rejects stream=false outright.
@@ -450,6 +502,13 @@ async def _fetch_and_extract(
                     f"{EXTRACTION_TIMEOUT:.0f}s",
                     provider_side=True,
                 )
+            except ExtractionUnavailable as e:
+                if not free_fallback_enabled():
+                    raise
+                # The page loaded; only the model is missing. Hand over its text.
+                logger.warning("web fetch: no extraction model (%s)", e)
+                artifact["error"] = "extraction_unavailable"
+                return _page_digest(markdown), artifact
             return extracted, artifact
         finally:
             if sitemap_task is not None and not sitemap_task.done():

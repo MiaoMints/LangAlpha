@@ -374,6 +374,7 @@ class TestGetFinancialDataProviderFactory:
         with (
             patch("src.data_client.registry._fmp_available", return_value=True),
             patch("src.data_client.registry._ginlix_data_available", return_value=False),
+            patch("src.data_client.registry._yfinance_available", return_value=False),
             patch("src.data_client.fmp.get_fmp_client", return_value=mock_fmp_client),
             patch("src.data_client.fmp.financial_source.FMPFinancialSource") as MockFMP,
         ):
@@ -381,7 +382,7 @@ class TestGetFinancialDataProviderFactory:
 
             provider = await get_financial_data_provider()
 
-        assert provider.financial is not None
+        assert provider.financial is MockFMP.return_value
         assert provider.intel is None
         MockFMP.assert_called_once_with(mock_fmp_client)
         self._reset_singleton()
@@ -437,8 +438,8 @@ class TestGetFinancialDataProviderFactory:
 
             provider = await get_financial_data_provider()
 
-        assert provider.financial._default is MockFMP.return_value
-        assert provider.intel._default is MockIntel.return_value
+        assert provider.financial._default._primary is MockFMP.return_value
+        assert provider.intel._default._primary is MockIntel.return_value
         MockFMP.assert_called_once_with(mock_fmp_client)
         MockIntel.assert_called_once()
         self._reset_singleton()
@@ -503,7 +504,7 @@ class TestGetFinancialDataProviderFactory:
             provider = await get_financial_data_provider()
 
         assert isinstance(provider.financial, RoutedFinancialSource)
-        assert provider.financial._default is MockFMP.return_value
+        assert provider.financial._default._primary is MockFMP.return_value
         assert "cn" in provider.financial._by_market
         assert isinstance(provider.intel, RoutedMarketIntelSource)
         assert "cn" in provider.intel._by_market
@@ -764,3 +765,47 @@ class TestScreenRowUnits:
             {"symbol": "BETA.L", "price": 3533, "currency": None, "quoteUnit": None},
             {"symbol": "GAMA.L", "price": 37.84, "lastAnnualDividend": 1.16, "currency": "GBP", "quoteUnit": "GBX"},
         ]
+
+
+class TestFallbackReviewRegressions:
+    @pytest.mark.asyncio
+    async def test_search_stocks_raises_primary_failure_when_secondary_is_empty(self):
+        from src.data_client.financial_data_provider import FallbackFinancialSource
+
+        primary, secondary = AsyncMock(), AsyncMock()
+        primary.search_stocks.side_effect = RuntimeError("402 Payment Required")
+        secondary.search_stocks.return_value = []
+        fb = FallbackFinancialSource(primary, secondary)
+
+        with pytest.raises(RuntimeError, match="402 Payment Required"):
+            await fb.search_stocks("AAPL")
+
+    @pytest.mark.asyncio
+    async def test_screen_stocks_preserves_empty_primary_etf_result(self):
+        from src.data_client.financial_data_provider import FallbackFinancialSource
+
+        primary, secondary = AsyncMock(), AsyncMock()
+        primary.screen_stocks.return_value = []
+        secondary.screen_stocks.side_effect = ValueError("Yahoo screens stocks only")
+        fb = FallbackFinancialSource(primary, secondary)
+
+        assert await fb.screen_stocks(isEtf=True) == []
+        secondary.screen_stocks.assert_not_awaited()
+
+    def test_chained_descriptor_allows_class_level_access(self):
+        from src.data_client.financial_data_provider import FallbackFinancialSource, _Chained
+
+        assert isinstance(FallbackFinancialSource.get_company_profile, _Chained)
+
+    @pytest.mark.asyncio
+    async def test_analyst_grades_raises_primary_failure_when_yahoo_returns_empty(self, monkeypatch):
+        from src.data_client import analyst_grades
+
+        monkeypatch.setenv("LANGALPHA_FREE_FALLBACK", "1")
+        monkeypatch.setattr(analyst_grades, "yahoo_stock_grades", lambda symbol, limit=10: [])
+
+        async def fail(*_args, **_kwargs):
+            raise RuntimeError("402 Payment Required")
+
+        with pytest.raises(RuntimeError, match="402 Payment Required"):
+            await analyst_grades.fmp_else_yahoo("get_stock_grades", "AAPL", 5, request=fail)

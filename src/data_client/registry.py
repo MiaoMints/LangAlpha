@@ -22,7 +22,7 @@ from .base import (
     MarketIntelSource,
     NewsDataSource,
 )
-from .financial_data_provider import FinancialDataProvider
+from .financial_data_provider import FallbackFinancialSource, FinancialDataProvider
 
 logger = logging.getLogger(__name__)
 
@@ -442,6 +442,14 @@ async def get_financial_data_provider() -> FinancialDataProvider:
             logger.debug(
                 "financial_data.source.registered | name=fmp (FinancialDataSource)"
             )
+            if _yfinance_available():
+                from .free_fallback import free_fallback_enabled
+
+                if free_fallback_enabled():
+                    # FMP paid plans lapse; Yahoo answers whatever it then cannot.
+                    from .yfinance.financial_source import YFinanceFinancialSource
+
+                    financial = FallbackFinancialSource(financial, YFinanceFinancialSource())
         elif _yfinance_available():
             from .yfinance.financial_source import YFinanceFinancialSource
 
@@ -459,6 +467,25 @@ async def get_financial_data_provider() -> FinancialDataProvider:
             logger.debug(
                 "financial_data.source.registered | name=ginlix-data (MarketIntelSource)"
             )
+            if _yfinance_available():
+                from .free_fallback import free_fallback_enabled
+
+                if free_fallback_enabled():
+                    # A lapsed ginlix-data plan leaves options and short data to Yahoo.
+                    from .financial_data_provider import FallbackMarketIntelSource
+                    from .yfinance.market_intel_source import YFinanceMarketIntelSource
+
+                    intel = FallbackMarketIntelSource(intel, YFinanceMarketIntelSource())
+        elif _yfinance_available():
+            from .free_fallback import free_fallback_enabled
+
+            if free_fallback_enabled():
+                from .yfinance.market_intel_source import YFinanceMarketIntelSource
+
+                intel = YFinanceMarketIntelSource()
+                logger.debug(
+                    "financial_data.source.registered | name=yfinance (MarketIntelSource)"
+                )
 
         if _ginlix_data_available():
             # CN fundamentals come from ginlix-data (vendor: Tushare).

@@ -18,8 +18,8 @@ import yfinance as yf
 from market_protocol import display_spelling, to_major_units
 from market_protocol.symbology import MINOR_UNIT_PLACES
 
-from src.data_client.base import SCREEN_HOME_EXCHANGES
-from src.data_client.normalize import minor_unit_places, scale_price, scale_quote_prices
+from ..base import SCREEN_HOME_EXCHANGES
+from ..normalize import minor_unit_places, scale_price, scale_quote_prices
 
 from .data_source import _fetch_single_snapshot
 from .yahoo import yahoo_ticker
@@ -668,7 +668,7 @@ def _screen_row(q: dict[str, Any]) -> dict[str, Any]:
 
 def _search_stocks(query: str, limit: int) -> list[dict[str, Any]]:
     try:
-        from src.data_client.desk.search import search_cn
+        from ..desk.search import search_cn
         head = search_cn(query, limit)
     except Exception:
         head = []
